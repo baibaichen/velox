@@ -104,6 +104,7 @@ endif()
 add_executable(clickhouse_dwio_parquet_reader_test parquet_read.cpp)
 target_link_libraries(clickhouse_dwio_parquet_reader_test
         clickhouse_dwio_native_parquet_reader
+        velox_hive_connector
         velox_exception
         velox_dwio_parquet_thrift
         parquet
