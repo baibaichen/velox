@@ -17,7 +17,7 @@
 
 #include <folly/Executor.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
-#include "velox/common/caching/AsyncDataCache.h"
+// #include "velox/common/caching/AsyncDataCache.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/core/QueryConfig.h"
 #include "velox/vector/DecodedVector.h"
@@ -39,7 +39,7 @@ class QueryCtx {
       std::unordered_map<std::string, std::string> queryConfigValues = {},
       std::unordered_map<std::string, std::shared_ptr<Config>>
           connectorConfigs = {},
-      cache::AsyncDataCache* cache = cache::AsyncDataCache::getInstance(),
+      // cache::AsyncDataCache* cache = cache::AsyncDataCache::getInstance(),
       std::shared_ptr<memory::MemoryPool> pool = nullptr,
       std::shared_ptr<folly::Executor> spillExecutor = nullptr,
       const std::string& queryId = "");
@@ -53,7 +53,7 @@ class QueryCtx {
       std::unordered_map<std::string, std::string> queryConfigValues = {},
       std::unordered_map<std::string, std::shared_ptr<Config>>
           connectorConfigs = {},
-      cache::AsyncDataCache* cache = cache::AsyncDataCache::getInstance(),
+      // cache::AsyncDataCache* cache = cache::AsyncDataCache::getInstance(),
       std::shared_ptr<memory::MemoryPool> pool = nullptr,
       const std::string& queryId = "");
 
@@ -63,9 +63,9 @@ class QueryCtx {
     return pool_.get();
   }
 
-  cache::AsyncDataCache* cache() const {
-    return cache_;
-  }
+  // cache::AsyncDataCache* cache() const {
+  //   return cache_;
+  // }
 
   folly::Executor* executor() const {
     if (executor_ != nullptr) {
@@ -133,7 +133,7 @@ class QueryCtx {
   const std::string queryId_;
 
   std::unordered_map<std::string, std::shared_ptr<Config>> connectorConfigs_;
-  cache::AsyncDataCache* cache_;
+  // cache::AsyncDataCache* cache_;
   std::shared_ptr<memory::MemoryPool> pool_;
   folly::Executor* executor_;
   folly::Executor::KeepAlive<> executorKeepalive_;

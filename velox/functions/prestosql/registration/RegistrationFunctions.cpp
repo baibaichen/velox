@@ -22,12 +22,12 @@ extern void registerArrayFunctions(const std::string& prefix);
 extern void registerBitwiseFunctions(const std::string& prefix);
 extern void registerCheckedArithmeticFunctions(const std::string& prefix);
 extern void registerComparisonFunctions(const std::string& prefix);
-extern void registerDateTimeFunctions(const std::string& prefix);
+//extern void registerDateTimeFunctions(const std::string& prefix);
 extern void registerGeneralFunctions(const std::string& prefix);
-extern void registerHyperLogFunctions(const std::string& prefix);
-extern void registerJsonFunctions(const std::string& prefix);
+//extern void registerHyperLogFunctions(const std::string& prefix);
+//extern void registerJsonFunctions(const std::string& prefix);
 extern void registerMapFunctions(const std::string& prefix);
-extern void registerStringFunctions(const std::string& prefix);
+//extern void registerStringFunctions(const std::string& prefix);
 extern void registerBinaryFunctions(const std::string& prefix);
 extern void registerURLFunctions(const std::string& prefix);
 extern void registerMapAllowingDuplicates(
@@ -56,11 +56,11 @@ void registerMapFunctions(const std::string& prefix) {
 }
 
 void registerJsonFunctions(const std::string& prefix) {
-  functions::registerJsonFunctions(prefix);
+  //functions::registerJsonFunctions(prefix);
 }
 
 void registerHyperLogFunctions(const std::string& prefix) {
-  functions::registerHyperLogFunctions(prefix);
+  //functions::registerHyperLogFunctions(prefix);
 }
 
 void registerGeneralFunctions(const std::string& prefix) {
@@ -68,7 +68,7 @@ void registerGeneralFunctions(const std::string& prefix) {
 }
 
 void registerDateTimeFunctions(const std::string& prefix) {
-  functions::registerDateTimeFunctions(prefix);
+  //functions::registerDateTimeFunctions(prefix);
 }
 
 void registerURLFunctions(const std::string& prefix) {
@@ -76,7 +76,7 @@ void registerURLFunctions(const std::string& prefix) {
 }
 
 void registerStringFunctions(const std::string& prefix) {
-  functions::registerStringFunctions(prefix);
+  //functions::registerStringFunctions(prefix);
 }
 
 void registerBinaryFunctions(const std::string& prefix) {
@@ -93,12 +93,12 @@ void registerAllScalarFunctions(const std::string& prefix) {
   registerComparisonFunctions(prefix);
   registerMapFunctions(prefix);
   registerArrayFunctions(prefix);
-  registerJsonFunctions(prefix);
-  registerHyperLogFunctions(prefix);
+  //registerJsonFunctions(prefix);
+  //registerHyperLogFunctions(prefix);
   registerGeneralFunctions(prefix);
-  registerDateTimeFunctions(prefix);
+  //registerDateTimeFunctions(prefix);
   registerURLFunctions(prefix);
-  registerStringFunctions(prefix);
+  //registerStringFunctions(prefix);
   registerBinaryFunctions(prefix);
   registerBitwiseFunctions(prefix);
 }

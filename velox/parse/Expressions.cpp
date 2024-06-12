@@ -399,10 +399,10 @@ const exec::FunctionSignature* findLambdaSignature(
   }
 
   // Look for an aggregate lambda function.
-  if (auto signatures =
-          exec::getAggregateFunctionSignatures(callExpr->getFunctionName())) {
-    return findLambdaSignature(signatures.value(), callExpr);
-  }
+  //if (auto signatures =
+          //exec::getAggregateFunctionSignatures(callExpr->getFunctionName())) {
+    //return findLambdaSignature(signatures.value(), callExpr);
+  //}
 
   return nullptr;
 }
