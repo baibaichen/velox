@@ -64,7 +64,9 @@ class SplitReader {
       const std::shared_ptr<io::IoStatistics>& ioStats,
       FileHandleFactory* fileHandleFactory,
       folly::Executor* executor,
-      const std::shared_ptr<common::ScanSpec>& scanSpec);
+      const std::shared_ptr<common::ScanSpec>& scanSpec,
+      core::ExpressionEvaluator* expressionEvaluator,
+      std::atomic<uint64_t>& totalRemainingFilterTime);
 
   virtual ~SplitReader() = default;
 
@@ -86,6 +88,8 @@ class SplitReader {
   bool emptySplit() const;
 
   void resetSplit();
+
+  std::shared_ptr<const dwio::common::TypeWithId> baseFileSchema();
 
   int64_t estimatedRowSize() const;
 

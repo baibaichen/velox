@@ -15,7 +15,12 @@
  */
 
 #include "velox/connectors/hive/iceberg/tests/IcebergSplitReaderBenchmark.h"
+
 #include <filesystem>
+
+#include <folly/executors/IOThreadPoolExecutor.h>
+
+#include "velox/vector/tests/utils/VectorMaker.h"
 
 using namespace facebook::velox;
 using namespace facebook::velox::dwio;
@@ -327,9 +332,14 @@ void IcebergSplitReaderBenchmark::readSingleColumn(
 
   suspender.dismiss();
 
+  auto ioExecutor = std::make_unique<folly::IOThreadPoolExecutor>(3);
+  std::shared_ptr<exec::ExprSet> remainingFilterExprSet{nullptr};
+  std::atomic<uint64_t> totalRemainingFilterTime;
+
   uint64_t resultSize = 0;
   for (std::shared_ptr<HiveConnectorSplit> split : splits) {
     scanSpec->resetCachedValues(true);
+
     std::unique_ptr<IcebergSplitReader> icebergSplitReader =
         std::make_unique<IcebergSplitReader>(
             split,
@@ -340,8 +350,10 @@ void IcebergSplitReaderBenchmark::readSingleColumn(
             rowType,
             ioStats,
             &fileHandleFactory,
-            nullptr,
-            scanSpec);
+            ioExecutor.get(),
+            scanSpec,
+            connectorQueryCtx_->expressionEvaluator(),
+            totalRemainingFilterTime);
 
     std::shared_ptr<random::RandomSkipTracker> randomSkip;
     icebergSplitReader->configureReaderOptions(randomSkip);

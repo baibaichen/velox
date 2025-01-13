@@ -679,6 +679,7 @@ bool applyPartitionFilter(
       VELOX_FAIL(
           "Bad type {} for partition value: {}", type->kind(), partitionValue);
   }
+  return true;
 }
 
 } // namespace
