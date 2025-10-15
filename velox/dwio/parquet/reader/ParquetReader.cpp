@@ -439,12 +439,22 @@ std::unique_ptr<ParquetTypeWithId> ReaderBase::getParquetColumnInfo(
             requestedRowType =
                 std::dynamic_pointer_cast<const velox::RowType>(requestedType);
           } else if (
-              requestedType->isArray() && isRepeated &&
+              requestedType->isArray() &&
               requestedType->asArray().elementType()->isRow()) {
-            // Handle the case of unannotated array of structs (repeated group
-            // without LIST annotation).
-            requestedRowType = std::dynamic_pointer_cast<const velox::RowType>(
-                requestedType->asArray().elementType());
+            if (isRepeated) {
+              // Handle the case of unannotated array of structs (repeated group
+              // without LIST annotation).
+              requestedRowType =
+                  std::dynamic_pointer_cast<const velox::RowType>(
+                      requestedType->asArray().elementType());
+            } else if (
+                !schemaElement.logicalType.__isset.LIST &&
+                schema[schemaIdx].repetition_type ==
+                    thrift::FieldRepetitionType::REPEATED) {
+              // If this is not a LIST element layer, unwrap one level of
+              // array for repeated child of struct.
+              childRequestedType = requestedType->asArray().elementType();
+            }
           }
         }
 
@@ -995,17 +1005,9 @@ TypePtr ReaderBase::convertType(
         switch (schemaElement.type) {
           case thrift::Type::BYTE_ARRAY:
           case thrift::Type::FIXED_LEN_BYTE_ARRAY:
-            VELOX_CHECK(
-                !requestedType ||
-                    isCompatible(
-                        requestedType,
-                        isRepeated,
-                        [](const TypePtr& type) {
-                          return type->kind() == TypeKind::VARCHAR;
-                        }),
-                kTypeMappingErrorFmtStr,
-                "VARCHAR",
-                requestedType->toString());
+            // UTF8 is a logical annotation on BYTE_ARRAY. Do not restrict the
+            // requested type — the column may be read as VARCHAR or as part of
+            // a struct/array in schema-evolution scenarios (e.g., parquet-thrift).
             return VARCHAR();
           default:
             VELOX_FAIL(
@@ -1016,17 +1018,7 @@ TypePtr ReaderBase::convertType(
             schemaElement.type,
             thrift::Type::BYTE_ARRAY,
             "ENUM converted type can only be set for value of thrift::Type::BYTE_ARRAY");
-        VELOX_CHECK(
-            !requestedType ||
-                isCompatible(
-                    requestedType,
-                    isRepeated,
-                    [](const TypePtr& type) {
-                      return type->kind() == TypeKind::VARCHAR;
-                    }),
-            kTypeMappingErrorFmtStr,
-            "VARCHAR",
-            requestedType->toString());
+        // ENUM is a logical annotation on BYTE_ARRAY, same as UTF8.
         return VARCHAR();
       }
       case thrift::ConvertedType::TIME_MILLIS:
@@ -1075,18 +1067,22 @@ TypePtr ReaderBase::convertType(
             requestedType->toString());
         return BOOLEAN();
       case thrift::Type::type::INT32:
-        VELOX_CHECK(
-            !requestedType ||
-                isCompatible(
-                    requestedType,
-                    isRepeated,
-                    [&](const TypePtr& type) {
-                      return isInt32Compatible(
-                          type, TypeKind::INTEGER, allowNarrowing);
-                    }),
-            kTypeMappingErrorFmtStr,
-            "INTEGER",
-            requestedType->toString());
+        // Skip type check for non-primitive requested types (ROW/ARRAY/MAP)
+        // to handle legacy 2-level LIST schema evolution where INT32 elements
+        // may be reinterpreted as group elements (SPARK-36803).
+        if (requestedType && requestedType->isPrimitiveType()) {
+          VELOX_CHECK(
+              isCompatible(
+                  requestedType,
+                  isRepeated,
+                  [&](const TypePtr& type) {
+                    return isInt32Compatible(
+                        type, TypeKind::INTEGER, allowNarrowing);
+                  }),
+              kTypeMappingErrorFmtStr,
+              "INTEGER",
+              requestedType->toString());
+        }
         return INTEGER();
       case thrift::Type::type::INT64:
         // For Int64 Timestamp in nano precision
@@ -1105,12 +1101,14 @@ TypePtr ReaderBase::convertType(
               requestedType->toString());
           return TIMESTAMP();
         }
-        VELOX_CHECK(
-            !requestedType ||
-                isCompatible(requestedType, isRepeated, isInt64Compatible),
-            kTypeMappingErrorFmtStr,
-            "BIGINT",
-            requestedType->toString());
+        // Same pattern as INT32: skip check for non-primitive requested types.
+        if (requestedType && requestedType->isPrimitiveType()) {
+          VELOX_CHECK(
+              isCompatible(requestedType, isRepeated, isInt64Compatible),
+              kTypeMappingErrorFmtStr,
+              "BIGINT",
+              requestedType->toString());
+        }
         return BIGINT();
       case thrift::Type::type::INT96:
         VELOX_CHECK(
