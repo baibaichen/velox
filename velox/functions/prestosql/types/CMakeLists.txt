@@ -43,6 +43,8 @@ velox_add_library(
   UuidType.cpp
   VarcharEnumRegistration.cpp
   VarcharEnumType.cpp
+  VariantEncoding.cpp
+  VariantRegistration.cpp
   HEADERS
   BigintEnumRegistration.h
   BigintEnumType.h
@@ -83,6 +85,9 @@ velox_add_library(
   UuidType.h
   VarcharEnumRegistration.h
   VarcharEnumType.h
+  VariantEncoding.h
+  VariantRegistration.h
+  VariantType.h
 )
 if(VELOX_ENABLE_GEO)
   velox_sources(

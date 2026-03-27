@@ -123,3 +123,35 @@ target_link_libraries(
   velox_functions_prestosql
   velox_row_fast
 )
+
+add_executable(velox_variant_format_benchmark VariantFormatBenchmark.cpp)
+target_link_libraries(
+  velox_variant_format_benchmark
+  velox_vector
+  velox_type
+  velox_memory
+  velox_tpch_gen
+  velox_presto_types
+  Folly::folly
+  Folly::follybenchmark
+  gflags::gflags
+  glog::glog
+)
+
+if(${VELOX_BUILD_TESTING})
+  add_executable(
+    velox_variant_format_benchmark_test VariantFormatBenchmarkTest.cpp)
+  target_link_libraries(
+    velox_variant_format_benchmark_test
+    velox_vector
+    velox_type
+    velox_memory
+    velox_tpch_gen
+    velox_presto_types
+    GTest::gtest
+    Folly::folly
+  )
+  add_test(
+    NAME velox_variant_format_benchmark_test
+    COMMAND velox_variant_format_benchmark_test)
+endif()

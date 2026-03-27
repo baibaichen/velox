@@ -28,6 +28,7 @@ add_executable(
   IPAddressTypeTest.cpp
   IPPrefixTypeTest.cpp
   PrestoTypesTest.cpp
+  VariantTypeTest.cpp
 )
 velox_add_test_headers(velox_presto_types_test TypeTestBase.h)
 
@@ -44,6 +45,8 @@ target_link_libraries(
   velox_presto_types_test
   velox_presto_types
   velox_presto_type_parser
+  velox_functions_prestosql_impl
+  velox_expression
   velox_vector_test_lib
   Folly::folly
   GTest::gtest

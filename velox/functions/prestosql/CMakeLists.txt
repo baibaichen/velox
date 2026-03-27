@@ -60,6 +60,7 @@ velox_add_library(
   UpperLower.cpp
   URIParser.cpp
   VectorArithmetic.cpp
+  VariantExtract.cpp
   WidthBucketArray.cpp
   Zip.cpp
   ZipWith.cpp
