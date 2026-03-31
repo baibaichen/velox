@@ -379,7 +379,7 @@ RowVectorPtr decodeToFormatA(
       valuesSizes,
       valuesStruct);
 
-  return std::make_shared<RowVector>(
+  return std::make_shared<VariantVector>(
       pool,
       VARIANT_COLUMNAR(),
       nullptr,
@@ -439,7 +439,7 @@ RowVectorPtr decodeToFormatB(
   metadataOut->addStringBuffer(metaBuf);
   valueOut->addStringBuffer(valBuf);
 
-  return std::make_shared<RowVector>(
+  return std::make_shared<VariantVector>(
       pool,
       VARIANT_ROW_BASED(),
       nullptr,
@@ -1328,7 +1328,7 @@ AddressBookDataset makeAddressBookDataset(
   bMetadataOut->addStringBuffer(bMetaBuf);
   bValueOut->addStringBuffer(bValBuf);
 
-  ds.formatB = std::make_shared<RowVector>(
+  ds.formatB = std::make_shared<VariantVector>(
       pool, VARIANT_ROW_BASED(), nullptr, numRows,
       std::vector<VectorPtr>{bMetadataOut, bValueOut});
 
@@ -1471,7 +1471,7 @@ AddressBookDataset makeAddressBookDataset(
       ARRAY(ROW({"type_id", "byte_offset"}, {TINYINT(), INTEGER()})),
       nullptr, numRows, valuesOffsets, valuesSizes, valuesStruct);
 
-  ds.formatA = std::make_shared<RowVector>(
+  ds.formatA = std::make_shared<VariantVector>(
       pool, VARIANT_COLUMNAR(), nullptr, numRows,
       std::vector<VectorPtr>{keysArray, childrenArray, valuesArray, dataVec});
 

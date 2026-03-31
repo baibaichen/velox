@@ -184,7 +184,7 @@ void RowVector::copy(
     for (auto i = 0; i < childrenSize_; ++i) {
       if (rowSource->childAt(i)) {
         BaseVector::ensureWritable(
-            rows, type()->asRow().childAt(i), pool(), children_[i]);
+            rows, type()->childAt(i), pool(), children_[i]);
         children_[i]->copy(
             rowSource->childAt(i)->loadedVector(), nonNullRows, toSourceRow);
       } else {
@@ -220,7 +220,7 @@ void RowVector::copy(
     for (auto i = 0; i < childrenSize_; ++i) {
       if (baseSource->childAt(i)) {
         BaseVector::ensureWritable(
-            rows, type()->asRow().childAt(i), pool(), children_[i]);
+            rows, type()->childAt(i), pool(), children_[i]);
         children_[i]->copy(
             baseSource->childAt(i)->loadedVector(),
             nonNullRows,
@@ -251,7 +251,7 @@ void RowVector::setType(const TypePtr& type) {
   for (auto i = 0; i < childrenSize_; i++) {
     auto& child = children_[i];
     if (child) {
-      child->setType(type_->asRow().childAt(i));
+      child->setType(type_->childAt(i));
     }
   }
 }
@@ -306,7 +306,7 @@ void RowVector::copyRanges(
   rows.updateBounds();
   for (auto i = 0; i < children_.size(); ++i) {
     BaseVector::ensureWritable(
-        rows, type()->asRow().childAt(i), pool(), children_[i]);
+        rows, type()->childAt(i), pool(), children_[i]);
   }
 
   DecodedVector decoded(*source);
@@ -490,6 +490,60 @@ void RowVector::updateContainsLazyNotLoaded() const {
       break;
     }
   }
+}
+
+VariantVector::VariantVector(
+    velox::memory::MemoryPool* pool,
+    const TypePtr& type,
+    BufferPtr nulls,
+    vector_size_t length,
+    std::vector<VectorPtr> children,
+    std::optional<vector_size_t> nullCount)
+    : RowVector(
+          pool,
+          type,
+          std::move(nulls),
+          length,
+          std::move(children),
+          nullCount) {
+  VELOX_CHECK(type->isVariant());
+}
+
+VectorPtr& VariantVector::childAt(const std::string& name) {
+  return children()[type()->asVariant().getChildIdx(name)];
+}
+
+const VectorPtr& VariantVector::childAt(const std::string& name) const {
+  return children()[type()->asVariant().getChildIdx(name)];
+}
+
+VectorPtr VariantVector::slice(
+    vector_size_t offset,
+    vector_size_t length) const {
+  std::vector<VectorPtr> slicedChildren(childrenSize());
+  for (size_t i = 0; i < childrenSize(); ++i) {
+    if (children()[i]) {
+      slicedChildren[i] = children()[i]->slice(offset, length);
+    }
+  }
+  return std::make_shared<VariantVector>(
+      pool_, type_, sliceNulls(offset, length), length, std::move(slicedChildren));
+}
+
+VectorPtr VariantVector::testingCopyPreserveEncodings(
+    velox::memory::MemoryPool* pool) const {
+  std::vector<VectorPtr> copiedChildren(childrenSize());
+  for (size_t i = 0; i < childrenSize(); ++i) {
+    copiedChildren[i] = children()[i]->testingCopyPreserveEncodings(pool);
+  }
+  auto selfPool = pool ? pool : pool_;
+  return std::make_shared<VariantVector>(
+      selfPool,
+      type_,
+      AlignedBuffer::copy(selfPool, nulls_),
+      length_,
+      std::move(copiedChildren),
+      nullCount_);
 }
 
 void ArrayVectorBase::copyRangesImpl(
@@ -812,7 +866,9 @@ VectorPtr pushDictionaryToRowVectorLeavesImpl(
           wrappers, size, lazy->loadedVectorShared(), pool);
     }
     case VectorEncoding::Simple::ROW: {
-      VELOX_CHECK_EQ(values->typeKind(), TypeKind::ROW);
+      VELOX_CHECK(
+          values->typeKind() == TypeKind::ROW ||
+          values->typeKind() == TypeKind::VARIANT);
       auto nulls = values->nulls();
       for (auto& wrapper : wrappers) {
         if (wrapper.encoded->nulls()) {
@@ -826,6 +882,10 @@ VectorPtr pushDictionaryToRowVectorLeavesImpl(
           child =
               pushDictionaryToRowVectorLeavesImpl(wrappers, size, child, pool);
         }
+      }
+      if (values->type()->isVariant()) {
+        return std::make_shared<VariantVector>(
+            pool, values->type(), std::move(nulls), size, std::move(children));
       }
       return std::make_shared<RowVector>(
           pool, values->type(), std::move(nulls), size, std::move(children));

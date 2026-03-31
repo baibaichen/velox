@@ -298,7 +298,7 @@ RowVectorPtr decodeToFormatA(
       nullptr, numRows,
       valuesOffsets, valuesSizes, valuesStruct);
 
-  return std::make_shared<RowVector>(
+  return std::make_shared<VariantVector>(
       pool,
       VARIANT_COLUMNAR(),
       nullptr,
@@ -342,7 +342,7 @@ RowVectorPtr decodeToFormatB(
     valOff += blob.size();
   }
 
-  return std::make_shared<RowVector>(
+  return std::make_shared<VariantVector>(
       pool,
       VARIANT_ROW_BASED(),
       nullptr,

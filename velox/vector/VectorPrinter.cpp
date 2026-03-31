@@ -237,10 +237,10 @@ class RowVectorPrinter : public VectorPrinterBase {
 
     auto rowIndex = decoded_.index(index);
 
-    const auto& rowType = decoded_.base()->type()->asRow();
+    auto* rowVector = decoded_.base()->as<RowVector>();
 
-    for (auto i = 0; i < rowType.size(); ++i) {
-      out << indent << "Field " << rowType.nameOf(i) << ": "
+    for (size_t i = 0; i < rowVector->childrenSize(); ++i) {
+      out << indent << "Field " << rowVector->nameOf(i) << ": "
           << children_[i]->summarize(rowIndex) << std::endl;
       out << children_[i]->print(rowIndex, addIndent(indent));
     }
@@ -341,9 +341,8 @@ std::string printTypeAndEncodingTree(
     case VectorEncoding::Simple::ROW: {
       printEncodingAndType(vector, indent, out);
       const auto* rowVector = vector.as<RowVector>();
-      const auto& rowType = vector.type()->asRow();
-      for (auto i = 0; i < rowType.size(); ++i) {
-        out << indent << "Field " << rowType.nameOf(i) << ":" << std::endl;
+      for (size_t i = 0; i < rowVector->childrenSize(); ++i) {
+        out << indent << "Field " << rowVector->nameOf(i) << ":" << std::endl;
         out << printTypeAndEncodingTree(*rowVector->childAt(i), newIndent);
       }
       break;
@@ -582,12 +581,11 @@ class VectorVisitor {
   }
 
   void visitRowVector(const RowVector& vector, Context& ctx) {
-    const auto& rowType = vector.type()->asRow();
     const auto cnt =
         std::min<size_t>(ctx.options.maxChildren, vector.childrenSize());
     for (size_t i = 0; i < cnt; ++i) {
       if (ctx.options.includeChildNames) {
-        ctx.name = rowType.nameOf(i);
+        ctx.name = vector.nameOf(i);
       }
 
       visit(*vector.childAt(i), ctx);

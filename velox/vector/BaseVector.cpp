@@ -436,7 +436,7 @@ VectorPtr BaseVector::createInternal(
       for (int32_t i = 0; i < variantType.size(); ++i) {
         children.push_back(create(variantType.childAt(i), size, pool));
       }
-      return std::make_shared<RowVector>(
+      return std::make_shared<VariantVector>(
           pool, type, nullptr, size, std::move(children));
     }
     case TypeKind::ARRAY: {
@@ -504,6 +504,10 @@ VectorPtr BaseVector::createEmptyLikeInternal(
       for (size_t i = 0; i < type->size(); ++i) {
         children.push_back(
             createEmptyLikeInternal(sourceRow->childAt(i).get(), size, pool));
+      }
+      if (type->isVariant()) {
+        return std::make_shared<VariantVector>(
+            pool, type, nullptr, size, std::move(children));
       }
       return std::make_shared<RowVector>(
           pool, type, nullptr, size, std::move(children));

@@ -129,7 +129,7 @@ class VariantTypeTest : public testing::Test, public TypeTestBase {
       valueFlat->set(i, StringView(val.data(), val.size()));
     }
 
-    return std::make_shared<RowVector>(
+    return std::make_shared<VariantVector>(
         pool_.get(),
         VARIANT_ROW_BASED(),
         nullptr,
@@ -290,7 +290,7 @@ class VariantTypeTest : public testing::Test, public TypeTestBase {
         valuesSizes,
         valuesElementsVec);
 
-    return std::make_shared<RowVector>(
+    return std::make_shared<VariantVector>(
         pool_.get(),
         VARIANT_COLUMNAR(),
         nullptr,
@@ -1428,7 +1428,7 @@ TEST_F(VariantTypeTest, columnarExtractVaryingChildCount) {
       valuesSizes,
       valuesElementsVec);
 
-  auto columnar = std::make_shared<RowVector>(
+  auto columnar = std::make_shared<VariantVector>(
       pool_.get(),
       VARIANT_COLUMNAR(),
       nullptr,

@@ -101,6 +101,12 @@ class RowVector : public BaseVector {
     return asRowType(type());
   }
 
+  /// Return the field name at the given child index.
+  const std::string& nameOf(uint32_t i) const {
+    return type()->isVariant() ? type()->asVariant().nameOf(i)
+                               : type()->asRow().nameOf(i);
+  }
+
   /// Return the number of child vectors.
   /// This will exactly match the number of fields.
   size_t childrenSize() const {
@@ -317,6 +323,37 @@ class RowVector : public BaseVector {
   // unprojected and unfilterd, and reuse its memory.
   VectorPtr rawVectorForBatchReader_;
 };
+
+/// Vector for VARIANT types. Inherits RowVector's physical layout (children
+/// vector) but overrides methods that need VariantType instead of RowType.
+/// Shares VectorEncoding::Simple::ROW because the physical layout is identical.
+class VariantVector : public RowVector {
+ public:
+  VariantVector(const VariantVector&) = delete;
+  VariantVector& operator=(const VariantVector&) = delete;
+
+  VariantVector(
+      velox::memory::MemoryPool* pool,
+      const TypePtr& type,
+      BufferPtr nulls,
+      vector_size_t length,
+      std::vector<VectorPtr> children,
+      std::optional<vector_size_t> nullCount = std::nullopt);
+
+  ~VariantVector() override = default;
+
+  /// String-based child access uses VariantType instead of RowType.
+  using RowVector::childAt;
+  VectorPtr& childAt(const std::string& name);
+  const VectorPtr& childAt(const std::string& name) const;
+
+  VectorPtr slice(vector_size_t offset, vector_size_t length) const override;
+
+  VectorPtr testingCopyPreserveEncodings(
+      velox::memory::MemoryPool* pool = nullptr) const override;
+};
+
+using VariantVectorPtr = std::shared_ptr<VariantVector>;
 
 /// Common parent class for ARRAY and MAP vectors.  Contains 'offsets' and
 /// 'sizes' data and provide manipulations on them.

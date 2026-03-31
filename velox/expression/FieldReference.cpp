@@ -182,7 +182,9 @@ void FieldReference::evalSpecialFormSimplified(
     row = input->as<RowVector>();
     VELOX_CHECK(row);
   }
-  auto index = row->type()->asRow().getChildIdx(field_);
+  auto index = row->type()->isVariant()
+      ? row->type()->asVariant().getChildIdx(field_)
+      : row->type()->asRow().getChildIdx(field_);
   if (index_ == -1) {
     index_ = index;
   } else {
