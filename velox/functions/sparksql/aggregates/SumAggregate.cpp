@@ -195,6 +195,8 @@ exec::AggregateRegistrationResult registerSum(
             }
             return std::make_unique<SumAggregate<double, double, double>>(
                 DOUBLE());
+          case TypeKind::VARIANT:
+            [[fallthrough]];
           case TypeKind::ROW: {
             VELOX_DCHECK(!exec::isRawInput(step));
             checkAccumulatorRowType(inputType);

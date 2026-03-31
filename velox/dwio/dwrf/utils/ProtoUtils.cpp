@@ -64,6 +64,8 @@ void ProtoUtils::writeType(
   self.setKind(typeKindWrapper);
 
   switch (type.kind()) {
+    case TypeKind::VARIANT:
+      VELOX_NYI("VARIANT in DWRF");
     case TypeKind::ROW: {
       auto& row = type.asRow();
       for (size_t i = 0; i < row.size(); ++i) {

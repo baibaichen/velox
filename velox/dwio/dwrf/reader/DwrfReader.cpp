@@ -791,9 +791,10 @@ std::optional<size_t> DwrfRowReader::estimatedRowSizeHelper(
     }
     case TypeKind::ARRAY:
     case TypeKind::MAP:
+    case TypeKind::VARIANT:
     case TypeKind::ROW: {
       // Start the estimate with the offsets and sizes buffers.
-      size_t totalEstimate = nodeType.kind() == TypeKind::ROW
+      size_t totalEstimate = is_row_kind(nodeType.kind())
           ? 0
           : 2 * valueCount * sizeof(vector_size_t);
       for (int32_t i = 0; i < nodeType.subtypesSize(); ++i) {
@@ -928,6 +929,8 @@ bool DwrfReader::hasMetadataValue(const std::string& key) const {
 uint64_t maxStreamsForType(const TypeWrapper& type) {
   if (type.format() == DwrfFormat::kOrc) {
     switch (type.kind()) {
+      case TypeKind::VARIANT:
+        VELOX_NYI("VARIANT in ORC");
       case TypeKind::ROW:
         return 1;
       case TypeKind::SMALLINT:
@@ -952,6 +955,8 @@ uint64_t maxStreamsForType(const TypeWrapper& type) {
 
   // DWRF
   switch (type.kind()) {
+    case TypeKind::VARIANT:
+      VELOX_NYI("VARIANT in DWRF");
     case TypeKind::ROW:
       return 1;
     case TypeKind::REAL:

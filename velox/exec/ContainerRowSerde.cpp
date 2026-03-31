@@ -70,10 +70,7 @@ void serializeOne<TypeKind::ROW>(
     const ContainerRowSerdeOptions& options) {
   auto row = vector.wrappedVector()->asUnchecked<RowVector>();
   auto wrappedIndex = vector.wrappedIndex(index);
-  const auto& type = row->type()->as<TypeKind::ROW>();
-  // The layout is given by the type, not the instance. This will work
-  // in the case of missing elements which will come out as null in
-  // deserialization.
+  const auto& type = *row->type();
   const auto childrenSize = type.size();
   const auto& children = row->children();
   std::vector<uint64_t> nulls(bits::nwords(childrenSize));
@@ -292,7 +289,7 @@ void deserializeOne<TypeKind::ROW>(
     ByteInputStream& in,
     vector_size_t index,
     BaseVector& result) {
-  const auto& type = result.type()->as<TypeKind::ROW>();
+  const auto& type = *result.type();
   VELOX_CHECK_EQ(result.encoding(), VectorEncoding::Simple::ROW);
   auto row = result.asUnchecked<RowVector>();
   auto childrenSize = type.size();
@@ -475,7 +472,7 @@ std::optional<int32_t> compare(
   auto row = right.wrappedVector()->asUnchecked<RowVector>();
   auto wrappedIndex = right.wrappedIndex(index);
   VELOX_CHECK_EQ(row->encoding(), VectorEncoding::Simple::ROW);
-  const auto& type = row->type()->as<TypeKind::ROW>();
+  const auto& type = *row->type();
   auto childrenSize = type.size();
   VELOX_CHECK_EQ(childrenSize, row->childrenSize());
   NullsReader nulls(left, childrenSize);
@@ -791,8 +788,7 @@ std::optional<int32_t> compare(
     ByteInputStream& right,
     const Type* type,
     CompareFlags flags) {
-  const auto& rowType = type->as<TypeKind::ROW>();
-  int size = rowType.size();
+  int size = type->size();
   NullsReader leftNulls(left, size);
   NullsReader rightNulls(right, size);
   for (auto i = 0; i < size; ++i) {
@@ -807,7 +803,7 @@ std::optional<int32_t> compare(
     }
 
     std::optional<int32_t> result;
-    const auto& childType = rowType.childAt(i);
+    const auto& childType = type->childAt(i);
     if (childType->providesCustomComparison()) {
       result = compareSwitch<true>(left, right, childType.get(), flags);
     } else {

@@ -164,10 +164,9 @@ void copy_from_internal<TypeKind::ROW>(
     auto fieldGenericView = dyanmicRowView.at(i);
 
     if (fieldGenericView.has_value()) {
-      TypeKind kind = fieldGenericView->kind();
       VELOX_DYNAMIC_TYPE_DISPATCH(
           copy_from_internal,
-          kind,
+          fieldGenericView->kind(),
           dynamicRowWriter.get_writer_at(i),
           fieldGenericView.value());
     } else {
@@ -179,7 +178,6 @@ void copy_from_internal<TypeKind::ROW>(
 } // namespace
 
 void GenericWriter::copy_from(const GenericView& view) {
-  TypeKind kind = this->kind();
-  VELOX_DYNAMIC_TYPE_DISPATCH_ALL(copy_from_internal, kind, *this, view);
+  VELOX_DYNAMIC_TYPE_DISPATCH_ALL(copy_from_internal, this->kind(), *this, view);
 }
 } // namespace facebook::velox::exec

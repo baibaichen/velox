@@ -925,6 +925,9 @@ void CastExpr::applyPeeled(
             fromType->asRow(),
             toType);
         break;
+      case TypeKind::VARIANT:
+        VELOX_NYI("Cast to/from VARIANT");
+        break;
       default: {
         // Handle primitive type conversions.
         VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(

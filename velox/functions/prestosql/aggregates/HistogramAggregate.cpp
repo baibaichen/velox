@@ -620,6 +620,7 @@ void registerHistogramAggregate(
             return std::make_unique<HistogramAggregate<StringView>>(resultType);
           case TypeKind::ARRAY:
           case TypeKind::MAP:
+          case TypeKind::VARIANT:
           case TypeKind::ROW:
             return std::make_unique<HistogramAggregate<ComplexType>>(
                 resultType);

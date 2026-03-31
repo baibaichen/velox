@@ -2194,6 +2194,8 @@ std::unique_ptr<BaseColumnWriter> BaseColumnWriter::create(
     case TypeKind::TIMESTAMP:
       return std::make_unique<TimestampColumnWriter>(
           context, type, sequence, onRecordPosition);
+    case TypeKind::VARIANT:
+      VELOX_NYI("VARIANT in DWRF");
     case TypeKind::ROW: {
       auto ret = std::make_unique<StructColumnWriter>(
           context, type, sequence, onRecordPosition);

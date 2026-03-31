@@ -33,6 +33,8 @@ AbstractOperand* WaveOperator::definesSubfield(
     bool sourceNullable) {
   VELOX_UNSUPPORTED();
   switch (type->kind()) {
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW: {
       auto& row = type->as<TypeKind::ROW>();
       for (auto i = 0; i < type->size(); ++i) {

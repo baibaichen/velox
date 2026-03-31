@@ -638,6 +638,8 @@ exec::AggregateFunctionFactory getMinMaxFunctionFactoryInternal(
             inputType, false);
       case TypeKind::ARRAY:
         [[fallthrough]];
+      case TypeKind::VARIANT:
+        [[fallthrough]];
       case TypeKind::ROW:
         if (nullHandlingMode == CompareFlags::NullHandlingMode::kNullAsValue) {
           return std::make_unique<

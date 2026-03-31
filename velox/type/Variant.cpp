@@ -288,6 +288,7 @@ std::string Variant::toString(const TypePtr& type) const {
     }
     case TypeKind::ARRAY:
     case TypeKind::MAP:
+    case TypeKind::VARIANT:
     case TypeKind::ROW:
     case TypeKind::OPAQUE:
     case TypeKind::FUNCTION:
@@ -419,6 +420,8 @@ std::string Variant::toJson(const Type& type) const {
       b += "]";
       return b;
     }
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW: {
       auto& row = value<TypeKind::ROW>();
       std::string b{};
@@ -553,6 +556,8 @@ std::string Variant::toJsonUnsafe(const TypePtr& type) const {
       b += "]";
       return b;
     }
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW: {
       auto& row = value<TypeKind::ROW>();
       std::string b{};
@@ -686,6 +691,8 @@ folly::dynamic Variant::serialize() const {
       objValue = velox::ISerializable::serialize(map);
       break;
     }
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW: {
       auto& row = value<TypeKind::ROW>();
       folly::dynamic arr = folly::dynamic::array;
@@ -805,10 +812,14 @@ Variant Variant::create(const folly::dynamic& variantobj) {
       }
       return Variant::map(map);
     }
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       [[fallthrough]];
     case TypeKind::ARRAY: {
-      VELOX_USER_CHECK(kind == TypeKind::ARRAY || kind == TypeKind::ROW);
+      VELOX_USER_CHECK(
+          kind == TypeKind::ARRAY || kind == TypeKind::ROW ||
+          kind == TypeKind::VARIANT);
       std::vector<Variant> values;
       for (auto& val : obj) {
         values.push_back(Variant::create(val));
@@ -1132,6 +1143,8 @@ bool Variant::equalsWithEpsilon(const Variant& other) const {
       return compareComplexTypeWithEpsilon<TypeKind::ARRAY>(*this, other);
     case TypeKind::MAP:
       return compareComplexTypeWithEpsilon<TypeKind::MAP>(*this, other);
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       return compareComplexTypeWithEpsilon<TypeKind::ROW>(*this, other);
     default:
@@ -1184,6 +1197,8 @@ TypePtr Variant::inferType() const {
       return MAP(
           keyType ? keyType : UNKNOWN(), valueType ? valueType : UNKNOWN());
     }
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW: {
       std::vector<TypePtr> children;
       if (!isNull()) {
@@ -1269,6 +1284,8 @@ bool Variant::isTypeCompatible(const TypePtr& type) const {
 
       return true;
     }
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW: {
       if (!isNull()) {
         const auto& r = row();

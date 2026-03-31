@@ -1102,6 +1102,8 @@ std::unique_ptr<exec::Aggregate> createNArg(
       [[fallthrough]];
     case TypeKind::MAP:
       [[fallthrough]];
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       return createNArg<NAggregate, ComplexType>(
           resultType, compareType, errorMessage);

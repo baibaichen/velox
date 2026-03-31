@@ -129,6 +129,7 @@ void registerAverageAggregate(
               return std::make_unique<
                   AverageAggregateBase<int64_t, double, float>>(resultType);
             case TypeKind::DOUBLE:
+            case TypeKind::VARIANT:
             case TypeKind::ROW:
               return std::make_unique<
                   AverageAggregateBase<int64_t, double, double>>(resultType);

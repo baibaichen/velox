@@ -72,7 +72,7 @@ class ConstantVector final : public SimpleVector<T> {
         initialized_(true) {
     makeNullsBuffer();
     // Special handling for complex types
-    if (type->size() > 0 || type->kind() == TypeKind::ROW) {
+    if (type->size() > 0 || is_row_kind(type->kind())) {
       // Only allow null constants to be created through this interface.
       VELOX_CHECK(isNull_);
       valueVector_ = BaseVector::create(type, 1, pool);

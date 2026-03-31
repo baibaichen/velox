@@ -89,7 +89,8 @@ enum class TypeKind : int8_t {
   UNKNOWN = 33,
   FUNCTION = 34,
   OPAQUE = 35,
-  INVALID = 36
+  VARIANT = 36,
+  INVALID = 37
 };
 
 VELOX_DECLARE_ENUM_NAME(TypeKind);
@@ -103,6 +104,7 @@ class MapType;
 class RowType;
 class FunctionType;
 class OpaqueType;
+class VariantType;
 class UnknownType;
 
 struct UnknownValue {
@@ -362,6 +364,19 @@ struct TypeTraits<TypeKind::OPAQUE> {
   static constexpr const char* name = "OPAQUE";
 };
 
+template <>
+struct TypeTraits<TypeKind::VARIANT> {
+  using ImplType = VariantType;
+  using NativeType = void;
+  using DeepCopiedType = void;
+  static constexpr uint32_t minSubTypes = 1;
+  static constexpr uint32_t maxSubTypes = std::numeric_limits<char16_t>::max();
+  static constexpr TypeKind typeKind = TypeKind::VARIANT;
+  static constexpr bool isPrimitiveType = false;
+  static constexpr bool isFixedWidth = false;
+  static constexpr const char* name = "VARIANT";
+};
+
 // Convenience constexpr function to check for string-like and nested type
 // kinds.
 constexpr bool is_string_kind(TypeKind kind) {
@@ -370,7 +385,12 @@ constexpr bool is_string_kind(TypeKind kind) {
 
 constexpr bool is_nested_kind(TypeKind kind) {
   return kind == TypeKind::ARRAY || kind == TypeKind::MAP ||
-      kind == TypeKind::ROW;
+      kind == TypeKind::ROW || kind == TypeKind::VARIANT;
+}
+
+/// True for ROW and VARIANT (which is physically a RowVector).
+constexpr bool is_row_kind(TypeKind kind) {
+  return kind == TypeKind::ROW || kind == TypeKind::VARIANT;
 }
 
 template <TypeKind KIND>
@@ -640,6 +660,7 @@ class Type : public Tree<const TypePtr>, public velox::ISerializable {
   VELOX_FLUENT_CAST(Map, MAP)
   VELOX_FLUENT_CAST(Row, ROW)
   VELOX_FLUENT_CAST(Opaque, OPAQUE)
+  VELOX_FLUENT_CAST(Variant, VARIANT)
   VELOX_FLUENT_CAST(Unknown, UNKNOWN)
   VELOX_FLUENT_CAST(Function, FUNCTION)
 
@@ -711,6 +732,8 @@ class TypeBase : public Type {
         kindCanProvideCustomComparison<KIND>::value,
         "Custom comparisons are only supported for primitive types that are fixed width.");
   }
+
+ public:
 
   bool isPrimitiveType() const override {
     return TypeTraits<KIND>::isPrimitiveType;
@@ -1226,6 +1249,71 @@ using RowTypePtr = std::shared_ptr<const RowType>;
 
 inline RowTypePtr asRowType(const TypePtr& type) {
   return std::dynamic_pointer_cast<const RowType>(type);
+}
+
+/// Base class for VARIANT types. Independent from RowType — has its own field
+/// storage. Two physical layouts derive from this:
+///   - VariantColumnarType (4-column decomposition)
+///   - VariantRowBasedType (2-column blob)
+class VariantType : public TypeBase<TypeKind::VARIANT> {
+ public:
+  uint32_t size() const override {
+    return children_.size();
+  }
+
+  const TypePtr& childAt(uint32_t idx) const override;
+
+  const std::vector<TypePtr>& children() const {
+    return children_;
+  }
+
+  /// Returns the name of the child at specified index.
+  const std::string& nameOf(uint32_t idx) const;
+
+  const std::vector<std::string>& names() const {
+    return names_;
+  }
+
+  /// Returns type of the first child with matching name. Throws if child with
+  /// this name doesn't exist.
+  const TypePtr& findChild(std::string_view name) const;
+
+  /// Returns true if child with specified name exists.
+  bool containsChild(std::string_view name) const;
+
+  /// Returns zero-based index of the first child with matching name. Throws if
+  /// child with this name doesn't exist.
+  uint32_t getChildIdx(std::string_view name) const;
+
+  /// Returns an optional zero-based index of the first child with matching
+  /// name. Returns std::nullopt if child with this name doesn't exist.
+  std::optional<uint32_t> getChildIdxIfExists(std::string_view name) const;
+
+  bool isOrderable() const override {
+    return false;
+  }
+
+  bool isComparable() const override {
+    return false;
+  }
+
+  /// Create an equivalent RowType for RowVector interop (Step 1 bridge).
+  RowTypePtr toRowType() const;
+
+ protected:
+  VariantType(std::vector<std::string>&& names, std::vector<TypePtr>&& types);
+
+  bool equals(const Type& other) const override;
+
+ private:
+  const std::vector<std::string> names_;
+  const std::vector<TypePtr> children_;
+};
+
+using VariantTypePtr = std::shared_ptr<const VariantType>;
+
+inline VariantTypePtr asVariantType(const TypePtr& type) {
+  return std::dynamic_pointer_cast<const VariantType>(type);
 }
 
 /// Represents a lambda function. The children are the argument types
@@ -2095,6 +2183,8 @@ std::shared_ptr<const OpaqueType> OPAQUE() {
       case ::facebook::velox::TypeKind::MAP: {                                 \
         return PREFIX<::facebook::velox::TypeKind::MAP> SUFFIX(__VA_ARGS__);   \
       }                                                                        \
+      case ::facebook::velox::TypeKind::VARIANT:                               \
+        [[fallthrough]];                                                       \
       case ::facebook::velox::TypeKind::ROW: {                                 \
         return PREFIX<::facebook::velox::TypeKind::ROW> SUFFIX(__VA_ARGS__);   \
       }                                                                        \
@@ -2261,6 +2351,9 @@ TypePtr createType<TypeKind::MAP>(std::vector<TypePtr>&& children);
 
 template <>
 TypePtr createType<TypeKind::OPAQUE>(std::vector<TypePtr>&& children);
+
+template <>
+TypePtr createType<TypeKind::VARIANT>(std::vector<TypePtr>&& children);
 
 #undef VELOX_SCALAR_ACCESSOR
 

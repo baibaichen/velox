@@ -266,7 +266,7 @@ void LazyVector::load(RowSet rows, ValueHook* hook) const {
   }
 
   // The loader expect structs to be pre-allocated.
-  if (!vector_ && type_->kind() == TypeKind::ROW) {
+  if (!vector_ && is_row_kind(type_->kind())) {
     vector_ = BaseVector::create(type_, rows.back() + 1, pool_);
   }
 

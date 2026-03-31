@@ -392,6 +392,8 @@ class InPredicate : public exec::VectorFunction {
         [[fallthrough]];
       case TypeKind::MAP:
         [[fallthrough]];
+      case TypeKind::VARIANT:
+        [[fallthrough]];
       case TypeKind::ROW:
         return VectorSetInPredicate::create(elements, offset, size);
       default:

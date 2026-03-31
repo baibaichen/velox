@@ -110,6 +110,7 @@ void addSubfields(
   subfields.resize(newSize);
 
   switch (type.kind()) {
+    case TypeKind::VARIANT:
     case TypeKind::ROW: {
       folly::F14FastMap<std::string, std::vector<SubfieldSpec>> required;
       for (auto& subfield : subfields) {
@@ -117,10 +118,13 @@ void addSubfields(
         auto* nestedField = element->asChecked<common::Subfield::NestedField>();
         required[nestedField->name()].push_back(subfield);
       }
-      const auto& rowType = type.asRow();
-      for (int i = 0; i < rowType.size(); ++i) {
-        auto& childName = rowType.nameOf(i);
-        auto& childType = rowType.childAt(i);
+      const auto numChildren = type.size();
+      const auto* variantType =
+          type.isVariant() ? &type.asVariant() : nullptr;
+      for (int i = 0; i < numChildren; ++i) {
+        const auto& childName = variantType ? variantType->nameOf(i)
+                                            : type.asRow().nameOf(i);
+        auto& childType = type.childAt(i);
         auto* child = spec.addField(childName, i);
         auto it = required.find(childName);
         if (it == required.end()) {
@@ -268,13 +272,16 @@ void checkColumnNameLowerCase(const TypePtr& type) {
       checkColumnNameLowerCase(type->asMap().valueType());
 
     } break;
+    case TypeKind::VARIANT:
     case TypeKind::ROW: {
-      for (const auto& outputName : type->asRow().names()) {
+      const auto& names = type->isVariant() ? type->asVariant().names()
+                                            : type->asRow().names();
+      for (const auto& outputName : names) {
         VELOX_CHECK(
             !std::any_of(outputName.begin(), outputName.end(), isupper));
       }
-      for (auto& childType : type->asRow().children()) {
-        checkColumnNameLowerCase(childType);
+      for (uint32_t i = 0; i < type->size(); ++i) {
+        checkColumnNameLowerCase(type->childAt(i));
       }
     } break;
     default:

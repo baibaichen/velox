@@ -1013,6 +1013,8 @@ std::string_view typeToEncodingName(const TypePtr& type) {
       return kArray;
     case TypeKind::MAP:
       return kMap;
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       if (isIPPrefixType(type)) {
         return kVariableWidth;

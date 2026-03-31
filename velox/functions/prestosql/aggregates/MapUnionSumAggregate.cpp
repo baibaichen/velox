@@ -551,6 +551,7 @@ void registerMapUnionSumAggregate(
                 valueTypeKind, resultType);
           case TypeKind::ARRAY:
           case TypeKind::MAP:
+          case TypeKind::VARIANT:
           case TypeKind::ROW:
             return createMapUnionSumAggregate<ComplexType>(
                 valueTypeKind, resultType);

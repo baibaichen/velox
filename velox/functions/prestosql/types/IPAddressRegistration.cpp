@@ -32,6 +32,8 @@ class IPAddressCastOperator : public exec::CastOperator {
       case TypeKind::VARBINARY:
       case TypeKind::VARCHAR:
         return true;
+      case TypeKind::VARIANT:
+        [[fallthrough]];
       case TypeKind::ROW:
         if (isIPPrefixType(other)) {
           return true;
@@ -47,6 +49,8 @@ class IPAddressCastOperator : public exec::CastOperator {
       case TypeKind::VARBINARY:
       case TypeKind::VARCHAR:
         return true;
+      case TypeKind::VARIANT:
+        [[fallthrough]];
       case TypeKind::ROW:
         if (isIPPrefixType(other)) {
           return true;

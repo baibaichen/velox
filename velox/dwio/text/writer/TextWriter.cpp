@@ -312,6 +312,8 @@ void TextWriter::writeCellValue(
 
       return;
     }
+    case TypeKind::VARIANT:
+      VELOX_NYI("VARIANT in text format");
     case TypeKind::ROW: {
       const RowVector* rowVecPtr = decodedColumnVector->base()->as<RowVector>();
       const auto& indices = decodedColumnVector->indices();

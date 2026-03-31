@@ -50,6 +50,8 @@ WaveVector::WaveVector(
       arena_(&arena),
       children_(std::move(children)) {
   switch (kind_) {
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       encoding_ = VectorEncoding::Simple::ROW;
       break;

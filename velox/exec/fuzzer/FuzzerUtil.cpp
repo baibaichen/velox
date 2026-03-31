@@ -326,6 +326,8 @@ TypePtr sanitize(const TypePtr& type) {
       return ARRAY(sanitize(type->childAt(0)));
     case TypeKind::MAP:
       return MAP(sanitize(type->childAt(0)), sanitize(type->childAt(1)));
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW: {
       const auto& children = asRowType(type)->children();
       std::vector<TypePtr> sanitizedChildren{children.size()};

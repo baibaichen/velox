@@ -208,6 +208,7 @@ exec::AggregateRegistrationResult registerAverage(
               return std::make_unique<AverageAggregate<int64_t, double, float>>(
                   resultType);
             case TypeKind::DOUBLE:
+            case TypeKind::VARIANT:
             case TypeKind::ROW:
               if (inputType->childAt(0)->isDecimal()) {
                 return std::make_unique<

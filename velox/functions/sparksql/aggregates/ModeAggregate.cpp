@@ -576,6 +576,7 @@ void registerModeAggregate(
                 step, argTypes, resultType);
           case TypeKind::ARRAY:
           case TypeKind::MAP:
+          case TypeKind::VARIANT:
           case TypeKind::ROW:
             return std::make_unique<ComplexTypeModeAggregate<ComplexType>>(
                 resultType, inputType);

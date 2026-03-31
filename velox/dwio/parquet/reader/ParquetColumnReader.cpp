@@ -69,6 +69,8 @@ std::unique_ptr<dwio::common::SelectiveColumnReader> ParquetColumnReader::build(
       return std::make_unique<FloatingPointColumnReader<double, double>>(
           requestedType, fileType, params, scanSpec);
 
+    case TypeKind::VARIANT:
+      VELOX_NYI("VARIANT in Parquet");
     case TypeKind::ROW:
       return std::make_unique<StructColumnReader>(
           columnReaderOptions, requestedType, fileType, params, scanSpec);

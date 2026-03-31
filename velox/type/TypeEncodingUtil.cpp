@@ -38,10 +38,11 @@ size_t approximateTypeEncodingwidth(const TypePtr& type) {
     case TypeKind::MAP:
       return 1 + approximateTypeEncodingwidth(type->asMap().keyType()) +
           approximateTypeEncodingwidth(type->asMap().valueType());
+    case TypeKind::VARIANT:
     case TypeKind::ROW: {
       size_t fieldWidth = 0;
-      for (const auto& child : type->asRow().children()) {
-        fieldWidth += approximateTypeEncodingwidth(child);
+      for (uint32_t i = 0; i < type->size(); ++i) {
+        fieldWidth += approximateTypeEncodingwidth(type->childAt(i));
       }
       return fieldWidth;
     }

@@ -45,6 +45,8 @@ void findProjectedNodes(
   }
   projectedNodes.insert(actual.id());
   switch (actual.type()->kind()) {
+    case TypeKind::VARIANT:
+      VELOX_NYI("VARIANT in DWRF");
     case TypeKind::ROW: {
       uint64_t childCount = std::min(expected.size(), actual.size());
       for (uint64_t i = 0; i < childCount; ++i) {

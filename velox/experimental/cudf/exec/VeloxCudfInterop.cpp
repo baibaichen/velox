@@ -101,6 +101,8 @@ cudf::data_type veloxToCudfDataType(const TypePtr& type) {
     // case TypeKind::INTERVAL_DAY_TIME: return cudf::type_id::EMPTY;
     case TypeKind::ARRAY:
       return cudf::data_type{cudf::type_id::LIST};
+    case TypeKind::VARIANT:
+      VELOX_NYI("VARIANT in cuDF conversion");
     case TypeKind::ROW:
       return cudf::data_type{cudf::type_id::STRUCT};
     // case TypeKind::MAP: return cudf::type_id::EMPTY;
@@ -159,6 +161,8 @@ namespace {
 
 void setArrowFormatBackToVarbinary(ArrowSchema* schema, const TypePtr& type) {
   switch (type->kind()) {
+    case TypeKind::VARIANT:
+      VELOX_NYI("VARIANT in cuDF conversion");
     case TypeKind::ROW: {
       if (schema->n_children != static_cast<int64_t>(type->size())) {
         break;

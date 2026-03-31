@@ -256,6 +256,8 @@ std::unique_ptr<exec::Aggregate> createSetAgg(
       return std::make_unique<SparkCollectSetAggregate<StringView>>(resultType);
     case TypeKind::ARRAY:
       [[fallthrough]];
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       return std::make_unique<SparkCollectSetAggregate<ComplexType>>(
           resultType);

@@ -497,6 +497,13 @@ ScanSpec* ScanSpec::addArrayElementFieldRecursively(const Type& type) {
 
 void ScanSpec::addAllChildFields(const Type& type) {
   switch (type.kind()) {
+    case TypeKind::VARIANT: {
+      auto& variantType = type.asVariant();
+      for (auto i = 0; i < type.size(); ++i) {
+        addFieldRecursively(variantType.nameOf(i), *type.childAt(i), i);
+      }
+      break;
+    }
     case TypeKind::ROW: {
       auto& rowType = type.asRow();
       for (auto i = 0; i < type.size(); ++i) {
@@ -547,6 +554,7 @@ void filterRows(
   switch (vector.typeKind()) {
     case TypeKind::ARRAY:
     case TypeKind::MAP:
+    case TypeKind::VARIANT:
     case TypeKind::ROW:
       VELOX_CHECK(
           filter.kind() == FilterKind::kIsNull ||

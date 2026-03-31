@@ -76,6 +76,8 @@ void UnsafeRowFast::initialize(const TypePtr& type) {
       childIsFixedWidth_.push_back(isFixedWidth(mapBase->mapValues()->type()));
       break;
     }
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW: {
       auto rowBase = base->as<RowVector>();
       for (const auto& child : rowBase->children()) {
@@ -157,6 +159,8 @@ int32_t UnsafeRowFast::variableWidthRowSize(vector_size_t index) const {
       return arrayRowSize(index);
     case TypeKind::MAP:
       return mapRowSize(index);
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       return rowRowSize(index);
     default:
@@ -224,6 +228,8 @@ int32_t UnsafeRowFast::serializeVariableWidth(vector_size_t index, char* buffer)
       return serializeArray(index, buffer);
     case TypeKind::MAP:
       return serializeMap(index, buffer);
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       return serializeRow(index, buffer);
     default:
@@ -947,6 +953,7 @@ ArrayVectorPtr deserializeArrays(
         break;
       case TypeKind::ARRAY:
       case TypeKind::MAP:
+      case TypeKind::VARIANT:
       case TypeKind::ROW:
         elements = deserializeComplexArrays(
             elementType,
@@ -1027,6 +1034,8 @@ VectorPtr deserialize(
       return deserializeArrays(type, data, nulls, pool);
     case TypeKind::MAP:
       return deserializeMaps(type, data, nulls, pool);
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       return deserializeRows(type, data, nulls, offsets, pool);
     default:

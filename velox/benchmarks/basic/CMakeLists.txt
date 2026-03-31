@@ -138,6 +138,22 @@ target_link_libraries(
   glog::glog
 )
 
+add_executable(velox_variant_expr_benchmark VariantExprBenchmark.cpp)
+target_link_libraries(
+  velox_variant_expr_benchmark
+  velox_vector
+  velox_type
+  velox_memory
+  velox_expression
+  velox_tpch_gen
+  velox_presto_types
+  velox_functions_prestosql_impl
+  Folly::folly
+  Folly::follybenchmark
+  gflags::gflags
+  glog::glog
+)
+
 if(${VELOX_BUILD_TESTING})
   add_executable(
     velox_variant_format_benchmark_test VariantFormatBenchmarkTest.cpp)

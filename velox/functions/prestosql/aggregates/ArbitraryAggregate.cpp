@@ -472,6 +472,8 @@ void registerArbitraryAggregate(
             [[fallthrough]];
           case TypeKind::MAP:
             [[fallthrough]];
+          case TypeKind::VARIANT:
+            [[fallthrough]];
           case TypeKind::ROW:
             [[fallthrough]];
           case TypeKind::UNKNOWN:

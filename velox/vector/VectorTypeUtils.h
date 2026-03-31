@@ -59,6 +59,13 @@ struct KindToFlatVector<TypeKind::ROW> {
 };
 
 template <>
+struct KindToFlatVector<TypeKind::VARIANT> {
+  using type = RowVector;
+  using WrapperType = ComplexType;
+  using HashRowType = StringView;
+};
+
+template <>
 struct KindToFlatVector<TypeKind::VARCHAR> {
   using type = FlatVector<StringView>;
   using WrapperType = StringView;

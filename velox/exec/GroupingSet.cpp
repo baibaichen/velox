@@ -1265,7 +1265,8 @@ void GroupingSet::prepareSpillResultWithoutAggregates(
     VELOX_CHECK_EQ(table_->rows()->keyTypes().size(), numColumns);
     std::vector<TypePtr> types{table_->rows()->keyTypes()};
 
-    const auto& resultType = dynamic_cast<const RowType*>(result->type().get());
+    const auto* resultType = dynamic_cast<const RowType*>(result->type().get());
+    VELOX_CHECK_NOT_NULL(resultType);
     for (auto i = 0; i < numColumns; ++i) {
       names[groupingKeyOutputProjections_[i]] = resultType->nameOf(i);
     }

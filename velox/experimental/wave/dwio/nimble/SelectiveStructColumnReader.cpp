@@ -86,6 +86,8 @@ std::unique_ptr<ColumnReader> NimbleFormatReader::build(
       return std::make_unique<ColumnReader>(
           requestedType, fileType, operand, params, scanSpec);
 
+    case TypeKind::VARIANT:
+      VELOX_NYI("VARIANT type not supported in wave nimble reader");
     case TypeKind::ROW:
       return std::make_unique<SelectiveStructColumnReader>(
           requestedType,

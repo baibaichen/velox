@@ -307,7 +307,7 @@ TEST_F(VariantTypeTest, columnarTypeSingleton) {
   auto t2 = VARIANT_COLUMNAR();
   ASSERT_EQ(t1.get(), t2.get());
   ASSERT_STREQ(t1->name(), "VARIANT_COLUMNAR");
-  ASSERT_STREQ(t1->kindName(), "ROW");
+  ASSERT_STREQ(t1->kindName(), "VARIANT");
   ASSERT_EQ(t1->size(), 4);
   ASSERT_TRUE(t1->parameters().empty());
 }
@@ -317,7 +317,7 @@ TEST_F(VariantTypeTest, rowBasedTypeSingleton) {
   auto t2 = VARIANT_ROW_BASED();
   ASSERT_EQ(t1.get(), t2.get());
   ASSERT_STREQ(t1->name(), "VARIANT_ROW_BASED");
-  ASSERT_STREQ(t1->kindName(), "ROW");
+  ASSERT_STREQ(t1->kindName(), "VARIANT");
   ASSERT_EQ(t1->size(), 2);
   ASSERT_TRUE(t1->parameters().empty());
 }
@@ -330,6 +330,14 @@ TEST_F(VariantTypeTest, typeDetection) {
   ASSERT_TRUE(isVariantType(VARIANT_COLUMNAR()));
   ASSERT_TRUE(isVariantType(VARIANT_ROW_BASED()));
   ASSERT_FALSE(isVariantType(VARCHAR()));
+
+  // Verify both VARIANT types report TypeKind::VARIANT.
+  ASSERT_EQ(VARIANT_COLUMNAR()->kind(), TypeKind::VARIANT);
+  ASSERT_EQ(VARIANT_ROW_BASED()->kind(), TypeKind::VARIANT);
+  ASSERT_TRUE(VARIANT_COLUMNAR()->isVariant());
+  ASSERT_TRUE(VARIANT_ROW_BASED()->isVariant());
+  ASSERT_FALSE(VARIANT_COLUMNAR()->isRow());
+  ASSERT_FALSE(VARIANT_ROW_BASED()->isRow());
 }
 
 TEST_F(VariantTypeTest, typeRegistration) {
@@ -337,6 +345,45 @@ TEST_F(VariantTypeTest, typeRegistration) {
   ASSERT_TRUE(hasType("VARIANT_ROW_BASED"));
   ASSERT_EQ(*getType("VARIANT_COLUMNAR", {}), *VARIANT_COLUMNAR());
   ASSERT_EQ(*getType("VARIANT_ROW_BASED", {}), *VARIANT_ROW_BASED());
+}
+
+TEST_F(VariantTypeTest, toRowType) {
+  auto variantType = VARIANT_ROW_BASED();
+  auto rowType = variantType->toRowType();
+  ASSERT_TRUE(rowType->isRow());
+  ASSERT_EQ(rowType->size(), 2);
+  ASSERT_EQ(rowType->nameOf(0), "metadata");
+  ASSERT_EQ(rowType->nameOf(1), "value");
+  ASSERT_TRUE(rowType->childAt(0)->isVarbinary());
+  ASSERT_TRUE(rowType->childAt(1)->isVarbinary());
+
+  auto columnarType = VARIANT_COLUMNAR();
+  auto columnarRowType = columnarType->toRowType();
+  ASSERT_TRUE(columnarRowType->isRow());
+  ASSERT_EQ(columnarRowType->size(), 4);
+  ASSERT_EQ(columnarRowType->nameOf(0), "keys");
+}
+
+TEST_F(VariantTypeTest, variantFieldAccess) {
+  auto type = VARIANT_ROW_BASED();
+
+  // asVariantType works.
+  auto variantPtr = asVariantType(type);
+  ASSERT_NE(variantPtr, nullptr);
+
+  // asRowType returns nullptr (no longer inherits RowType).
+  auto rowPtr = asRowType(type);
+  ASSERT_EQ(rowPtr, nullptr);
+
+  // Field access methods.
+  ASSERT_EQ(type->nameOf(0), "metadata");
+  ASSERT_EQ(type->nameOf(1), "value");
+  ASSERT_EQ(type->getChildIdx("metadata"), 0);
+  ASSERT_EQ(type->getChildIdx("value"), 1);
+  ASSERT_TRUE(type->containsChild("metadata"));
+  ASSERT_FALSE(type->containsChild("nonexistent"));
+  ASSERT_EQ(type->getChildIdxIfExists("nonexistent"), std::nullopt);
+  ASSERT_TRUE(type->findChild("value")->isVarbinary());
 }
 
 TEST_F(VariantTypeTest, columnarTypeSerde) {
@@ -618,6 +665,45 @@ TEST_F(VariantTypeTest, extractInt32FieldFromObject) {
 
   // Field that doesn't exist.
   EXPECT_FALSE(extractInt32Field(val.data(), val.size(), 5, result));
+}
+
+// ---- extractInt64Field tests ----
+
+TEST_F(VariantTypeTest, extractInt64FieldFromObject) {
+  std::vector<std::string_view> keys = {"field_a", "field_b"};
+  auto metadata = buildMetadata(keys);
+
+  std::string childValues[2];
+  childValues[0] = encodeInt64Value(1'000'000'000'000LL);
+  childValues[1] = encodeInt64Value(-42LL);
+
+  uint8_t objectHeader =
+      (0 << 6) | (0 << 4) | (0 << 2) | basic_type::kObject;
+  std::string val;
+  val.push_back(static_cast<char>(objectHeader));
+  val.push_back(static_cast<char>(2));
+  val.push_back(static_cast<char>(0));
+  val.push_back(static_cast<char>(1));
+
+  uint8_t offset = 0;
+  for (int f = 0; f < 2; ++f) {
+    val.push_back(static_cast<char>(offset));
+    offset += static_cast<uint8_t>(childValues[f].size());
+  }
+  val.push_back(static_cast<char>(offset));
+
+  for (auto& cv : childValues) {
+    val.append(cv);
+  }
+
+  int64_t result;
+  ASSERT_TRUE(extractInt64Field(val.data(), val.size(), 0, result));
+  EXPECT_EQ(result, 1'000'000'000'000LL);
+
+  ASSERT_TRUE(extractInt64Field(val.data(), val.size(), 1, result));
+  EXPECT_EQ(result, -42LL);
+
+  EXPECT_FALSE(extractInt64Field(val.data(), val.size(), 5, result));
 }
 
 // ---- extractStringField tests ----
@@ -1116,6 +1202,7 @@ TEST_F(VariantTypeTest, encodeObjectLargeFieldId) {
 }
 
 // Verify encodeObjectWithFieldIds rejects unsorted field_ids in debug mode.
+#ifndef NDEBUG
 TEST_F(VariantTypeTest, encodeObjectWithFieldIdsRejectsUnsorted) {
   std::vector<uint32_t> unsortedIds = {5, 2};
   std::vector<std::string> children = {
@@ -1126,6 +1213,7 @@ TEST_F(VariantTypeTest, encodeObjectWithFieldIdsRejectsUnsorted) {
       encodeObjectWithFieldIds(unsortedIds, children),
       "fieldIds must be sorted");
 }
+#endif
 
 // ---- VariantExtract UDF bug: applyColumnar crashes on missing field ----
 

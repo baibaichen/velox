@@ -260,6 +260,8 @@ std::unique_ptr<VectorPrinterBase> createVectorPrinter(
       return std::make_unique<ArrayVectorPrinter>(vector);
     case TypeKind::MAP:
       return std::make_unique<MapVectorPrinter>(vector);
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       return std::make_unique<RowVectorPrinter>(vector);
     default:

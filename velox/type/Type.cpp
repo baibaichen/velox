@@ -64,6 +64,7 @@ const auto& typeKindNames() {
       {TypeKind::FUNCTION, "FUNCTION"},
       {TypeKind::UNKNOWN, "UNKNOWN"},
       {TypeKind::OPAQUE, "OPAQUE"},
+      {TypeKind::VARIANT, "VARIANT"},
       {TypeKind::INVALID, "INVALID"},
   };
   return kNames;
@@ -225,6 +226,10 @@ TypePtr Type::create(const folly::dynamic& obj) {
   // 'typeName' must be a built-in type.
   TypeKind typeKind = TypeKindName::toTypeKind(typeName);
   switch (typeKind) {
+    case TypeKind::VARIANT:
+      VELOX_USER_FAIL(
+          "VARIANT types should be deserialized via custom type registry, "
+          "not built-in deserialization");
     case TypeKind::ROW: {
       VELOX_USER_CHECK(obj["names"].isArray());
       std::vector<std::string> names;
@@ -412,6 +417,119 @@ RowType::RowType(std::vector<std::string>&& names, std::vector<TypePtr>&& types)
   }
 }
 
+VariantType::VariantType(
+    std::vector<std::string>&& names,
+    std::vector<TypePtr>&& types)
+    : names_{std::move(names)}, children_{std::move(types)} {
+  VELOX_CHECK_EQ(
+      names_.size(),
+      children_.size(),
+      "Mismatch names/types sizes: {}",
+      namesAndTypesToString(names_, children_));
+  for (auto& child : children_) {
+    VELOX_CHECK_NOT_NULL(
+        child,
+        "Child types cannot be null: {}",
+        namesAndTypesToString(names_, children_));
+  }
+}
+
+const TypePtr& VariantType::childAt(uint32_t idx) const {
+  VELOX_CHECK_LT(idx, children_.size());
+  return children_[idx];
+}
+
+const std::string& VariantType::nameOf(uint32_t idx) const {
+  VELOX_CHECK_LT(idx, names_.size());
+  return names_[idx];
+}
+
+namespace {
+template <typename T>
+std::string makeFieldNotFoundErrorMessage(
+    const T& name,
+    const std::vector<std::string>& availableNames) {
+  static constexpr auto kMaxFields = 50;
+
+  const auto numAvailable = availableNames.size();
+
+  std::stringstream errorMessage;
+  errorMessage << "Field not found: " << name << ". Available fields are: ";
+  for (auto i = 0; i < numAvailable && i < kMaxFields; ++i) {
+    if (i > 0) {
+      errorMessage << ", ";
+    }
+    errorMessage << availableNames[i];
+  }
+
+  if (numAvailable > kMaxFields) {
+    errorMessage << ", ..." << (numAvailable - kMaxFields) << " more";
+  }
+
+  errorMessage << ".";
+  return errorMessage.str();
+}
+} // namespace
+
+const TypePtr& VariantType::findChild(std::string_view name) const {
+  if (auto i = getChildIdxIfExists(name)) {
+    return children_[*i];
+  }
+  VELOX_USER_FAIL(makeFieldNotFoundErrorMessage(name, names_));
+}
+
+bool VariantType::containsChild(std::string_view name) const {
+  for (const auto& n : names_) {
+    if (n == name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+uint32_t VariantType::getChildIdx(std::string_view name) const {
+  auto index = getChildIdxIfExists(name);
+  if (!index.has_value()) {
+    VELOX_USER_FAIL(makeFieldNotFoundErrorMessage(name, names_));
+  }
+  return index.value();
+}
+
+std::optional<uint32_t> VariantType::getChildIdxIfExists(
+    std::string_view name) const {
+  for (uint32_t i = 0; i < names_.size(); ++i) {
+    if (names_[i] == name) {
+      return i;
+    }
+  }
+  return std::nullopt;
+}
+
+RowTypePtr VariantType::toRowType() const {
+  std::vector<std::string> namesCopy(names_);
+  std::vector<TypePtr> typesCopy(children_);
+  return std::make_shared<RowType>(std::move(namesCopy), std::move(typesCopy));
+}
+
+bool VariantType::equals(const Type& other) const {
+  if (this == &other) {
+    return true;
+  }
+  if (!Type::hasSameTypeId(other)) {
+    return false;
+  }
+  const auto& otherVariant = static_cast<const VariantType&>(other);
+  if (names_ != otherVariant.names_) {
+    return false;
+  }
+  for (size_t i = 0; i < children_.size(); ++i) {
+    if (*children_[i] != *otherVariant.children_[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 RowType::~RowType() {
   auto* parameters = parameters_.load(std::memory_order_acquire);
   delete parameters;
@@ -458,33 +576,6 @@ const RowType::NameToIndex* RowType::ensureNameToIndex() const {
 
   return newNameToIndex.release();
 }
-
-namespace {
-template <typename T>
-std::string makeFieldNotFoundErrorMessage(
-    const T& name,
-    const std::vector<std::string>& availableNames) {
-  static constexpr auto kMaxFields = 50;
-
-  const auto numAvailable = availableNames.size();
-
-  std::stringstream errorMessage;
-  errorMessage << "Field not found: " << name << ". Available fields are: ";
-  for (auto i = 0; i < numAvailable && i < kMaxFields; ++i) {
-    if (i > 0) {
-      errorMessage << ", ";
-    }
-    errorMessage << availableNames[i];
-  }
-
-  if (numAvailable > kMaxFields) {
-    errorMessage << ", ..." << (numAvailable - kMaxFields) << " more";
-  }
-
-  errorMessage << ".";
-  return errorMessage.str();
-}
-} // namespace
 
 const TypePtr& RowType::findChild(std::string_view name) const {
   if (auto i = getChildIdxIfExists(name)) {
@@ -1084,6 +1175,12 @@ TypePtr createType<TypeKind::OPAQUE>(std::vector<TypePtr>&& /*children*/) {
   VELOX_USER_FAIL("Not supported for kind: {}", name);
 }
 
+template <>
+TypePtr createType<TypeKind::VARIANT>(std::vector<TypePtr>&& /*children*/) {
+  std::string name{TypeTraits<TypeKind::VARIANT>::name};
+  VELOX_USER_FAIL("Not supported for kind: {}", name);
+}
+
 bool Type::containsUnknown() const {
   if (kind_ == TypeKind::UNKNOWN) {
     return true;
@@ -1234,6 +1331,19 @@ void toTypeSql(const TypePtr& type, std::ostream& out) {
       toTypeSql(type->childAt(1), out);
       out << ")";
       break;
+    case TypeKind::VARIANT: {
+      const auto& variantType = type->asVariant();
+      out << "struct(";
+      for (auto i = 0; i < type->size(); ++i) {
+        if (i > 0) {
+          out << ", ";
+        }
+        out << variantType.nameOf(i) << " ";
+        toTypeSql(type->childAt(i), out);
+      }
+      out << ")";
+      break;
+    }
     case TypeKind::ROW: {
       // Append struct(name1 type1, name2 type2,..), e.g.
       // struct(a bigint, b real);

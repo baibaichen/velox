@@ -1197,6 +1197,8 @@ bool JsonCastOperator::isSupportedFromType(const TypePtr& other) const {
       return true;
     case TypeKind::ARRAY:
       return isSupportedFromType(other->childAt(0));
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       for (const auto& child : other->as<TypeKind::ROW>().children()) {
         if (!isSupportedFromType(child)) {
@@ -1276,6 +1278,8 @@ bool JsonCastOperator::isSupportedToType(const TypePtr& other) const {
   switch (other->kind()) {
     case TypeKind::ARRAY:
       return isSupportedToType(other->childAt(0));
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       for (const auto& child : other->as<TypeKind::ROW>().children()) {
         if (!isSupportedToType(child)) {

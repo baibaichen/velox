@@ -50,6 +50,10 @@ std::string typeName(const TypePtr& type) {
         "map({}, {})", typeName(type->childAt(0)), typeName(type->childAt(1)));
   }
 
+  if (type->kind() == TypeKind::VARIANT) {
+    return "variant";
+  }
+
   if (type->kind() == TypeKind::ROW) {
     if (isIPPrefixType(type)) {
       return "ipprefix";

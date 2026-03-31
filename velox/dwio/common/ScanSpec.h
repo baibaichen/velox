@@ -482,6 +482,8 @@ void ScanSpec::visit(const Type& type, F&& f) {
     return;
   }
   switch (type.kind()) {
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       for (auto& child : children_) {
         VELOX_CHECK_NE(child->channel(), kNoChannel);

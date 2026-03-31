@@ -430,6 +430,15 @@ VectorPtr BaseVector::createInternal(
       return std::make_shared<RowVector>(
           pool, type, nullptr, size, std::move(children));
     }
+    case TypeKind::VARIANT: {
+      std::vector<VectorPtr> children;
+      auto& variantType = type->as<TypeKind::VARIANT>();
+      for (int32_t i = 0; i < variantType.size(); ++i) {
+        children.push_back(create(variantType.childAt(i), size, pool));
+      }
+      return std::make_shared<RowVector>(
+          pool, type, nullptr, size, std::move(children));
+    }
     case TypeKind::ARRAY: {
       BufferPtr sizes = allocateSizes(size, pool);
       BufferPtr offsets = allocateOffsets(size, pool);
@@ -487,12 +496,12 @@ VectorPtr BaseVector::createEmptyLikeInternal(
   const auto& type = source->type();
 
   switch (type->kind()) {
+    case TypeKind::VARIANT:
     case TypeKind::ROW: {
-      auto& rowType = type->as<TypeKind::ROW>();
       auto* sourceRow = wrapped->as<RowVector>();
       std::vector<VectorPtr> children;
-      children.reserve(rowType.size());
-      for (size_t i = 0; i < rowType.size(); ++i) {
+      children.reserve(type->size());
+      for (size_t i = 0; i < type->size(); ++i) {
         children.push_back(
             createEmptyLikeInternal(sourceRow->childAt(i).get(), size, pool));
       }

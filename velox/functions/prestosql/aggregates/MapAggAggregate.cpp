@@ -218,6 +218,7 @@ void registerMapAggAggregate(
             return std::make_unique<MapAggAggregate<StringView>>(resultType);
           case TypeKind::ARRAY:
           case TypeKind::MAP:
+          case TypeKind::VARIANT:
           case TypeKind::ROW:
             return std::make_unique<MapAggAggregate<ComplexType>>(
                 resultType, throwOnNestedNulls);

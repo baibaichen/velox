@@ -485,6 +485,8 @@ class WriterContext : public CompressionBufferPool {
       const velox::dwio::common::TypeWithId& type,
       PhysicalSizeAggregator* parent = nullptr) {
     switch (type.type()->kind()) {
+      case TypeKind::VARIANT:
+        VELOX_NYI("VARIANT in DWRF");
       case TypeKind::ROW: {
         physicalSizeAggregators_.emplace(
             type.id(), std::make_unique<PhysicalSizeAggregator>(parent));

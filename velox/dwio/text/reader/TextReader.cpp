@@ -1282,6 +1282,9 @@ void TextRowReader::readElement(
       break;
     }
 
+    case TypeKind::VARIANT:
+      VELOX_NYI("VARIANT in text format");
+
     case TypeKind::ROW: {
       const auto& childCount = t->size();
       const auto& rowVector = data ? data->asChecked<RowVector>() : nullptr;
@@ -1471,6 +1474,8 @@ void TextRowReader::readElement(
 
 uint64_t maxStreamsForType(const std::shared_ptr<const Type>& type) {
   switch (type->kind()) {
+    case TypeKind::VARIANT:
+      VELOX_NYI("VARIANT in text format");
     case TypeKind::ROW:
     case TypeKind::REAL:
     case TypeKind::DOUBLE:

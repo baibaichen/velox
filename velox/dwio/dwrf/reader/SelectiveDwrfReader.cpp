@@ -119,6 +119,8 @@ std::unique_ptr<SelectiveColumnReader> SelectiveDwrfReader::build(
       return std::make_unique<
           SelectiveFloatingPointColumnReader<double, double>>(
           requestedType, fileType, params, scanSpec);
+    case TypeKind::VARIANT:
+      VELOX_NYI("VARIANT in DWRF");
     case TypeKind::ROW:
       return std::make_unique<SelectiveStructColumnReader>(
           columnReaderOptions,

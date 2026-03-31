@@ -122,6 +122,8 @@ Variant variantAt(const VectorPtr& vector, vector_size_t row) {
       return arrayVariantAt(vector, row);
     case TypeKind::MAP:
       return mapVariantAt(vector, row);
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       return rowVariantAt(vector, row);
     case TypeKind::OPAQUE:

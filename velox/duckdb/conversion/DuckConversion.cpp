@@ -97,6 +97,8 @@ LogicalType fromVeloxType(const TypePtr& type) {
     case TypeKind::MAP:
       return LogicalType::MAP(
           fromVeloxType(type->childAt(0)), fromVeloxType(type->childAt(1)));
+    case TypeKind::VARIANT:
+      VELOX_NYI("VARIANT in DuckDB conversion");
     case TypeKind::ROW: {
       const auto& rowType = type->asRow();
       std::vector<std::pair<std::string, LogicalType>> children;

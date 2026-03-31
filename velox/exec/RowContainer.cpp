@@ -180,7 +180,12 @@ RowContainer::RowContainer(
   int32_t flagOffset = 0;
   bool isVariableWidth = false;
   for (auto& type : keyTypes_) {
-    typeKinds_.push_back(type->kind());
+    auto kind = type->kind();
+    // Map VARIANT to ROW since they share the same physical layout.
+    if (kind == TypeKind::VARIANT) {
+      kind = TypeKind::ROW;
+    }
+    typeKinds_.push_back(kind);
     types_.push_back(type);
     offsets_.push_back(offset);
     offset += typeKindSize(type->kind());
@@ -211,7 +216,11 @@ RowContainer::RowContainer(
   }
   for (auto& type : dependentTypes) {
     types_.push_back(type);
-    typeKinds_.push_back(type->kind());
+    auto kind = type->kind();
+    if (kind == TypeKind::VARIANT) {
+      kind = TypeKind::ROW;
+    }
+    typeKinds_.push_back(kind);
     nullOffsets_.push_back(flagOffset);
     ++flagOffset;
     isVariableWidth |= !type->isFixedWidth();

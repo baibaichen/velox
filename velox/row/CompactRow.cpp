@@ -227,6 +227,8 @@ void CompactRow::initialize(const TypePtr& type) {
           mapBase->mapValues()->type()->isFixedWidth());
       break;
     }
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW: {
       auto* rowBase = base->as<RowVector>();
       for (const auto& child : rowBase->children()) {
@@ -451,6 +453,8 @@ int32_t CompactRow::variableWidthRowSize(vector_size_t index) const {
       return arrayRowSize(index);
     case TypeKind::MAP:
       return mapRowSize(index);
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       return rowRowSize(index);
     default:
@@ -714,6 +718,8 @@ int32_t CompactRow::serializeVariableWidth(vector_size_t index, char* buffer)
       return serializeArray(index, buffer);
     case TypeKind::MAP:
       return serializeMap(index, buffer);
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       return serializeRow(index, buffer);
     default:
@@ -1072,6 +1078,7 @@ ArrayVectorPtr deserializeArrays(
         break;
       case TypeKind::ARRAY:
       case TypeKind::MAP:
+      case TypeKind::VARIANT:
       case TypeKind::ROW:
         elements = deserializeComplexArrays(
             elementType, data, arraySizes, offsets, pool);
@@ -1149,6 +1156,8 @@ VectorPtr deserialize(
       return deserializeArrays(type, data, nulls, offsets, pool);
     case TypeKind::MAP:
       return deserializeMaps(type, data, nulls, offsets, pool);
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       return deserializeRows(type, data, nulls, offsets, pool);
     default:

@@ -672,6 +672,8 @@ std::unique_ptr<exec::Aggregate> create(
       [[fallthrough]];
     case TypeKind::MAP:
       [[fallthrough]];
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       return std::make_unique<Aggregate<
           W,
@@ -785,6 +787,8 @@ std::unique_ptr<exec::Aggregate> create(
     case TypeKind::ARRAY:
       [[fallthrough]];
     case TypeKind::MAP:
+      [[fallthrough]];
+    case TypeKind::VARIANT:
       [[fallthrough]];
     case TypeKind::ROW:
       return create<

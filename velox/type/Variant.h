@@ -166,6 +166,15 @@ struct VariantTypeTraits<TypeKind::ROW, usesCustomComparison> {
 };
 
 template <bool usesCustomComparison>
+struct VariantTypeTraits<TypeKind::VARIANT, usesCustomComparison> {
+  using stored_type = TypeStorage<
+      std::vector<Variant>,
+      TypeKind::VARIANT,
+      usesCustomComparison>;
+  using value_type = std::vector<Variant>;
+};
+
+template <bool usesCustomComparison>
 struct VariantTypeTraits<TypeKind::MAP, usesCustomComparison> {
   using stored_type = TypeStorage<
       std::map<Variant, Variant>,

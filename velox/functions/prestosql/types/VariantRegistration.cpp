@@ -61,10 +61,10 @@ class VariantRowBasedTypeFactory : public CustomTypeFactory {
 
 void registerVariantTypes() {
   registerCustomType(
-      "variant_columnar",
+      kVariantColumnarTypeName,
       std::make_unique<const VariantColumnarTypeFactory>());
   registerCustomType(
-      "variant_row_based",
+      kVariantRowBasedTypeName,
       std::make_unique<const VariantRowBasedTypeFactory>());
 }
 

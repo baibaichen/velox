@@ -380,6 +380,8 @@ struct ToJsonFunction {
       bool isRootType = false,
       bool isMapKey = false) {
     switch (type->kind()) {
+      case TypeKind::VARIANT:
+        [[fallthrough]];
       case TypeKind::ROW: {
         for (const auto& child : asRowType(type)->children()) {
           if (!isSupportedType(child, false, isMapKey)) {

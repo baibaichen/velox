@@ -377,6 +377,8 @@ uint64_t FlatMapColumnWriter<K>::write(
       }
 
       return writeMap(slice, ranges);
+    case TypeKind::VARIANT:
+      VELOX_NYI("VARIANT in DWRF");
     case TypeKind::ROW:
       if (!structKeys_.empty()) {
         return writeRow(slice, ranges);

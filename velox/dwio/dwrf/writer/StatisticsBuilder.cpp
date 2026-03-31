@@ -135,6 +135,9 @@ void StatisticsBuilder::createTree(
       break;
     }
 
+    case TypeKind::VARIANT:
+      VELOX_NYI("VARIANT in DWRF");
+
     case TypeKind::ROW: {
       statBuilders.push_back(StatisticsBuilder::create(type, options));
       const auto& rowType = dynamic_cast<const RowType&>(type);

@@ -372,6 +372,8 @@ std::shared_ptr<const Type> ReaderBase::convertType(
           convertType(footer, type.subtypes(0), fileColumnNamesReadAsLowerCase),
           convertType(
               footer, type.subtypes(1), fileColumnNamesReadAsLowerCase));
+    case TypeKind::VARIANT:
+      VELOX_NYI("VARIANT in DWRF");
     case TypeKind::ROW: {
       std::vector<std::shared_ptr<const Type>> types;
       types.reserve(type.subtypesSize());

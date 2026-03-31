@@ -206,6 +206,8 @@ std::unique_ptr<exec::Aggregate> create(
       [[fallthrough]];
     case TypeKind::MAP:
       [[fallthrough]];
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       return std::make_unique<Aggregate<ComplexType>>(resultType);
     case TypeKind::UNKNOWN:
@@ -299,6 +301,8 @@ void registerSetAggAggregate(
           case TypeKind::ARRAY:
             [[fallthrough]];
           case TypeKind::MAP:
+            [[fallthrough]];
+          case TypeKind::VARIANT:
             [[fallthrough]];
           case TypeKind::ROW:
             return std::make_unique<SetAggAggregate<ComplexType>>(resultType);
@@ -414,6 +418,8 @@ void registerCountDistinctAggregate(
           case TypeKind::ARRAY:
             [[fallthrough]];
           case TypeKind::MAP:
+            [[fallthrough]];
+          case TypeKind::VARIANT:
             [[fallthrough]];
           case TypeKind::ROW:
             return std::make_unique<CountDistinctAggregate<ComplexType>>(

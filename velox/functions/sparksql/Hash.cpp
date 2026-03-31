@@ -140,6 +140,8 @@ std::shared_ptr<SparkVectorHasher<HashClass>> createVectorHasher(
       return std::make_shared<ArrayVectorHasher<HashClass>>(decoded);
     case TypeKind::MAP:
       return std::make_shared<MapVectorHasher<HashClass>>(decoded);
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       return std::make_shared<RowVectorHasher<HashClass>>(decoded);
     case TypeKind::UNKNOWN:
@@ -656,12 +658,14 @@ bool checkHashElementType(const TypePtr& type) {
     case TypeKind::MAP:
       return checkHashElementType(type->asMap().keyType()) &&
           checkHashElementType(type->asMap().valueType());
+    case TypeKind::VARIANT:
     case TypeKind::ROW: {
-      const auto& children = type->asRow().children();
-      return std::all_of(
-          children.begin(), children.end(), [](const auto& child) {
-            return checkHashElementType(child);
-          });
+      for (uint32_t i = 0; i < type->size(); ++i) {
+        if (!checkHashElementType(type->childAt(i))) {
+          return false;
+        }
+      }
+      return true;
     }
     default:
       return false;

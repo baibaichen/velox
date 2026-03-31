@@ -123,6 +123,8 @@ std::string TypeWithId::fullName() const {
   auto* child = this;
   while (auto* parent = child->parent_) {
     switch (parent->type()->kind()) {
+      case TypeKind::VARIANT:
+        [[fallthrough]];
       case TypeKind::ROW: {
         auto& siblings = parent->children_;
         bool found = false;

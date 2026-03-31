@@ -496,6 +496,7 @@ AggregateRegistrationResult registerFirstLast(
           case TypeKind::VARCHAR:
           case TypeKind::ARRAY:
           case TypeKind::MAP:
+          case TypeKind::VARIANT:
           case TypeKind::ROW:
             return std::make_unique<TClass<ignoreNull, ComplexType, false>>(
                 resultType);

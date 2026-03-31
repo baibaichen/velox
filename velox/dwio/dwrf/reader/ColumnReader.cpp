@@ -2649,6 +2649,8 @@ std::unique_ptr<ColumnReader> ColumnReader::build(
           executor,
           decodingParallelismFactor,
           factory);
+    case TypeKind::VARIANT:
+      VELOX_NYI("VARIANT in DWRF");
     case TypeKind::ROW:
       return std::make_unique<StructColumnReader>(
           requestedType,

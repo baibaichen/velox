@@ -137,6 +137,8 @@ folly::dynamic JsonInputGenerator::convertVariantToDynamic(
       }
       return map;
     }
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW: {
       folly::dynamic array = folly::dynamic::array;
       for (const auto& element : object.value<TypeKind::ROW>()) {
@@ -538,6 +540,8 @@ void JsonPathGenerator::generateImpl(std::string& path, const TypePtr& type) {
         generateImpl(path, type->childAt(0));
       }
       return;
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW: {
       const auto selectedField =
           rand<uint64_t>(rng_, 0, type->asRow().size() - 1);

@@ -16,6 +16,7 @@
 
 #include "velox/expression/VectorFunction.h"
 #include "velox/functions/prestosql/types/VariantEncoding.h"
+#include "velox/functions/prestosql/types/VariantRegistration.h"
 #include "velox/functions/prestosql/types/VariantType.h"
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/FlatVector.h"
@@ -28,6 +29,7 @@ using namespace variant_encoding;
 enum class ExtractKind {
   kDouble,
   kInt32,
+  kInt64,
   kDate,
   kString,
 };
@@ -112,6 +114,21 @@ class VariantExtractFunction : public exec::VectorFunction {
         auto sv = valueCol->valueAt(row);
         int32_t val;
         if (extractInt32Field(sv.data(), sv.size(), fieldId, val)) {
+          flat->set(row, val);
+        } else {
+          flat->setNull(row, true);
+        }
+      });
+    } else if constexpr (KIND == ExtractKind::kInt64) {
+      auto* flat = result->as<FlatVector<int64_t>>();
+      rows.applyToSelected([&](auto row) {
+        if (input->isNullAt(row)) {
+          flat->setNull(row, true);
+          return;
+        }
+        auto sv = valueCol->valueAt(row);
+        int64_t val;
+        if (extractInt64Field(sv.data(), sv.size(), fieldId, val)) {
           flat->set(row, val);
         } else {
           flat->setNull(row, true);
@@ -245,6 +262,25 @@ class VariantExtractFunction : public exec::VectorFunction {
           flat->setNull(row, true);
         }
       });
+    } else if constexpr (KIND == ExtractKind::kInt64) {
+      auto* flat = result->as<FlatVector<int64_t>>();
+      rows.applyToSelected([&](auto row) {
+        if (input->isNullAt(row) ||
+            fieldId >= childrenArray->sizeAt(row)) {
+          flat->setNull(row, true);
+          return;
+        }
+        auto childrenOffset = childrenArray->offsetAt(row);
+        auto valIdx = valuesIndexCol->valueAt(childrenOffset + fieldId);
+        auto byteOff = byteOffsetCol->valueAt(valIdx);
+        auto data = dataCol->valueAt(row);
+        if (byteOff + 9 <= static_cast<int32_t>(data.size())) {
+          flat->set(
+              row, static_cast<int64_t>(readLE64(data.data() + byteOff + 1)));
+        } else {
+          flat->setNull(row, true);
+        }
+      });
     } else if constexpr (KIND == ExtractKind::kString) {
       auto* flat = result->as<FlatVector<StringView>>();
       rows.applyToSelected([&](auto row) {
@@ -282,25 +318,39 @@ class VariantExtractFunctionFactory {
       returnType = "double";
     } else if constexpr (KIND == ExtractKind::kInt32) {
       returnType = "integer";
+    } else if constexpr (KIND == ExtractKind::kInt64) {
+      returnType = "bigint";
     } else if constexpr (KIND == ExtractKind::kDate) {
       returnType = "integer";
     } else if constexpr (KIND == ExtractKind::kString) {
       returnType = "varchar";
     }
 
-    // Accept both 2-column (row-based) and 4-column (columnar) ROW types.
-    return {exec::FunctionSignatureBuilder()
-                .returnType(returnType)
-                .argumentType("row(varbinary,varbinary)")
-                .constantArgumentType("varchar")
-                .build(),
-            exec::FunctionSignatureBuilder()
-                .returnType(returnType)
-                .argumentType(
-                    "row(array(varchar),array(row(integer,integer)),"
-                    "array(row(tinyint,integer)),varbinary)")
-                .constantArgumentType("varchar")
-                .build()};
+    // Accept structural ROW types and registered VARIANT custom types.
+    return {
+        exec::FunctionSignatureBuilder()
+            .returnType(returnType)
+            .argumentType("row(varbinary,varbinary)")
+            .constantArgumentType("varchar")
+            .build(),
+        exec::FunctionSignatureBuilder()
+            .returnType(returnType)
+            .argumentType(
+                "row(array(varchar),array(row(integer,integer)),"
+                "array(row(tinyint,integer)),varbinary)")
+            .constantArgumentType("varchar")
+            .build(),
+        exec::FunctionSignatureBuilder()
+            .returnType(returnType)
+            .argumentType(kVariantRowBasedTypeName)
+            .constantArgumentType("varchar")
+            .build(),
+        exec::FunctionSignatureBuilder()
+            .returnType(returnType)
+            .argumentType(kVariantColumnarTypeName)
+            .constantArgumentType("varchar")
+            .build(),
+    };
   }
 
   static std::shared_ptr<exec::VectorFunction> create(
@@ -312,12 +362,10 @@ class VariantExtractFunctionFactory {
     // Determine columnar vs row-based by checking child count:
     // columnar = 4 children (keys, children, values, data),
     // row-based = 2 children (metadata, value).
-    // The size==4 fallback handles the case where signature resolution passes
-    // a structural ROW type (not the VARIANT_COLUMNAR singleton). This is safe
-    // because the 4-column signature already constrains the type structure to
-    // row(array(varchar),array(row(int,int)),array(row(tinyint,int)),varbinary).
+    // The size==4 fallback is safe because the function signatures already
+    // constrain the 4-column input to the exact columnar schema.
     bool isColumnar = isVariantColumnarType(inputArgs[0].type) ||
-        (inputArgs[0].type->isRow() && inputArgs[0].type->size() == 4);
+        inputArgs[0].type->size() == 4;
 
     auto fieldNameVector = inputArgs[1].constantValue;
     VELOX_USER_CHECK_NOT_NULL(
@@ -349,6 +397,12 @@ VELOX_DECLARE_STATEFUL_VECTOR_FUNCTION_WITH_METADATA(
     VariantExtractFunctionFactory<ExtractKind::kInt32>::create);
 
 VELOX_DECLARE_STATEFUL_VECTOR_FUNCTION_WITH_METADATA(
+    udf_variant_extract_int64,
+    (VariantExtractFunctionFactory<ExtractKind::kInt64>::signatures()),
+    exec::VectorFunctionMetadataBuilder().defaultNullBehavior(false).build(),
+    VariantExtractFunctionFactory<ExtractKind::kInt64>::create);
+
+VELOX_DECLARE_STATEFUL_VECTOR_FUNCTION_WITH_METADATA(
     udf_variant_extract_date,
     (VariantExtractFunctionFactory<ExtractKind::kDate>::signatures()),
     exec::VectorFunctionMetadataBuilder().defaultNullBehavior(false).build(),
@@ -359,5 +413,13 @@ VELOX_DECLARE_STATEFUL_VECTOR_FUNCTION_WITH_METADATA(
     (VariantExtractFunctionFactory<ExtractKind::kString>::signatures()),
     exec::VectorFunctionMetadataBuilder().defaultNullBehavior(false).build(),
     VariantExtractFunctionFactory<ExtractKind::kString>::create);
+
+void registerVariantExtractFunctions(const std::string& prefix) {
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_variant_extract_double, prefix + "double");
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_variant_extract_int32, prefix + "int32");
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_variant_extract_int64, prefix + "int64");
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_variant_extract_date, prefix + "date");
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_variant_extract_string, prefix + "string");
+}
 
 } // namespace facebook::velox

@@ -19,6 +19,9 @@
 
 namespace facebook::velox {
 
+inline constexpr const char* kVariantColumnarTypeName = "variant_columnar";
+inline constexpr const char* kVariantRowBasedTypeName = "variant_row_based";
+
 /// Columnar VARIANT layout (DuckDB-style 4-column decomposition).
 ///
 /// Physical schema: ROW<
@@ -30,9 +33,9 @@ namespace facebook::velox {
 ///
 /// At scan time the Parquet binary blob is fully decomposed into these four
 /// columns. Field extraction uses index-based lookups through the arrays.
-class VariantColumnarType final : public RowType {
+class VariantColumnarType final : public VariantType {
   VariantColumnarType()
-      : RowType(
+      : VariantType(
             {"keys", "children", "values", "data"},
             {ARRAY(VARCHAR()),
              ARRAY(ROW(
@@ -79,9 +82,9 @@ class VariantColumnarType final : public RowType {
 /// blob (field name dictionary) and a value blob (binary-encoded object).
 /// Decode cost is a single memcpy per column. Field extraction parses the
 /// blob on demand.
-class VariantRowBasedType final : public RowType {
+class VariantRowBasedType final : public VariantType {
   VariantRowBasedType()
-      : RowType({"metadata", "value"}, {VARBINARY(), VARBINARY()}) {}
+      : VariantType({"metadata", "value"}, {VARBINARY(), VARBINARY()}) {}
 
  public:
   static std::shared_ptr<const VariantRowBasedType> get() {

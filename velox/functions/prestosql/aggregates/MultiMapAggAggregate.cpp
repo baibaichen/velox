@@ -656,6 +656,8 @@ void registerMultiMapAggAggregate(
             [[fallthrough]];
           case TypeKind::MAP:
             [[fallthrough]];
+          case TypeKind::VARIANT:
+            [[fallthrough]];
           case TypeKind::ROW:
             return std::make_unique<MultiMapAggAggregate<ComplexType>>(
                 resultType);

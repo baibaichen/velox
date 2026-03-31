@@ -604,6 +604,8 @@ VectorPtr VectorFuzzer::fuzzComplex(const TypePtr& type, vector_size_t size) {
   opts_.allowLazyVector = false;
 
   switch (type->kind()) {
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW: {
       if (isIPPrefixType(type)) {
         ScopedOptions restorer(this);

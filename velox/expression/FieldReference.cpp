@@ -115,9 +115,13 @@ void FieldReference::apply(
     }
   }
   if (index_ == -1) {
-    auto rowType = dynamic_cast<const RowType*>(row->type().get());
-    VELOX_CHECK(rowType);
-    index_ = rowType->getChildIdx(field_);
+    if (row->type()->isVariant()) {
+      index_ = row->type()->asVariant().getChildIdx(field_);
+    } else {
+      auto rowType = dynamic_cast<const RowType*>(row->type().get());
+      VELOX_CHECK(rowType);
+      index_ = rowType->getChildIdx(field_);
+    }
   }
   VectorPtr child =
       inputs_.empty() ? context.getField(index_) : row->childAt(index_);

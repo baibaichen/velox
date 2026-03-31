@@ -228,6 +228,7 @@ std::unique_ptr<exec::Aggregate> createMapAggregate(const TypePtr& resultType) {
       return std::make_unique<TAggregate<StringView>>(resultType);
     case TypeKind::ARRAY:
     case TypeKind::MAP:
+    case TypeKind::VARIANT:
     case TypeKind::ROW:
       return std::make_unique<TAggregate<ComplexType>>(resultType);
     case TypeKind::UNKNOWN:

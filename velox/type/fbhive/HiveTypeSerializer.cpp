@@ -51,6 +51,8 @@ std::string HiveTypeSerializer::visit(const Type& type) const {
       return "array<" + visitChildren(type.asArray()) + ">";
     case TypeKind::MAP:
       return "map<" + visitChildren(type.asMap()) + ">";
+    case TypeKind::VARIANT:
+      VELOX_NYI("VARIANT in Hive type serialization");
     case TypeKind::ROW:
       return "struct<" + visitChildren(type.asRow()) + ">";
     case TypeKind::OPAQUE: {

@@ -334,6 +334,7 @@ std::unique_ptr<DistinctAggregations> DistinctAggregations::create(
           aggregates, inputType, pool);
     case TypeKind::ARRAY:
     case TypeKind::MAP:
+    case TypeKind::VARIANT:
     case TypeKind::ROW:
       return std::make_unique<TypedDistinctAggregations<ComplexType>>(
           aggregates, inputType, pool);

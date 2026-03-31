@@ -310,6 +310,13 @@ bool extractInt32Field(
     uint32_t targetFieldId,
     int32_t& out);
 
+/// Extract an INT64 field.
+bool extractInt64Field(
+    const char* value,
+    size_t valueLen,
+    uint32_t targetFieldId,
+    int64_t& out);
+
 /// Decode a string from a value blob (short or long encoding).
 bool decodeStringValue(
     const char* childValue,

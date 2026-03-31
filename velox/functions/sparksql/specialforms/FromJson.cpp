@@ -716,20 +716,24 @@ class FromJsonFunction final : public exec::VectorFunction {
         constructRowSchemaInfoMap(type->childAt(1), index);
         break;
       }
+      case TypeKind::VARIANT:
       case TypeKind::ROW: {
-        const auto& rowType = asRowType(type);
-        const auto& names = rowType->names();
+        const auto* variantType =
+            type->isVariant() ? &type->asVariant() : nullptr;
+        const auto& names =
+            variantType ? variantType->names() : asRowType(type)->names();
         bool allFieldsAreAscii =
             std::all_of(names.begin(), names.end(), [](const auto& name) {
               return functions::stringCore::isAscii(name.data(), name.size());
             });
         auto isFieldMissing = std::make_shared<std::vector<bool>>();
-        isFieldMissing->resize(rowType->size(), true);
+        isFieldMissing->resize(type->size(), true);
         folly::F14FastMap<std::string, column_index_t> fieldIndices;
         folly::F14FastMap<std::string, column_index_t> nodeIndices;
-        const auto size = rowType->size();
+        const auto size = type->size();
         for (auto i = 0; i < size; ++i) {
-          std::string key = rowType->nameOf(i);
+          std::string key = variantType ? variantType->nameOf(i)
+                                        : asRowType(type)->nameOf(i);
           if (allFieldsAreAscii) {
             folly::toLowerAscii(key);
           } else {
@@ -787,9 +791,10 @@ bool isSupportedType(const TypePtr& type, bool isRootType) {
     case TypeKind::ARRAY: {
       return isSupportedType(type->childAt(0), false);
     }
+    case TypeKind::VARIANT:
     case TypeKind::ROW: {
-      for (const auto& child : asRowType(type)->children()) {
-        if (!isSupportedType(child, false)) {
+      for (uint32_t i = 0; i < type->size(); ++i) {
+        if (!isSupportedType(type->childAt(i), false)) {
           return false;
         }
       }

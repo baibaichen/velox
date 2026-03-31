@@ -60,9 +60,14 @@ class FieldReference : public SpecialForm {
     if (index_ != -1) {
       return index_;
     }
-    auto* rowType = dynamic_cast<const RowType*>(context.row()->type().get());
-    VELOX_CHECK(rowType, "The context has no row");
-    index_ = rowType->getChildIdx(field_);
+    const auto* type = context.row()->type().get();
+    if (type->isVariant()) {
+      index_ = type->asVariant().getChildIdx(field_);
+    } else {
+      auto* rowType = dynamic_cast<const RowType*>(type);
+      VELOX_CHECK(rowType, "The context has no row");
+      index_ = rowType->getChildIdx(field_);
+    }
     return index_;
   }
 

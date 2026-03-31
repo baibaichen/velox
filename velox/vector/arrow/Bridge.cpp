@@ -329,6 +329,8 @@ const char* exportArrowFormatStr(
       return "+l"; // list
     case TypeKind::MAP:
       return "+m"; // map
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       return "+s"; // struct
 
@@ -1577,7 +1579,7 @@ void exportToArrow(
       child->name = "item";
       bridgeHolder->setChildAtIndex(0, std::move(child), arrowSchema);
 
-    } else if (type->kind() == TypeKind::ROW) {
+    } else if (is_row_kind(type->kind())) {
       auto& rows = *vec->asUnchecked<RowVector>();
       auto numChildren = rows.childrenSize();
       bridgeHolder->childrenRaw.resize(numChildren);
@@ -2327,7 +2329,7 @@ VectorPtr importFromArrowImpl(
         arrowArray.length,
         arrowArray.null_count,
         wrapInBufferView);
-  } else if (type->isRow()) {
+  } else if (is_row_kind(type->kind())) {
     // Row/structs.
     return createRowVector(
         pool,

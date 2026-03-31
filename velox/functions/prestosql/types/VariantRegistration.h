@@ -15,9 +15,15 @@
  */
 #pragma once
 
+#include <string>
+
 namespace facebook::velox {
 
 /// Register VARIANT_COLUMNAR and VARIANT_ROW_BASED custom types.
 void registerVariantTypes();
+
+/// Register all variant_extract_* UDFs (double, int32, int64, date, string).
+void registerVariantExtractFunctions(
+    const std::string& prefix = "variant_extract_");
 
 } // namespace facebook::velox

@@ -303,6 +303,26 @@ bool extractInt32Field(
   return true;
 }
 
+bool extractInt64Field(
+    const char* value,
+    size_t valueLen,
+    uint32_t targetFieldId,
+    int64_t& out) {
+  const char* childValue;
+  size_t childLen;
+  if (!locateObjectField(value, valueLen, targetFieldId, childValue, childLen)) {
+    return false;
+  }
+  if (childLen < 9) {
+    return false;
+  }
+  if (static_cast<uint8_t>(childValue[0]) != header_byte::kInt64) {
+    return false;
+  }
+  out = static_cast<int64_t>(readLE64(childValue + 1));
+  return true;
+}
+
 bool decodeStringValue(
     const char* childValue,
     size_t childLen,
@@ -414,7 +434,7 @@ std::string encodeObject(const std::vector<std::string>& childValues) {
 std::string encodeObjectWithFieldIds(
     const std::vector<uint32_t>& fieldIds,
     const std::vector<std::string>& childValues) {
-  VELOX_CHECK_EQ(fieldIds.size(), childValues.size());
+  VELOX_DCHECK_EQ(fieldIds.size(), childValues.size());
   VELOX_DCHECK(
       std::is_sorted(fieldIds.begin(), fieldIds.end()),
       "fieldIds must be sorted ascending");

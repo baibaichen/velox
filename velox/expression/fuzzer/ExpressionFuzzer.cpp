@@ -251,6 +251,8 @@ uint32_t levelOfNesting(const TypePtr& type) {
           std::max(
                  levelOfNesting(type->asMap().keyType()),
                  levelOfNesting(type->asMap().valueType()));
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW: {
       auto children = type->asRow().children();
       VELOX_CHECK(!children.empty());

@@ -51,8 +51,6 @@ class RowVector : public BaseVector {
         children_(std::move(children)) {
     // Some columns may not be projected out
     VELOX_CHECK_LE(children_.size(), type->size());
-    [[maybe_unused]] const auto* rowType =
-        dynamic_cast<const RowType*>(type.get());
 
     // Check child vector types.
     // This can be an expensive operation, so it's only done at debug time.
@@ -61,9 +59,8 @@ class RowVector : public BaseVector {
       if (child) {
         VELOX_DCHECK(
             child->type()->kindEquals(type->childAt(i)),
-            "Got type {} for field `{}` at position {}, but expected {}.",
+            "Got type {} at position {}, but expected {}.",
             child->type()->toString(),
-            rowType->nameOf(i),
             i,
             type->childAt(i)->toString());
       }
@@ -95,8 +92,12 @@ class RowVector : public BaseVector {
 
   std::unique_ptr<SimpleVector<uint64_t>> hashAll() const override;
 
-  /// Convenience getter. Shortcut for asRowType(type()).
+  /// Convenience getter. Returns the RowType for this vector's type.
+  /// For VARIANT types, creates an equivalent RowType via toRowType().
   RowTypePtr rowType() const {
+    if (type()->isVariant()) {
+      return type()->asVariant().toRowType();
+    }
     return asRowType(type());
   }
 

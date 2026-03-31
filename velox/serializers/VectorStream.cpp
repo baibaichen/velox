@@ -233,6 +233,8 @@ void VectorStream::flush(OutputStream* out) {
   }
 
   switch (type_->kind()) {
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       if (isIPPrefixType(type_)) {
         writeInt32(out, nullCount_ + nonNullCount_);
@@ -314,7 +316,7 @@ void VectorStream::clear() {
   totalLength_ = 0;
   if (hasLengths_) {
     lengths_.startWrite(lengths_.size());
-    if ((type_->kind() == TypeKind::ROW && !isIpPrefix_) ||
+    if ((is_row_kind(type_->kind()) && !isIpPrefix_) ||
         type_->kind() == TypeKind::ARRAY || type_->kind() == TypeKind::MAP) {
       // The first element in the offsets in the wire format is always 0 for
       // nested types. Set upon construction/reset in case empty (no append
@@ -384,6 +386,8 @@ void VectorStream::initializeFlatStream(
   nulls_.startWrite(0);
 
   switch (type_->kind()) {
+    case TypeKind::VARIANT:
+      [[fallthrough]];
     case TypeKind::ROW:
       [[fallthrough]];
     case TypeKind::ARRAY:

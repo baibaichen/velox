@@ -120,6 +120,8 @@ std::string toSqlType(const TypePtr& type) {
       out << ")";
       return out.str();
     }
+    case TypeKind::VARIANT:
+      return "VARIANT";
     default:
       return type->toString();
   }
@@ -225,6 +227,9 @@ void appendSqlLiteral(
       out << ")";
       break;
     }
+    case TypeKind::VARIANT:
+      VELOX_NYI("VARIANT SQL literals");
+      break;
     default:
       // TODO: update ExprStatsTest.exceptionPreparingStatsForListener once
       // support for VARBINARY is added.
