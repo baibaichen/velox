@@ -138,6 +138,21 @@ target_link_libraries(
   glog::glog
 )
 
+add_executable(velox_variant_realistic_benchmark VariantRealisticBenchmark.cpp)
+target_link_libraries(
+  velox_variant_realistic_benchmark
+  velox_vector
+  velox_type
+  velox_memory
+  velox_tpch_gen
+  velox_presto_types
+  simdjson::simdjson
+  Folly::folly
+  Folly::follybenchmark
+  gflags::gflags
+  glog::glog
+)
+
 add_executable(velox_variant_expr_benchmark VariantExprBenchmark.cpp)
 target_link_libraries(
   velox_variant_expr_benchmark
