@@ -25,8 +25,8 @@
 # <fbthrift_github>/build/fbcode_builder/CMake/FBThriftCppLibrary.cmake
 # The new FB_OS version of fbthrift might require changes such that thrift
 # files are generated properly on all platforms.
-FB_OS_VERSION="v2026.01.05.00"
-FMT_VERSION="11.2.0"
+FB_OS_VERSION="v2026.05.18.00"
+FMT_VERSION="12.1.0"
 BOOST_VERSION="boost-1.84.0"
 ARROW_VERSION="18.0.0"
 DUCKDB_VERSION="v0.8.1"

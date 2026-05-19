@@ -17,10 +17,10 @@ cmake_minimum_required(VERSION 3.28)
 velox_set_source(FastFloat)
 velox_resolve_dependency(FastFloat CONFIG REQUIRED)
 
-set(VELOX_FOLLY_BUILD_VERSION v2026.01.05.00)
+set(VELOX_FOLLY_BUILD_VERSION v2026.05.18.00)
 set(
   VELOX_FOLLY_BUILD_SHA256_CHECKSUM
-  8b41494b664fcde3d02f652d6a27381ec5e938ef58cf986d8ce4958d424af101
+  a7a451df74fdfa9cde4fa2f5a46201fc5a42cb60f081932a4ce0450b0f678ea3
 )
 set(
   VELOX_FOLLY_SOURCE_URL
@@ -44,7 +44,9 @@ FetchContent_Declare(
   folly
   URL ${VELOX_FOLLY_SOURCE_URL}
   URL_HASH ${VELOX_FOLLY_BUILD_SHA256_CHECKSUM}
-  PATCH_COMMAND git apply ${CMAKE_CURRENT_LIST_DIR}/folly-no-export.patch ${glog_patch}
+  PATCH_COMMAND
+    git apply ${CMAKE_CURRENT_LIST_DIR}/folly-no-export.patch && git apply
+    ${CMAKE_CURRENT_LIST_DIR}/folly-boost-module.patch ${glog_patch}
   OVERRIDE_FIND_PACKAGE
   SYSTEM
   EXCLUDE_FROM_ALL
@@ -57,9 +59,15 @@ set(FOLLY_HAVE_INT128_T ON)
 
 FetchContent_MakeAvailable(folly)
 
-# Folly::folly is not valid for FC but we want to match FindFolly
-add_library(Folly::folly ALIAS folly)
-add_library(Folly::follybenchmark ALIAS follybenchmark)
+# Folly v2026.05.18.00+ creates Folly::folly and Folly::follybenchmark ALIAS
+# targets internally via folly_add_library / FollyFunctions.cmake.  Guard
+# against re-creation so this remains compatible with older folly versions.
+if(NOT TARGET Folly::folly)
+  add_library(Folly::folly ALIAS folly)
+endif()
+if(NOT TARGET Folly::follybenchmark)
+  add_library(Folly::follybenchmark ALIAS follybenchmark)
+endif()
 
 if(gflags_SOURCE STREQUAL "BUNDLED")
   add_dependencies(folly glog::glog gflags::gflags fmt::fmt)
