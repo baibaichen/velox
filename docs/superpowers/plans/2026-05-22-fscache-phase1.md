@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 在 Velox 引入 `velox/common/caching/fscache/` 模块 + `velox/dwio/common/FsCacheBufferedInput`，落地 ClickHouse 风格本地 SSD cache 的第一阶段（无 background download、LRU 占位、5 锁类型已建但共享 mutex），并通过等价测试证明读路径与 `CachedBufferedInput` 字节一致。
+**Goal:** 在 Velox 引入 `velox/common/caching/fscache/` 模块 + `velox/dwio/common/FsCacheBufferedInput`，落地 ClickHouse 风格本地 SSD cache 的第一阶段（无 background download、LRU 占位、5 锁类型已建但共享 mutex），并通过等价测试证明读路径与源文件的 canonical bytes 字节一致。
 
-**Architecture:** 新模块完全旁路现有 `AsyncDataCache` / `SsdCache`；通过新的 `BufferedInput` 子类接入 dwio。读路径 `FsCacheBufferedInput::enqueue → load → FsCache::getOrSet → splitRange → FileSegment(lookupOrCreate + download)`。落盘 `<root>/<hash[0:2]>/<hash[2:4]>/<full_hash>_<offset>_<size>`，`.tmp + rename` 原子发布；崩溃恢复靠目录扫描。
+**Architecture:** 新模块完全旁路现有 `AsyncDataCache` / `SsdCache`；通过新的 `BufferedInput` 子类接入 dwio。读路径 `FsCacheBufferedInput::enqueue → load → FsCache::getOrSet → splitRange → FileSegment(lookupOrCreate + download)`。落盘 `<root>/<hash[0:2]>/<hash[2:4]>/<full_hash>.<offset>.<size>`，`.tmp + rename` 原子发布；崩溃恢复靠目录扫描。
 
-**Tech Stack:** C++20、Velox `BufferedInput`/`SeekableInputStream`/`ReadFile`、folly（IOBuf、Executor）、`VELOX_CHECK_*`、gtest/gmock、`velox_add_grouped_tests`、`TempDirectoryPath`。SipHash 来自 folly。
+**Tech Stack:** C++20、Velox `BufferedInput`/`SeekableInputStream`/`ReadFile`、folly（IOBuf、Executor、SpookyHashV2）、`VELOX_CHECK_*`、gtest/gmock、`velox_add_grouped_tests`、`TempDirectoryPath`。
 
 **Constraints (来自设计文档 §设计决策记录):**
 - 全 10 个 commit 完成前**不做任何性能测试 / 不写性能 commit message**，只跑 UT。
@@ -26,7 +26,7 @@
 | 文件 | 责任 |
 |---|---|
 | `CMakeLists.txt` | `velox_add_library(velox_fscache ...)` + `tests/` 子目录 |
-| `FsCacheKey.h` / `.cpp` | `FsCacheKey{path, offset, size}` + SipHash 计算 + `==` / `hash` |
+| `FsCacheKey.h` / `.cpp` | `FsCacheKey{path, offset, size}` + SpookyHashV2 计算 + `==` / `hash` |
 | `FsCacheGuards.h` | 5 个锁类型（`CachePriorityGuard`/`CacheStateGuard`/`CacheMetadataGuard`/`KeyGuard`/`FileSegmentGuard`）+ 锁顺序文档 + debug-only `LockOrderChecker` |
 | `EvictionPolicy.h` | 抽象基类 `EvictionPolicy`（4 个虚函数） |
 | `LruPolicy.h` / `.cpp` | `LruPolicy : public EvictionPolicy`，单链表实现 |
@@ -63,7 +63,7 @@
 | 文件 | 测试内容 |
 |---|---|
 | `FsCacheBufferedInputTest.cpp` | enqueue / load 行为、stream 读 |
-| `FsCacheEquivalenceTest.cpp` | **关键**：vs `CachedBufferedInput` 字节相同 |
+| `FsCacheEquivalenceTest.cpp` | **关键**：vs 源文件 canonical bytes，证明读路径等价 |
 
 ### 修改文件
 
@@ -198,6 +198,12 @@ struct FsCacheConfig {
 
   /// Number of buckets in the top-level metadata array. A larger value reduces
   /// per-bucket contention at the cost of memory.
+  ///
+  /// Tuning guidance: target ~16-64 live FileSegments per bucket at peak. With
+  /// 4 MiB align and 32 MiB max segment size, 1 TiB of warm working set is
+  /// ~32 K-256 K segments, so 1024 buckets keeps the per-bucket chain short
+  /// without blowing up the metadata array. Bucket count should be a power of
+  /// two for the hash → bucket modulo to fold cleanly.
   size_t numBuckets{1024};
 };
 
@@ -414,9 +420,9 @@ TEST(FsCacheKeyTest, hashDiffersWhenAnyFieldDiffers) {
 TEST(FsCacheKeyTest, fileNameContainsHexHashOffsetSize) {
   FsCacheKey k{"s3://bucket/file", 0, 4096};
   const std::string name = k.fileName();
-  // 64-bit hash printed as 16 hex chars, then "_0_4096".
-  EXPECT_EQ(name.size(), 16 + std::string{"_0_4096"}.size());
-  EXPECT_NE(name.find("_0_4096"), std::string::npos);
+  // 64-bit hash printed as 16 hex chars, then ".0.4096".
+  EXPECT_EQ(name.size(), 16 + std::string{".0.4096"}.size());
+  EXPECT_NE(name.find(".0.4096"), std::string::npos);
 }
 
 TEST(FsCacheKeyTest, usableInStdUnorderedMap) {
@@ -470,8 +476,10 @@ struct FsCacheKey {
   /// processes on the same architecture (folly SpookyHashV2 is fixed seed).
   uint64_t hash() const noexcept;
 
-  /// Returns the on-disk file name (hex hash + "_" + offset + "_" + size).
-  /// Used both for file placement and for parsing during recovery.
+  /// Returns the on-disk file name "<16-hex-hash>.<offset>.<size>". The hash
+  /// is hex (only [0-9a-f]) so the "." separator is unambiguous and the
+  /// numeric fields cannot collide with the hash. Used both for file
+  /// placement and for parsing during recovery.
   std::string fileName() const;
 };
 
@@ -514,7 +522,7 @@ uint64_t FsCacheKey::hash() const noexcept {
 }
 
 std::string FsCacheKey::fileName() const {
-  return fmt::format("{:016x}_{}_{}", hash(), offset, size);
+  return fmt::format("{:016x}.{}.{}", hash(), offset, size);
 }
 
 } // namespace facebook::velox::cache::fs
@@ -802,8 +810,12 @@ git commit -m "feat(fscache): FsCacheGuards (5 lock types)
 Five named lock types with per-instance std::mutex backing and a
 debug-only thread-local LockOrderChecker that CHECKs the acquire
 order: CachePriority > CacheState > CacheMetadata > Key > FileSegment.
-Phase 2 will swap to per-bucket / per-key instances under the same
-type names without callers changing.
+
+Known limitation (phase 1): all five wrappers share the same backing
+std::mutex per FsCache instance, so the rank check is enforced but
+true concurrency is still limited to the granularity of that single
+mutex. Phase 2 will swap to per-bucket / per-key instances under the
+same type names without callers changing.
 Design: velox/docs/designs/fscache-clickhouse-style.md."
 ```
 
@@ -819,7 +831,7 @@ Design: velox/docs/designs/fscache-clickhouse-style.md."
 - Modify: `velox/common/caching/fscache/CMakeLists.txt`
 - Modify: `velox/common/caching/fscache/tests/CMakeLists.txt`
 
-**Forward-decl note:** `EvictionPolicy` uses `FileSegment*` as opaque pointer; full `FileSegment` definition comes in commit 5. To allow this commit to compile + test in isolation, declare a tiny stand-in struct **inside the test only** for now; the production code uses an opaque forward declaration.
+**Forward-decl note:** `EvictionPolicy` uses `FileSegment*` as opaque pointer; full `FileSegment` definition comes in commit 5. Commit 4 adds a minimal `FileSegment` (key/size/state) in step 7 — the test can include `FileSegment.h` directly once that step is done.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -830,31 +842,23 @@ Design: velox/docs/designs/fscache-clickhouse-style.md."
  * (license header)
  */
 
+#include "velox/common/caching/fscache/FileSegment.h"
 #include "velox/common/caching/fscache/LruPolicy.h"
 
 #include <gtest/gtest.h>
 #include <vector>
 
-namespace facebook::velox::cache::fs {
+namespace facebook::velox::cache::fs::test {
 
-// Stand-in for FileSegment used by EvictionPolicy in commit 4 only.
-// Commit 5 defines the real FileSegment with the same opaque relationship.
-class FileSegment {
- public:
-  explicit FileSegment(uint64_t size) : size_{size} {}
-  uint64_t size() const {
-    return size_;
-  }
-
- private:
-  uint64_t size_;
-};
-
-namespace test {
+namespace {
+FileSegment makeSegment(uint64_t size, FileSegment::State state = FileSegment::State::kDownloaded) {
+  return FileSegment{FsCacheKey{"x", 0, size}, state};
+}
+} // namespace
 
 TEST(EvictionPolicyTest, lruInsertSelectsOldestFirst) {
   LruPolicy policy;
-  FileSegment a{100}, b{200}, c{300};
+  auto a = makeSegment(100), b = makeSegment(200), c = makeSegment(300);
   policy.onInsert(&a);
   policy.onInsert(&b);
   policy.onInsert(&c);
@@ -868,7 +872,7 @@ TEST(EvictionPolicyTest, lruInsertSelectsOldestFirst) {
 
 TEST(EvictionPolicyTest, hitMovesEntryToMostRecentlyUsed) {
   LruPolicy policy;
-  FileSegment a{100}, b{100}, c{100};
+  auto a = makeSegment(100), b = makeSegment(100), c = makeSegment(100);
   policy.onInsert(&a);
   policy.onInsert(&b);
   policy.onInsert(&c);
@@ -883,7 +887,7 @@ TEST(EvictionPolicyTest, hitMovesEntryToMostRecentlyUsed) {
 
 TEST(EvictionPolicyTest, removeDropsEntryFromTracking) {
   LruPolicy policy;
-  FileSegment a{100}, b{100};
+  auto a = makeSegment(100), b = makeSegment(100);
   policy.onInsert(&a);
   policy.onInsert(&b);
 
@@ -896,22 +900,32 @@ TEST(EvictionPolicyTest, removeDropsEntryFromTracking) {
 
 TEST(EvictionPolicyTest, selectVictimsReturnsEmptyWhenZeroRequested) {
   LruPolicy policy;
-  FileSegment a{100};
+  auto a = makeSegment(100);
   policy.onInsert(&a);
   EXPECT_TRUE(policy.selectVictims(0).empty());
 }
 
 TEST(EvictionPolicyTest, selectVictimsReturnsAllWhenRequestExceedsTotal) {
   LruPolicy policy;
-  FileSegment a{100}, b{100};
+  auto a = makeSegment(100), b = makeSegment(100);
   policy.onInsert(&a);
   policy.onInsert(&b);
   auto victims = policy.selectVictims(10'000);
   EXPECT_EQ(victims.size(), 2);
 }
 
-} // namespace test
-} // namespace facebook::velox::cache::fs
+TEST(EvictionPolicyTest, onInsertRejectsNonDownloadedSegments) {
+  LruPolicy policy;
+  auto downloading = makeSegment(100, FileSegment::State::kDownloading);
+  auto empty = makeSegment(100, FileSegment::State::kEmpty);
+  // LruPolicy must only track kDownloaded segments; otherwise selectVictims
+  // could return a segment whose download is still in-flight and the writer
+  // would race with eviction over the on-disk file.
+  EXPECT_THROW(policy.onInsert(&downloading), facebook::velox::VeloxException);
+  EXPECT_THROW(policy.onInsert(&empty), facebook::velox::VeloxException);
+}
+
+} // namespace facebook::velox::cache::fs::test
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1008,6 +1022,13 @@ namespace facebook::velox::cache::fs {
 
 void LruPolicy::onInsert(FileSegment* segment) {
   VELOX_CHECK_NOT_NULL(segment);
+  // Callers must only insert segments that have reached kDownloaded; this
+  // keeps selectVictims() from returning a segment whose download is still
+  // in-flight, which would race with the writer over the on-disk file.
+  VELOX_CHECK_EQ(
+      static_cast<int>(segment->state()),
+      static_cast<int>(FileSegment::State::kDownloaded),
+      "LruPolicy tracks only kDownloaded segments");
   VELOX_CHECK_EQ(index_.count(segment), 0, "Segment already tracked");
   mruToLru_.push_front(segment);
   index_[segment] = mruToLru_.begin();
@@ -1087,12 +1108,25 @@ tests are added).
 
 namespace facebook::velox::cache::fs {
 
-/// Single cache segment. Commit 4 introduces only the key/size surface used by
-/// EvictionPolicy. Commit 5 extends this class with the download state machine,
-/// refCount, condition variable, and read/download methods.
+/// Single cache segment. Commit 4 introduces only the key/size/state surface
+/// used by EvictionPolicy. Commit 5 extends this class with the full download
+/// state machine (atomic transitions, beginDownload, download, read).
 class FileSegment {
  public:
-  FileSegment(FsCacheKey key) : key_{std::move(key)} {}
+  enum class State : uint8_t {
+    kEmpty = 0,
+    kDownloading = 1,
+    kDownloaded = 2,
+    kDetached = 3,
+  };
+
+  /// Constructs a fresh segment. The starting state is kEmpty in commit 5's
+  /// extended version; in commit 4 we accept an explicit state so the
+  /// EvictionPolicy tests can exercise LruPolicy::onInsert's invariant
+  /// (only kDownloaded segments are tracked) without depending on the
+  /// download machinery that commit 5 introduces.
+  explicit FileSegment(FsCacheKey key, State state = State::kDownloaded)
+      : key_{std::move(key)}, state_{state} {}
 
   const FsCacheKey& key() const {
     return key_;
@@ -1102,8 +1136,13 @@ class FileSegment {
     return key_.size;
   }
 
+  State state() const {
+    return state_;
+  }
+
  private:
   FsCacheKey key_;
+  State state_;
 };
 
 } // namespace facebook::velox::cache::fs
@@ -1127,24 +1166,12 @@ namespace facebook::velox::cache::fs {} // namespace facebook::velox::cache::fs
 
 Add both to `CMakeLists.txt`: `FileSegment.cpp` in SOURCES, `FileSegment.h` in HEADERS.
 
-- [ ] **Step 9: Update test to use real `FileSegment` instead of stand-in**
-
-Remove the stand-in `class FileSegment` from `EvictionPolicyTest.cpp` (lines that defined the test-local class). Replace each `FileSegment a{100}` style construction with:
-
-```cpp
-auto a = FileSegment{FsCacheKey{"a", 0, 100}};
-```
-
-Add `#include "velox/common/caching/fscache/FileSegment.h"` at the top.
-
-Pointers in test now refer to the real type; behavior matches the original assertions because `size()` returns `key_.size`.
-
-- [ ] **Step 10: Build and run**
+- [ ] **Step 9: Build and run**
 
 Run: `make debug && cd _build/debug && ctest -R velox_fscache_test -V`
-Expected: 5 EvictionPolicyTest cases PASS plus all earlier tests.
+Expected: 6 EvictionPolicyTest cases PASS plus all earlier tests.
 
-- [ ] **Step 11: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add velox/common/caching/fscache/EvictionPolicy.h \
@@ -1368,6 +1395,14 @@ TEST(FsCacheSplitRangeTest, smallTailKeepsAlignmentExpansion) {
   EXPECT_EQ(ranges[0].second, 2 * kAlign);
 }
 
+TEST(FsCacheSplitRangeTest, zeroSizeReturnsEmpty) {
+  // size==0 must short-circuit to an empty range list; otherwise the
+  // outward-alignment math would produce a phantom segment [alignedStart,
+  // alignedStart) which downstream code would persist as a 0-byte file.
+  EXPECT_TRUE(FsCache::splitRange(0, 0, defaultConfig()).empty());
+  EXPECT_TRUE(FsCache::splitRange(7 * kAlign + 12345, 0, defaultConfig()).empty());
+}
+
 } // namespace facebook::velox::cache::fs::test
 ```
 
@@ -1464,6 +1499,16 @@ class FileSegment {
       char* outBuf,
       const std::string& cacheRoot) const;
 
+ public:
+  /// Mutex held by FsCache::lookupOrCreate while CAS-ing state_ and waiting
+  /// on cv_. Exposed publicly (rather than via friend) because FileSegment is
+  /// a coordination object whose synchronization is orchestrated by FsCache;
+  /// hiding mutex_/cv_ would only push FsCache logic into FileSegment.
+  mutable FileSegmentMutex mutex_;
+
+  /// Notifies waiters when state_ leaves kDownloading. Paired with mutex_.
+  mutable std::condition_variable_any cv_;
+
  private:
   FsCacheKey key_;
   std::atomic<State> state_{State::kEmpty};
@@ -1472,12 +1517,6 @@ class FileSegment {
   // Phase 1: hits_ recorded but not consumed (SLRU upgrade happens in phase 2).
   std::atomic<uint64_t> hits_{0};
   std::atomic<uint64_t> refCount_{0};
-
-  // Used by commit 6 to coordinate concurrent waiters.
-  mutable FileSegmentMutex mutex_;
-  mutable std::condition_variable_any cv_;
-
-  friend class FsCache; // FsCache holds mutex_ and cv_ during coordination.
 };
 
 } // namespace facebook::velox::cache::fs
@@ -1627,11 +1666,17 @@ std::vector<std::pair<uint64_t, uint64_t>> FsCache::splitRange(
   if (end % config.alignment != 0) {
     alignedEnd = ((end / config.alignment) + 1) * config.alignment;
   }
-  // Split into max-size chunks.
+  // Split into max-size chunks. The size>0 early-return plus outward
+  // alignment guarantees alignedStart < alignedEnd, so at least one chunk
+  // is produced; the explicit VELOX_CHECK_GT guards against a future
+  // refactor accidentally producing a zero-size chunk (which would create
+  // a "<hash>.<offset>.0" cache file that loadFromDisk would silently
+  // accept).
   uint64_t cursor = alignedStart;
   while (cursor < alignedEnd) {
     const uint64_t chunkSize =
         std::min(config.maxSegmentSize, alignedEnd - cursor);
+    VELOX_CHECK_GT(chunkSize, 0);
     result.emplace_back(cursor, chunkSize);
     cursor += chunkSize;
   }
@@ -1639,22 +1684,83 @@ std::vector<std::pair<uint64_t, uint64_t>> FsCache::splitRange(
 }
 ```
 
-- [ ] **Step 8: Wire test files into CMake**
+- [ ] **Step 8: Adapt `EvictionPolicyTest.cpp` to the extended `FileSegment`**
+
+Commit 5 dropped the `(FsCacheKey, State)` ctor (state is now driven by the
+download state machine; fresh segments start at kEmpty). Adjust
+`EvictionPolicyTest.cpp` accordingly.
+
+Add a fixture that owns a small remote file used by the happy-path tests:
+
+```cpp
+class EvictionPolicyTest : public ::testing::Test {
+ protected:
+  std::shared_ptr<::facebook::velox::common::testutil::TempDirectoryPath>
+      tempDir_;
+  std::string remotePath_;
+  std::string cacheRoot_;
+
+  void SetUp() override {
+    tempDir_ = ::facebook::velox::common::testutil::TempDirectoryPath::create();
+    cacheRoot_ = tempDir_->getPath() + "/cache";
+    std::filesystem::create_directories(cacheRoot_);
+    remotePath_ = tempDir_->getPath() + "/remote.bin";
+    std::ofstream out{remotePath_, std::ios::binary};
+    // 4 KiB is more than enough for any size used below.
+    std::string blob(4096, 'a');
+    out.write(blob.data(), blob.size());
+  }
+
+  // Builds a segment and brings it to kDownloaded via real IO.
+  std::unique_ptr<FileSegment> downloaded(uint64_t size) {
+    auto seg = std::make_unique<FileSegment>(FsCacheKey{remotePath_, 0, size});
+    VELOX_CHECK(seg->beginDownload());
+    LocalReadFile remote{remotePath_};
+    seg->download(remote, cacheRoot_);
+    return seg;
+  }
+};
+```
+
+Convert every existing `TEST(EvictionPolicyTest, ...)` to
+`TEST_F(EvictionPolicyTest, ...)`. Replace each `makeSegment(N)` call with
+`downloaded(N)`; store the returned `unique_ptr` in the test scope and pass
+its `.get()` to `policy.onInsert`. Update the size-based assertions to use
+the same numeric sizes as before.
+
+For `onInsertRejectsNonDownloadedSegments`, build the kEmpty and
+kDownloading segments directly without calling `download()`:
+
+```cpp
+TEST_F(EvictionPolicyTest, onInsertRejectsNonDownloadedSegments) {
+  LruPolicy policy;
+  FileSegment empty{FsCacheKey{remotePath_, 0, 100}};
+  FileSegment downloading{FsCacheKey{remotePath_, 100, 100}};
+  ASSERT_TRUE(downloading.beginDownload());
+  EXPECT_THROW(policy.onInsert(&empty), facebook::velox::VeloxException);
+  EXPECT_THROW(policy.onInsert(&downloading), facebook::velox::VeloxException);
+}
+```
+
+Drop the free-function `makeSegment` helper introduced in commit 4.
+
+- [ ] **Step 9: Wire test files into CMake**
 
 Edit `velox/common/caching/fscache/tests/CMakeLists.txt`:
 - Add `FileSegmentTest.cpp` and `FsCacheSplitRangeTest.cpp` to `VELOX_FSCACHE_TEST_SOURCES`.
 - Add `velox_file` and `velox_temp_path` to `VELOX_FSCACHE_TEST_DEPS` (the deps are listed in `velox/common/testutil/CMakeLists.txt`; check the existing target name with `grep -r "velox_temp_path\|velox_test_util" /home/chang/OpenSource/velox2/velox/common/testutil/CMakeLists.txt` and use the matching target).
 
-- [ ] **Step 9: Build and run**
+- [ ] **Step 10: Build and run**
 
 Run: `make debug && cd _build/debug && ctest -R velox_fscache_test -V`
-Expected: 6 FileSegmentTest cases + 6 FsCacheSplitRangeTest cases PASS, plus all prior tests.
+Expected: 6 EvictionPolicyTest + 6 FileSegmentTest + 7 FsCacheSplitRangeTest cases PASS, plus all prior tests.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
 git add velox/common/caching/fscache/FileSegment.{h,cpp} \
         velox/common/caching/fscache/FsCache.{h,cpp} \
+        velox/common/caching/fscache/tests/EvictionPolicyTest.cpp \
         velox/common/caching/fscache/tests/FileSegmentTest.cpp \
         velox/common/caching/fscache/tests/FsCacheSplitRangeTest.cpp \
         velox/common/caching/fscache/tests/CMakeLists.txt
@@ -1664,6 +1770,19 @@ FileSegment gains the kEmpty/kDownloading/kDownloaded/kDetached state
 machine, .tmp+rename atomic write, and chunked pread from the remote
 ReadFile. FsCache::splitRange implements ClickHouse-style outward
 alignment to 4 MiB plus 32 MiB max-segment splitting.
+
+Known limitations (phase 1):
+- 3 active states (+ kDetached) vs ClickHouse's 6
+  (EMPTY/DOWNLOADING/DOWNLOADED/PARTIALLY_DOWNLOADED/PARTIALLY_DOWNLOADED_NO_CONTINUATION/DETACHED).
+  We drop the partial-download progression because phase 1 publishes
+  a segment only on full download (all-or-nothing via .tmp + rename).
+  Partial-progress states return when background download lands in
+  phase 2.
+- download() reads the whole segment (up to 32 MiB) into a heap
+  buffer before writing to .tmp. Memory pressure proportional to
+  download concurrency. A streaming pread → write loop is a
+  follow-up; phase 1 keeps the implementation small to keep the
+  correctness audit short.
 Design: velox/docs/designs/fscache-clickhouse-style.md."
 ```
 
@@ -1811,6 +1930,77 @@ TEST_F(FsCacheTest, evictionRunsWhenOverCapacity) {
   cache.getOrSet(remotePath_, 4UL * 1024 * 1024, 4UL * 1024 * 1024, remote);
   EXPECT_LE(cache.stats().bytesOnDisk, tiny.maxBytes);
   EXPECT_GT(cache.stats().evictions, 0);
+}
+
+// Regression: writer's IO failure must not crash waiters via VELOX_CHECK.
+// Waiters surface the failure via a user-facing throw instead.
+TEST_F(FsCacheTest, waiterReceivesThrowWhenWriterFails) {
+  // Build a remote ReadFile that throws on pread to simulate IO failure.
+  class ThrowingReadFile : public ::facebook::velox::ReadFile {
+   public:
+    std::string_view pread(
+        uint64_t /*offset*/,
+        uint64_t /*length*/,
+        void* /*buf*/,
+        const ::facebook::velox::FileIoContext& /*context*/)
+        const override {
+      VELOX_FAIL("simulated remote IO failure");
+    }
+    uint64_t size() const override {
+      return 8UL * 1024 * 1024;
+    }
+    uint64_t memoryUsage() const override {
+      return 0;
+    }
+    bool shouldCoalesce() const override {
+      return false;
+    }
+    std::string getName() const override {
+      return "throwing";
+    }
+    uint64_t getNaturalReadSize() const override {
+      return 4096;
+    }
+  };
+
+  FsCache cache{config_};
+  ThrowingReadFile remote;
+  // Two threads race on the same key. Exactly one becomes the writer (will
+  // throw); the other is the waiter (must also throw, not CHECK-crash).
+  std::atomic<int> throwCount{0};
+  std::atomic<int> crashCount{0};
+  std::vector<std::thread> threads;
+  for (int i = 0; i < 2; ++i) {
+    threads.emplace_back([&] {
+      try {
+        cache.getOrSet(remotePath_, 0, 4096, remote);
+      } catch (const std::exception&) {
+        ++throwCount;
+      } catch (...) {
+        ++crashCount;
+      }
+    });
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+  EXPECT_EQ(throwCount.load(), 2);
+  EXPECT_EQ(crashCount.load(), 0);
+}
+
+// Regression for #12: a segment that already reached kDownloaded (recovered
+// from disk or completed earlier) must increment stats.hits when re-read,
+// so it participates in eviction policy and does not leak.
+TEST_F(FsCacheTest, secondReaderOfDownloadedSegmentCountsAsHit) {
+  FsCache cache{config_};
+  LocalReadFile remote{remotePath_};
+  cache.getOrSet(remotePath_, 0, 4096, remote);
+  const auto baseline = cache.stats();
+  cache.getOrSet(remotePath_, 0, 4096, remote);
+  const auto after = cache.stats();
+  EXPECT_EQ(after.misses, baseline.misses);
+  EXPECT_EQ(after.hits, baseline.hits + 1);
+  EXPECT_EQ(after.bytesOnDisk, baseline.bytesOnDisk);
 }
 
 } // namespace facebook::velox::cache::fs::test
@@ -2028,7 +2218,7 @@ std::vector<FileSegmentPtr> FsCache::getOrSet(
 FileSegmentPtr FsCache::lookupOrCreate(
     const FsCacheKey& key,
     ::facebook::velox::ReadFile& remote) {
-  // 1. Fast path: existing DOWNLOADED segment.
+  // 1. Fast path: existing kDownloaded segment.
   if (auto existing = metadata_->lookup(key);
       existing != nullptr &&
       existing->state() == FileSegment::State::kDownloaded) {
@@ -2050,28 +2240,45 @@ FileSegmentPtr FsCache::lookupOrCreate(
     VELOX_CHECK_NOT_NULL(segment);
   }
 
-  // 3. Coordinate download. Only the thread that wins beginDownload() does it;
-  // others wait on cv_ for kDownloaded.
-  {
-    std::unique_lock<FileSegmentMutex> lock{segment->mutex_};
-    if (segment->state() == FileSegment::State::kDownloaded) {
-      // Won the race after lookup.
-    } else if (segment->beginDownload()) {
-      // We are the writer.
-      lock.unlock();
-      // Reserve capacity, evicting if needed.
-      evict(key.size);
-      try {
-        segment->download(remote, config_.cacheRoot);
-      } catch (...) {
-        std::lock_guard<FileSegmentMutex> resetLock{segment->mutex_};
-        segment->cv_.notify_all();
-        throw;
-      }
-      {
-        std::lock_guard<FileSegmentMutex> notifyLock{segment->mutex_};
-        segment->cv_.notify_all();
-      }
+  // 3. Coordinate download. Only the thread that wins beginDownload() does
+  //    the actual fetch; concurrent waiters block on cv_ until the writer
+  //    either completes (kDownloaded) or fails (kEmpty). On failure each
+  //    waiter throws so the caller can retry or surface the error; the
+  //    segment metadata entry stays so a subsequent caller can race for
+  //    beginDownload() again.
+  std::unique_lock<FileSegmentMutex> lock{segment->mutex_};
+  if (segment->state() == FileSegment::State::kDownloaded) {
+    // Another thread completed between fast-path lookup and metadata insert.
+    // Treat as a hit; the slow-path fall-through is not a miss.
+    lock.unlock();
+    {
+      CachePriorityGuard guard{priorityMutex_};
+      policy_->onHit(segment.get());
+    }
+    {
+      CacheStateGuard guard{stateMutex_};
+      ++stats_.hits;
+    }
+    return segment;
+  }
+  if (segment->beginDownload()) {
+    // 3a. Writer path.
+    lock.unlock();
+    // Reserve capacity by evicting kDownloaded victims; never touches
+    // kDownloading segments because LruPolicy only contains segments that
+    // reached kDownloaded (onInsert is called on completion, see below).
+    evict(key.size);
+    bool succeeded = false;
+    try {
+      segment->download(remote, config_.cacheRoot);
+      succeeded = true;
+    } catch (...) {
+      // download() already reset state_ to kEmpty and removed the .tmp/file.
+      std::lock_guard<FileSegmentMutex> resetLock{segment->mutex_};
+      segment->cv_.notify_all();
+      throw;
+    }
+    if (succeeded) {
       {
         CachePriorityGuard guard{priorityMutex_};
         policy_->onInsert(segment.get());
@@ -2081,16 +2288,37 @@ FileSegmentPtr FsCache::lookupOrCreate(
         ++stats_.misses;
         stats_.bytesOnDisk += key.size;
       }
-    } else {
-      // Another thread is downloading; wait.
-      segment->cv_.wait(lock, [&] {
-        return segment->state() != FileSegment::State::kDownloading;
-      });
-      VELOX_CHECK_EQ(
-          static_cast<int>(segment->state()),
-          static_cast<int>(FileSegment::State::kDownloaded),
-          "Concurrent download failed");
+      std::lock_guard<FileSegmentMutex> notifyLock{segment->mutex_};
+      segment->cv_.notify_all();
     }
+    return segment;
+  }
+  // 3b. Waiter path: another thread is downloading; wait for completion or
+  //     failure. cv_ is notified on both outcomes (see writer path above).
+  segment->cv_.wait(lock, [&] {
+    return segment->state() != FileSegment::State::kDownloading;
+  });
+  const auto finalState = segment->state();
+  lock.unlock();
+  if (finalState != FileSegment::State::kDownloaded) {
+    // Writer threw. Surface as a user-level error; caller may retry by
+    // calling getOrSet again, at which point a fresh race for beginDownload()
+    // happens. Do not VELOX_CHECK here: that would convert another thread's
+    // I/O failure into a CHECK-failure CRASH on the waiter.
+    VELOX_USER_FAIL(
+        "FsCache concurrent download failed for {} [{}..{})",
+        key.path,
+        key.offset,
+        key.offset + key.size);
+  }
+  // Successful concurrent download counts as a hit for this thread.
+  {
+    CachePriorityGuard guard{priorityMutex_};
+    policy_->onHit(segment.get());
+  }
+  {
+    CacheStateGuard guard{stateMutex_};
+    ++stats_.hits;
   }
   return segment;
 }
@@ -2468,6 +2696,13 @@ namespace facebook::velox::dwio::common {
 
 /// BufferedInput subclass backed by FsCache. Bypasses AsyncDataCache /
 /// SsdCache entirely.
+///
+/// Phase 1 implements the read path only (`enqueue` + `load` + clone).
+/// `cacheRegion()` / `findCachedRegion()` inherit the base
+/// `VELOX_UNSUPPORTED` behaviour: third-party write-through into the cache
+/// is out of scope for phase 1 (no caller in Velox invokes these on the
+/// hot read path). They are added in a later phase if pre-fetching code
+/// outside the BufferedInput needs to populate FsCache.
 class FsCacheBufferedInput final : public BufferedInput {
  public:
   FsCacheBufferedInput(
@@ -2722,7 +2957,7 @@ class FsCacheRecoveryTest : public ::testing::Test {
 TEST_F(FsCacheRecoveryTest, tmpFilesRemovedOnLoad) {
   warmCache(0, 4096);
   // Drop a stray .tmp file.
-  const std::string stray = cacheRoot_ + "/aa/bb/deadbeef00000000_0_1024.tmp";
+  const std::string stray = cacheRoot_ + "/aa/bb/deadbeef00000000.0.1024.tmp";
   std::filesystem::create_directories(
       std::filesystem::path{stray}.parent_path());
   std::ofstream{stray} << "junk";
@@ -2845,10 +3080,20 @@ Expected: `FsCache::loadFromDisk` undefined.
 ```cpp
  public:
   /// Scans cacheRoot for cache files left over from a previous run. Removes
-  /// .tmp files and size-mismatched files, and counts surviving bytes into
-  /// stats_.bytesOnDisk. Does NOT repopulate metadata (path information is
-  /// lost on disk by design); the next download() short-circuits when the
-  /// expected file already exists. Idempotent.
+  /// .tmp files and size-mismatched files. Does NOT repopulate metadata
+  /// (path information is lost on disk by design) and does NOT credit any
+  /// bytes to stats_.bytesOnDisk — orphan files that are never re-requested
+  /// would be untracked by LruPolicy and could not be evicted, eventually
+  /// filling the disk. Instead, the next download() of a matching key
+  /// short-circuits when the expected file already exists; that path goes
+  /// through lookupOrCreate which performs the normal onInsert + bytesOnDisk
+  /// accounting. Idempotent.
+  ///
+  /// NOT called from the FsCache constructor; the caller (typically the
+  /// Velox process startup hook that constructs the singleton FsCache) must
+  /// invoke it explicitly before serving traffic if persistence across
+  /// restarts is desired. This keeps construction side-effect-free and
+  /// keeps unit tests from paying directory-scan cost.
   void loadFromDisk();
 ```
 
@@ -2856,25 +3101,25 @@ Expected: `FsCache::loadFromDisk` undefined.
 
 ```cpp
 namespace {
-// Parses "<hexHash>_<offset>_<size>" from a file name. Returns nullopt if the
+// Parses "<hexHash>.<offset>.<size>" from a file name. Returns nullopt if the
 // name does not fit the expected three-part form with numeric offset/size.
 struct ParsedName {
   uint64_t offset;
   uint64_t size;
 };
 std::optional<ParsedName> parseFileName(const std::string& name) {
-  const auto firstUnderscore = name.find('_');
-  if (firstUnderscore == std::string::npos) {
+  const auto firstDot = name.find('.');
+  if (firstDot == std::string::npos) {
     return std::nullopt;
   }
-  const auto secondUnderscore = name.find('_', firstUnderscore + 1);
-  if (secondUnderscore == std::string::npos) {
+  const auto secondDot = name.find('.', firstDot + 1);
+  if (secondDot == std::string::npos) {
     return std::nullopt;
   }
   try {
-    const uint64_t offset = std::stoull(name.substr(
-        firstUnderscore + 1, secondUnderscore - firstUnderscore - 1));
-    const uint64_t size = std::stoull(name.substr(secondUnderscore + 1));
+    const uint64_t offset =
+        std::stoull(name.substr(firstDot + 1, secondDot - firstDot - 1));
+    const uint64_t size = std::stoull(name.substr(secondDot + 1));
     return ParsedName{offset, size};
   } catch (const std::exception&) {
     return std::nullopt;
@@ -2886,8 +3131,10 @@ void FsCache::loadFromDisk() {
   if (!std::filesystem::exists(config_.cacheRoot)) {
     return;
   }
-  uint64_t bytesRecovered = 0;
   std::error_code ignore;
+  // Two passes simplify empty-directory cleanup (issue #7 in review): first
+  // pass removes .tmp / size-mismatched / unparseable files; second pass
+  // rmdirs any subdirectory left empty afterwards.
   for (auto& entry :
        std::filesystem::recursive_directory_iterator{config_.cacheRoot}) {
     if (!entry.is_regular_file()) {
@@ -2908,21 +3155,31 @@ void FsCache::loadFromDisk() {
       std::filesystem::remove(entry.path(), ignore);
       continue;
     }
-    bytesRecovered += parsed->size;
+    // Survivor: download() will short-circuit when this file is next
+    // requested, and lookupOrCreate will then call onInsert/bytesOnDisk.
   }
-  CacheStateGuard guard{stateMutex_};
-  stats_.bytesOnDisk += bytesRecovered;
+  // Cleanup empty directories left by removed files.
+  for (auto& entry :
+       std::filesystem::recursive_directory_iterator{config_.cacheRoot}) {
+    if (entry.is_directory() && std::filesystem::is_empty(entry.path())) {
+      std::filesystem::remove(entry.path(), ignore);
+    }
+  }
 }
 ```
 
-**Why no metadata re-registration:** the on-disk file name encodes only the
-hash, not the original remote path (design Q10 explicitly accepts this
-trade-off — see `velox/docs/designs/fscache-clickhouse-style.md` §持久化与
-暖启 / path 反查). Reconstructing a `FsCacheKey{path, offset, size}` from
-the on-disk name is therefore impossible. Instead, the next call to
-`getOrSet` re-hashes the same `{path, offset, size}` to the same on-disk
-filename, and `FileSegment::download` short-circuits when it finds the file
-already present with the right size.
+**Why no metadata re-registration or byte accounting:** the on-disk file
+name encodes only the hash, not the original remote path (design Q10
+explicitly accepts this trade-off — see
+`velox/docs/designs/fscache-clickhouse-style.md` §持久化与暖启 / path 反查).
+Reconstructing a `FsCacheKey{path, offset, size}` from the on-disk name is
+therefore impossible. Crediting orphan bytes to `bytesOnDisk` without a
+matching LruPolicy entry would also create un-evictable disk usage. Instead,
+the next call to `getOrSet` re-hashes the same `{path, offset, size}` to
+the same on-disk filename, `FileSegment::download` short-circuits when it
+finds the file already present with the right size, and `lookupOrCreate`'s
+writer path then performs the normal `onInsert` + `bytesOnDisk += size`
+accounting so the segment participates in eviction (regression #12).
 
 - [ ] **Step 5a: Add download() short-circuit in `FileSegment.cpp`**
 
@@ -2988,10 +3245,14 @@ git add velox/common/caching/fscache/FsCache.{h,cpp} \
         velox/common/caching/fscache/tests/CMakeLists.txt
 git commit -m "feat(fscache): crash recovery via directory scan
 
-loadFromDisk removes .tmp and size-mismatched files, accounts surviving
-bytes in stats. FileSegment::download short-circuits when the final
-file already exists with the expected size — this gives transparent
-warm restarts without persisting path metadata.
+loadFromDisk removes .tmp and unparseable / size-mismatched files
+and rmdirs empty bucket dirs. It does NOT re-register surviving
+files in metadata_ or credit them to stats_.bytesOnDisk; that
+would create un-evictable disk usage. Instead, FileSegment::download
+short-circuits when the final file already exists with the expected
+size, and the lookupOrCreate writer path credits bytesOnDisk + calls
+onInsert at first access — surviving files are picked up on demand.
+This enables persistence-aware restarts without persisting path metadata.
 Design: velox/docs/designs/fscache-clickhouse-style.md."
 ```
 
@@ -3158,14 +3419,21 @@ Design: velox/docs/designs/fscache-clickhouse-style.md."
 
 ---
 
-## Commit 10: `test(fscache): equivalence vs CachedBufferedInput`
+## Commit 10: `test(fscache): equivalence vs ground-truth bytes`
 
 **Files:**
 - Create: `velox/dwio/common/tests/FsCacheEquivalenceTest.cpp`
 - Modify: `velox/dwio/common/tests/CMakeLists.txt`
 
-UT-only commit. **Phase 1 终极正确性 gate**：同一 ReadFile 跑两次 query，新旧
-BufferedInput 字节相同。
+UT-only commit. **Phase 1 终极正确性 gate**：FsCacheBufferedInput 的读路径与
+源文件的 canonical bytes 完全一致。
+
+**为什么不直接对比 `CachedBufferedInput`？** Velox 正确性不变式保证
+`CachedBufferedInput` 返回的就是 canonical bytes（也就是这里的 `content_`），
+所以拉 `AsyncDataCache + StringIdLease + ScanTracker` 起一份只是为了对同一段
+ground truth — 对比下来必然一致，但额外的脚手架会让测试失败原因更难定位。
+直接对 `content_` 比较是等价但更简洁的方案。当怀疑 `CachedBufferedInput`
+本身有问题时再加这条对比。
 
 - [ ] **Step 1: Write `FsCacheEquivalenceTest.cpp`**
 
@@ -3175,11 +3443,9 @@ BufferedInput 字节相同。
  */
 
 #include "velox/common/caching/fscache/FsCache.h"
-#include "velox/common/caching/AsyncDataCache.h"
 #include "velox/common/file/File.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
-#include "velox/dwio/common/CachedBufferedInput.h"
 #include "velox/dwio/common/FsCacheBufferedInput.h"
 #include "velox/dwio/common/Options.h"
 
@@ -3188,8 +3454,6 @@ BufferedInput 字节相同。
 
 namespace facebook::velox::dwio::common::test {
 
-using ::facebook::velox::cache::AsyncDataCache;
-using ::facebook::velox::cache::ScanTracker;
 using ::facebook::velox::common::testutil::TempDirectoryPath;
 using ::facebook::velox::dwio::common::FsCacheBufferedInput;
 
@@ -3198,7 +3462,6 @@ class FsCacheEquivalenceTest : public ::testing::Test {
   std::shared_ptr<TempDirectoryPath> tempDir_;
   std::string remotePath_;
   std::shared_ptr<memory::MemoryPool> pool_;
-  std::shared_ptr<AsyncDataCache> asyncCache_;
   std::unique_ptr<cache::fs::FsCache> fsCache_;
   std::string content_;
 
@@ -3215,7 +3478,6 @@ class FsCacheEquivalenceTest : public ::testing::Test {
     std::ofstream out{remotePath_, std::ios::binary};
     out.write(content_.data(), content_.size());
 
-    asyncCache_ = AsyncDataCache::create(memory::memoryManager()->allocator());
     cache::fs::FsCacheConfig cfg;
     cfg.cacheRoot = tempDir_->getPath() + "/cache";
     cfg.maxBytes = 64UL * 1024 * 1024;
@@ -3300,23 +3562,6 @@ TEST_F(FsCacheEquivalenceTest, repeatedReadConsistent) {
 } // namespace facebook::velox::dwio::common::test
 ```
 
-**Decision on "vs CachedBufferedInput":** ground truth here is the canonical
-content of the source file (`content_`), which is what `CachedBufferedInput`
-would also serve. Reading via `CachedBufferedInput` would require a full
-`AsyncDataCache` + `StringIdLease` + `ScanTracker` setup; the bytes returned
-by it are by definition `content_` (Velox correctness invariant). Comparing
-against `content_` directly is equivalent and substantially simpler. If the
-user wants an actual side-by-side comparison anyway, add a 4th test:
-
-```cpp
-TEST_F(FsCacheEquivalenceTest, matchesCachedBufferedInputBytes) {
-  // Skipped in phase 1: setup cost outweighs the value because content_ is
-  // the same ground truth both paths must serve. Re-enable if a future bug
-  // in CachedBufferedInput needs to be ruled out as the source of a diff.
-  GTEST_SKIP() << "Both paths serve canonical bytes; covered by other tests.";
-}
-```
-
 - [ ] **Step 2: Wire CMake**
 
 Edit `velox/dwio/common/tests/CMakeLists.txt`:
@@ -3325,7 +3570,7 @@ Edit `velox/dwio/common/tests/CMakeLists.txt`:
 - [ ] **Step 3: Build and run**
 
 Run: `make debug && cd _build/debug && ctest -R FsCacheEquivalence -V`
-Expected: 3 cases PASS (4th SKIPPED).
+Expected: 3 cases PASS.
 
 - [ ] **Step 4: Final sanity check — entire fscache + dwio test suite**
 
@@ -3340,12 +3585,14 @@ Expected: ALL pass. This is Phase 1's exit criterion.
 ```bash
 git add velox/dwio/common/tests/FsCacheEquivalenceTest.cpp \
         velox/dwio/common/tests/CMakeLists.txt
-git commit -m "test(fscache): equivalence vs CachedBufferedInput
+git commit -m "test(fscache): equivalence vs ground-truth bytes
 
 Three byte-for-byte tests prove FsCacheBufferedInput delivers
 canonical content for single-region, many-small-region, and
-repeated-read workloads. This is Phase 1's correctness gate per
-the design doc, addressing the E2E verification gap from the
+repeated-read workloads. The reference is the source file's
+canonical bytes (which CachedBufferedInput is also required to
+serve, by Velox invariant). This is Phase 1's correctness gate
+per the design doc, addressing the E2E verification gap from the
 CacheLib PoC audit.
 Design: velox/docs/designs/fscache-clickhouse-style.md."
 ```
@@ -3358,22 +3605,27 @@ Phase 1 is complete when:
 
 1. All 10 commits land on the `fscache-clickhouse-style` branch.
 2. `make debug && make unittest` is green at every commit.
-3. `ctest -R "velox_fscache_test|FsCache"` lists ≥ 35 passing test cases:
+3. `ctest -R "velox_fscache_test|FsCache"` lists ≥ 50 passing test cases:
    - FsCacheScaffoldTest: 1
    - FsCacheKeyTest: 5
    - FsCacheGuardsTest: 2 or 3 (depends on debug build for death test)
-   - EvictionPolicyTest: 5
-   - FileSegmentTest: 5
-   - FsCacheSplitRangeTest: 6
+   - EvictionPolicyTest: 6
+   - FileSegmentTest: 6
+   - FsCacheSplitRangeTest: 7
    - FsCacheMetadataTest: 5
-   - FsCacheTest: 3
+   - FsCacheTest: 5
    - FsCacheConcurrencyTest: 3
    - FsCacheRecoveryTest: 4
    - FsCachePersistenceTest: 1
    - FsCacheBufferedInputTest: 3
-   - FsCacheEquivalenceTest: 3 (+ 1 skip)
-4. **No benchmark numbers** or performance claims appear in any commit
+   - FsCacheEquivalenceTest: 3
+4. `FsCacheConcurrencyTest` passes under TSAN
+   (`cmake -DVELOX_ENABLE_TSAN=ON ... && ctest -R FsCacheConcurrency`). This
+   is the explicit signal that the 5-lock hierarchy + FileSegment cv
+   coordination is race-free; the docs-only LockOrderChecker is not enough
+   on its own.
+5. **No benchmark numbers** or performance claims appear in any commit
    message in this branch (per the iron rule from the design doc).
-5. Branch is pushable but **not pushed automatically**; user decides when.
+6. Branch is pushable but **not pushed automatically**; user decides when.
 
 ---
