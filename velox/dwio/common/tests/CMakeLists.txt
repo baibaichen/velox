@@ -57,6 +57,7 @@ add_executable(
   CachedBufferedInputTest.cpp
   DirectBufferedInputTest.cpp
   FsCacheBufferedInputTest.cpp
+  FsCacheEquivalenceTest.cpp
   ThrottlerTest.cpp
   TypeTests.cpp
   UnitLoaderToolsTests.cpp
