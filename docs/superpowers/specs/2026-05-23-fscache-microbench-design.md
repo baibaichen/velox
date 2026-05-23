@@ -155,17 +155,23 @@ CellResult runCell(workload, threads, wsMult, latencyUs) {
 
   CellResult r;
   r.opsPerSec    = ops / wallSec;
-  // hits + misses can be < ops if some ops short-circuit (e.g. all-hit
-  // paths inside one getOrSet); we divide by ops because that is the user-
-  // visible work unit.
+  // Phase 1 invariant: every getOrSet returns exactly one segment (size =
+  // segmentSize = 1 MiB), so lookupOrCreate bumps either hits or misses
+  // once per op. hitsDelta + missesDelta == ops absent IO failure. If a
+  // future caller passes size > maxSegmentSize, getOrSet emits N segments
+  // per op and the identity becomes hits + misses == N * ops; the
+  // hit-rate formula still wants ops in the denominator because ops is
+  // the user-visible work unit.
   r.hitRatePct   = 100.0 * hitsDelta / ops;
   r.bytesDl_MB   = bytesReadDelta / (1ULL << 20);
   // stats_.evictions is a COUNT of segments evicted, NOT bytes. Phase 1
   // segments are uniformly 1 MiB (FsCacheConfig: alignment = maxSegmentSize
   // = 1 MiB), so count == MiB; if either knob changes this formula must
-  // change too.
+  // change too. Multiply before divide so a sub-MiB maxSegmentSize does
+  // not silently truncate to 0.
+  const auto& cfg = d.fsCache.config();   // FsCache.h:72
   r.evicCount    = evictionsDelta;
-  r.bytesEvic_MB = evictionsDelta * (cfg.maxSegmentSize / (1ULL << 20));
+  r.bytesEvic_MB = (evictionsDelta * cfg.maxSegmentSize) / (1ULL << 20);
   r.p50_us       = quantile(allLatencies, 0.50) / 1000.0;
   r.p95_us       = quantile(allLatencies, 0.95) / 1000.0;
   r.p99_us       = quantile(allLatencies, 0.99) / 1000.0;
@@ -198,7 +204,7 @@ key, for 13 total per row.
 | hit% | (hits_final - hits_base) / ops | Whether cache is actually working |
 | dl MB | sleepyReadFile.bytesRead() (reset post-warmup) | Write amplification, cross-check vs hit% |
 | evic count | evictions_final - evictions_base | Eviction pressure (raw segment count) |
-| evic MB | evic_count * cfg.maxSegmentSize | Same in MiB; Phase 1 = evic_count * 1 MiB |
+| evic MB | (evic_count * cfg.maxSegmentSize) / 1 MiB; Phase 1 = evic_count * 1 MiB | Eviction pressure (bytes); cross-check vs dl_MB |
 | p50/p95/p99 µs | Per-op latency quantiles | Lock contention, eviction spikes |
 | wallSec | Wall clock | Debugging / sanity |
 
