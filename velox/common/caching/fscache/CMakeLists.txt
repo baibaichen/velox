@@ -15,10 +15,12 @@
 velox_add_library(
   velox_fscache
   FsCache.cpp
+  FsCacheGuards.cpp
   FsCacheKey.cpp
   HEADERS
   FsCache.h
   FsCacheConfig.h
+  FsCacheGuards.h
   FsCacheKey.h
 )
 
