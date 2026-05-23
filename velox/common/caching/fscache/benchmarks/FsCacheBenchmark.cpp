@@ -25,6 +25,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <ostream>
 #include <random>
 #include <string>
 #include <thread>
@@ -32,6 +33,7 @@
 
 #include <unistd.h>
 
+#include <folly/Format.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
@@ -165,6 +167,38 @@ using ::facebook::velox::cache::fs::bench::Workload;
 constexpr uint64_t kSegmentBytes = 1ULL << 20;
 constexpr uint64_t kMaxCacheBytes = 512ULL * (1ULL << 20);
 
+struct CellKey {
+  Workload workload;
+  uint64_t threads;
+  double wsMult;
+  uint64_t latencyUs;
+};
+
+struct CellResult {
+  CellKey key;
+  double opsPerSec{0};
+  double hitRatePct{0};
+  uint64_t bytesDlMB{0};
+  uint64_t evicCount{0};
+  uint64_t bytesEvicMB{0};
+  double p50Us{0};
+  double p95Us{0};
+  double p99Us{0};
+  double wallSec{0};
+};
+
+const char* workloadName(Workload w) {
+  switch (w) {
+    case Workload::kSequential:
+      return "sequential";
+    case Workload::kZipfian:
+      return "zipfian";
+    case Workload::kUniform:
+      return "uniform";
+  }
+  VELOX_UNREACHABLE();
+}
+
 class FsCacheDriver {
  public:
   FsCacheDriver(uint64_t workingSetKeys, uint64_t latencyUs, int cellIdx)
@@ -265,6 +299,121 @@ void parallelRun(
   }
   for (auto& th : workers) {
     th.join();
+  }
+}
+
+CellResult runCell(
+    const CellKey& key,
+    uint64_t warmupOps,
+    uint64_t ops,
+    uint64_t seedBase,
+    int cellIdx) {
+  const uint64_t wsKeys = static_cast<uint64_t>(
+      key.wsMult * static_cast<double>(kMaxCacheBytes) /
+      static_cast<double>(kSegmentBytes));
+  VELOX_USER_CHECK_GT(wsKeys, 0, "ws_mult too small for kMaxCacheBytes");
+  VELOX_USER_CHECK_EQ(
+      ops % key.threads,
+      0,
+      "ops {} must divide cleanly by threads {}",
+      ops,
+      key.threads);
+
+  FsCacheDriver driver(wsKeys, key.latencyUs, cellIdx);
+
+  // Warmup. recordLatency=false; SleepyReadFile bytesRead_ reset below
+  // so the post-warmup main loop is the only contributor to bytesDl.
+  std::vector<std::vector<uint64_t>> dummyLat;
+  parallelRun(
+      driver,
+      key.workload,
+      key.threads,
+      warmupOps / key.threads,
+      /*recordLatency=*/false,
+      seedBase,
+      &dummyLat);
+
+  // Baseline snapshot AFTER warmup so deltas exclude warmup counters.
+  // Without this reset, hit% can exceed 100% because warmup misses count
+  // against the main loop's op total.
+  const auto statsBase = driver.fsCache().stats();
+  driver.sleepyReadFile().resetBytesRead();
+
+  std::vector<std::vector<uint64_t>> mainLat;
+  const auto wallStart = std::chrono::steady_clock::now();
+  parallelRun(
+      driver,
+      key.workload,
+      key.threads,
+      ops / key.threads,
+      /*recordLatency=*/true,
+      seedBase + key.threads,
+      &mainLat);
+  const double wallSec = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - wallStart)
+                             .count();
+
+  const auto statsFinal = driver.fsCache().stats();
+  const uint64_t hitsDelta = statsFinal.hits - statsBase.hits;
+  const uint64_t evictionsDelta = statsFinal.evictions - statsBase.evictions;
+  const uint64_t bytesReadDelta = driver.sleepyReadFile().bytesRead();
+
+  size_t total = 0;
+  for (const auto& v : mainLat) {
+    total += v.size();
+  }
+  std::vector<uint64_t> all;
+  all.reserve(total);
+  for (const auto& v : mainLat) {
+    all.insert(all.end(), v.begin(), v.end());
+  }
+
+  const auto& cfg = driver.fsCache().config();
+  CellResult r;
+  r.key = key;
+  r.opsPerSec = static_cast<double>(ops) / wallSec;
+  r.hitRatePct =
+      100.0 * static_cast<double>(hitsDelta) / static_cast<double>(ops);
+  r.bytesDlMB = bytesReadDelta / (1ULL << 20);
+  r.evicCount = evictionsDelta;
+  // stats_.evictions is a COUNT of segments, not bytes. Multiply before
+  // divide so a (future) sub-MiB maxSegmentSize would not silently
+  // truncate to 0.
+  r.bytesEvicMB = (evictionsDelta * cfg.maxSegmentSize) / (1ULL << 20);
+  r.p50Us = quantileNs(all, 0.50) / 1000.0;
+  r.p95Us = quantileNs(all, 0.95) / 1000.0;
+  r.p99Us = quantileNs(all, 0.99) / 1000.0;
+  r.wallSec = wallSec;
+  return r;
+}
+
+void printMarkdownTable(
+    std::ostream& os,
+    const std::vector<CellResult>& rows) {
+  os << "| workload   | threads | ws_mult | lat_us |     ops/s |  hit% |"
+     << " dl_MB | evic_count | evic_MB | p50_us | p95_us | p99_us |"
+     << " wallSec |\n"
+     << "|------------|--------:|--------:|-------:|----------:|------:|"
+     << "------:|-----------:|--------:|-------:|-------:|-------:|"
+     << "--------:|\n";
+  for (const auto& r : rows) {
+    os << folly::sformat(
+        "| {:<10} | {:>7} | {:>7.2f} | {:>6} | {:>9.0f} | {:>4.1f}% |"
+        " {:>5} | {:>10} | {:>7} | {:>6.1f} | {:>6.1f} | {:>6.1f} |"
+        " {:>7.3f} |\n",
+        workloadName(r.key.workload),
+        r.key.threads,
+        r.key.wsMult,
+        r.key.latencyUs,
+        r.opsPerSec,
+        r.hitRatePct,
+        r.bytesDlMB,
+        r.evicCount,
+        r.bytesEvicMB,
+        r.p50Us,
+        r.p95Us,
+        r.p99Us,
+        r.wallSec);
   }
 }
 
