@@ -17,12 +17,34 @@
 #include "velox/common/caching/fscache/FsCache.h"
 
 #include "velox/common/base/Exceptions.h"
+#include "velox/common/caching/fscache/LruPolicy.h"
+#include "velox/common/file/File.h"
+
+#include <glog/logging.h>
 
 #include <algorithm>
+#include <filesystem>
+#include <mutex>
 
 namespace facebook::velox::cache::fs {
 
-FsCache::FsCache(FsCacheConfig config) : config_{std::move(config)} {}
+FsCache::FsCache(FsCacheConfig config)
+    : config_{std::move(config)},
+      metadata_{std::make_unique<FsCacheMetadata>(config_.numBuckets)},
+      policy_{std::make_unique<LruPolicy>()} {
+  // splitRange relies on maxSegmentSize being a multiple of alignment so
+  // chunk starts remain aligned. Validate at construction since the
+  // FsCacheConfig struct itself has no constructor to enforce it.
+  VELOX_CHECK_GT(config_.alignment, 0, "FsCacheConfig.alignment must be > 0");
+  VELOX_CHECK_GT(
+      config_.maxSegmentSize, 0, "FsCacheConfig.maxSegmentSize must be > 0");
+  VELOX_CHECK_EQ(
+      config_.maxSegmentSize % config_.alignment,
+      0,
+      "FsCacheConfig.maxSegmentSize must be a multiple of alignment, got maxSegmentSize={} alignment={}",
+      config_.maxSegmentSize,
+      config_.alignment);
+}
 
 FsCache::~FsCache() = default;
 
@@ -60,6 +82,185 @@ std::vector<std::pair<uint64_t, uint64_t>> FsCache::splitRange(
     cursor += chunkSize;
   }
   return result;
+}
+
+std::vector<FileSegmentPtr> FsCache::getOrSet(
+    const std::string& path,
+    uint64_t offset,
+    uint64_t size,
+    ::facebook::velox::ReadFile& remote) {
+  const auto ranges = splitRange(offset, size, config_);
+  std::vector<FileSegmentPtr> result;
+  result.reserve(ranges.size());
+  for (const auto& [segOffset, segSize] : ranges) {
+    FsCacheKey key{path, segOffset, segSize};
+    result.push_back(lookupOrCreate(key, remote));
+  }
+  return result;
+}
+
+FileSegmentPtr FsCache::lookupOrCreate(
+    const FsCacheKey& key,
+    ::facebook::velox::ReadFile& remote) {
+  // 1. Fast path: existing kDownloaded segment.
+  if (auto existing = metadata_->lookup(key); existing != nullptr &&
+      existing->state() == FileSegment::State::kDownloaded) {
+    recordHit(existing.get());
+    return existing;
+  }
+
+  // 2. Insert (or pick up existing) segment under the metadata lock. If the
+  //    insert races with a concurrent inserter, lookup() returns the winning
+  //    entry so writer/waiter coordination on the SAME FileSegment instance
+  //    is preserved.
+  auto segment = std::make_shared<FileSegment>(key);
+  if (!metadata_->insert(segment)) {
+    segment = metadata_->lookup(key);
+    VELOX_CHECK_NOT_NULL(segment);
+  }
+
+  // 3. Coordinate download. Only the thread that wins beginDownload() does
+  //    the actual fetch; concurrent waiters block on cv_ until the writer
+  //    either completes (kDownloaded) or fails (kEmpty). On failure each
+  //    waiter throws so the caller can retry or surface the error; the
+  //    segment metadata entry stays so a subsequent caller can race for
+  //    beginDownload() again.
+  std::unique_lock<FileSegmentMutex> lock{segment->mutex_};
+  if (segment->state() == FileSegment::State::kDownloaded) {
+    // Another thread completed between fast-path lookup and metadata insert.
+    // Treat as a hit; the slow-path fall-through is not a miss.
+    lock.unlock();
+    recordHit(segment.get());
+    return segment;
+  }
+  if (segment->beginDownload()) {
+    // 3a. Writer path. Release the FileSegment mutex before evict() and
+    // download() so waiters can register on cv_ while we work.
+    lock.unlock();
+    // Reserve capacity by evicting kDownloaded victims; never touches
+    // kDownloading segments because LruPolicy only contains segments that
+    // reached kDownloaded (onInsert runs after a successful download below).
+    evict(key.size);
+    try {
+      segment->download(remote, config_.cacheRoot);
+    } catch (...) {
+      // download() already reset state_ to kEmpty and removed the .tmp.
+      // Notify waiters so they can throw rather than wait forever.
+      std::lock_guard<FileSegmentMutex> resetLock{segment->mutex_};
+      segment->cv_.notify_all();
+      throw;
+    }
+    recordMiss(segment.get(), key.size);
+    std::lock_guard<FileSegmentMutex> notifyLock{segment->mutex_};
+    segment->cv_.notify_all();
+    return segment;
+  }
+  // 3b. Waiter path: another thread is downloading; wait for completion or
+  //     failure. cv_ is notified on both outcomes (see writer path above).
+  segment->cv_.wait(lock, [&] {
+    return segment->state() != FileSegment::State::kDownloading;
+  });
+  const auto finalState = segment->state();
+  lock.unlock();
+  if (finalState != FileSegment::State::kDownloaded) {
+    // Writer threw. Surface as a user-level error; caller may retry by
+    // calling getOrSet again, at which point a fresh race for
+    // beginDownload() happens. Do not VELOX_CHECK here: that would turn
+    // another thread's IO failure into a CHECK-failure crash on the waiter.
+    VELOX_USER_FAIL(
+        "FsCache concurrent download failed for path={} offset={} size={}",
+        key.path,
+        key.offset,
+        key.size);
+  }
+  // Successful concurrent download counts as a hit for this thread.
+  recordHit(segment.get());
+  return segment;
+}
+
+void FsCache::evict(uint64_t bytesNeeded) {
+  // Serialize concurrent eviction. Without this, two writers that both miss
+  // the cache could each receive the same victim from selectVictims() (which
+  // does not detach entries from the LRU list -- detachment happens later via
+  // onRemove). The first thread's metadata_->erase() then drops the only
+  // shared_ptr to the segment, and the second thread dereferences a freed
+  // FileSegment. Holding evictionMutex_ across the whole pass guarantees at
+  // most one in-flight selectVictims+remove cycle at a time.
+  std::lock_guard<std::mutex> evictGuard{evictionMutex_};
+  uint64_t current;
+  {
+    CacheStateGuard guard{stateMutex_};
+    current = stats_.bytesOnDisk;
+  }
+  if (current + bytesNeeded <= config_.maxBytes) {
+    return;
+  }
+  const uint64_t toFree = current + bytesNeeded - config_.maxBytes;
+
+  // selectVictims is read-only: pick candidates under priorityMutex_ but do
+  // NOT yet call policy_->onRemove. Filesystem removal must succeed first;
+  // otherwise an LRU-evicted-but-still-on-disk file becomes an orphan that
+  // no future eviction pass can find (gone from policy but still consuming
+  // bytes), and metadata becomes inconsistent with the on-disk state.
+  std::vector<FileSegment*> candidates;
+  {
+    CachePriorityGuard guard{priorityMutex_};
+    candidates = policy_->selectVictims(toFree);
+  }
+
+  uint64_t freed = 0;
+  uint32_t evictedCount = 0;
+  for (auto* victim : candidates) {
+    const auto key = victim->key();
+    std::error_code ec;
+    std::filesystem::remove(victim->localPath(config_.cacheRoot), ec);
+    if (ec) {
+      // Filesystem removal failed (disk error, race with manual cleanup,
+      // permission change). Leave the victim in policy_ and metadata_ so a
+      // later evict() can retry; better a temporary over-capacity than
+      // losing the entry and leaking the file.
+      LOG(WARNING) << "FsCache evict: failed to remove " << key.path << " ["
+                   << key.offset << ".." << key.offset + key.size
+                   << "): " << ec.message();
+      continue;
+    }
+    {
+      CachePriorityGuard guard{priorityMutex_};
+      policy_->onRemove(victim);
+    }
+    metadata_->erase(key);
+    freed += key.size;
+    ++evictedCount;
+  }
+  {
+    CacheStateGuard guard{stateMutex_};
+    stats_.evictions += evictedCount;
+    stats_.bytesOnDisk -= std::min(stats_.bytesOnDisk, freed);
+  }
+}
+
+FsCacheStats FsCache::stats() const {
+  CacheStateGuard guard{stateMutex_};
+  return stats_;
+}
+
+void FsCache::recordHit(FileSegment* segment) {
+  {
+    CachePriorityGuard guard{priorityMutex_};
+    policy_->onHit(segment);
+  }
+  CacheStateGuard guard{stateMutex_};
+  ++stats_.hits;
+}
+
+void FsCache::recordMiss(FileSegment* segment, uint64_t segmentSize) {
+  {
+    CachePriorityGuard guard{priorityMutex_};
+    policy_->onInsert(segment);
+  }
+  CacheStateGuard guard{stateMutex_};
+  ++stats_.misses;
+  stats_.bytesOnDisk += segmentSize;
 }
 
 } // namespace facebook::velox::cache::fs

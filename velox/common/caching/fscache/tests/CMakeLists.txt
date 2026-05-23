@@ -20,6 +20,8 @@ set(
   EvictionPolicyTest.cpp
   FileSegmentTest.cpp
   FsCacheSplitRangeTest.cpp
+  FsCacheMetadataTest.cpp
+  FsCacheTest.cpp
 )
 
 set(
