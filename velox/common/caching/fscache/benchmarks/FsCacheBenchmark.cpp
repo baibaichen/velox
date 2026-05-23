@@ -25,6 +25,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <ostream>
 #include <random>
 #include <string>
@@ -34,6 +35,7 @@
 #include <unistd.h>
 
 #include <folly/Format.h>
+#include <folly/String.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
@@ -108,6 +110,37 @@ DEFINE_bool(
     rebuild_remote_file,
     false,
     "Force rebuild of the shared remote blob even if size matches.");
+DEFINE_uint64(
+    ops,
+    200'000,
+    "Measured ops per cell. Must divide by every value in --threads_list "
+    "cleanly.");
+DEFINE_uint64(warmup_ops, 20'000, "Warmup ops per cell (not counted).");
+DEFINE_string(
+    workloads,
+    "sequential,zipfian,uniform",
+    "Comma-separated subset of {sequential,zipfian,uniform}.");
+DEFINE_string(
+    threads_list,
+    "1,4,16",
+    "Comma-separated thread counts to sweep.");
+DEFINE_string(
+    ws_mult_list,
+    "0.5,2.0",
+    "Comma-separated working-set / maxBytes ratios.");
+DEFINE_string(
+    remote_latency_us_list,
+    "0,200",
+    "Comma-separated SleepyReadFile sleep durations (us).");
+DEFINE_string(
+    out,
+    "",
+    "If non-empty, write the Markdown table to this path instead of "
+    "stdout. glog still goes to stderr.");
+DEFINE_uint64(
+    seed_base,
+    42,
+    "Base seed; per-thread seed = seed_base + tid.");
 
 namespace {
 
@@ -197,6 +230,43 @@ const char* workloadName(Workload w) {
       return "uniform";
   }
   VELOX_UNREACHABLE();
+}
+
+Workload parseWorkload(const std::string& s) {
+  if (s == "sequential") {
+    return Workload::kSequential;
+  }
+  if (s == "zipfian") {
+    return Workload::kZipfian;
+  }
+  if (s == "uniform") {
+    return Workload::kUniform;
+  }
+  VELOX_USER_FAIL("Unknown workload: {}", s);
+}
+
+uint64_t parseU64(const std::string& s) {
+  return std::stoull(s);
+}
+
+double parseDouble(const std::string& s) {
+  return std::stod(s);
+}
+
+template <typename T>
+std::vector<T> parseCsv(
+    const std::string& csv,
+    T (*parse)(const std::string&)) {
+  std::vector<std::string> toks;
+  folly::split(',', csv, toks);
+  std::vector<T> out;
+  for (const auto& t : toks) {
+    auto s = folly::trimWhitespace(t).str();
+    if (!s.empty()) {
+      out.push_back(parse(s));
+    }
+  }
+  return out;
 }
 
 class FsCacheDriver {
@@ -426,12 +496,60 @@ int main(int argc, char** argv) {
   facebook::velox::filesystems::registerLocalFileSystem();
 
   signal(SIGINT, onSigint);
-  const std::string tmpRoot = benchTmpRoot();
-  std::filesystem::create_directories(tmpRoot);
-
+  std::filesystem::create_directories(benchTmpRoot());
   ensureRemoteFile();
-  LOG(INFO) << "Setup complete. tmpRoot=" << tmpRoot
-            << " remote=" << kRemotePath;
+
+  const auto workloads = parseCsv<Workload>(FLAGS_workloads, parseWorkload);
+  const auto threadsList = parseCsv<uint64_t>(FLAGS_threads_list, parseU64);
+  const auto wsMultList = parseCsv<double>(FLAGS_ws_mult_list, parseDouble);
+  const auto latencyList =
+      parseCsv<uint64_t>(FLAGS_remote_latency_us_list, parseU64);
+  VELOX_USER_CHECK(!workloads.empty(), "--workloads is empty");
+  VELOX_USER_CHECK(!threadsList.empty(), "--threads_list is empty");
+  VELOX_USER_CHECK(!wsMultList.empty(), "--ws_mult_list is empty");
+  VELOX_USER_CHECK(!latencyList.empty(), "--remote_latency_us_list is empty");
+  for (auto t : threadsList) {
+    VELOX_USER_CHECK_GT(t, 0, "threads must be > 0");
+    VELOX_USER_CHECK_EQ(
+        FLAGS_ops % t,
+        0,
+        "ops {} must divide cleanly by threads {}",
+        FLAGS_ops,
+        t);
+    VELOX_USER_CHECK_EQ(
+        FLAGS_warmup_ops % t,
+        0,
+        "warmup_ops {} must divide cleanly by threads {}",
+        FLAGS_warmup_ops,
+        t);
+  }
+
+  std::vector<CellResult> rows;
+  int cellIdx = 0;
+  for (auto w : workloads) {
+    for (auto th : threadsList) {
+      for (auto mult : wsMultList) {
+        for (auto lat : latencyList) {
+          CellKey k{w, th, mult, lat};
+          LOG(INFO) << "cell " << cellIdx << " workload=" << workloadName(w)
+                    << " threads=" << th << " ws_mult=" << mult
+                    << " lat_us=" << lat;
+          rows.push_back(runCell(
+              k, FLAGS_warmup_ops, FLAGS_ops, FLAGS_seed_base, cellIdx));
+          ++cellIdx;
+        }
+      }
+    }
+  }
+
+  if (FLAGS_out.empty()) {
+    printMarkdownTable(std::cout, rows);
+  } else {
+    std::ofstream out{FLAGS_out};
+    VELOX_USER_CHECK(out.good(), "Failed to open --out path: {}", FLAGS_out);
+    printMarkdownTable(out, rows);
+    LOG(INFO) << "Wrote " << rows.size() << " rows to " << FLAGS_out;
+  }
 
   cleanupBenchTmp();
   return 0;
