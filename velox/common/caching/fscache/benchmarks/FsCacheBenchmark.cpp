@@ -203,32 +203,69 @@ class FsCacheDriver {
   std::unique_ptr<FsCache> fsCache_;
 };
 
-void doOps(FsCacheDriver& driver, KeyGenerator& gen, uint64_t ops) {
-  for (uint64_t i = 0; i < ops; ++i) {
-    const uint64_t offset = gen.next() * kSegmentBytes;
-    auto segs = driver.fsCache().getOrSet(
-        kRemotePath, offset, kSegmentBytes, driver.sleepyReadFile());
-    (void)segs;
+double quantileNs(std::vector<uint64_t>& v, double q) {
+  if (v.empty()) {
+    return 0.0;
   }
+  const size_t idx =
+      std::min<size_t>(v.size() - 1, static_cast<size_t>(q * v.size()));
+  std::nth_element(v.begin(), v.begin() + idx, v.end());
+  return static_cast<double>(v[idx]);
 }
 
-void runCellSkeleton(
+void parallelRun(
+    FsCacheDriver& driver,
     Workload workload,
-    uint64_t wsKeys,
-    uint64_t latencyUs,
-    uint64_t warmupOps,
-    uint64_t ops,
-    int cellIdx) {
-  FsCacheDriver driver(wsKeys, latencyUs, cellIdx);
-  KeyGenerator warm{workload, wsKeys, /*seed=*/42};
-  doOps(driver, warm, warmupOps);
-  KeyGenerator main{workload, wsKeys, /*seed=*/43};
-  const auto start = std::chrono::steady_clock::now();
-  doOps(driver, main, ops);
-  const auto end = std::chrono::steady_clock::now();
-  const double wallSec = std::chrono::duration<double>(end - start).count();
-  LOG(INFO) << "cell " << cellIdx << " ops=" << ops << " wallSec=" << wallSec
-            << " bytesOnDisk=" << driver.fsCache().stats().bytesOnDisk;
+    uint64_t threads,
+    uint64_t opsPerThread,
+    bool recordLatency,
+    uint64_t seedBase,
+    std::vector<std::vector<uint64_t>>* perThreadLatencies) {
+  if (recordLatency) {
+    perThreadLatencies->assign(threads, {});
+    for (auto& v : *perThreadLatencies) {
+      v.reserve(opsPerThread);
+    }
+  }
+  std::vector<std::thread> workers;
+  workers.reserve(threads);
+  for (uint64_t t = 0; t < threads; ++t) {
+    workers.emplace_back([&, t] {
+      // Sequential: each thread owns a disjoint slice of
+      // [0, workingSetKeys) by giving KeyGenerator universe = slice and
+      // adding keyOffset to every output. KeyGenerator stays
+      // workload-agnostic; the per-thread offset lives here in the driver.
+      // Zipfian / uniform: shared keyspace, no offset.
+      uint64_t universe;
+      uint64_t keyOffset;
+      if (workload == Workload::kSequential) {
+        const uint64_t slice = driver.workingSetKeys() / threads;
+        universe = slice;
+        keyOffset = t * slice;
+      } else {
+        universe = driver.workingSetKeys();
+        keyOffset = 0;
+      }
+      KeyGenerator gen{workload, universe, seedBase + t};
+      auto* lat = recordLatency ? &(*perThreadLatencies)[t] : nullptr;
+      for (uint64_t i = 0; i < opsPerThread; ++i) {
+        const uint64_t offset = (keyOffset + gen.next()) * kSegmentBytes;
+        const auto start = std::chrono::steady_clock::now();
+        auto segs = driver.fsCache().getOrSet(
+            kRemotePath, offset, kSegmentBytes, driver.sleepyReadFile());
+        const auto end = std::chrono::steady_clock::now();
+        (void)segs;
+        if (lat != nullptr) {
+          lat->push_back(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(end - start)
+                  .count());
+        }
+      }
+    });
+  }
+  for (auto& th : workers) {
+    th.join();
+  }
 }
 
 } // namespace
