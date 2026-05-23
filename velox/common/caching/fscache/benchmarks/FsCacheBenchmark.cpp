@@ -36,6 +36,9 @@
 #include <glog/logging.h>
 
 #include "velox/common/base/Exceptions.h"
+#include "velox/common/caching/fscache/FsCache.h"
+#include "velox/common/caching/fscache/FsCacheConfig.h"
+#include "velox/common/caching/fscache/benchmarks/KeyGenerator.h"
 #include "velox/common/file/File.h"
 #include "velox/common/file/FileSystems.h"
 
@@ -152,6 +155,80 @@ void onSigint(int /*signo*/) {
   // conventional 128+SIGINT status instead of swallowing the signal.
   signal(SIGINT, SIG_DFL);
   raise(SIGINT);
+}
+
+using ::facebook::velox::cache::fs::FsCache;
+using ::facebook::velox::cache::fs::FsCacheConfig;
+using ::facebook::velox::cache::fs::bench::KeyGenerator;
+using ::facebook::velox::cache::fs::bench::Workload;
+
+constexpr uint64_t kSegmentBytes = 1ULL << 20;
+constexpr uint64_t kMaxCacheBytes = 512ULL * (1ULL << 20);
+
+class FsCacheDriver {
+ public:
+  FsCacheDriver(uint64_t workingSetKeys, uint64_t latencyUs, int cellIdx)
+      : cacheRoot_(benchTmpRoot() + "/" + std::to_string(cellIdx)),
+        workingSetKeys_(workingSetKeys),
+        sleepyReadFile_(kRemotePath, latencyUs) {
+    std::filesystem::create_directories(cacheRoot_);
+    FsCacheConfig cfg;
+    cfg.cacheRoot = cacheRoot_;
+    cfg.maxBytes = kMaxCacheBytes;
+    cfg.alignment = kSegmentBytes;
+    cfg.maxSegmentSize = kSegmentBytes;
+    fsCache_ = std::make_unique<FsCache>(cfg);
+  }
+
+  ~FsCacheDriver() {
+    fsCache_.reset();
+    std::error_code ec;
+    std::filesystem::remove_all(cacheRoot_, ec);
+  }
+
+  FsCache& fsCache() {
+    return *fsCache_;
+  }
+  SleepyReadFile& sleepyReadFile() {
+    return sleepyReadFile_;
+  }
+  uint64_t workingSetKeys() const {
+    return workingSetKeys_;
+  }
+
+ private:
+  const std::string cacheRoot_;
+  const uint64_t workingSetKeys_;
+  SleepyReadFile sleepyReadFile_;
+  std::unique_ptr<FsCache> fsCache_;
+};
+
+void doOps(FsCacheDriver& driver, KeyGenerator& gen, uint64_t ops) {
+  for (uint64_t i = 0; i < ops; ++i) {
+    const uint64_t offset = gen.next() * kSegmentBytes;
+    auto segs = driver.fsCache().getOrSet(
+        kRemotePath, offset, kSegmentBytes, driver.sleepyReadFile());
+    (void)segs;
+  }
+}
+
+void runCellSkeleton(
+    Workload workload,
+    uint64_t wsKeys,
+    uint64_t latencyUs,
+    uint64_t warmupOps,
+    uint64_t ops,
+    int cellIdx) {
+  FsCacheDriver driver(wsKeys, latencyUs, cellIdx);
+  KeyGenerator warm{workload, wsKeys, /*seed=*/42};
+  doOps(driver, warm, warmupOps);
+  KeyGenerator main{workload, wsKeys, /*seed=*/43};
+  const auto start = std::chrono::steady_clock::now();
+  doOps(driver, main, ops);
+  const auto end = std::chrono::steady_clock::now();
+  const double wallSec = std::chrono::duration<double>(end - start).count();
+  LOG(INFO) << "cell " << cellIdx << " ops=" << ops << " wallSec=" << wallSec
+            << " bytesOnDisk=" << driver.fsCache().stats().bytesOnDisk;
 }
 
 } // namespace
