@@ -17,11 +17,16 @@ velox_add_library(
   FsCache.cpp
   FsCacheGuards.cpp
   FsCacheKey.cpp
+  FileSegment.cpp
+  LruPolicy.cpp
   HEADERS
   FsCache.h
   FsCacheConfig.h
   FsCacheGuards.h
   FsCacheKey.h
+  EvictionPolicy.h
+  FileSegment.h
+  LruPolicy.h
 )
 
 velox_link_libraries(

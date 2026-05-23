@@ -17,6 +17,7 @@ set(
   FsCacheScaffoldTest.cpp
   FsCacheKeyTest.cpp
   FsCacheGuardsTest.cpp
+  EvictionPolicyTest.cpp
 )
 
 set(
