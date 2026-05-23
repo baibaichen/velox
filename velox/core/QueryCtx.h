@@ -25,6 +25,7 @@
 #include <typeindex>
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/caching/AsyncDataCache.h"
+#include "velox/common/caching/fscache/FsCache.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/core/QueryConfig.h"
 #include "velox/core/ScanBatchEvent.h"
@@ -119,7 +120,8 @@ class QueryCtx : public std::enable_shared_from_this<QueryCtx> {
       std::shared_ptr<memory::MemoryPool> pool = nullptr,
       folly::Executor* spillExecutor = nullptr,
       std::string queryId = "",
-      std::shared_ptr<filesystems::TokenProvider> tokenProvider = {});
+      std::shared_ptr<filesystems::TokenProvider> tokenProvider = {},
+      cache::fs::FsCache* fsCache = cache::fs::FsCache::getInstance());
 
   /// Builder pattern for constructing QueryCtx instances.
   ///
@@ -180,6 +182,11 @@ class QueryCtx : public std::enable_shared_from_this<QueryCtx> {
       return *this;
     }
 
+    Builder& fsCache(cache::fs::FsCache* fsCache) {
+      fsCache_ = fsCache;
+      return *this;
+    }
+
     /// Adds a callback to be invoked when the QueryCtx is destroyed.
     /// Multiple callbacks can be added by calling this method multiple times.
     Builder& releaseCallback(ReleaseCallback callback) {
@@ -207,6 +214,7 @@ class QueryCtx : public std::enable_shared_from_this<QueryCtx> {
     folly::Executor* spillExecutor_{nullptr};
     std::string queryId_;
     std::shared_ptr<filesystems::TokenProvider> tokenProvider_;
+    cache::fs::FsCache* fsCache_{cache::fs::FsCache::getInstance()};
     std::deque<ReleaseCallback> releaseCallbacks_;
     TraceCtxProvider traceCtxProvider_;
   };
@@ -229,6 +237,13 @@ class QueryCtx : public std::enable_shared_from_this<QueryCtx> {
 
   cache::AsyncDataCache* cache() const {
     return cache_;
+  }
+
+  /// Returns the FsCache wired into this query, or nullptr if no FsCache
+  /// plumbing is installed (e.g. CBI mode in the TPC-DS A/B benchmark, or any
+  /// caller that does not install the process-global FsCache singleton).
+  cache::fs::FsCache* fsCache() const {
+    return fsCache_;
   }
 
   folly::Executor* executor() const {
@@ -404,6 +419,7 @@ class QueryCtx : public std::enable_shared_from_this<QueryCtx> {
       folly::Executor* spillExecutor = nullptr,
       const std::string& queryId = "",
       std::shared_ptr<filesystems::TokenProvider> tokenProvider = {},
+      cache::fs::FsCache* fsCache = cache::fs::FsCache::getInstance(),
       TraceCtxProvider traceCtxProvider = nullptr);
 
   class MemoryReclaimer : public memory::MemoryReclaimer {
@@ -467,6 +483,7 @@ class QueryCtx : public std::enable_shared_from_this<QueryCtx> {
   folly::Executor* const executor_{nullptr};
   folly::Executor* const spillExecutor_{nullptr};
   cache::AsyncDataCache* const cache_;
+  cache::fs::FsCache* const fsCache_;
 
   std::unordered_map<std::string, std::shared_ptr<config::ConfigBase>>
       connectorSessionProperties_;

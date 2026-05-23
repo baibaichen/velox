@@ -207,4 +207,27 @@ TEST_F(FsCacheTest, concurrentEvictionIsSafe) {
   EXPECT_EQ(stats.hits + stats.misses, kThreads * kIterations);
 }
 
+TEST(FsCacheSingletonTest, defaultsToNullptr) {
+  // Defensive: a prior test that forgot to reset the singleton would otherwise
+  // poison this assertion. The singleton lives across the whole process.
+  FsCache::setInstance(nullptr);
+  EXPECT_EQ(FsCache::getInstance(), nullptr);
+}
+
+TEST(FsCacheSingletonTest, setInstanceRoundTrip) {
+  FsCache::setInstance(nullptr);
+
+  auto tempDir = TempDirectoryPath::create();
+  FsCacheConfig config;
+  config.cacheRoot = tempDir->getPath();
+  config.maxBytes = 16ULL << 20;
+  auto cache = std::make_unique<FsCache>(config);
+
+  FsCache::setInstance(cache.get());
+  EXPECT_EQ(FsCache::getInstance(), cache.get());
+
+  FsCache::setInstance(nullptr);
+  EXPECT_EQ(FsCache::getInstance(), nullptr);
+}
+
 } // namespace facebook::velox::cache::fs::test

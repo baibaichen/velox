@@ -70,7 +70,8 @@ OperatorCtx::createConnectorQueryCtx(
       driverCtx_->queryConfig().sessionTimezone(),
       driverCtx_->queryConfig().adjustTimestampToTimezone(),
       task->getCancellationToken(),
-      task->queryCtx()->fsTokenProvider());
+      task->queryCtx()->fsTokenProvider(),
+      task->queryCtx()->fsCache());
   connectorQueryCtx->setSelectiveNimbleReaderEnabled(
       driverCtx_->queryConfig().selectiveNimbleReaderEnabled());
   connectorQueryCtx->setRowSizeTrackingMode(

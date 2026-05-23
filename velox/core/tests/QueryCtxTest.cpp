@@ -16,6 +16,9 @@
 #include <gtest/gtest.h>
 
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/common/caching/fscache/FsCache.h"
+#include "velox/common/caching/fscache/FsCacheConfig.h"
+#include "velox/common/testutil/TempDirectoryPath.h"
 #include "velox/core/QueryCtx.h"
 
 namespace facebook::velox::core::test {
@@ -136,5 +139,23 @@ TEST_F(QueryCtxTest, builderReleaseCallbacks) {
   // After QueryCtx destruction, all callbacks should have been invoked.
   ASSERT_EQ(callbackCount, 2);
   ASSERT_EQ(capturedQueryId, "builder_test_query_id");
+}
+
+TEST_F(QueryCtxTest, fsCacheDefaultsToSingleton) {
+  cache::fs::FsCache::setInstance(nullptr);
+  auto ctx = QueryCtx::create();
+  EXPECT_EQ(ctx->fsCache(), nullptr);
+
+  auto tempDir = common::testutil::TempDirectoryPath::create();
+  cache::fs::FsCacheConfig config;
+  config.cacheRoot = tempDir->getPath();
+  config.maxBytes = 16ULL << 20;
+  auto installed = std::make_unique<cache::fs::FsCache>(config);
+  cache::fs::FsCache::setInstance(installed.get());
+
+  auto ctxWithSingleton = QueryCtx::create();
+  EXPECT_EQ(ctxWithSingleton->fsCache(), installed.get());
+
+  cache::fs::FsCache::setInstance(nullptr);
 }
 } // namespace facebook::velox::core::test

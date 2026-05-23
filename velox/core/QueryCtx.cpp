@@ -31,7 +31,8 @@ std::shared_ptr<QueryCtx> QueryCtx::create(
     std::shared_ptr<memory::MemoryPool> pool,
     folly::Executor* spillExecutor,
     std::string queryId,
-    std::shared_ptr<filesystems::TokenProvider> tokenProvider) {
+    std::shared_ptr<filesystems::TokenProvider> tokenProvider,
+    cache::fs::FsCache* fsCache) {
   return QueryCtx::Builder()
       .executor(executor)
       .queryConfig(std::move(queryConfig))
@@ -41,6 +42,7 @@ std::shared_ptr<QueryCtx> QueryCtx::create(
       .spillExecutor(spillExecutor)
       .queryId(std::move(queryId))
       .tokenProvider(std::move(tokenProvider))
+      .fsCache(fsCache)
       .build();
 }
 
@@ -54,6 +56,7 @@ std::shared_ptr<QueryCtx> QueryCtx::Builder::build() {
       spillExecutor_,
       std::move(queryId_),
       std::move(tokenProvider_),
+      fsCache_,
       std::move(traceCtxProvider_)));
   queryCtx->maybeSetReclaimer();
   for (auto& cb : releaseCallbacks_) {
@@ -72,11 +75,13 @@ QueryCtx::QueryCtx(
     folly::Executor* spillExecutor,
     const std::string& queryId,
     std::shared_ptr<filesystems::TokenProvider> tokenProvider,
+    cache::fs::FsCache* fsCache,
     TraceCtxProvider traceCtxProvider)
     : queryId_(queryId),
       executor_(executor),
       spillExecutor_(spillExecutor),
       cache_(cache),
+      fsCache_(fsCache),
       connectorSessionProperties_(connectorSessionProperties),
       pool_(std::move(pool)),
       queryConfig_{std::move(queryConfig)},

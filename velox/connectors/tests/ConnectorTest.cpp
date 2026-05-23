@@ -22,7 +22,10 @@
 #include <fmt/format.h>
 #include <gtest/gtest.h>
 
+#include "velox/common/caching/fscache/FsCache.h"
+#include "velox/common/caching/fscache/FsCacheConfig.h"
 #include "velox/common/memory/Memory.h"
+#include "velox/common/testutil/TempDirectoryPath.h"
 #include "velox/connectors/ConnectorRegistry.h"
 #include "velox/core/QueryCtx.h"
 
@@ -197,6 +200,58 @@ TEST(ConnectorTest, connectorSplit) {
         split.toString(),
         "[split: connector id test, weight 50, cacheable false]");
   }
+}
+
+class ConnectorQueryCtxTest : public testing::Test {
+ protected:
+  static void SetUpTestSuite() {
+    memory::MemoryManager::testingSetInstance({});
+  }
+};
+
+TEST_F(ConnectorQueryCtxTest, fsCacheGetterRoundTrip) {
+  auto pool = memory::memoryManager()->addLeafPool("ConnectorQueryCtxTest");
+  config::ConfigBase sessionProperties{{}};
+
+  ConnectorQueryCtx ctxDefault{
+      pool.get(),
+      pool.get(),
+      &sessionProperties,
+      /*spillConfig=*/nullptr,
+      common::PrefixSortConfig{},
+      /*expressionEvaluator=*/nullptr,
+      /*cache=*/nullptr,
+      "q",
+      "t",
+      "p",
+      /*driverId=*/0,
+      "UTC"};
+  EXPECT_EQ(ctxDefault.fsCache(), nullptr);
+
+  cache::fs::FsCacheConfig fsCfg;
+  auto tempDir = common::testutil::TempDirectoryPath::create();
+  fsCfg.cacheRoot = tempDir->getPath();
+  fsCfg.maxBytes = 16ULL << 20;
+  auto fsCache = std::make_unique<cache::fs::FsCache>(fsCfg);
+
+  ConnectorQueryCtx ctxWith{
+      pool.get(),
+      pool.get(),
+      &sessionProperties,
+      /*spillConfig=*/nullptr,
+      common::PrefixSortConfig{},
+      /*expressionEvaluator=*/nullptr,
+      /*cache=*/nullptr,
+      "q",
+      "t",
+      "p",
+      /*driverId=*/0,
+      "UTC",
+      /*adjustTimestampToTimezone=*/false,
+      /*cancellationToken=*/{},
+      /*tokenProvider=*/{},
+      fsCache.get()};
+  EXPECT_EQ(ctxWith.fsCache(), fsCache.get());
 }
 } // namespace
 } // namespace facebook::velox::connector

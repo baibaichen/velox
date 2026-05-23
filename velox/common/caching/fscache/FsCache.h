@@ -73,6 +73,16 @@ class FsCache {
     return config_;
   }
 
+  /// Process-global singleton. Mirrors AsyncDataCache::getInstance(). The
+  /// caller owns the FsCache lifetime; this only stores a raw pointer. Used
+  /// by the default-init in QueryCtx so bench / test setups that want FsCache
+  /// plumbing can install one without touching every QueryCtx construction
+  /// site.
+  static FsCache* getInstance();
+
+  /// Installs the singleton. Pass nullptr on teardown to reset.
+  static void setInstance(FsCache* instance);
+
   /// Splits an arbitrary [offset, offset + size) range into aligned cache
   /// segments. The outer boundaries are snapped to config.alignment; internal
   /// cuts produced by the maxSegmentSize chunk loop preserve aligned starts

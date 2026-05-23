@@ -49,6 +49,26 @@ FsCache::FsCache(FsCacheConfig config)
 
 FsCache::~FsCache() = default;
 
+namespace {
+// Local-static-pointer idiom (mirrors AsyncDataCache::getInstance): avoids
+// needing a class-scope static definition while still giving the singleton a
+// single canonical storage cell.
+FsCache** instancePtr() {
+  static FsCache* instance{nullptr};
+  return &instance;
+}
+} // namespace
+
+// static
+FsCache* FsCache::getInstance() {
+  return *instancePtr();
+}
+
+// static
+void FsCache::setInstance(FsCache* instance) {
+  *instancePtr() = instance;
+}
+
 std::vector<std::pair<uint64_t, uint64_t>> FsCache::splitRange(
     uint64_t offset,
     uint64_t size,

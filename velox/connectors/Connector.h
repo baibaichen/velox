@@ -23,6 +23,7 @@
 #include "velox/common/base/SpillConfig.h"
 #include "velox/common/caching/AsyncDataCache.h"
 #include "velox/common/caching/ScanTracker.h"
+#include "velox/common/caching/fscache/FsCache.h"
 #include "velox/common/config/ConfigProvider.h"
 #include "velox/common/file/TokenProvider.h"
 #include "velox/common/future/VeloxPromise.h"
@@ -459,7 +460,8 @@ class ConnectorQueryCtx {
       const std::string& sessionTimezone,
       bool adjustTimestampToTimezone = false,
       folly::CancellationToken cancellationToken = {},
-      std::shared_ptr<filesystems::TokenProvider> tokenProvider = {})
+      std::shared_ptr<filesystems::TokenProvider> tokenProvider = {},
+      cache::fs::FsCache* fsCache = nullptr)
       : operatorPool_(operatorPool),
         connectorPool_(connectorPool),
         sessionProperties_(sessionProperties),
@@ -475,7 +477,8 @@ class ConnectorQueryCtx {
         sessionTimezone_(sessionTimezone),
         adjustTimestampToTimezone_(adjustTimestampToTimezone),
         cancellationToken_(std::move(cancellationToken)),
-        fsTokenProvider_(std::move(tokenProvider)) {
+        fsTokenProvider_(std::move(tokenProvider)),
+        fsCache_(fsCache) {
     VELOX_CHECK_NOT_NULL(sessionProperties);
   }
 
@@ -577,6 +580,12 @@ class ConnectorQueryCtx {
     return fsTokenProvider_;
   }
 
+  /// Returns the FsCache wired into this query, or nullptr if no FsCache
+  /// plumbing is installed for this query (e.g. CBI mode).
+  cache::fs::FsCache* fsCache() const {
+    return fsCache_;
+  }
+
  private:
   memory::MemoryPool* const operatorPool_;
   memory::MemoryPool* const connectorPool_;
@@ -594,6 +603,7 @@ class ConnectorQueryCtx {
   const bool adjustTimestampToTimezone_;
   const folly::CancellationToken cancellationToken_;
   const std::shared_ptr<filesystems::TokenProvider> fsTokenProvider_;
+  cache::fs::FsCache* const fsCache_;
   bool selectiveNimbleReaderEnabled_{false};
   core::QueryConfig::RowSizeTrackingMode rowSizeTrackingEnabled_{
       core::QueryConfig::RowSizeTrackingMode::ENABLED_FOR_ALL};
