@@ -34,6 +34,7 @@ velox_link_libraries(
   PUBLIC
     velox_common_base
     velox_exception
+    velox_file
     Folly::folly
     fmt::fmt
 )

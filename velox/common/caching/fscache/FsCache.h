@@ -18,6 +18,10 @@
 
 #include "velox/common/caching/fscache/FsCacheConfig.h"
 
+#include <cstdint>
+#include <utility>
+#include <vector>
+
 namespace facebook::velox::cache::fs {
 
 class FsCacheKey;
@@ -32,6 +36,17 @@ class FsCache {
  public:
   explicit FsCache(FsCacheConfig config);
   ~FsCache();
+
+  /// Splits an arbitrary [offset, offset + size) range into aligned cache
+  /// segments. The outer boundaries are snapped to config.alignment; internal
+  /// cuts produced by the maxSegmentSize chunk loop preserve aligned starts
+  /// but may have sub-alignment tail size. Each returned (offset, size) is
+  /// at most config.maxSegmentSize bytes. Returns an empty vector if size
+  /// is zero.
+  static std::vector<std::pair<uint64_t, uint64_t>> splitRange(
+      uint64_t offset,
+      uint64_t size,
+      const FsCacheConfig& config);
 
  private:
   const FsCacheConfig config_;

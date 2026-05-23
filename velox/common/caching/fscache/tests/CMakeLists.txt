@@ -18,13 +18,18 @@ set(
   FsCacheKeyTest.cpp
   FsCacheGuardsTest.cpp
   EvictionPolicyTest.cpp
+  FileSegmentTest.cpp
+  FsCacheSplitRangeTest.cpp
 )
 
 set(
   VELOX_FSCACHE_TEST_DEPS
   velox_fscache
+  velox_file
+  velox_test_util
   Folly::folly
   glog::glog
+  GTest::gmock
   GTest::gtest
   GTest::gtest_main
 )

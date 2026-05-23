@@ -16,21 +16,34 @@
 
 #pragma once
 
+#include "velox/common/caching/fscache/FsCacheGuards.h"
 #include "velox/common/caching/fscache/FsCacheKey.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <string>
 #include <utility>
+
+namespace facebook::velox {
+class ReadFile;
+} // namespace facebook::velox
 
 namespace facebook::velox::cache::fs {
 
-/// Single cache segment. Commit 4 introduces only the key/size/state surface
-/// used by EvictionPolicy. Commit 5 extends this class with the full download
-/// state machine (atomic transitions, beginDownload, download, read).
+/// Single cache segment with a download state machine.
+///
+/// Lifecycle:
+///   kEmpty --beginDownload()--> kDownloading --download() ok--> kDownloaded
+///                                            --download() throws--> kEmpty
+///   kDownloaded --evict() while readers active--> kDetached
+///
+/// Phase 1: downloads are synchronous and all-or-nothing — the segment is
+/// either kEmpty or kDownloaded on disk; .tmp + rename keeps the published
+/// file atomic. Background / partial downloads return in phase 2.
 class FileSegment {
  public:
-  /// Download lifecycle state. kEmpty -> kDownloading -> kDownloaded is the
-  /// happy path; kDetached marks a segment that has been removed from the
-  /// metadata index but may still be in use by readers.
+  /// Download lifecycle state.
   enum class State : uint8_t {
     kEmpty = 0,
     kDownloading = 1,
@@ -38,13 +51,9 @@ class FileSegment {
     kDetached = 3,
   };
 
-  /// Constructs a fresh segment. The starting state is kEmpty in commit 5's
-  /// extended version; in commit 4 we accept an explicit state so the
-  /// EvictionPolicy tests can exercise LruPolicy::onInsert's invariant
-  /// (only kDownloaded segments are tracked) without depending on the
-  /// download machinery that commit 5 introduces.
-  explicit FileSegment(FsCacheKey key, State state = State::kDownloaded)
-      : key_{std::move(key)}, state_{state} {}
+  /// Constructs a fresh kEmpty segment. State transitions happen via
+  /// beginDownload() / download().
+  explicit FileSegment(FsCacheKey key) : key_{std::move(key)} {}
 
   /// Returns the cache key (path/offset/size) that identifies this segment.
   const FsCacheKey& key() const {
@@ -58,12 +67,67 @@ class FileSegment {
 
   /// Returns the current lifecycle state.
   State state() const {
-    return state_;
+    return state_.load(std::memory_order_acquire);
   }
+
+  /// Returns the number of bytes downloaded so far. Equals size() once the
+  /// segment reaches kDownloaded; 0 after a failed download.
+  uint64_t downloadedSize() const {
+    return downloadedSize_.load(std::memory_order_acquire);
+  }
+
+  /// Returns the absolute local path under cacheRoot for this segment. Does
+  /// not touch the filesystem. Layout is "<cacheRoot>/<hex[0:2]>/<hex[2:4]>/
+  /// <fileName>" where <hex> is the 16-hex-digit hash from key().fileName().
+  std::string localPath(const std::string& cacheRoot) const;
+
+  /// Atomically transitions kEmpty -> kDownloading. Returns true if this
+  /// caller won the CAS race and must follow up with download(); returns
+  /// false otherwise. FsCache calls this under mutex_ during coordination;
+  /// standalone callers (and tests) must call it before download().
+  bool beginDownload();
+
+  /// Downloads the segment from remote into cacheRoot. State must be
+  /// kDownloading on entry (i.e. beginDownload() returned true). On success
+  /// the segment transitions to kDownloaded and a sub-aligned file is
+  /// published atomically via .tmp + rename. On failure the .tmp / final
+  /// path are removed, downloadedSize_ is reset, state reverts to kEmpty,
+  /// and the exception is rethrown.
+  void download(
+      ::facebook::velox::ReadFile& remote,
+      const std::string& cacheRoot);
+
+  /// Reads bytes [offsetInSegment, offsetInSegment + length) from the local
+  /// file into outBuf. State must be kDownloaded or kDetached.
+  void read(
+      uint64_t offsetInSegment,
+      uint64_t length,
+      char* outBuf,
+      const std::string& cacheRoot) const;
+
+ public:
+  /// Held by FsCache::lookupOrCreate while CAS-ing state_ and waiting on cv_.
+  /// Exposed publicly (not via friend) because FileSegment is a coordination
+  /// object whose synchronization is orchestrated by FsCache; hiding
+  /// mutex_/cv_ would just push FsCache logic into FileSegment.
+  ///
+  /// TODO: phase 2 will move per-key serialization into a KeyMutex on the
+  /// metadata side; at that point FileSegment can expose waitForDownload() /
+  /// notifyAll() helpers and drop the public mutex_/cv_.
+  mutable FileSegmentMutex mutex_;
+
+  /// Notifies waiters when state_ leaves kDownloading. Paired with mutex_.
+  mutable std::condition_variable_any cv_;
 
  private:
   FsCacheKey key_;
-  State state_;
+  std::atomic<State> state_{State::kEmpty};
+  std::atomic<uint64_t> downloadedSize_{0};
+
+  // Phase 1: hits_ is recorded but not consumed; SLRU promotion lands in
+  // phase 2.
+  std::atomic<uint64_t> hits_{0};
+  std::atomic<uint64_t> refCount_{0};
 };
 
 } // namespace facebook::velox::cache::fs
