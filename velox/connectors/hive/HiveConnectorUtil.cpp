@@ -24,6 +24,7 @@
 #include "velox/connectors/hive/FileTableHandle.h"
 #include "velox/dwio/common/CachedBufferedInput.h"
 #include "velox/dwio/common/DirectBufferedInput.h"
+#include "velox/dwio/common/FsCacheBufferedInput.h"
 #include "velox/expression/Expr.h"
 #include "velox/expression/ExprConstants.h"
 #include "velox/expression/ExprToSubfieldFilter.h"
@@ -658,6 +659,15 @@ std::unique_ptr<dwio::common::BufferedInput> createBufferedInput(
     std::shared_ptr<IoStats> ioStats,
     folly::Executor* executor,
     const folly::F14FastMap<std::string, std::string>& fileReadOps) {
+  if (auto* fsCache = connectorQueryCtx->fsCache()) {
+    // FsCache wins over AsyncDataCache when both are installed. Spec
+    // 2026-05-23-fscache-vs-cbi-tpcds §2.6 makes the bench startup enforce
+    // mutual exclusion; this dispatch order guarantees that a misconfigured
+    // setup still funnels reads through FsCache instead of silently splitting
+    // them across two backends.
+    return std::make_unique<dwio::common::FsCacheBufferedInput>(
+        fileHandle.file, readerOpts.memoryPool(), fsCache);
+  }
   if (connectorQueryCtx->cache()) {
     return std::make_unique<dwio::common::CachedBufferedInput>(
         fileHandle.file,

@@ -17,11 +17,20 @@
 #include "velox/connectors/hive/HiveConnectorUtil.h"
 #include <gtest/gtest.h>
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/common/caching/AsyncDataCache.h"
+#include "velox/common/caching/FileIds.h"
+#include "velox/common/caching/fscache/FsCache.h"
+#include "velox/common/caching/fscache/FsCacheConfig.h"
+#include "velox/common/file/File.h"
 #include "velox/common/io/IoStatistics.h"
+#include "velox/common/testutil/TempDirectoryPath.h"
 #include "velox/connectors/hive/HiveConfig.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/connectors/hive/TableHandle.h"
 #include "velox/core/Expressions.h"
+#include "velox/dwio/common/CachedBufferedInput.h"
+#include "velox/dwio/common/DirectBufferedInput.h"
+#include "velox/dwio/common/FsCacheBufferedInput.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 #include "velox/expression/Expr.h"
 #include "velox/expression/ExprToSubfieldFilter.h"
@@ -1211,6 +1220,106 @@ TEST_F(HiveConnectorUtilTest, createRangeFilter) {
         hive::createRangeFilter(
             unsupported.type, unsupported.value, unsupported.value),
         "");
+  }
+}
+
+TEST_F(HiveConnectorUtilTest, createBufferedInputBackendSelection) {
+  dwio::common::ReaderOptions readerOpts{pool_.get()};
+  FileHandle fileHandle{
+      std::make_shared<InMemoryReadFile>(std::string(64UL * 1'024, 'x')),
+      StringIdLease{fileIds(), "HiveConnectorUtilTest.fileId"},
+      StringIdLease{fileIds(), "HiveConnectorUtilTest.groupId"},
+  };
+  config::ConfigBase sessionProperties{{}};
+  const folly::F14FastMap<std::string, std::string> fileReadOps;
+
+  auto buildInput = [&](const ConnectorQueryCtx& ctx) {
+    return hive::createBufferedInput(
+        fileHandle,
+        readerOpts,
+        &ctx,
+        dataIoStats_,
+        /*ioStats=*/nullptr,
+        /*executor=*/nullptr,
+        fileReadOps);
+  };
+
+  // FsCache branch: fsCache non-null wins regardless of cache.
+  {
+    auto tempDir = velox::common::testutil::TempDirectoryPath::create();
+    cache::fs::FsCacheConfig fsCfg;
+    fsCfg.cacheRoot = tempDir->getPath();
+    fsCfg.maxBytes = 16ULL << 20;
+    auto fsCache = std::make_unique<cache::fs::FsCache>(fsCfg);
+
+    ConnectorQueryCtx ctx{
+        pool_.get(),
+        pool_.get(),
+        &sessionProperties,
+        /*spillConfig=*/nullptr,
+        common::PrefixSortConfig{},
+        /*expressionEvaluator=*/nullptr,
+        /*cache=*/nullptr,
+        "q",
+        "t",
+        "p",
+        /*driverId=*/0,
+        "UTC",
+        /*adjustTimestampToTimezone=*/false,
+        /*cancellationToken=*/{},
+        /*tokenProvider=*/{},
+        fsCache.get(),
+    };
+    EXPECT_NE(
+        dynamic_cast<dwio::common::FsCacheBufferedInput*>(buildInput(ctx).get()),
+        nullptr);
+  }
+
+  // CBI branch: cache non-null, fsCache null. Reuses the process-singleton
+  // AsyncDataCache installed by OperatorTestBase::setupMemory() -- the
+  // MallocAllocator only tolerates one registered cache, so this test cannot
+  // create a second one.
+  {
+    auto* cache = cache::AsyncDataCache::getInstance();
+    ASSERT_NE(cache, nullptr);
+    ConnectorQueryCtx ctx{
+        pool_.get(),
+        pool_.get(),
+        &sessionProperties,
+        /*spillConfig=*/nullptr,
+        common::PrefixSortConfig{},
+        /*expressionEvaluator=*/nullptr,
+        cache,
+        "q",
+        "t",
+        "p",
+        /*driverId=*/0,
+        "UTC",
+    };
+    EXPECT_NE(
+        dynamic_cast<dwio::common::CachedBufferedInput*>(buildInput(ctx).get()),
+        nullptr);
+  }
+
+  // Direct branch: both null, non-Nimble format.
+  {
+    ConnectorQueryCtx ctx{
+        pool_.get(),
+        pool_.get(),
+        &sessionProperties,
+        /*spillConfig=*/nullptr,
+        common::PrefixSortConfig{},
+        /*expressionEvaluator=*/nullptr,
+        /*cache=*/nullptr,
+        "q",
+        "t",
+        "p",
+        /*driverId=*/0,
+        "UTC",
+    };
+    EXPECT_NE(
+        dynamic_cast<dwio::common::DirectBufferedInput*>(buildInput(ctx).get()),
+        nullptr);
   }
 }
 
