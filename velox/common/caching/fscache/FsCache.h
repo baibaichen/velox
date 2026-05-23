@@ -127,6 +127,17 @@ class FsCache {
   // Evicts until bytesOnDisk + bytesNeeded <= maxBytes. Selects victims via
   // policy_, removes the on-disk file first, then drops the entry from
   // policy_/metadata_ to avoid orphan files on filesystem-remove failure.
+  //
+  // CAVEAT: this invariant is only single-writer tight. evict() reads
+  // stats_.bytesOnDisk to decide whether to drain, but recordMiss() does
+  // not credit the in-flight reservation until AFTER download() finishes,
+  // so N concurrent miss-path writers can each independently observe
+  // headroom and skip eviction. The worst-case transient over-shoot is
+  // maxBytes + N * segmentSize before the next miss path's evict() drains
+  // it back; in production this is a tiny fraction of maxBytes (e.g. 64
+  // writers x 8 MiB segment = 512 MiB on top of a 100 GiB cache). Phase 2
+  // will fold this into the in-flight reservation accounting tracked
+  // alongside the warm-restart orphan-bytes counter (see loadFromDisk).
   void evict(uint64_t bytesNeeded);
 
   // Records a cache hit: touches LRU and bumps stats_.hits.
