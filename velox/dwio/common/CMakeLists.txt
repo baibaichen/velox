@@ -36,6 +36,8 @@ velox_add_library(
   DirectBufferedInput.cpp
   DirectDecoder.cpp
   DirectInputStream.cpp
+  FsCacheBufferedInput.cpp
+  FsCacheInputStream.cpp
   MetricsLog.cpp
   ExecutorBarrier.cpp
   FileSink.cpp
@@ -94,6 +96,8 @@ velox_add_library(
   FlatMapHelper.h
   FlushPolicy.h
   FormatData.h
+  FsCacheBufferedInput.h
+  FsCacheInputStream.h
   InputStream.h
   IntCodecCommon.h
   IntDecoder.h
@@ -150,6 +154,7 @@ velox_link_libraries(
   velox_dwio_common_exception
   velox_exception
   velox_expression
+  velox_fscache
   velox_memory
   velox_type_tz
   Folly::folly
