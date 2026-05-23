@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 在 Velox 引入 `velox/common/caching/fscache/` 模块 + `velox/dwio/common/FsCacheBufferedInput`，落地 ClickHouse 风格本地 SSD cache 的第一阶段（无 background download、LRU 占位、5 锁类型已建但共享 mutex），并通过等价测试证明读路径与源文件的 canonical bytes 字节一致。
+**Goal:** 在 Velox 引入 `velox/common/caching/fscache/` 模块 + `velox/dwio/common/FsCacheBufferedInput`，落地 ClickHouse 风格本地 SSD cache 的第一阶段（无 background download、LRU 占位、5 个独立 ranked mutex 但仍是 whole-cache 粒度，未做 per-bucket / per-key 细分），并通过等价测试证明读路径与源文件的 canonical bytes 字节一致。
 
 **Architecture:** 新模块完全旁路现有 `AsyncDataCache` / `SsdCache`；通过新的 `BufferedInput` 子类接入 dwio。读路径 `FsCacheBufferedInput::enqueue → load → FsCache::getOrSet → splitRange → FileSegment(lookupOrCreate + download)`。落盘 `<root>/<hash[0:2]>/<hash[2:4]>/<full_hash>.<offset>.<size>`，`.tmp + rename` 原子发布；崩溃恢复靠目录扫描。
 
@@ -649,9 +649,12 @@ namespace facebook::velox::cache::fs {
 ///   CachePriorityGuard > CacheStateGuard > CacheMetadataGuard
 ///     > KeyGuard > FileSegmentGuard
 ///
-/// Phase 1: each guard type wraps an independent std::mutex instance. No
-/// per-bucket or per-key subdivision yet. Phase 2 swaps the implementations
-/// under the same type names so callers do not change.
+/// Phase 1: each guard type wraps its own std::mutex; FsCache holds exactly
+/// one mutex of each priority/state/metadata type and one FileSegmentMutex
+/// per FileSegment. Per-key / per-bucket subdivision (where KeyMutex /
+/// FileSegmentMutex live alongside the bucket they protect) is a phase 2
+/// concern — the type names and rank ordering stay stable so callers do not
+/// change.
 
 /// Order rank used by LockOrderChecker. Lower values must be acquired before
 /// higher values on the same thread.
@@ -807,15 +810,19 @@ git add velox/common/caching/fscache/FsCacheGuards.{h,cpp} \
         velox/common/caching/fscache/tests/FsCacheGuardsTest.cpp
 git commit -m "feat(fscache): FsCacheGuards (5 lock types)
 
-Five named lock types with per-instance std::mutex backing and a
-debug-only thread-local LockOrderChecker that CHECKs the acquire
-order: CachePriority > CacheState > CacheMetadata > Key > FileSegment.
+Five named lock types, each a distinct C++ type backed by its own
+std::mutex, with a debug-only thread-local LockOrderChecker that
+CHECKs the acquire order: CachePriority > CacheState > CacheMetadata
+> Key > FileSegment.
 
-Known limitation (phase 1): all five wrappers share the same backing
-std::mutex per FsCache instance, so the rank check is enforced but
-true concurrency is still limited to the granularity of that single
-mutex. Phase 2 will swap to per-bucket / per-key instances under the
-same type names without callers changing.
+Known limitation (phase 1): FsCache holds exactly one instance of
+each lock type (priorityMutex_, stateMutex_, metadataMutex_), so the
+metadata + key + segment paths are coarse-grained — every keyed
+operation contends on the same metadataMutex_, every state update on
+the same stateMutex_. The rank discipline is enforced and the types
+are stable, so phase 2 can swap in per-bucket / per-key instances
+(KeyMutex per bucket, FileSegmentMutex per segment) without callers
+changing.
 Design: velox/docs/designs/fscache-clickhouse-style.md."
 ```
 
@@ -1504,6 +1511,12 @@ class FileSegment {
   /// on cv_. Exposed publicly (rather than via friend) because FileSegment is
   /// a coordination object whose synchronization is orchestrated by FsCache;
   /// hiding mutex_/cv_ would only push FsCache logic into FileSegment.
+  ///
+  /// TODO(phase-2, B3 from PR review): encapsulate this. The phase-2 KeyMutex
+  /// will let us serialize per-key download contention at the metadata level,
+  /// at which point FileSegment can expose `waitForDownload()` / `notifyAll()`
+  /// helpers and drop the public mutex_/cv_. Keep public for phase 1 to avoid
+  /// inventing a coordination API that phase 2 immediately replaces.
   mutable FileSegmentMutex mutex_;
 
   /// Notifies waiters when state_ leaves kDownloading. Paired with mutex_.
@@ -1614,16 +1627,14 @@ void FileSegment::read(
       static_cast<int>(state()));
   VELOX_CHECK_LE(offsetInSegment + length, key_.size);
 
+  // Go through Velox's LocalReadFile rather than std::ifstream so the read
+  // honours the same FileIoContext / pread semantics every other Velox path
+  // uses; this also makes it cheap to swap in a different FileSystem later.
   const std::string path = localPath(cacheRoot);
-  std::ifstream in{path, std::ios::binary};
-  VELOX_CHECK(in.is_open(), "Cannot open cache file: {}", path);
-  in.seekg(static_cast<std::streamoff>(offsetInSegment));
-  in.read(outBuf, static_cast<std::streamsize>(length));
+  ::facebook::velox::LocalReadFile file{path};
+  const auto view = file.pread(offsetInSegment, length, outBuf);
   VELOX_CHECK_EQ(
-      static_cast<uint64_t>(in.gcount()),
-      length,
-      "Short read from cache file: {}",
-      path);
+      view.size(), length, "Short read from cache file: {}", path);
 }
 
 } // namespace facebook::velox::cache::fs
@@ -1659,6 +1670,18 @@ std::vector<std::pair<uint64_t, uint64_t>> FsCache::splitRange(
   if (size == 0) {
     return result;
   }
+  // Phase-1 design (C3 from PR review): only the outer boundaries
+  // [alignedStart, alignedEnd) are snapped to `alignment`. The internal cuts
+  // produced by the maxSegmentSize chunk loop are NOT re-aligned, so e.g.
+  // alignment=4MiB, maxSegmentSize=32MiB, size=40MiB yields
+  //   [0, 32MiB), [32MiB, 40MiB)   -- second chunk's size is unaligned
+  // (the chunk's *start* is still aligned because 32MiB is a multiple of
+  // 4MiB, which is guaranteed by the contract that maxSegmentSize % alignment
+  // == 0). ClickHouse behaves the same way: alignment is a sharing key for
+  // adjacent reads, not a strict invariant on every segment. The trailing
+  // sub-alignment chunk costs one extra entry in the LRU; equivalence with
+  // ground-truth bytes (commit 10) is unaffected because read() honours the
+  // exact (offset, size) requested.
   // Align outwards.
   const uint64_t alignedStart = (offset / config.alignment) * config.alignment;
   const uint64_t end = offset + size;
@@ -1853,6 +1876,15 @@ TEST(FsCacheMetadataTest, keysWithSamePathDifferentOffsetCoexist) {
   EXPECT_TRUE(metadata.insert(b));
   EXPECT_EQ(metadata.lookup(FsCacheKey{"p", 0, 16}).get(), a.get());
   EXPECT_EQ(metadata.lookup(FsCacheKey{"p", 16, 16}).get(), b.get());
+}
+
+TEST(FsCacheMetadataTest, ctorRejectsNonPowerOfTwoBuckets) {
+  // 6 is not a power of two; the bucketMask folding requires p2.
+  EXPECT_THROW(FsCacheMetadata{6}, ::facebook::velox::VeloxException);
+  EXPECT_THROW(FsCacheMetadata{0}, ::facebook::velox::VeloxException);
+  // Sanity: powers of two are accepted.
+  EXPECT_NO_THROW(FsCacheMetadata{1});
+  EXPECT_NO_THROW(FsCacheMetadata{1024});
 }
 
 } // namespace facebook::velox::cache::fs::test
@@ -2061,10 +2093,13 @@ class FsCacheMetadata {
 
  private:
   size_t bucketIndex(const FsCacheKey& key) const {
-    return static_cast<size_t>(key.hash() % buckets_.size());
+    // numBuckets is power-of-two (CHECKed in ctor) so the modulo folds to
+    // a bitmask: hash & (numBuckets - 1). Cheaper than `%` and equivalent.
+    return static_cast<size_t>(key.hash() & bucketMask_);
   }
 
   mutable CacheMetadataMutex mutex_;
+  const size_t bucketMask_;  // numBuckets - 1; see ctor for power-of-two CHECK.
   std::vector<std::unordered_map<FsCacheKey, FileSegmentPtr, FsCacheKeyHash>>
       buckets_;
 };
@@ -2081,9 +2116,19 @@ class FsCacheMetadata {
 
 #include "velox/common/caching/fscache/FsCacheMetadata.h"
 
+#include "velox/common/base/Exceptions.h"
+
 namespace facebook::velox::cache::fs {
 
-FsCacheMetadata::FsCacheMetadata(size_t numBuckets) : buckets_(numBuckets) {}
+FsCacheMetadata::FsCacheMetadata(size_t numBuckets)
+    : bucketMask_{numBuckets - 1}, buckets_(numBuckets) {
+  VELOX_CHECK_GT(numBuckets, 0, "FsCacheMetadata requires numBuckets > 0");
+  VELOX_CHECK_EQ(
+      numBuckets & (numBuckets - 1),
+      0,
+      "FsCacheMetadata numBuckets must be a power of two, got {}",
+      numBuckets);
+}
 
 bool FsCacheMetadata::insert(FileSegmentPtr segment) {
   CacheMetadataGuard guard{mutex_};
@@ -2152,6 +2197,13 @@ class FsCache {
   /// Snapshot of counters. Cheap; for tests / observability.
   FsCacheStats stats() const;
 
+  /// Returns the immutable config (cacheRoot, maxBytes, segmentSize,
+  /// numBuckets). Public so callers like FsCacheBufferedInput can resolve
+  /// `cacheRoot` when constructing input streams over downloaded segments.
+  const FsCacheConfig& config() const {
+    return config_;
+  }
+
   static std::vector<std::pair<uint64_t, uint64_t>> splitRange(
       uint64_t offset,
       uint64_t size,
@@ -2170,9 +2222,12 @@ class FsCache {
   std::unique_ptr<FsCacheMetadata> metadata_;
   std::unique_ptr<EvictionPolicy> policy_;
 
-  mutable CacheStateMutex stateMutex_;
+  // Phase 1 lock instances. CacheMetadataMutex lives inside FsCacheMetadata;
+  // FileSegmentMutex lives inside each FileSegment; KeyMutex is reserved
+  // for phase 2 (per-key serialization of concurrent downloads).
   mutable CachePriorityMutex priorityMutex_;
-  FsCacheStats stats_;
+  mutable CacheStateMutex stateMutex_;
+  FsCacheStats stats_;  // Guarded by stateMutex_.
 };
 
 } // namespace facebook::velox::cache::fs
@@ -2182,7 +2237,9 @@ Add includes: `<memory>`, `EvictionPolicy.h`, `FsCacheMetadata.h`.
 
 - [ ] **Step 7: Implement `FsCache.cpp`**
 
-Append below the existing constructor:
+Replace the entire file body (the commit-1 stub ctor goes away; this step
+provides the real ctor with CHECK validations plus `getOrSet`, `lookupOrCreate`,
+`evict`, and `stats`):
 
 ```cpp
 #include "velox/common/caching/fscache/FsCache.h"
@@ -2196,7 +2253,19 @@ namespace facebook::velox::cache::fs {
 FsCache::FsCache(FsCacheConfig config)
     : config_{std::move(config)},
       metadata_{std::make_unique<FsCacheMetadata>(config_.numBuckets)},
-      policy_{std::make_unique<LruPolicy>()} {}
+      policy_{std::make_unique<LruPolicy>()} {
+  // splitRange's C3 invariant: chunk starts stay aligned because
+  // maxSegmentSize is a multiple of alignment. Validate at construction.
+  VELOX_CHECK_GT(config_.alignment, 0, "FsCacheConfig.alignment must be > 0");
+  VELOX_CHECK_GT(
+      config_.maxSegmentSize, 0, "FsCacheConfig.maxSegmentSize must be > 0");
+  VELOX_CHECK_EQ(
+      config_.maxSegmentSize % config_.alignment,
+      0,
+      "FsCacheConfig.maxSegmentSize ({}) must be a multiple of alignment ({})",
+      config_.maxSegmentSize,
+      config_.alignment);
+}
 
 FsCache::~FsCache() = default;
 
@@ -2334,26 +2403,46 @@ void FsCache::evict(uint64_t bytesNeeded) {
   }
   const uint64_t toFree = current + bytesNeeded - config_.maxBytes;
 
-  std::vector<FileSegment*> victims;
+  // selectVictims is read-only: pick candidates while holding priorityMutex_
+  // but do NOT yet call policy_->onRemove. We must succeed at filesystem
+  // removal first; otherwise an LRU-evicted-but-still-on-disk file becomes
+  // an orphan that no future eviction pass can find (it's gone from policy
+  // but still consuming bytes), and metadata may also become inconsistent
+  // with the on-disk state.
+  std::vector<FileSegment*> candidates;
   {
     CachePriorityGuard guard{priorityMutex_};
-    victims = policy_->selectVictims(toFree);
-    for (auto* v : victims) {
-      policy_->onRemove(v);
-    }
+    candidates = policy_->selectVictims(toFree);
   }
 
   uint64_t freed = 0;
-  for (auto* victim : victims) {
+  uint32_t evictedCount = 0;
+  for (auto* victim : candidates) {
     const auto key = victim->key();
+    std::error_code ec;
+    std::filesystem::remove(victim->localPath(config_.cacheRoot), ec);
+    if (ec) {
+      // Filesystem removal failed (disk error, race with manual cleanup,
+      // permission change). Leave the victim in policy_ and metadata_ so
+      // a later evict() can retry; better a temporary over-capacity than
+      // losing the entry and leaking the file.
+      LOG(WARNING) << "FsCache evict: failed to remove " << key.path
+                   << " [" << key.offset << ".." << key.offset + key.size
+                   << "): " << ec.message();
+      continue;
+    }
+    // File is gone — now safe to drop from policy + metadata.
+    {
+      CachePriorityGuard guard{priorityMutex_};
+      policy_->onRemove(victim);
+    }
     metadata_->erase(key);
-    std::error_code ignore;
-    std::filesystem::remove(victim->localPath(config_.cacheRoot), ignore);
     freed += key.size;
+    ++evictedCount;
   }
   {
     CacheStateGuard guard{stateMutex_};
-    stats_.evictions += victims.size();
+    stats_.evictions += evictedCount;
     stats_.bytesOnDisk -= std::min(stats_.bytesOnDisk, freed);
   }
 }
@@ -2378,7 +2467,7 @@ Edit `velox/common/caching/fscache/tests/CMakeLists.txt`:
 - [ ] **Step 9: Build and run**
 
 Run: `make debug && cd _build/debug && ctest -R velox_fscache_test -V`
-Expected: 5 FsCacheMetadataTest + 3 FsCacheTest cases PASS, plus all prior tests.
+Expected: 6 FsCacheMetadataTest + 5 FsCacheTest cases PASS, plus all prior tests.
 
 - [ ] **Step 10: Commit**
 
@@ -2508,6 +2597,27 @@ TEST_F(FsCacheBufferedInputTest, hasCacheReturnsTrue) {
   auto readFile = std::make_shared<LocalReadFile>(remotePath_);
   FsCacheBufferedInput input{readFile, *pool_, fsCache_.get()};
   EXPECT_TRUE(input.hasCache());
+}
+
+TEST_F(FsCacheBufferedInputTest, skipBeforeLoadPositionsCorrectly) {
+  auto readFile = std::make_shared<LocalReadFile>(remotePath_);
+  FsCacheBufferedInput input{readFile, *pool_, fsCache_.get()};
+  auto stream = input.enqueue({0, 4096});
+  // Skip before load() — DeferredStream should remember the position.
+  ASSERT_TRUE(stream->SkipInt64(100));
+  EXPECT_EQ(stream->ByteCount(), 100);
+  // Now load and read the remainder; bytes must start at offset 100.
+  input.load(LogType::FILE);
+  std::string got;
+  const void* data;
+  int32_t len;
+  while (got.size() < 3996 && stream->Next(&data, &len)) {
+    const size_t toCopy = std::min<size_t>(len, 3996 - got.size());
+    got.append(static_cast<const char*>(data), toCopy);
+  }
+  EXPECT_EQ(got.size(), 3996);
+  EXPECT_EQ(got, remoteContent_.substr(100, 3996));
+  EXPECT_EQ(stream->ByteCount(), 4096);
 }
 
 } // namespace facebook::velox::dwio::common::test
@@ -2698,11 +2808,14 @@ namespace facebook::velox::dwio::common {
 /// SsdCache entirely.
 ///
 /// Phase 1 implements the read path only (`enqueue` + `load` + clone).
-/// `cacheRegion()` / `findCachedRegion()` inherit the base
-/// `VELOX_UNSUPPORTED` behaviour: third-party write-through into the cache
-/// is out of scope for phase 1 (no caller in Velox invokes these on the
-/// hot read path). They are added in a later phase if pre-fetching code
-/// outside the BufferedInput needs to populate FsCache.
+/// `hasCache()` returns true so callers (e.g. MetadataCache) know not to
+/// duplicate raw-byte caching; however `cacheRegion()` /
+/// `findCachedRegion()` are explicitly overridden to throw
+/// `VELOX_UNSUPPORTED("phase 1 read-path only ...")`. Inheriting the base
+/// default would also throw, but the message ("requires a backing cache")
+/// is misleading once `hasCache()==true`. Explicit overrides make the
+/// phase-1 contract obvious at the call site. A later phase will implement
+/// these so external pre-fetchers can populate FsCache.
 class FsCacheBufferedInput final : public BufferedInput {
  public:
   FsCacheBufferedInput(
@@ -2723,6 +2836,20 @@ class FsCacheBufferedInput final : public BufferedInput {
   bool hasCache() const override {
     return true;
   }
+
+  void cacheRegion(
+      uint64_t offset,
+      uint64_t length,
+      std::string_view data) override;
+
+  void cacheRegion(
+      uint64_t offset,
+      uint64_t length,
+      const folly::IOBuf& buffer,
+      uint64_t bufferOffset) override;
+
+  std::optional<CachedRegion> findCachedRegion(
+      uint64_t offset) const override;
 
  private:
   struct EnqueuedRegion {
@@ -2771,27 +2898,58 @@ std::unique_ptr<SeekableInputStream> FsCacheBufferedInput::enqueue(
   // captured by a custom stream type. Simplest: defer construction by
   // returning a wrapper stream that lazily reads via slot->segments after
   // load() populates them.
+  //
+  // Thread-safety (C8 from PR review): DeferredStream is NOT thread-safe; the
+  // SeekableInputStream contract assumes single-threaded access by one
+  // reader at a time. bytesConsumed_ is plain int64, inner_ is a unique_ptr
+  // without external synchronization, and slot_ is shared with the owning
+  // FsCacheBufferedInput only via load() happening-before any stream call
+  // (load() is always invoked on the reader thread before Next/Skip/etc).
+  // Concurrent use from multiple threads is undefined behaviour, matching
+  // CachedBufferedInput's CacheInputStream.
   class DeferredStream final : public SeekableInputStream {
    public:
     DeferredStream(EnqueuedRegion* slot, cache::fs::FsCache* cache)
         : slot_{slot}, cache_{cache} {}
     bool Next(const void** data, int32_t* size) override {
-      ensure();
+      // Next() truly needs bytes: load() must have run.
+      ensureWithData();
       return inner_->Next(data, size);
     }
     void BackUp(int32_t count) override {
-      ensure();
+      // BackUp only makes sense after Next() returned a buffer, so inner_
+      // must already exist. Forward unconditionally.
+      VELOX_CHECK_NOT_NULL(
+          inner_, "BackUp called before any Next() — no buffer to back up");
       inner_->BackUp(count);
     }
     bool SkipInt64(int64_t count) override {
-      ensure();
-      return inner_->SkipInt64(count);
+      // Skip is allowed pre-load: the caller is positioning the stream
+      // without needing data yet. Mirror CacheInputStream's behaviour
+      // (which just bumps an integer position_).
+      if (count < 0) {
+        return false;
+      }
+      const auto unsignedCount = static_cast<uint64_t>(count);
+      if (inner_) {
+        return inner_->SkipInt64(count);
+      }
+      // Clamp at region.length so post-load ByteCount is consistent with
+      // inner_'s own bounds.
+      const uint64_t newPos = std::min<uint64_t>(
+          slot_->region.length, bytesConsumed_ + unsignedCount);
+      const bool fits = newPos == bytesConsumed_ + unsignedCount;
+      bytesConsumed_ = newPos;
+      return fits;
     }
     int64_t ByteCount() const override {
-      return inner_ ? inner_->ByteCount() : 0;
+      // Pre-load: report skip-accumulated position so callers that probe
+      // ByteCount() between Skip() calls see a monotonic value.
+      return inner_ ? inner_->ByteCount()
+                    : static_cast<int64_t>(bytesConsumed_);
     }
     void seekToPosition(PositionProvider& p) override {
-      ensure();
+      ensureWithData();
       inner_->seekToPosition(p);
     }
     std::string getName() const override {
@@ -2802,7 +2960,10 @@ std::unique_ptr<SeekableInputStream> FsCacheBufferedInput::enqueue(
     }
 
    private:
-    void ensure() {
+    // Materializes inner_ from slot_->segments (load() must have run) and
+    // replays any pre-load SkipInt64 so inner_'s position matches what
+    // ByteCount() has been reporting.
+    void ensureWithData() {
       if (inner_) {
         return;
       }
@@ -2814,10 +2975,20 @@ std::unique_ptr<SeekableInputStream> FsCacheBufferedInput::enqueue(
           slot_->region.offset,
           slot_->region.length,
           cache_->config().cacheRoot);
+      if (bytesConsumed_ > 0) {
+        // SkipInt64 on a freshly-constructed inner_ at position 0 advances
+        // it by exactly bytesConsumed_, restoring the position the caller
+        // already observed via pre-load Skip/ByteCount.
+        const bool ok = inner_->SkipInt64(static_cast<int64_t>(bytesConsumed_));
+        VELOX_CHECK(ok, "Replaying pre-load skip past region end");
+      }
     }
     EnqueuedRegion* slot_;
     cache::fs::FsCache* cache_;
     std::unique_ptr<FsCacheInputStream> inner_;
+    // Skip distance accumulated while inner_ is still null; replayed onto
+    // inner_ the first time we need real bytes.
+    uint64_t bytesConsumed_{0};
   };
   return std::make_unique<DeferredStream>(slot, fsCache_);
 }
@@ -2847,17 +3018,33 @@ std::unique_ptr<BufferedInput> FsCacheBufferedInput::clone() const {
       input_->getReadFile(), *pool_, fsCache_);
 }
 
+void FsCacheBufferedInput::cacheRegion(
+    uint64_t /*offset*/,
+    uint64_t /*length*/,
+    std::string_view /*data*/) {
+  VELOX_UNSUPPORTED(
+      "FsCacheBufferedInput::cacheRegion: phase 1 read-path only; "
+      "external write-through into FsCache is not implemented yet");
+}
+
+void FsCacheBufferedInput::cacheRegion(
+    uint64_t /*offset*/,
+    uint64_t /*length*/,
+    const folly::IOBuf& /*buffer*/,
+    uint64_t /*bufferOffset*/) {
+  VELOX_UNSUPPORTED(
+      "FsCacheBufferedInput::cacheRegion(IOBuf): phase 1 read-path only; "
+      "external write-through into FsCache is not implemented yet");
+}
+
+std::optional<CachedRegion> FsCacheBufferedInput::findCachedRegion(
+    uint64_t /*offset*/) const {
+  VELOX_UNSUPPORTED(
+      "FsCacheBufferedInput::findCachedRegion: phase 1 read-path only; "
+      "external cache lookup against FsCache is not implemented yet");
+}
+
 } // namespace facebook::velox::dwio::common
-```
-
-**Note on `config()` accessor:** the above uses `cache_->config().cacheRoot`.
-This requires adding a public accessor to `FsCache`. Edit `FsCache.h` and add:
-
-```cpp
- public:
-  const FsCacheConfig& config() const {
-    return config_;
-  }
 ```
 
 - [ ] **Step 7: Wire CMake**
@@ -3102,7 +3289,8 @@ Expected: `FsCache::loadFromDisk` undefined.
 ```cpp
 namespace {
 // Parses "<hexHash>.<offset>.<size>" from a file name. Returns nullopt if the
-// name does not fit the expected three-part form with numeric offset/size.
+// name does not fit the expected three-part form with a 16-char lowercase-hex
+// prefix and numeric offset/size.
 struct ParsedName {
   uint64_t offset;
   uint64_t size;
@@ -3111,6 +3299,21 @@ std::optional<ParsedName> parseFileName(const std::string& name) {
   const auto firstDot = name.find('.');
   if (firstDot == std::string::npos) {
     return std::nullopt;
+  }
+  // Hash is fmt::format("{:016x}", ...) so exactly 16 lowercase-hex chars.
+  // Reject anything that does not match — stops cleanup from being tricked
+  // into removing user files that happen to live under cacheRoot and contain
+  // dots in their names.
+  if (firstDot != 16) {
+    return std::nullopt;
+  }
+  for (size_t i = 0; i < firstDot; ++i) {
+    const char c = name[i];
+    const bool isHex =
+        (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    if (!isHex) {
+      return std::nullopt;
+    }
   }
   const auto secondDot = name.find('.', firstDot + 1);
   if (secondDot == std::string::npos) {
@@ -3605,19 +3808,19 @@ Phase 1 is complete when:
 
 1. All 10 commits land on the `fscache-clickhouse-style` branch.
 2. `make debug && make unittest` is green at every commit.
-3. `ctest -R "velox_fscache_test|FsCache"` lists ≥ 50 passing test cases:
+3. `ctest -R "velox_fscache_test|FsCache"` lists ≥ 53 passing test cases:
    - FsCacheScaffoldTest: 1
    - FsCacheKeyTest: 5
    - FsCacheGuardsTest: 2 or 3 (depends on debug build for death test)
    - EvictionPolicyTest: 6
    - FileSegmentTest: 6
    - FsCacheSplitRangeTest: 7
-   - FsCacheMetadataTest: 5
+   - FsCacheMetadataTest: 6
    - FsCacheTest: 5
    - FsCacheConcurrencyTest: 3
    - FsCacheRecoveryTest: 4
    - FsCachePersistenceTest: 1
-   - FsCacheBufferedInputTest: 3
+   - FsCacheBufferedInputTest: 4
    - FsCacheEquivalenceTest: 3
 4. `FsCacheConcurrencyTest` passes under TSAN
    (`cmake -DVELOX_ENABLE_TSAN=ON ... && ctest -R FsCacheConcurrency`). This
