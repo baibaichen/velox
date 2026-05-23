@@ -18,14 +18,24 @@
 // docs/superpowers/specs/2026-05-23-fscache-microbench-design.md for the
 // design and the 36-cell sweep specification.
 
+#include <algorithm>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <random>
 #include <string>
 #include <thread>
+#include <vector>
+
+#include <unistd.h>
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include "velox/common/base/Exceptions.h"
 #include "velox/common/file/File.h"
 #include "velox/common/file/FileSystems.h"
 
@@ -84,11 +94,82 @@ class SleepyReadFile : public ReadFile {
 
 } // namespace
 
+DEFINE_uint64(
+    remote_file_size_gb,
+    2,
+    "Size of /tmp/velox_fscache_bench_remote.bin in GiB. Rebuilt if "
+    "missing or size-mismatched.");
+DEFINE_bool(
+    rebuild_remote_file,
+    false,
+    "Force rebuild of the shared remote blob even if size matches.");
+
+namespace {
+
+constexpr const char* kRemotePath = "/tmp/velox_fscache_bench_remote.bin";
+
+std::string benchTmpRoot() {
+  return "/tmp/velox_fscache_bench/" + std::to_string(::getpid());
+}
+
+// Lazily (re)builds the shared remote blob. Rebuilt only if the file is
+// missing, the size disagrees with --remote_file_size_gb, or
+// --rebuild_remote_file is set. Pseudo-random content is deterministic
+// (seed 0xfeedface) so repeated runs reproduce.
+void ensureRemoteFile() {
+  namespace fs = std::filesystem;
+  const uint64_t want = FLAGS_remote_file_size_gb * (1ULL << 30);
+  if (!FLAGS_rebuild_remote_file && fs::exists(kRemotePath) &&
+      fs::file_size(kRemotePath) == want) {
+    return;
+  }
+  LOG(INFO) << "Building remote blob " << kRemotePath << " (" << want
+            << " bytes)";
+  std::ofstream out{kRemotePath, std::ios::binary | std::ios::trunc};
+  constexpr size_t kChunk = 1 << 20;
+  std::vector<char> chunk(kChunk);
+  std::mt19937_64 rng{0xfeedfaceULL};
+  for (uint64_t written = 0; written < want; written += kChunk) {
+    for (size_t i = 0; i < kChunk; i += 8) {
+      const uint64_t v = rng();
+      std::memcpy(chunk.data() + i, &v, 8);
+    }
+    const size_t toWrite =
+        static_cast<size_t>(std::min<uint64_t>(kChunk, want - written));
+    out.write(chunk.data(), toWrite);
+  }
+  VELOX_CHECK(out.good(), "Failed to write remote blob");
+}
+
+void cleanupBenchTmp() {
+  std::error_code ec;
+  std::filesystem::remove_all(benchTmpRoot(), ec);
+}
+
+void onSigint(int /*signo*/) {
+  cleanupBenchTmp();
+  // Re-raise with the default handler so the process exits with the
+  // conventional 128+SIGINT status instead of swallowing the signal.
+  signal(SIGINT, SIG_DFL);
+  raise(SIGINT);
+}
+
+} // namespace
+
 int main(int argc, char** argv) {
   gflags::ParseCommandLineFlags(&argc, &argv, /*remove_flags=*/true);
   FLAGS_logtostderr = true;
   google::InitGoogleLogging(argv[0]);
   facebook::velox::filesystems::registerLocalFileSystem();
-  LOG(INFO) << "velox_fscache_benchmark scaffold OK";
+
+  signal(SIGINT, onSigint);
+  const std::string tmpRoot = benchTmpRoot();
+  std::filesystem::create_directories(tmpRoot);
+
+  ensureRemoteFile();
+  LOG(INFO) << "Setup complete. tmpRoot=" << tmpRoot
+            << " remote=" << kRemotePath;
+
+  cleanupBenchTmp();
   return 0;
 }
