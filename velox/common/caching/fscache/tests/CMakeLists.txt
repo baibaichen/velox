@@ -15,6 +15,7 @@
 set(
   VELOX_FSCACHE_TEST_SOURCES
   FsCacheScaffoldTest.cpp
+  FsCacheKeyTest.cpp
 )
 
 set(
