@@ -293,7 +293,7 @@ exists:
 
 | Flag | Source | Notes for this A/B |
 |---|---|---|
-| `--input_source={cbi,fscache}` | **new** | required, no default |
+| `--input_source={cbi,fscache}` | **new** | required for the new A/B path; if absent, the binary falls back to the legacy `folly::runBenchmarks()` flow (§4.5) and the rest of the new flags are ignored |
 | `--cache_gb=8` | existing (QueryBenchmarkBase) | CBI RAM tier; ignored in fscache mode |
 | `--ssd_cache_gb=50` | existing | CBI SSD tier; ignored in fscache mode |
 | `--ssd_path=/tmp/velox_cbi_ssd` | existing | CBI SsdCache dir; ignored in fscache mode |
