@@ -22,6 +22,8 @@ set(
   FsCacheSplitRangeTest.cpp
   FsCacheMetadataTest.cpp
   FsCacheTest.cpp
+  FsCacheRecoveryTest.cpp
+  FsCachePersistenceTest.cpp
 )
 
 set(

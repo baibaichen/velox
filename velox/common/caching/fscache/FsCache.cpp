@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 
 namespace facebook::velox::cache::fs {
 
@@ -261,6 +262,122 @@ void FsCache::recordMiss(FileSegment* segment, uint64_t segmentSize) {
   CacheStateGuard guard{stateMutex_};
   ++stats_.misses;
   stats_.bytesOnDisk += segmentSize;
+}
+
+namespace {
+
+struct ParsedName {
+  uint64_t offset;
+  uint64_t size;
+};
+
+// Parses "<16-hex>.<offset>.<size>" produced by FsCacheKey::fileName().
+// Returns nullopt for anything that does not match, so loadFromDisk leaves
+// unrelated files in cacheRoot untouched rather than deleting them.
+std::optional<ParsedName> parseFileName(const std::string& name) {
+  // Hash prefix is fmt::format("{:016x}", ...): exactly 16 lowercase hex
+  // chars followed by a dot.
+  if (name.size() < 18 || name[16] != '.') {
+    return std::nullopt;
+  }
+  for (size_t i = 0; i < 16; ++i) {
+    const char c = name[i];
+    const bool isHex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    if (!isHex) {
+      return std::nullopt;
+    }
+  }
+  const auto secondDot = name.find('.', 17);
+  if (secondDot == std::string::npos || secondDot == 17 ||
+      secondDot + 1 >= name.size()) {
+    return std::nullopt;
+  }
+  // Strict digit-only check on both numeric tokens. std::stoull would
+  // otherwise accept leading whitespace and '+'/'-' signs, neither of which
+  // FsCacheKey::fileName() ever produces.
+  auto isAllDigits = [](const std::string& s) {
+    if (s.empty()) {
+      return false;
+    }
+    for (const char c : s) {
+      if (c < '0' || c > '9') {
+        return false;
+      }
+    }
+    return true;
+  };
+  const std::string offsetStr = name.substr(17, secondDot - 17);
+  const std::string sizeStr = name.substr(secondDot + 1);
+  if (!isAllDigits(offsetStr) || !isAllDigits(sizeStr)) {
+    return std::nullopt;
+  }
+  try {
+    const uint64_t offset = std::stoull(offsetStr);
+    const uint64_t size = std::stoull(sizeStr);
+    return ParsedName{offset, size};
+  } catch (const std::exception&) {
+    // stoull only throws here on overflow; treat as unrecognised name.
+    return std::nullopt;
+  }
+}
+
+} // namespace
+
+void FsCache::loadFromDisk() {
+  if (!std::filesystem::exists(config_.cacheRoot)) {
+    return;
+  }
+  // Collect victims during the scan, then delete after iteration finishes.
+  // std::filesystem::recursive_directory_iterator does not guarantee safe
+  // increment after the current entry is unlinked, and even less so when the
+  // unlink empties the parent directory. Two-phase deletion side-steps both.
+  std::vector<std::filesystem::path> toRemove;
+  for (auto& entry :
+       std::filesystem::recursive_directory_iterator{config_.cacheRoot}) {
+    if (!entry.is_regular_file()) {
+      continue;
+    }
+    if (entry.path().extension() == ".tmp") {
+      toRemove.push_back(entry.path());
+      continue;
+    }
+    const auto parsed = parseFileName(entry.path().filename().string());
+    if (!parsed.has_value()) {
+      // Unrecognised file. Leave it untouched --- admin tooling owns
+      // cleanup of foreign content under cacheRoot.
+      continue;
+    }
+    if (entry.file_size() != parsed->size) {
+      toRemove.push_back(entry.path());
+    }
+    // Survivor: the next getOrSet() will hash to the same filename,
+    // FileSegment::download() short-circuits on the existence + size check,
+    // and lookupOrCreate() credits onInsert + bytesOnDisk so the segment
+    // participates in eviction.
+  }
+  std::error_code ignore;
+  for (const auto& path : toRemove) {
+    std::filesystem::remove(path, ignore);
+  }
+  // Second pass: rmdir any subdirectory left empty after victim removal.
+  // Repeated until no further dirs are removed so cleanup also reaches the
+  // intermediate two-char buckets ("/aa/bb/") in any iteration order.
+  bool removedAny = true;
+  while (removedAny) {
+    removedAny = false;
+    std::vector<std::filesystem::path> emptyDirs;
+    for (auto& entry :
+         std::filesystem::recursive_directory_iterator{config_.cacheRoot}) {
+      if (entry.is_directory() && std::filesystem::is_empty(entry.path())) {
+        emptyDirs.push_back(entry.path());
+      }
+    }
+    for (const auto& dir : emptyDirs) {
+      if (std::filesystem::remove(dir, ignore)) {
+        removedAny = true;
+      }
+    }
+  }
 }
 
 } // namespace facebook::velox::cache::fs

@@ -84,6 +84,38 @@ class FsCache {
       uint64_t size,
       const FsCacheConfig& config);
 
+  /// Scans cacheRoot for cache files left over from a previous run. Removes
+  /// .tmp files and size-mismatched files, then rmdirs any subdirectory left
+  /// empty afterwards. Does NOT repopulate metadata_ (the on-disk filename
+  /// encodes only the hash, not the original remote path, so a
+  /// FsCacheKey{path, offset, size} cannot be reconstructed) and does NOT
+  /// credit surviving files to stats_.bytesOnDisk: orphan files that are
+  /// never re-requested would then be untracked by the LruPolicy and could
+  /// not be evicted, eventually filling the disk. Instead, surviving files
+  /// are picked up on demand --- the next getOrSet() for the same key hashes
+  /// to the same on-disk filename, FileSegment::download() short-circuits
+  /// when it finds the file already present with the expected size, and
+  /// lookupOrCreate()'s writer path then performs the normal onInsert +
+  /// bytesOnDisk accounting so the segment participates in eviction.
+  /// Idempotent.
+  ///
+  /// CAVEAT: between loadFromDisk() and the demand-pickup of all survivors,
+  /// the cache will tolerate up to `survivor_bytes` of additional downloads
+  /// before evict() catches up, so on-disk usage may transiently reach
+  /// roughly `maxBytes + survivor_bytes` (worst case ~2x maxBytes if the
+  /// previous run filled the cache). Phase 2 will track an orphan-bytes
+  /// counter so evict() sees the true on-disk total during the warmup
+  /// window.
+  ///
+  /// NOT called from the FsCache constructor; the caller (typically the
+  /// Velox process startup hook that constructs the singleton FsCache) must
+  /// invoke it explicitly before serving traffic if persistence across
+  /// restarts is desired, AND must invoke it BEFORE any concurrent thread
+  /// calls getOrSet() --- calling it concurrently with active downloads
+  /// would race against in-flight .tmp files. This also keeps construction
+  /// side-effect-free and keeps unit tests from paying directory-scan cost.
+  void loadFromDisk();
+
  private:
   // Looks up an existing segment or coordinates a fresh download. Single
   // writer per key via FileSegment::beginDownload(); concurrent callers wait
