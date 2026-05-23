@@ -12,39 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-velox_add_library(
-  velox_fscache
-  FsCache.cpp
-  FsCacheGuards.cpp
-  FsCacheKey.cpp
-  FsCacheMetadata.cpp
-  FileSegment.cpp
-  LruPolicy.cpp
-  HEADERS
-  FsCache.h
-  FsCacheConfig.h
-  FsCacheGuards.h
-  FsCacheKey.h
-  FsCacheMetadata.h
-  EvictionPolicy.h
-  FileSegment.h
-  LruPolicy.h
-)
-
-velox_link_libraries(
-  velox_fscache
-  PUBLIC
-    velox_common_base
-    velox_exception
+# Phase-1 FsCache::getOrSet self-cost microbenchmark. Gated on
+# VELOX_ENABLE_BENCHMARKS_BASIC so the default OFF build is unaffected.
+add_executable(velox_fscache_benchmark FsCacheBenchmark.cpp)
+target_link_libraries(
+  velox_fscache_benchmark
+  PRIVATE
+    velox_fscache
     velox_file
+    velox_memory
+    velox_exception
     Folly::folly
-    fmt::fmt
-)
-
-if(${VELOX_BUILD_TESTING})
-  add_subdirectory(tests)
-endif()
-
-if(VELOX_ENABLE_BENCHMARKS_BASIC)
-  add_subdirectory(benchmarks)
-endif()
+    gflags::gflags
+    glog::glog)
