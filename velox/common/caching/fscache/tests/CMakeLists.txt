@@ -25,6 +25,7 @@ set(
   FsCacheRecoveryTest.cpp
   FsCachePersistenceTest.cpp
   FsCacheConcurrencyTest.cpp
+  KeyGeneratorTest.cpp
 )
 
 set(
