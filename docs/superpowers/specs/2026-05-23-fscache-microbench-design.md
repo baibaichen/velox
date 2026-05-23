@@ -22,9 +22,11 @@ Single binary `velox_fscache_benchmark`, folly + gflags driver, gated on
 branch's CacheBackendBenchmark).
 
 Single driver class `FsCacheDriver` owns one `FsCache` instance plus one
-`SleepyReadFile` (which wraps `LocalReadFile`). A cell run = one driver
-lifetime: construct → warmup → main loop → collect → destruct (cacheRoot
-removed in destructor).
+`SleepyReadFile` (which wraps `LocalReadFile`). Each cell gets a fresh
+driver with cacheRoot at `/tmp/velox_fscache_bench/<pid>/<cell_idx>/`;
+the driver's destructor `rm -rf`s it. `main()` installs a SIGINT handler
+that recursively removes `/tmp/velox_fscache_bench/<pid>/` so Ctrl-C
+during a long sweep does not leave gigabytes behind.
 
 ### Cell sweep dimensions
 
@@ -59,23 +61,54 @@ numBuckets       = 1024  (FsCacheConfig default)
 
 ### SleepyReadFile
 
-~30 LOC, anonymous namespace inside `FsCacheBenchmark.cpp`. Wraps a
-`LocalReadFile`. `pread()` does `sleep_for(latency_us)` then delegates;
-`latency_us == 0` skips the sleep call entirely (not `sleep_for(0)`) so the
-"hot local" cell pays zero scheduler overhead. Other `ReadFile` virtuals
-(`size()`, `getName()`, etc.) forward unchanged.
+~40 LOC, anonymous namespace inside `FsCacheBenchmark.cpp`. Requires
+`#include "velox/common/file/File.h"` (precedent: `FileSegment.cpp:20`).
+Holds a `LocalReadFile` by value. `pread()` does `sleep_for(latency_us)`
+then delegates; `latency_us == 0` skips the sleep call entirely (not
+`sleep_for(0)`) so the "hot local" cell pays zero scheduler overhead.
+Other `ReadFile` virtuals (`size()`, `getName()`, `shouldCoalesce()`,
+`memoryUsage()`, `getNaturalReadSize()`) forward unchanged.
 
-All cells share one pre-populated 8 GiB random-bytes file at
-`/tmp/velox_fscache_bench_remote.bin`. Bench rebuilds this file at startup if
-absent or `--rebuild_remote_file` is set. Size is overridable via
-`--remote_file_size_gb` (must be >= max keyIndex * 1 MiB across all cells in
-the run).
+`ReadFile::bytesRead()` is provided by the base class but only increments
+when the implementing `pread` writes to `bytesRead_`. SleepyReadFile MUST
+either (a) update its own `bytesRead_` in `pread()` (`bytesRead_ +=
+length`), or (b) override `bytesRead()` to return `inner_.bytesRead()`.
+Pick (a) so SleepyReadFile is the single source of truth. The driver
+exposes `bytesRead()` via the cell's `SleepyReadFile&` reference.
+
+Reset between cells via `d.sleepyReadFile.resetBytesRead()` so each cell's
+`dl_MB` reflects that cell only.
+
+All cells share one pre-populated random-bytes file at
+`/tmp/velox_fscache_bench_remote.bin`. Size defaults to 2 GiB (covers max
+1024 keys * 1 MiB = 1 GiB working set with comfortable headroom);
+overridable via `--remote_file_size_gb`. Bench rebuilds the file at startup
+if absent, size-mismatched, or `--rebuild_remote_file` is set.
 
 ### KeyGenerator
 
 Pattern lifted from cachelib branch's `CacheBackendBenchmark.cpp`:
 sequential / zipfian (theta=1.0) / uniform. Per-thread instance, per-thread
-seed (`seed_base + tid`).
+seed (`seed_base + tid`, where `seed_base` defaults to **42** and is
+overridable via `--seed_base`).
+
+**Multi-thread semantics** (explicit, since CacheBackendBenchmark exposes a
+`--keyspace_mode` flag for this and we deliberately fix it):
+
+- **sequential**: each thread owns a **disjoint** slice
+  `[tid * workingSetKeys / threads, (tid + 1) * workingSetKeys / threads)`
+  and walks it in order, wrapping at slice end. Rationale: makes the
+  per-cell hit% deterministic (each thread does one full scan over its
+  slice during warmup, all subsequent main-loop ops hit), and matches
+  CacheBackendBenchmark's `keyspace_mode=partitioned` —
+  the option more typical of "many independent table scans".
+- **zipfian** and **uniform**: full `[0, workingSetKeys)` universe per
+  thread (shared keyspace), matching CacheBackendBenchmark's default
+  `keyspace_mode=shared` — the option more typical of "concurrent queries
+  on hot data".
+
+`--keyspace_mode` is NOT exposed in Phase 1; the per-workload defaults
+above are fixed to keep the cell key small.
 
 Returns `keyIndex ∈ [0, workingSetKeys)`. Driver maps to
 `offset = keyIndex * 1 MiB`, `size = 1 MiB`.
@@ -92,18 +125,47 @@ will revisit.
 
 ```cpp
 CellResult runCell(workload, threads, wsMult, latencyUs) {
-  FsCacheDriver d(workingSetKeys, latencyUs);  // fresh cache + cacheRoot
+  // cacheRoot is per-cell: /tmp/velox_fscache_bench/<pid>/<cell_idx>/
+  // Driver dtor rm -rf's it. Main also installs a SIGINT handler that walks
+  // /tmp/velox_fscache_bench/<pid>/ on Ctrl-C.
+  FsCacheDriver d(workingSetKeys, latencyUs, cellIdx);
+
+  // --- Warmup phase: do NOT count in any metric ---
+  d.sleepyReadFile.resetBytesRead();
   parallelRun(d, threads, warmupOps / threads, /*recordLatency=*/false);
 
+  // --- Take baselines AFTER warmup ---
+  // stats() returns cumulative counters. recordHit/recordMiss bump them
+  // during warmup too, so we must subtract baseline below or the reported
+  // hit% can exceed 100%.
+  const auto statsBase = d.fsCache.stats();
+  d.sleepyReadFile.resetBytesRead();
+
+  // --- Main loop ---
   auto wallStart = steady_clock::now();
   parallelRun(d, threads, ops / threads, /*recordLatency=*/true);
   auto wallSec = duration<double>(steady_clock::now() - wallStart).count();
 
+  // --- Deltas (single source of truth: cumulative - baseline) ---
+  const auto statsFinal = d.fsCache.stats();
+  const uint64_t hitsDelta      = statsFinal.hits      - statsBase.hits;
+  const uint64_t missesDelta    = statsFinal.misses    - statsBase.misses;
+  const uint64_t evictionsDelta = statsFinal.evictions - statsBase.evictions;
+  const uint64_t bytesReadDelta = d.sleepyReadFile.bytesRead();  // reset above
+
   CellResult r;
   r.opsPerSec    = ops / wallSec;
-  r.hitRatePct   = 100.0 * d.fsCache.stats().hits / ops;
-  r.bytesDl_MB   = sleepyReadFile.bytesRead() / (1ULL << 20);
-  r.bytesEvic_MB = d.fsCache.stats().evictions;  // already in MiB-segments
+  // hits + misses can be < ops if some ops short-circuit (e.g. all-hit
+  // paths inside one getOrSet); we divide by ops because that is the user-
+  // visible work unit.
+  r.hitRatePct   = 100.0 * hitsDelta / ops;
+  r.bytesDl_MB   = bytesReadDelta / (1ULL << 20);
+  // stats_.evictions is a COUNT of segments evicted, NOT bytes. Phase 1
+  // segments are uniformly 1 MiB (FsCacheConfig: alignment = maxSegmentSize
+  // = 1 MiB), so count == MiB; if either knob changes this formula must
+  // change too.
+  r.evicCount    = evictionsDelta;
+  r.bytesEvic_MB = evictionsDelta * (cfg.maxSegmentSize / (1ULL << 20));
   r.p50_us       = quantile(allLatencies, 0.50) / 1000.0;
   r.p95_us       = quantile(allLatencies, 0.95) / 1000.0;
   r.p99_us       = quantile(allLatencies, 0.99) / 1000.0;
@@ -117,20 +179,26 @@ Each worker thread owns a `std::vector<uint64_t>` pre-reserved to
 path. After all threads join, the main thread concatenates and runs
 `std::nth_element` for each quantile.
 
+`ops` MUST be divisible by every value in `--threads_list` (the default
+`{1, 4, 16}` divides 200K cleanly). If not divisible the bench aborts at
+startup with a clear message — silently dropping ops would corrupt the
+A/B comparison.
+
 Memory budget for latency vectors: 1M ops × 8 bytes = 8 MB peak per cell —
 negligible.
 
 ## Metrics (per cell)
 
-Eight metric columns plus four dimension columns echoed back from the cell
-key, for 12 total per row.
+Nine metric columns plus four dimension columns echoed back from the cell
+key, for 13 total per row.
 
 | Column | Source | Tells us |
 |---|---|---|
 | ops/s | ops / wallSec | Aggregate throughput |
-| hit% | stats.hits / ops | Whether cache is actually working |
-| dl MB | SleepyReadFile cumulative bytes read | Write amplification, cross-check vs hit% |
-| evic MB | stats.evictions * 1 MiB | Eviction pressure |
+| hit% | (hits_final - hits_base) / ops | Whether cache is actually working |
+| dl MB | sleepyReadFile.bytesRead() (reset post-warmup) | Write amplification, cross-check vs hit% |
+| evic count | evictions_final - evictions_base | Eviction pressure (raw segment count) |
+| evic MB | evic_count * cfg.maxSegmentSize | Same in MiB; Phase 1 = evic_count * 1 MiB |
 | p50/p95/p99 µs | Per-op latency quantiles | Lock contention, eviction spikes |
 | wallSec | Wall clock | Debugging / sanity |
 
@@ -138,7 +206,7 @@ key, for 12 total per row.
 
 Markdown table on stdout. Single table with one row per cell, columns:
 ```
-| workload | threads | ws_mult | lat_us | ops/s | hit% | dl_MB | evic_MB | p50_us | p95_us | p99_us | wallSec |
+| workload | threads | ws_mult | lat_us | ops/s | hit% | dl_MB | evic_count | evic_MB | p50_us | p95_us | p99_us | wallSec |
 ```
 
 `--out=<path>` redirects the table (and only the table) to a file; glog still
