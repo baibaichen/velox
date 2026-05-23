@@ -19,72 +19,28 @@
 
 ## File Structure
 
-下表列出第一阶段新增/修改的所有文件。每个文件单一职责，方便聚焦阅读与编辑。
-
-### 新增文件 — `velox/common/caching/fscache/`
+第一阶段新增/修改的所有文件（权威清单见各 commit 的 `**Files:**` 块）。
 
 | 文件 | 责任 |
 |---|---|
-| `CMakeLists.txt` | `velox_add_library(velox_fscache ...)` + `tests/` 子目录 |
-| `FsCacheKey.h` / `.cpp` | `FsCacheKey{path, offset, size}` + SpookyHashV2 计算 + `==` / `hash` |
-| `FsCacheGuards.h` | 5 个锁类型（`CachePriorityGuard`/`CacheStateGuard`/`CacheMetadataGuard`/`KeyGuard`/`FileSegmentGuard`）+ 锁顺序文档 + debug-only `LockOrderChecker` |
-| `EvictionPolicy.h` | 抽象基类 `EvictionPolicy`（4 个虚函数） |
-| `LruPolicy.h` / `.cpp` | `LruPolicy : public EvictionPolicy`，单链表实现 |
-| `FileSegment.h` / `.cpp` | 3 态机（`EMPTY` → `DOWNLOADING` → `DOWNLOADED`，加 `DETACHED`）+ `download()` + `read()` + `cv_` |
-| `FsCacheMetadata.h` / `.cpp` | bucket 数组（默认 1024）+ per-key `std::map<offset, FileSegmentPtr>` + 增删查 |
-| `FsCacheConfig.h` | POD config（`cacheRoot`, `maxBytes`, `alignment=4MiB`, `maxSegmentSize=32MiB`, `numBuckets=1024`） |
-| `FsCache.h` / `.cpp` | 顶层入口；`getOrSet(path, offset, size)` → `std::vector<FileSegmentPtr>`、`splitRange()`、`loadFromDisk()` |
+| `velox/common/caching/fscache/CMakeLists.txt` | `velox_add_library(velox_fscache ...)` + `tests/` |
+| `velox/common/caching/fscache/FsCacheConfig.h` | POD config（`cacheRoot`/`maxBytes`/`alignment=4MiB`/`maxSegmentSize=32MiB`/`numBuckets=1024`） |
+| `velox/common/caching/fscache/FsCacheKey.h` / `.cpp` | `FsCacheKey{path, offset, size}` + SpookyHashV2 hash + `==` |
+| `velox/common/caching/fscache/FsCacheGuards.h` / `.cpp` | 5 个锁类型 + 锁顺序文档 + debug-only `LockOrderChecker` |
+| `velox/common/caching/fscache/EvictionPolicy.h` | 抽象基类（4 个虚函数） |
+| `velox/common/caching/fscache/LruPolicy.h` / `.cpp` | 单链表 LRU 实现 |
+| `velox/common/caching/fscache/FileSegment.h` / `.cpp` | 3 态机（`kEmpty`/`kDownloading`/`kDownloaded` + `kDetached`）+ `download()` + `read()` + `cv_` |
+| `velox/common/caching/fscache/FsCacheMetadata.h` / `.cpp` | bucket 数组 + per-key 索引 + 增删查 |
+| `velox/common/caching/fscache/FsCache.h` / `.cpp` | 顶层入口；`getOrSet` / `splitRange` / `loadFromDisk` |
+| `velox/common/caching/fscache/tests/*Test.cpp` | 11 个测试文件（Scaffold/Key/Guards/EvictionPolicy/FileSegment/Metadata/SplitRange/FsCache/Concurrency/Recovery/Persistence） |
+| `velox/dwio/common/FsCacheBufferedInput.h` / `.cpp` | `: public BufferedInput`，覆写 `enqueue/load/clone/hasCache/cacheRegion/findCachedRegion` |
+| `velox/dwio/common/FsCacheInputStream.h` / `.cpp` | `: public SeekableInputStream`，从 `FileSegment` 本地文件读 |
+| `velox/dwio/common/tests/FsCacheBufferedInputTest.cpp` | enqueue / load / stream 读 |
+| `velox/dwio/common/tests/FsCacheEquivalenceTest.cpp` | **关键**：vs 源文件 canonical bytes 字节等价 |
+| `velox/common/caching/CMakeLists.txt` | 一行 `add_subdirectory(fscache)` |
+| `velox/dwio/common/CMakeLists.txt` / `tests/CMakeLists.txt` | 新增 FsCache* 源/测试 + link `velox_fscache` |
 
-### 新增文件 — `velox/common/caching/fscache/tests/`
-
-| 文件 | 测试内容 |
-|---|---|
-| `CMakeLists.txt` | `velox_add_grouped_tests(PREFIX velox_fscache_test ...)` |
-| `FsCacheKeyTest.cpp` | hash 稳定性、不同字段差异化 |
-| `FsCacheGuardsTest.cpp` | RAII 行为、debug-only 锁顺序检查 |
-| `EvictionPolicyTest.cpp` | LRU 顺序、`selectVictims` 数量、`onRemove` |
-| `FileSegmentTest.cpp` | 单线程状态机转换、download 成功/失败 |
-| `FsCacheMetadataTest.cpp` | bucket 分布、insert/lookup/erase |
-| `FsCacheSplitRangeTest.cpp` | CH 风格 align + max 切分边界 |
-| `FsCacheTest.cpp` | `getOrSet` 端到端（含 eviction 触发） |
-| `FsCacheConcurrencyTest.cpp` | 多 reader 同 segment：唯一 download |
-| `FsCacheRecoveryTest.cpp` | `.tmp` 清理、size mismatch、unknown filename |
-| `FsCachePersistenceTest.cpp` | 多次启停 cache 命中 |
-
-### 新增文件 — `velox/dwio/common/`
-
-| 文件 | 责任 |
-|---|---|
-| `FsCacheBufferedInput.h` / `.cpp` | `: public BufferedInput`，覆写 `enqueue/load/clone/hasCache` |
-| `FsCacheInputStream.h` / `.cpp` | `: public SeekableInputStream`，从 `FileSegment` 本地文件读 |
-
-### 新增文件 — `velox/dwio/common/tests/`
-
-| 文件 | 测试内容 |
-|---|---|
-| `FsCacheBufferedInputTest.cpp` | enqueue / load 行为、stream 读 |
-| `FsCacheEquivalenceTest.cpp` | **关键**：vs 源文件 canonical bytes，证明读路径等价 |
-
-### 修改文件
-
-| 文件 | 修改 |
-|---|---|
-| `velox/common/caching/CMakeLists.txt` | `add_subdirectory(fscache)` |
-| `velox/common/caching/tests/CMakeLists.txt` | 无需改（fscache tests 自带 grouped tests） |
-| `velox/dwio/common/CMakeLists.txt` | 新增 `FsCacheBufferedInput.cpp` / `FsCacheInputStream.cpp`，link `velox_fscache` |
-| `velox/dwio/common/tests/CMakeLists.txt` | 新增 `FsCacheBufferedInputTest.cpp`、`FsCacheEquivalenceTest.cpp` 到 grouped tests |
-
----
-
-## Naming & Style Quick Reference
-
-- Namespace：`facebook::velox::cache::fs`（避免与 `facebook::velox::cache` 现有 `AsyncDataCache` 冲突）。
-- BufferedInput 子类 namespace 沿用 `facebook::velox::dwio::common`。
-- Comments：headers 公共 API 用 `///` 全句号；实现/私有/局部用 `//`。
-- 命名：types `PascalCase`、methods/locals `camelCase`、private members `camelCase_`、constants `kPascalCase`、namespaces `snake_case`。
-- 数字字面量 ≥ 4 位用 `'` 分隔（`4'194'304`）。
-- 初始化用 `{}` 而非 `=`。
-- 多行参数列表加 trailing comma。
+命名/注释/初始化规则见 `.claude/CLAUDE.md`。本 plan 额外约定：namespace `facebook::velox::cache::fs`（避免与现有 `facebook::velox::cache` 冲突）；`FsCacheBufferedInput` 沿用 `facebook::velox::dwio::common`。
 
 ---
 
@@ -1089,15 +1045,6 @@ Edit `velox/common/caching/fscache/CMakeLists.txt`:
 Edit `velox/common/caching/fscache/tests/CMakeLists.txt`:
 - Add `EvictionPolicyTest.cpp` to `VELOX_FSCACHE_TEST_SOURCES`.
 
-**Important compile note:** `LruPolicy.cpp` includes `FileSegment.h` for the
-`segment->size()` call. Commit 5 defines `FileSegment`. Until then, the build
-will fail. The test stand-in won't help production code.
-
-**Resolution:** In this commit, also add a **minimal** `FileSegment.h` and
-`.cpp` with just enough surface for `size()`. Commit 5 then **extends** them
-with the full state machine (existing test cases keep passing; new state-machine
-tests are added).
-
 - [ ] **Step 7: Add minimal `FileSegment.h`**
 
 `velox/common/caching/fscache/FileSegment.h`:
@@ -1709,11 +1656,14 @@ std::vector<std::pair<uint64_t, uint64_t>> FsCache::splitRange(
 
 - [ ] **Step 8: Adapt `EvictionPolicyTest.cpp` to the extended `FileSegment`**
 
-Commit 5 dropped the `(FsCacheKey, State)` ctor (state is now driven by the
-download state machine; fresh segments start at kEmpty). Adjust
-`EvictionPolicyTest.cpp` accordingly.
-
-Add a fixture that owns a small remote file used by the happy-path tests:
+Commit 5 dropped the `(FsCacheKey, State)` ctor — fresh segments now start at
+kEmpty and are driven by the download state machine. Convert each
+`TEST(EvictionPolicyTest, ...)` to `TEST_F` against the fixture below, replace
+each `makeSegment(N)` with `downloaded(N)` (store the returned `unique_ptr` in
+test scope and pass `.get()` to `policy.onInsert`), and drop the
+free-function `makeSegment` helper introduced in commit 4. For
+`onInsertRejectsNonDownloadedSegments`, build the kEmpty / kDownloading
+segments directly without `download()` (see second snippet below).
 
 ```cpp
 class EvictionPolicyTest : public ::testing::Test {
@@ -1745,15 +1695,6 @@ class EvictionPolicyTest : public ::testing::Test {
 };
 ```
 
-Convert every existing `TEST(EvictionPolicyTest, ...)` to
-`TEST_F(EvictionPolicyTest, ...)`. Replace each `makeSegment(N)` call with
-`downloaded(N)`; store the returned `unique_ptr` in the test scope and pass
-its `.get()` to `policy.onInsert`. Update the size-based assertions to use
-the same numeric sizes as before.
-
-For `onInsertRejectsNonDownloadedSegments`, build the kEmpty and
-kDownloading segments directly without calling `download()`:
-
 ```cpp
 TEST_F(EvictionPolicyTest, onInsertRejectsNonDownloadedSegments) {
   LruPolicy policy;
@@ -1764,8 +1705,6 @@ TEST_F(EvictionPolicyTest, onInsertRejectsNonDownloadedSegments) {
   EXPECT_THROW(policy.onInsert(&downloading), facebook::velox::VeloxException);
 }
 ```
-
-Drop the free-function `makeSegment` helper introduced in commit 4.
 
 - [ ] **Step 9: Wire test files into CMake**
 
@@ -2237,9 +2176,7 @@ Add includes: `<memory>`, `EvictionPolicy.h`, `FsCacheMetadata.h`.
 
 - [ ] **Step 7: Implement `FsCache.cpp`**
 
-Replace the entire file body (the commit-1 stub ctor goes away; this step
-provides the real ctor with CHECK validations plus `getOrSet`, `lookupOrCreate`,
-`evict`, and `stats`):
+Replace `FsCache.cpp` body with:
 
 ```cpp
 #include "velox/common/caching/fscache/FsCache.h"
