@@ -75,6 +75,53 @@ TEST_F(FsCacheTest, getOrSetSecondCallHitsCache) {
   EXPECT_GT(cache.stats().hits, 0);
 }
 
+// Regression: when remote file size < cache alignment, splitRange's outward
+// alignment used to overshoot EOF, causing LocalReadFile::preadInternal to
+// crash on the short read. getOrSet must clamp the read length to the file's
+// actual size so a tiny file (e.g. a Parquet footer-only fixture) round-trips
+// successfully through FsCache. See spec 2026-05-23-fscache-vs-cbi-tpcds §7
+// OQ #2.
+TEST_F(FsCacheTest, getOrSetClampsToFileSizeWhenSmallerThanAlignment) {
+  const std::string tinyPath = tempDir_->getPath() + "/tiny.bin";
+  const std::string tinyContent(3UL * 1'024, 'b');
+  {
+    std::ofstream out{tinyPath, std::ios::binary};
+    out.write(tinyContent.data(), tinyContent.size());
+  }
+  FsCacheConfig cfg = config_;
+  cfg.alignment = 4UL * 1'024;
+  cfg.maxSegmentSize = 64UL * 1'024;
+  FsCache cache{cfg};
+  LocalReadFile tinyRemote{tinyPath};
+  // alignedEnd would be 4096, but file size is 3072. Without the clamp,
+  // FileSegment::download asks remote for 4096 bytes and crashes.
+  const auto segments =
+      cache.getOrSet(tinyPath, 0, tinyContent.size(), tinyRemote);
+  ASSERT_FALSE(segments.empty());
+  for (const auto& segment : segments) {
+    EXPECT_EQ(segment->state(), FileSegment::State::kDownloaded);
+  }
+}
+
+TEST_F(FsCacheTest, getOrSetReturnsEmptyAtExactEof) {
+  FsCache cache{config_};
+  LocalReadFile remote{remotePath_};
+  // offset == size: legitimate zero-byte read at EOF must return an empty
+  // vector rather than throw.
+  EXPECT_TRUE(cache.getOrSet(remotePath_, remote.size(), 0, remote).empty());
+  EXPECT_TRUE(cache.getOrSet(remotePath_, 0, 0, remote).empty());
+}
+
+TEST_F(FsCacheTest, getOrSetThrowsWhenOffsetPastEof) {
+  FsCache cache{config_};
+  LocalReadFile remote{remotePath_};
+  // offset > size: caller bug; surface immediately rather than silently
+  // returning an empty range.
+  EXPECT_THROW(
+      cache.getOrSet(remotePath_, remote.size() + 1, 1, remote),
+      ::facebook::velox::VeloxException);
+}
+
 TEST_F(FsCacheTest, evictionRunsWhenOverCapacity) {
   FsCacheConfig tiny = config_;
   tiny.maxBytes = 5UL * 1'024 * 1'024;

@@ -48,8 +48,12 @@ class FailIfReadCalled final : public ::facebook::velox::ReadFile {
   bool shouldCoalesce() const override {
     return false;
   }
+  // Must report the actual file size: FsCache::getOrSet clamps the requested
+  // range to size() so the warm-restart short-circuit code path can run on a
+  // key whose size matches what is on disk. Returning 0 would clamp the
+  // request to empty and bypass lookupOrCreate entirely.
   uint64_t size() const override {
-    return 0;
+    return 4UL * 1'024 * 1'024;
   }
   uint64_t memoryUsage() const override {
     return 0;

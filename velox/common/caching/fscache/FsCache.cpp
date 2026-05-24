@@ -110,11 +110,39 @@ std::vector<FileSegmentPtr> FsCache::getOrSet(
     uint64_t offset,
     uint64_t size,
     ::facebook::velox::ReadFile& remote) {
-  const auto ranges = splitRange(offset, size, config_);
+  // Clamp the requested range to the remote file's actual size. splitRange
+  // aligns the outer end outward to config_.alignment, which would otherwise
+  // overshoot EOF for files smaller than alignment (or for reads near the
+  // tail of any file) and cause LocalReadFile::preadInternal to reject the
+  // short read inside FileSegment::download. See spec
+  // 2026-05-23-fscache-vs-cbi-tpcds §7 OQ #2.
+  const uint64_t fileSize = remote.size();
+  VELOX_USER_CHECK_LE(
+      offset,
+      fileSize,
+      "FsCache::getOrSet offset past EOF, fileSize={}",
+      fileSize);
+  if (offset == fileSize || size == 0) {
+    return {};
+  }
+  const uint64_t clampedSize = std::min(size, fileSize - offset);
+  const auto ranges = splitRange(offset, clampedSize, config_);
   std::vector<FileSegmentPtr> result;
   result.reserve(ranges.size());
   for (const auto& [segOffset, segSize] : ranges) {
-    FsCacheKey key{path, segOffset, segSize};
+    // splitRange rounds alignedEnd outward to config_.alignment, so the LAST
+    // emitted segment's (segOffset + segSize) can exceed fileSize even though
+    // the outer clampedSize already fits. Re-clamp per segment so key.size
+    // (which names the on-disk file and is what FileSegment::download reads
+    // from remote) matches the true byte count; a mismatched key.size would
+    // otherwise re-trigger the EOF overshoot inside download. Underflow is
+    // impossible: every cursor emitted by splitRange is alignment-aligned and
+    // < alignedEnd, and the only segment whose end can exceed fileSize is the
+    // last one whose start is still < fileSize (alignedStart <= offset <
+    // fileSize, every subsequent cursor is offset + k*alignment <= alignedEnd
+    // - alignment < fileSize until the loop exits).
+    const uint64_t effectiveSize = std::min(segSize, fileSize - segOffset);
+    FsCacheKey key{path, segOffset, effectiveSize};
     result.push_back(lookupOrCreate(key, remote));
   }
   return result;

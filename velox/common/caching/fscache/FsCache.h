@@ -53,9 +53,15 @@ class FsCache {
   explicit FsCache(FsCacheConfig config);
   ~FsCache();
 
-  /// Returns segments covering [offset, offset + size) for the given path,
-  /// downloading any missing segments synchronously from remote. Segment
-  /// boundaries follow splitRange(offset, size, config); each returned
+  /// Returns segments covering [offset, min(offset + size, remote.size()))
+  /// for the given path, downloading any missing segments synchronously from
+  /// remote. The requested range is clamped to remote.size() so reads near
+  /// EOF (or on files smaller than config.alignment) do not overshoot the
+  /// file --- the last returned segment's key.size therefore reflects the
+  /// true byte count, not the splitRange outward-alignment overshoot.
+  /// Returns an empty vector when offset == remote.size() or size == 0.
+  /// VELOX_USER_CHECKs that offset <= remote.size(). Segment boundaries
+  /// otherwise follow splitRange(offset, clampedSize, config); each returned
   /// segment is in state kDownloaded on return.
   std::vector<FileSegmentPtr> getOrSet(
       const std::string& path,
