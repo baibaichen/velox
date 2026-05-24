@@ -19,6 +19,7 @@
 #include "velox/common/file/File.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
+#include "velox/dwio/common/tests/utils/DataFiles.h"
 
 #include <gtest/gtest.h>
 
@@ -153,6 +154,45 @@ TEST_F(FsCacheBufferedInputTest, cacheRegionThrowsUnsupported) {
       ::facebook::velox::VeloxException);
   EXPECT_THROW(
       input.findCachedRegion(0), ::facebook::velox::VeloxException);
+}
+
+// Smoke gate: round-tripping a real Parquet file through FsCacheBufferedInput
+// must produce the same raw bytes as a plain LocalReadFile. Per spec
+// 2026-05-23-fscache-vs-cbi-tpcds §1.4 assumption 2, this is the integration
+// guard between Phase-1 read-path work and the bench-level wiring; it does
+// not exercise the Parquet decoder itself, only the byte-level fidelity of
+// enqueue / load / Next().
+TEST_F(FsCacheBufferedInputTest, parquetSampleRoundTrips) {
+  // getDataFilePath ignores baseDir outside fbcode and only joins cwd + filePath.
+  // ctest runs this binary from the build dir's velox/dwio/common/tests, so the
+  // relative path walks up to velox/dwio/parquet/tests/examples/.
+  const auto path = ::facebook::velox::test::getDataFilePath(
+      "velox/dwio/common/tests",
+      "../../parquet/tests/examples/sample.parquet");
+  auto readFile = std::make_shared<LocalReadFile>(path);
+  const uint64_t size = readFile->size();
+  ASSERT_GT(size, 0UL);
+
+  std::string truth(size, '\0');
+  readFile->pread(0, size, truth.data());
+
+  // The bundled sample.parquet is only a few KiB. The default 4 MiB alignment
+  // would force FsCache to issue a 4 MiB pread that overshoots EOF and crashes
+  // inside LocalReadFile. Use a 4 KiB alignment so a small fixture still
+  // exercises the splitRange / segment plumbing without changing the read-path
+  // logic under test.
+  FsCacheConfig tinyCfg;
+  tinyCfg.cacheRoot = tempDir_->getPath() + "/cache_parquet";
+  tinyCfg.maxBytes = 64UL * 1'024 * 1'024;
+  tinyCfg.alignment = 4UL * 1'024;
+  tinyCfg.maxSegmentSize = 64UL * 1'024;
+  std::filesystem::create_directories(tinyCfg.cacheRoot);
+  auto tinyCache = std::make_unique<FsCache>(tinyCfg);
+
+  FsCacheBufferedInput input{readFile, *pool_, tinyCache.get()};
+  auto stream = input.enqueue({0, size});
+  input.load(LogType::FILE);
+  EXPECT_EQ(drain(*stream, size), truth);
 }
 
 } // namespace facebook::velox::dwio::common::test
