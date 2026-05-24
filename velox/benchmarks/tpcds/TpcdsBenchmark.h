@@ -38,6 +38,15 @@ class TpcdsBenchmark : public facebook::velox::QueryBenchmarkBase {
 
   void runQuery(int32_t queryId);
 
+  /// Runs the spec 2026-05-23-fscache-vs-cbi-tpcds A/B sweep:
+  /// FLAGS_rounds outer iterations x 99 queries, plan construction
+  /// hoisted once before the round loop. Per-query wall_ms is measured
+  /// by std::chrono::steady_clock around QueryBenchmarkBase::run().
+  /// Writes one CSV row per (round, query) to FLAGS_out. Returns the
+  /// number of failed queries (rows with non-empty error column) so
+  /// the caller can set a non-zero exit code without re-reading the CSV.
+  int32_t runAb();
+
   /// Override to stamp splits with the plan's connector ID (e.g. "hive")
   /// instead of the default "test-hive" used by the base class.
   std::vector<std::shared_ptr<facebook::velox::connector::ConnectorSplit>>
