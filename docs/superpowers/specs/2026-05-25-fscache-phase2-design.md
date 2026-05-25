@@ -214,10 +214,11 @@ hash），渲染格式不变，但同一 `(path, offset, size)` 在 phase-1 / ph
 启动时，`loadFromDisk` 解析出来的 PathKey 与新 hash 函数算出的 PathKey
 不一致 → 这些文件成为孤儿。
 
-**接受弃用既有缓存**：phase-2 启动时 `loadFromDisk` 检测到 fileName 前缀
-与重算 hash 不匹配的文件直接 unlink（一次性 reformat）。这条由 plan-1
-实现时显式落地，并在 release notes 标注 "phase-2 upgrade 会丢弃所有
-现存 cache，首次启动相当于冷启动"。详见 §10 R7。
+**接受弃用既有缓存**：phase-2 首次启动如检测到 `cacheRoot` 非空，
+**整体清空** 后再进入正常 `loadFromDisk` 流程（disk-walk 阶段无 path
+可用于 phase-1 vs phase-2 甄别，盲扫清空是唯一可行的"接受弃用"实现）。
+release notes 中标注 "phase-2 upgrade 首次启动会清空所有 phase-1 写入
+的 cache 文件"。详见 §10 R7。
 
 ### 4.5 锁顺序更新
 
@@ -269,6 +270,15 @@ void FsCache::evict(uint64_t bytesNeeded) {
 仍未达 `bytesNeeded`，对剩余字节数对每个仍繁忙的 bucket 做 blocking
 `lock()` 兜底，按 round-robin 顺序逐个收 victim 直到补齐 `bytesNeeded`
 或全部 bucket 都查过。**不**跨多次 `evict()` 调用累计计数。
+
+**Blocking fallback 的最坏等待**：兜底阶段对每个 bucket 串行 blocking
+`lock()`，单次 `evict()` 最坏等待 ≈ `numBuckets` × per-bucket 持锁时长。
+phase-1 measurements 显示单 bucket 持锁内只做 `unordered_map` 插入/删除
+与 LRU list splice，典型 < 10 μs；phase-2 numBuckets = 1024 时最坏
+~10 ms，pathological 写盘风暴下可达数百 ms。spec **接受**该上限：
+`evict` 是后台/低频路径（仅在 `reserve` 超 quota 时触发），不在 hit
+fast-path 上；若 microbench 显示 `reserve → evict` 成为瓶颈，phase-3
+可改 background evict thread 异步化。
 
 ## 5. 数据结构（plan-1）
 
@@ -330,9 +340,10 @@ Bucket 数组**构造后不可 resize**——`buckets_.size()` 进入 const 状�
 但 `<pathkey-hex>` 的计算方式从 phase-1 的 `combinedHash(path, offset, size)`
 （`FsCacheKey.cpp:28-35`）改为 PathKey-only hash（仅 path）。
 
-phase-1 写盘的 cache 文件在 phase-2 启动时由 `loadFromDisk` 一次性
-reformat：解析 fileName 拿到候选 `(path?, offset, size)`，但 path 已丢失
-（hash 不可逆），所以 phase-1 文件**全部 unlink 弃用**。详见 §10 R7。
+phase-1 写盘的 cache 文件在 phase-2 启动时**无法区分**（fileName schema
+一致，且 disk-walk 阶段无 path 可重算比对）。phase-2 首次启动如检测到
+`cacheRoot` 非空，**整体清空后再进入正常 `loadFromDisk` 流程**——既有
+phase-1 文件全部弃用。详见 §10 R7。
 
 **Crash recovery 测试要回归**：phase-1 的 `FsCacheRecoveryTest` 必须在
 phase-2 代码下不修改即通过——但前提是 fixture 在 phase-2 代码下用
@@ -370,11 +381,20 @@ struct FsCacheConfig {
 **回退发生在调用点**（`HiveConnectorUtil::createBufferedInput` 那一侧
 或调用方主入口），由调用点把 `connector->ioExecutor()` 注入
 `FsCacheConfig`，再构造 `FsCacheBufferedInput`。
-`FsCacheBufferedInput` 自身只持有 `folly::Executor*`，不依赖 `Connector*`
-（phase-1 ctor 签名 `(shared_ptr<ReadFile>, MemoryPool&, FsCache*)` 不变
-其参数，只新增一个 `folly::Executor*` 参数）。本 spec 不引入"默认独立池"
-或"helper 工厂"，保持与 phase-1 同款的 zero-defaults 策略
+`FsCacheBufferedInput` 自身只持有 `folly::Executor*`，不依赖 `Connector*`。
+phase-1 ctor 签名 `(shared_ptr<ReadFile>, MemoryPool&, FsCache*)` 在
+phase-2 末尾**追加** `folly::Executor*` 一个参数，变为
+`(shared_ptr<ReadFile>, MemoryPool&, FsCache*, folly::Executor*)`；
+原 3 个参数语义与顺序保持不变。本 spec 不引入"默认独立池"或
+"helper 工厂"，保持与 phase-1 同款的 zero-defaults 策略
 （OQ #2-c 决策）。
+
+**Cross-spec impact**：TPC-DS A/B spec
+（`docs/superpowers/specs/2026-05-23-fscache-vs-cbi-tpcds-design.md`
+§2.5）的 `createBufferedInput` 新分支构造 `FsCacheBufferedInput` 时
+需同步补传 `executor` 参数。plan-2 落地 R0 时一并更新该调用点；
+本 spec 与 TPC-DS A/B spec 之间不形成接口循环依赖（TPC-DS spec
+只 consume ctor，不 export）。
 
 池大小与限流策略**完全由调用方控制**，FsCache 不引入 semaphore / token
 bucket / 自适应限流。CH 默认 5 线程是其工程经验值，Velox 这边 reuse
@@ -784,9 +804,19 @@ size)` 在 phase-1 / phase-2 生成的 fileName 前缀**不同**。phase-2 启�
 扫到 phase-1 的 cache 文件无法重建索引（因为反解只能拿到 hex 前缀
 而非 path 本身）。
 
-**接受弃用**：phase-2 启动 `loadFromDisk` 阶段一次性 unlink 所有
-"hash 前缀与重算不匹配"的文件，等价于首次启动冷启动。release notes
-中显式标注；不引入双 hash 兼容代码或迁移工具。
+**关键约束**：phase-2 启动时盘上 fileName 只含 `<16-hex>.<offset>.<size>`
+（见 `FsCache.cpp:325` `parseFileName`），**没有 path 字符串**——所以
+"phase-1 hash vs phase-2 hash" 在 disk-walk 阶段根本无法区分（两版
+fileName schema 完全一致，且无 path 可重算比对）。
+
+**接受弃用，落地方案**：phase-2 启动时若检测到 `cacheRoot` 非空，
+**整体清空** 后再进入正常 `loadFromDisk` 流程（盲扫清空，与"接受弃用 +
+不引入兼容代码"立场一致）。release notes 显式标注 "phase-2 upgrade
+首次启动会清空所有 phase-1 写入的 cache 文件"。
+
+可选替代方案（本 spec 不选）：fileName 加 `v2-` 版本前缀以便甄别。
+代价：破坏 §5.5 "schema 不变"承诺，且未来每次 hash 函数变更都要
+推进一次版本号——复杂度不值。
 
 ### R8：per-bucket SLRU 稀释 scan-resistance
 
