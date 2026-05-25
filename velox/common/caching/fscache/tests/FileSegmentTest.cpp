@@ -140,4 +140,20 @@ TEST_F(FileSegmentTest, localPathFollowsTwoLevelLayout) {
   EXPECT_EQ(path, expected);
 }
 
+TEST_F(FileSegmentTest, increasePriorityMutexIsAccessible) {
+  FsCacheKey key{PathKey::fromPath("/x"), 0, 4096};
+  FileSegment seg{key, "/x"};
+  std::unique_lock<std::mutex> lk{seg.increasePriorityMutex_, std::try_to_lock};
+  EXPECT_TRUE(lk.owns_lock());
+}
+
+TEST_F(FileSegmentTest, increasePriorityMutexExcludesConcurrentTryLock) {
+  FsCacheKey key{PathKey::fromPath("/x"), 0, 4096};
+  FileSegment seg{key, "/x"};
+  std::unique_lock<std::mutex> first{seg.increasePriorityMutex_};
+  std::unique_lock<std::mutex> second{
+      seg.increasePriorityMutex_, std::try_to_lock};
+  EXPECT_FALSE(second.owns_lock());
+}
+
 } // namespace facebook::velox::cache::fs::test

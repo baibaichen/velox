@@ -22,6 +22,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <utility>
 
@@ -123,6 +124,14 @@ class FileSegment {
   /// metadata side; at that point FileSegment can expose waitForDownload() /
   /// notifyAll() helpers and drop the public mutex_/cv_.
   mutable FileSegmentMutex mutex_;
+
+  /// Collapses concurrent LRU bumps on the same segment. recordHit() callers
+  /// take this mutex with try_to_lock; losers skip the bump (LRU bump is
+  /// best-effort, and one bump per burst of concurrent hits is enough to
+  /// move the segment toward MRU). Plain std::mutex (not RankedMutex)
+  /// because it is acquired strictly outside any cache-level mutex chain
+  /// and held only across a single onHit() call.
+  mutable std::mutex increasePriorityMutex_;
 
   /// Notifies waiters when state_ leaves kDownloading. Paired with mutex_.
   mutable std::condition_variable_any cv_;
