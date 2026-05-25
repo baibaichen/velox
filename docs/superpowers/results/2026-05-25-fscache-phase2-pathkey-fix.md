@@ -119,3 +119,28 @@ hit-path PathKey delta (e.g. `sequential.16t.0.5ws.200us` 2'309'813 →
 1'875'180 = 0.81), and they share the same residual envelope as the
 0-lat hit cells above plus extra short-wall noise. This is the expected
 shape and confirms the fix is correctly scoped to the hot path.
+
+---
+
+## Appendix: long-run rerun of `sequential.16t.0.5ws.200us`
+
+The 0.81 ratio on this cell in the 200k-op sweep was suspect: the wall
+times were 0.087 s (phase-1) and 0.107 s (phase-2), far too short for
+stable 16-thread numbers. Reran the cell at `--ops=150'000'000` (~75 s
+wall) twice on each side, serially (one binary at a time, fresh
+`/tmp/velox_fscache_bench` between runs) on the same host:
+
+| side                       | run | ops/s     | wall (s) |
+|----------------------------|----:|----------:|---------:|
+| phase-1 (8dfe97c38)        |   1 | 2'096'860 |    71.5  |
+| phase-1 (8dfe97c38)        |   2 | 2'044'759 |    73.4  |
+| phase-2-pathkey (c63541c45)|   1 | 1'999'748 |    75.0  |
+| phase-2-pathkey (c63541c45)|   2 | 1'969'659 |    76.2  |
+
+Means: phase-1 2'070'810, phase-2-pathkey 1'984'704. **Ratio = 0.96**
+(−4.2 %). Within-side spread is ≤1.3 % on phase-1 and ≤0.8 % on
+phase-2, so the long-run ratio is stable. The 0.81 short-run number
+was almost entirely sub-100-ms sampling noise; the true delta on this
+cell is in the same 4-13 % residual envelope as the other 1-thread
+hit cells.
+
