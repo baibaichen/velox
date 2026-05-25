@@ -23,6 +23,7 @@
 #include "velox/common/caching/fscache/FsCacheKey.h"
 #include "velox/common/caching/fscache/FsCacheMetadata.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -105,7 +106,7 @@ class FsCache {
   /// empty afterwards. Does NOT repopulate metadata_ (the on-disk filename
   /// encodes only the hash, not the original remote path, so a
   /// FsCacheKey{path, offset, size} cannot be reconstructed) and does NOT
-  /// credit surviving files to stats_.bytesOnDisk: orphan files that are
+  /// credit surviving files to counters_.bytesOnDisk: orphan files that are
   /// never re-requested would then be untracked by the LruPolicy and could
   /// not be evicted, eventually filling the disk. Instead, surviving files
   /// are picked up on demand --- the next getOrSet() for the same key hashes
@@ -148,7 +149,7 @@ class FsCache {
   // policy_/metadata_ to avoid orphan files on filesystem-remove failure.
   //
   // CAVEAT: this invariant is only single-writer tight. evict() reads
-  // stats_.bytesOnDisk to decide whether to drain, but recordMiss() does
+  // counters_.bytesOnDisk to decide whether to drain, but recordMiss() does
   // not credit the in-flight reservation until AFTER download() finishes,
   // so N concurrent miss-path writers can each independently observe
   // headroom and skip eviction. The worst-case transient over-shoot is
@@ -159,12 +160,23 @@ class FsCache {
   // alongside the warm-restart orphan-bytes counter (see loadFromDisk).
   void evict(uint64_t bytesNeeded);
 
-  // Records a cache hit: touches LRU and bumps stats_.hits.
+  // Records a cache hit: touches LRU and bumps counters_.hits.
   void recordHit(FileSegment* segment);
 
-  // Records a fresh miss: inserts into LRU and bumps stats_.misses /
-  // stats_.bytesOnDisk by segmentSize.
+  // Records a fresh miss: inserts into LRU and bumps counters_.misses /
+  // counters_.bytesOnDisk by segmentSize.
   void recordMiss(FileSegment* segment, uint64_t segmentSize);
+
+  // Live atomic counters. stats() composes an FsCacheStats POD snapshot from
+  // per-field relaxed loads. Per-field atomicity is enough for the
+  // observability use case; cross-field consistency between hits/misses/bytes
+  // is best-effort.
+  struct AtomicCounters {
+    std::atomic<uint64_t> hits{0};
+    std::atomic<uint64_t> misses{0};
+    std::atomic<uint64_t> evictions{0};
+    std::atomic<uint64_t> bytesOnDisk{0};
+  };
 
   const FsCacheConfig config_;
   std::unique_ptr<FsCacheMetadata> metadata_;
@@ -183,7 +195,7 @@ class FsCache {
   // it is held strictly outside the priority/state/metadata acquisitions
   // inside the eviction loop, so no rank ordering with those locks applies.
   mutable std::mutex evictionMutex_;
-  FsCacheStats stats_;
+  AtomicCounters counters_;
 };
 
 } // namespace facebook::velox::cache::fs

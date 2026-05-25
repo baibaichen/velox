@@ -238,11 +238,8 @@ void FsCache::evict(uint64_t bytesNeeded) {
   // FileSegment. Holding evictionMutex_ across the whole pass guarantees at
   // most one in-flight selectVictims+remove cycle at a time.
   std::lock_guard<std::mutex> evictGuard{evictionMutex_};
-  uint64_t current;
-  {
-    CacheStateGuard guard{stateMutex_};
-    current = stats_.bytesOnDisk;
-  }
+  const uint64_t current =
+      counters_.bytesOnDisk.load(std::memory_order_relaxed);
   if (current + bytesNeeded <= config_.maxBytes) {
     return;
   }
@@ -283,16 +280,23 @@ void FsCache::evict(uint64_t bytesNeeded) {
     freed += key.size;
     ++evictedCount;
   }
-  {
-    CacheStateGuard guard{stateMutex_};
-    stats_.evictions += evictedCount;
-    stats_.bytesOnDisk -= std::min(stats_.bytesOnDisk, freed);
-  }
+  counters_.evictions.fetch_add(evictedCount, std::memory_order_relaxed);
+  // fetch_sub does not clamp to zero; bytesOnDisk should never go negative
+  // (recordMiss always credits before evict can debit), but guard with
+  // DCHECK in debug to surface accounting bugs early.
+  const uint64_t prev =
+      counters_.bytesOnDisk.fetch_sub(freed, std::memory_order_relaxed);
+  VELOX_DCHECK_GE(
+      prev, freed, "bytesOnDisk underflow: prev={} freed={}", prev, freed);
 }
 
 FsCacheStats FsCache::stats() const {
-  CacheStateGuard guard{stateMutex_};
-  return stats_;
+  FsCacheStats snapshot;
+  snapshot.hits = counters_.hits.load(std::memory_order_relaxed);
+  snapshot.misses = counters_.misses.load(std::memory_order_relaxed);
+  snapshot.evictions = counters_.evictions.load(std::memory_order_relaxed);
+  snapshot.bytesOnDisk = counters_.bytesOnDisk.load(std::memory_order_relaxed);
+  return snapshot;
 }
 
 void FsCache::recordHit(FileSegment* segment) {
@@ -300,8 +304,7 @@ void FsCache::recordHit(FileSegment* segment) {
     CachePriorityGuard guard{priorityMutex_};
     policy_->onHit(segment);
   }
-  CacheStateGuard guard{stateMutex_};
-  ++stats_.hits;
+  counters_.hits.fetch_add(1, std::memory_order_relaxed);
 }
 
 void FsCache::recordMiss(FileSegment* segment, uint64_t segmentSize) {
@@ -309,9 +312,8 @@ void FsCache::recordMiss(FileSegment* segment, uint64_t segmentSize) {
     CachePriorityGuard guard{priorityMutex_};
     policy_->onInsert(segment);
   }
-  CacheStateGuard guard{stateMutex_};
-  ++stats_.misses;
-  stats_.bytesOnDisk += segmentSize;
+  counters_.misses.fetch_add(1, std::memory_order_relaxed);
+  counters_.bytesOnDisk.fetch_add(segmentSize, std::memory_order_relaxed);
 }
 
 namespace {

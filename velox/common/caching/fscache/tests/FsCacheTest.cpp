@@ -254,6 +254,36 @@ TEST_F(FsCacheTest, concurrentEvictionIsSafe) {
   EXPECT_EQ(stats.hits + stats.misses, kThreads * kIterations);
 }
 
+// Regression: Phase-2 moves stats counters to std::atomic and drops the
+// CacheStateGuard from the hit fast-path. The test pre-creates the segment
+// once so subsequent reads are pure hits, then hammers the hit path from
+// many threads; with mutex-protected counters this passes (baseline), and
+// with the relaxed-atomic refactor it must keep passing (no lost updates).
+TEST_F(FsCacheTest, statsCountersIncrementAcrossThreadsWithoutLoss) {
+  FsCache cache{config_};
+  LocalReadFile remote{remotePath_};
+  constexpr int kThreads{16};
+  constexpr int kPerThread{200};
+  constexpr uint64_t kSegmentSize{4UL * 1'024 * 1'024};
+
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&] {
+      LocalReadFile threadRemote{remotePath_};
+      for (int i = 0; i < kPerThread; ++i) {
+        (void)cache.getOrSet(remotePath_, 0, kSegmentSize, threadRemote);
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  const auto snapshot = cache.stats();
+  EXPECT_EQ(snapshot.misses, 1u);
+  EXPECT_EQ(snapshot.hits, kThreads * kPerThread - 1u);
+}
+
 TEST(FsCacheSingletonTest, defaultsToNullptr) {
   // Defensive: a prior test that forgot to reset the singleton would otherwise
   // poison this assertion. The singleton lives across the whole process.
