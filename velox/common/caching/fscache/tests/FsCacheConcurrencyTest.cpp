@@ -178,4 +178,42 @@ TEST_F(FsCacheConcurrencyTest, evictionUnderConcurrentLoadIsRaceFree) {
       cache.stats().bytesOnDisk, tiny.maxBytes + kThreads * kSegmentSize);
 }
 
+// 32 threads each hit the SAME segment 100 times. With try_lock-coalesced
+// LRU bumps, the total onHit invocation count is bounded above by hit
+// count (trivially) and below by at least 1 (the first hit must bump).
+// The counter we can observe through public API is FsCacheStats::hits,
+// which still reflects every hit -- what we're proving here is that the
+// test does not deadlock and produces consistent hit counts under
+// concurrent contention on increasePriorityMutex_.
+TEST_F(FsCacheConcurrencyTest, hitPathTolerates32WayContention) {
+  FsCache cache{config_};
+  constexpr int kThreads = 32;
+  constexpr int kPerThread = 100;
+  constexpr uint64_t kSegmentSize = 4UL * 1'024 * 1'024;
+  // Prime the segment as kDownloaded before racing on hits, so all kThreads
+  // observe a hit (not a miss-cv-wait).
+  {
+    LocalReadFile remote{remotePath_};
+    (void)cache.getOrSet(remotePath_, 0, kSegmentSize, remote);
+  }
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&] {
+      LocalReadFile remote{remotePath_};
+      for (int i = 0; i < kPerThread; ++i) {
+        (void)cache.getOrSet(remotePath_, 0, kSegmentSize, remote);
+      }
+    });
+  }
+  for (auto& th : threads) {
+    th.join();
+  }
+  const auto s = cache.stats();
+  EXPECT_EQ(s.misses, 1u);
+  // The priming call is one miss; every racing getOrSet hits the cached
+  // segment. hits == kThreads * kPerThread, with 0 hits from the priming
+  // call itself (recordMiss path, not recordHit).
+  EXPECT_EQ(s.hits, kThreads * kPerThread);
+}
+
 } // namespace facebook::velox::cache::fs::test

@@ -303,11 +303,17 @@ FsCacheStats FsCache::stats() const {
 }
 
 void FsCache::recordHit(FileSegment* segment) {
-  {
-    CachePriorityGuard guard{priorityMutex_};
-    policy_->onHit(segment);
-  }
   counters_.hits.fetch_add(1, std::memory_order_relaxed);
+  // increasePriorityMutex_ collapses concurrent LRU bumps on the same
+  // segment. Losers drop the bump entirely -- one bump per burst is enough
+  // to move the segment toward MRU (CH FileSegment.cpp:1196-1223 pattern).
+  std::unique_lock<std::mutex> bumpLock{
+      segment->increasePriorityMutex_, std::try_to_lock};
+  if (!bumpLock.owns_lock()) {
+    return;
+  }
+  CachePriorityGuard guard{priorityMutex_};
+  policy_->onHit(segment);
 }
 
 void FsCache::recordMiss(FileSegment* segment, uint64_t segmentSize) {
