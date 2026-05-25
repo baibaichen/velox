@@ -29,6 +29,7 @@ namespace facebook::velox::cache::fs {
 /// the remote file path. Used to bucket and index per-key metadata so that all
 /// segments of the same file land in the same bucket and KeyMetadata entry.
 struct PathKey {
+  /// Lowercase hex characters; no NUL terminator. Always 16 bytes.
   std::array<char, 16> chars;
 
   /// Computes PathKey from a remote file path.

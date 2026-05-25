@@ -28,8 +28,8 @@ PathKey PathKey::fromPath(std::string_view path) {
   uint64_t hash2{0};
   folly::hash::SpookyHashV2::Hash128(path.data(), path.size(), &hash1, &hash2);
   const uint64_t combined = hash1 ^ hash2;
-  PathKey key;
-  fmt::format_to(key.chars.data(), "{:016x}", combined);
+  PathKey key{};
+  fmt::format_to_n(key.chars.data(), key.chars.size(), "{:016x}", combined);
   return key;
 }
 
