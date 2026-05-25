@@ -23,6 +23,16 @@
 
 namespace facebook::velox::cache::fs {
 
+PathKey PathKey::fromPath(std::string_view path) {
+  uint64_t hash1{0};
+  uint64_t hash2{0};
+  folly::hash::SpookyHashV2::Hash128(path.data(), path.size(), &hash1, &hash2);
+  const uint64_t combined = hash1 ^ hash2;
+  PathKey key;
+  fmt::format_to(key.chars.data(), "{:016x}", combined);
+  return key;
+}
+
 namespace {
 // SpookyHashV2 64-bit hash mixes path bytes with offset and size.
 uint64_t combinedHash(std::string_view path, uint64_t offset, uint64_t size) {

@@ -17,6 +17,8 @@
 #include "velox/common/caching/fscache/FsCacheKey.h"
 
 #include <gtest/gtest.h>
+#include <cstring>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -68,6 +70,29 @@ TEST(FsCacheKeyTest, usableInStdUnorderedMap) {
   m.emplace(FsCacheKey{"p", 16, 16}, 2);
   EXPECT_EQ(m.size(), 2);
   EXPECT_EQ(m.at(FsCacheKey{"p", 0, 16}), 1);
+}
+
+TEST(PathKeyTest, samePathYieldsSameHex) {
+  const PathKey a = PathKey::fromPath("/data/file.parquet");
+  const PathKey b = PathKey::fromPath("/data/file.parquet");
+  EXPECT_EQ(a, b);
+  EXPECT_EQ(a.hex().size(), 16);
+  for (char c : a.hex()) {
+    EXPECT_TRUE((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));
+  }
+}
+
+TEST(PathKeyTest, differentPathsYieldDifferentHex) {
+  const PathKey a = PathKey::fromPath("/data/a");
+  const PathKey b = PathKey::fromPath("/data/b");
+  EXPECT_NE(a, b);
+}
+
+TEST(PathKeyTest, stdHashMatchesFirst8Bytes) {
+  const PathKey k = PathKey::fromPath("/x");
+  uint64_t expected{0};
+  std::memcpy(&expected, k.hex().data(), sizeof(expected));
+  EXPECT_EQ(std::hash<PathKey>{}(k), static_cast<size_t>(expected));
 }
 
 } // namespace facebook::velox::cache::fs::test

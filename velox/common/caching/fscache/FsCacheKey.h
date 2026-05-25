@@ -16,10 +16,38 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
+#include <cstring>
+#include <functional>
 #include <string>
+#include <string_view>
 
 namespace facebook::velox::cache::fs {
+
+/// Path-only hash key. Holds the 16 lowercase hex chars of SpookyHashV2 over
+/// the remote file path. Used to bucket and index per-key metadata so that all
+/// segments of the same file land in the same bucket and KeyMetadata entry.
+struct PathKey {
+  std::array<char, 16> chars;
+
+  /// Computes PathKey from a remote file path.
+  static PathKey fromPath(std::string_view path);
+
+  /// Returns the 16 hex chars as a string_view (non-owning, valid as long as
+  /// the PathKey is alive).
+  std::string_view hex() const noexcept {
+    return std::string_view(chars.data(), chars.size());
+  }
+
+  bool operator==(const PathKey& other) const noexcept {
+    return std::memcmp(chars.data(), other.chars.data(), chars.size()) == 0;
+  }
+
+  bool operator!=(const PathKey& other) const noexcept {
+    return !(*this == other);
+  }
+};
 
 /// Identifies a single cache segment by remote file path, byte offset, and
 /// segment size. Phase 1 carries no file version — the design assumes remote
@@ -56,3 +84,15 @@ struct FsCacheKeyHash {
 };
 
 } // namespace facebook::velox::cache::fs
+
+namespace std {
+template <>
+struct hash<::facebook::velox::cache::fs::PathKey> {
+  size_t operator()(
+      const ::facebook::velox::cache::fs::PathKey& key) const noexcept {
+    uint64_t first8{0};
+    std::memcpy(&first8, key.chars.data(), sizeof(first8));
+    return static_cast<size_t>(first8);
+  }
+};
+} // namespace std
