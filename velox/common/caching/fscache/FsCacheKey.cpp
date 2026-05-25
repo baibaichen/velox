@@ -17,7 +17,6 @@
 #include "velox/common/caching/fscache/FsCacheKey.h"
 
 #include <cstring>
-#include <string_view>
 
 #include <fmt/format.h>
 #include <folly/hash/SpookyHashV2.h>
@@ -30,22 +29,26 @@ PathKey PathKey::fromPath(std::string_view path) {
   folly::hash::SpookyHashV2::Hash128(path.data(), path.size(), &hash1, &hash2);
   const uint64_t combined = hash1 ^ hash2;
   PathKey key{};
-  fmt::format_to_n(key.chars.data(), key.chars.size(), "{:016x}", combined);
+  std::memcpy(key.bytes.data(), &combined, sizeof(combined));
   return key;
+}
+
+std::string PathKey::hex() const {
+  uint64_t combined{0};
+  std::memcpy(&combined, bytes.data(), sizeof(combined));
+  return fmt::format("{:016x}", combined);
 }
 
 uint64_t FsCacheKey::hash() const noexcept {
   uint64_t first8{0};
-  std::memcpy(&first8, path.chars.data(), sizeof(first8));
+  std::memcpy(&first8, path.bytes.data(), sizeof(first8));
   return first8;
 }
 
 std::string FsCacheKey::fileName() const {
-  return fmt::format(
-      "{}.{}.{}",
-      std::string_view{path.chars.data(), path.chars.size()},
-      offset,
-      size);
+  uint64_t combined{0};
+  std::memcpy(&combined, path.bytes.data(), sizeof(combined));
+  return fmt::format("{:016x}.{}.{}", combined, offset, size);
 }
 
 } // namespace facebook::velox::cache::fs

@@ -64,6 +64,14 @@ TEST(FsCacheKeyTest, fileNameSchemaUnchanged) {
   EXPECT_EQ(name.substr(22), "4096");
 }
 
+TEST(FsCacheKeyTest, fileNameHexMatchesPathKeyHex) {
+  // Guards on-disk filename contract enforced by FsCache::parseFileName: the
+  // 16 hex prefix in fileName() must equal PathKey::hex() byte-for-byte so
+  // round-tripping a cache directory produces the same PathKey.
+  FsCacheKey key{PathKey::fromPath("s3://bucket/file.parquet"), 0, 4'096};
+  EXPECT_EQ(key.fileName().substr(0, 16), key.path.hex());
+}
+
 TEST(FsCacheKeyTest, usableInStdUnorderedMap) {
   std::unordered_map<FsCacheKey, int, FsCacheKeyHash> m;
   m.emplace(FsCacheKey{PathKey::fromPath("p"), 0, 16}, 1);
@@ -76,8 +84,9 @@ TEST(PathKeyTest, samePathYieldsSameHex) {
   const PathKey a = PathKey::fromPath("/data/file.parquet");
   const PathKey b = PathKey::fromPath("/data/file.parquet");
   EXPECT_EQ(a, b);
-  EXPECT_EQ(a.hex().size(), 16);
-  for (char c : a.hex()) {
+  const std::string hexA = a.hex();
+  EXPECT_EQ(hexA.size(), 16);
+  for (char c : hexA) {
     EXPECT_TRUE((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));
   }
 }
@@ -88,10 +97,10 @@ TEST(PathKeyTest, differentPathsYieldDifferentHex) {
   EXPECT_NE(a, b);
 }
 
-TEST(PathKeyTest, stdHashMatchesFirst8Bytes) {
+TEST(PathKeyTest, stdHashEqualsBytesAsUint64) {
   const PathKey k = PathKey::fromPath("/x");
   uint64_t expected{0};
-  std::memcpy(&expected, k.hex().data(), sizeof(expected));
+  std::memcpy(&expected, k.bytes.data(), sizeof(expected));
   EXPECT_EQ(std::hash<PathKey>{}(k), static_cast<size_t>(expected));
 }
 

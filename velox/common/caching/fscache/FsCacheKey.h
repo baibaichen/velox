@@ -25,24 +25,26 @@
 
 namespace facebook::velox::cache::fs {
 
-/// Path-only hash key. Holds the 16 lowercase hex chars of SpookyHashV2 over
-/// the remote file path. Used to bucket and index per-key metadata so that all
-/// segments of the same file land in the same bucket and KeyMetadata entry.
+/// Path-only hash key. Holds the folded 64-bit SpookyHashV2 of the remote
+/// path as raw bytes; kept as a POD so the hot path (FsCache::getOrSet ->
+/// PathKey::fromPath) is two memcpys with no formatting. Hex stringification
+/// is moved into hex() / FsCacheKey::fileName(), which only run on the slow
+/// paths (logging, disk I/O). Used to bucket and index per-key metadata so
+/// all segments of the same file land in the same bucket and KeyMetadata
+/// entry.
 struct PathKey {
-  /// Lowercase hex characters; no NUL terminator. Always 16 bytes.
-  std::array<char, 16> chars;
+  /// Raw bytes of the folded SpookyHashV2 64-bit hash. Not hex-encoded.
+  std::array<uint8_t, 8> bytes{};
 
   /// Computes PathKey from a remote file path.
   static PathKey fromPath(std::string_view path);
 
-  /// Returns the 16 hex chars as a string_view (non-owning, valid as long as
-  /// the PathKey is alive).
-  std::string_view hex() const noexcept {
-    return std::string_view(chars.data(), chars.size());
-  }
+  /// Returns the 8 hash bytes hex-encoded as 16 lowercase chars. Allocates;
+  /// intended for fileName(), logging, and tests, not for the hot path.
+  std::string hex() const;
 
   bool operator==(const PathKey& other) const noexcept {
-    return std::memcmp(chars.data(), other.chars.data(), chars.size()) == 0;
+    return std::memcmp(bytes.data(), other.bytes.data(), bytes.size()) == 0;
   }
 
   bool operator!=(const PathKey& other) const noexcept {
@@ -91,7 +93,7 @@ struct hash<::facebook::velox::cache::fs::PathKey> {
   size_t operator()(
       const ::facebook::velox::cache::fs::PathKey& key) const noexcept {
     uint64_t first8{0};
-    std::memcpy(&first8, key.chars.data(), sizeof(first8));
+    std::memcpy(&first8, key.bytes.data(), sizeof(first8));
     return static_cast<size_t>(first8);
   }
 };
