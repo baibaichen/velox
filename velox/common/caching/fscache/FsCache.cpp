@@ -129,6 +129,7 @@ std::vector<FileSegmentPtr> FsCache::getOrSet(
   const auto ranges = splitRange(offset, clampedSize, config_);
   std::vector<FileSegmentPtr> result;
   result.reserve(ranges.size());
+  const PathKey pathKey = PathKey::fromPath(path);
   for (const auto& [segOffset, segSize] : ranges) {
     // splitRange rounds alignedEnd outward to config_.alignment, so the LAST
     // emitted segment's (segOffset + segSize) can exceed fileSize even though
@@ -142,7 +143,7 @@ std::vector<FileSegmentPtr> FsCache::getOrSet(
     // fileSize, every subsequent cursor is offset + k*alignment <= alignedEnd
     // - alignment < fileSize until the loop exits).
     const uint64_t effectiveSize = std::min(segSize, fileSize - segOffset);
-    FsCacheKey key{PathKey::fromPath(path), segOffset, effectiveSize};
+    FsCacheKey key{pathKey, segOffset, effectiveSize};
     result.push_back(lookupOrCreate(key, path, remote));
   }
   return result;
