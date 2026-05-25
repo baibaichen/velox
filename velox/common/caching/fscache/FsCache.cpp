@@ -23,8 +23,10 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <optional>
+#include <string_view>
 
 namespace facebook::velox::cache::fs {
 
@@ -412,6 +414,54 @@ void FsCache::recordMiss(FileSegment* segment, uint64_t segmentSize) {
 
 namespace {
 
+std::filesystem::path sentinelPath(std::string_view cacheRoot) {
+  return std::filesystem::path{cacheRoot} / kFsCacheVersionSentinelName;
+}
+
+bool sentinelMatches(std::string_view cacheRoot) {
+  std::ifstream in{sentinelPath(cacheRoot)};
+  if (!in.is_open()) {
+    return false;
+  }
+  std::string content;
+  std::getline(in, content);
+  return content == kFsCacheCurrentVersion;
+}
+
+bool writeSentinel(std::string_view cacheRoot) {
+  std::ofstream out{sentinelPath(cacheRoot), std::ios::trunc};
+  out << kFsCacheCurrentVersion;
+  out.close();
+  return out.good();
+}
+
+// Recursively removes every direct child of cacheRoot (including
+// subdirectories) but leaves cacheRoot itself in place. Returns true only
+// when the directory could be opened AND every removal succeeded; callers
+// must NOT write the version sentinel on a false return, otherwise a
+// partially-cleared phase-1 layout would silently be promoted to
+// "v2 verified" on the next restart.
+bool blindClearCacheRoot(std::string_view cacheRoot) {
+  std::error_code ec;
+  std::filesystem::directory_iterator it{cacheRoot, ec};
+  if (ec) {
+    LOG(ERROR) << "FsCache blind-clear: failed to open " << cacheRoot << ": "
+               << ec.message();
+    return false;
+  }
+  bool ok = true;
+  for (const auto& entry : it) {
+    std::error_code rmEc;
+    std::filesystem::remove_all(entry.path(), rmEc);
+    if (rmEc) {
+      LOG(WARNING) << "FsCache blind-clear: failed to remove "
+                   << entry.path().string() << ": " << rmEc.message();
+      ok = false;
+    }
+  }
+  return ok;
+}
+
 struct ParsedName {
   uint64_t offset;
   uint64_t size;
@@ -471,8 +521,34 @@ std::optional<ParsedName> parseFileName(const std::string& name) {
 
 void FsCache::loadFromDisk() {
   if (!std::filesystem::exists(config_.cacheRoot)) {
+    std::filesystem::create_directories(config_.cacheRoot);
+    VELOX_CHECK(
+        writeSentinel(config_.cacheRoot),
+        "FsCache: failed to write version sentinel under cacheRoot: {}",
+        config_.cacheRoot);
     return;
   }
+  if (!sentinelMatches(config_.cacheRoot)) {
+    // Either a fresh phase-2 install on top of phase-1 files, or an
+    // unrelated foreign cacheRoot. Disk layout from phase-1 is not
+    // re-keyable (filename only encodes hash, not original path), so spec
+    // §10 R7 commits to blind-clear and re-fetch on demand. Refuse to
+    // stamp the sentinel if the clear was incomplete --- otherwise the
+    // next restart would skip this branch and operate on a half-cleared
+    // tree of phase-1 files.
+    VELOX_CHECK(
+        blindClearCacheRoot(config_.cacheRoot),
+        "FsCache: blind-clear of cacheRoot failed; refusing to advance "
+        "version sentinel. cacheRoot: {}",
+        config_.cacheRoot);
+    VELOX_CHECK(
+        writeSentinel(config_.cacheRoot),
+        "FsCache: failed to write version sentinel after blind-clear "
+        "under cacheRoot: {}",
+        config_.cacheRoot);
+    return;
+  }
+
   // Collect victims during the scan, then delete after iteration finishes.
   // std::filesystem::recursive_directory_iterator does not guarantee safe
   // increment after the current entry is unlinked, and even less so when the
@@ -481,6 +557,9 @@ void FsCache::loadFromDisk() {
   for (auto& entry :
        std::filesystem::recursive_directory_iterator{config_.cacheRoot}) {
     if (!entry.is_regular_file()) {
+      continue;
+    }
+    if (entry.path().filename() == kFsCacheVersionSentinelName) {
       continue;
     }
     if (entry.path().extension() == ".tmp") {

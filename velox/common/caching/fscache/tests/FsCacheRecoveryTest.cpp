@@ -17,6 +17,7 @@
 #include "velox/common/caching/fscache/FsCache.h"
 
 #include "velox/common/caching/fscache/FileSegment.h"
+#include "velox/common/caching/fscache/FsCacheKey.h"
 #include "velox/common/file/File.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
 
@@ -42,6 +43,12 @@ class FsCacheRecoveryTest : public ::testing::Test {
     cacheRoot_ = tempDir_->getPath() + "/cache";
     remotePath_ = tempDir_->getPath() + "/remote.bin";
     std::filesystem::create_directories(cacheRoot_);
+    // Phase-2 fixtures that pre-populate cacheRoot must declare the layout
+    // is already v2-compatible; otherwise loadFromDisk() will blind-clear
+    // and the test loses coverage of the .tmp / size-mismatch path.
+    std::ofstream{
+        std::filesystem::path{cacheRoot_} / kFsCacheVersionSentinelName}
+        << kFsCacheCurrentVersion;
 
     std::ofstream out{remotePath_, std::ios::binary};
     const std::string blob(8UL * 1'024 * 1'024, 'x');
@@ -142,6 +149,63 @@ TEST_F(FsCacheRecoveryTest, validFilesSurvive) {
     }
   }
   EXPECT_EQ(bytesOnDiskAfter, bytesOnDiskBefore);
+}
+
+TEST_F(FsCacheRecoveryTest, blindClearsCacheRootWithoutVersionSentinel) {
+  // Simulate a phase-1 (or unknown) cache: cacheRoot has files but no
+  // .fscache_version sentinel. Spec §10 R7: phase-1 hashes are not
+  // re-keyable, so loadFromDisk must clear everything on first phase-2
+  // start. SetUp() pre-writes the sentinel for the other fixtures; this
+  // test removes it to drive the no-sentinel branch.
+  std::filesystem::remove(
+      std::filesystem::path{cacheRoot_} / kFsCacheVersionSentinelName);
+  const auto stale = cacheRoot_ + "/aa/bb/legacy.0.4096";
+  std::filesystem::create_directories(
+      std::filesystem::path{stale}.parent_path());
+  {
+    std::ofstream out{stale, std::ios::binary};
+    out.write("garbage", 7);
+  }
+  ASSERT_TRUE(std::filesystem::exists(stale));
+
+  FsCache cache{config_};
+  cache.loadFromDisk();
+
+  EXPECT_FALSE(std::filesystem::exists(stale))
+      << "phase-2 loadFromDisk must blind-clear cacheRoot when no version "
+         "sentinel is present";
+  EXPECT_TRUE(std::filesystem::exists(
+      std::filesystem::path{cacheRoot_} / kFsCacheVersionSentinelName))
+      << "sentinel must be written after blind clear so subsequent "
+         "restarts skip the clear";
+}
+
+TEST_F(FsCacheRecoveryTest, preservesCacheRootWithMatchingVersionSentinel) {
+  {
+    std::ofstream out{
+        std::filesystem::path{cacheRoot_} / kFsCacheVersionSentinelName};
+    out << kFsCacheCurrentVersion;
+  }
+  const FsCacheKey key{PathKey::fromPath("/data/x"), 0, 4'096};
+  const std::string fileName = key.fileName();
+  const std::string prefix = fileName.substr(0, 2);
+  const std::string sub = fileName.substr(2, 2);
+  std::filesystem::create_directories(
+      cacheRoot_ + "/" + prefix + "/" + sub);
+  const auto survivor =
+      cacheRoot_ + "/" + prefix + "/" + sub + "/" + fileName;
+  {
+    std::ofstream out{survivor, std::ios::binary};
+    const std::string blob(4'096, 'q');
+    out.write(blob.data(), blob.size());
+  }
+
+  FsCache cache{config_};
+  cache.loadFromDisk();
+
+  EXPECT_TRUE(std::filesystem::exists(survivor))
+      << "phase-2 cache with matching sentinel must preserve survivor "
+         "files";
 }
 
 } // namespace facebook::velox::cache::fs::test

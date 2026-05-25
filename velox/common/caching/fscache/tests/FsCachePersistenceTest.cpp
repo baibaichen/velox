@@ -71,6 +71,12 @@ TEST(FsCachePersistenceTest, dataSurvivesRestart) {
   const std::string remotePath = tempDir->getPath() + "/remote.bin";
   const std::string cacheRoot = tempDir->getPath() + "/cache";
   std::filesystem::create_directories(cacheRoot);
+  // The first-run FsCache does not call loadFromDisk(), so the sentinel
+  // would never be written. Pre-write it so the second-run loadFromDisk()
+  // takes the survivor-preserving path rather than blind-clearing.
+  std::ofstream{
+      std::filesystem::path{cacheRoot} / kFsCacheVersionSentinelName}
+      << kFsCacheCurrentVersion;
   {
     std::ofstream out{remotePath, std::ios::binary};
     const std::string blob(4UL * 1'024 * 1'024, 'z');
@@ -96,7 +102,8 @@ TEST(FsCachePersistenceTest, dataSurvivesRestart) {
   uint64_t diskBytesBetweenRuns = 0;
   for (auto& p :
        std::filesystem::recursive_directory_iterator{cacheRoot}) {
-    if (p.is_regular_file()) {
+    if (p.is_regular_file() &&
+        p.path().filename() != kFsCacheVersionSentinelName) {
       diskBytesBetweenRuns += p.file_size();
     }
   }

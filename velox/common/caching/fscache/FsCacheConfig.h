@@ -19,8 +19,21 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 namespace facebook::velox::cache::fs {
+
+/// On-disk version sentinel file, written under cacheRoot to mark the
+/// directory layout produced by this build. loadFromDisk() blind-clears
+/// cacheRoot when the sentinel is absent or its content does not match
+/// kFsCacheCurrentVersion, since phase-1 hashes are not re-keyable.
+inline constexpr std::string_view kFsCacheVersionSentinelName =
+    ".fscache_version";
+
+/// Current on-disk layout version written into kFsCacheVersionSentinelName.
+/// Bump when the on-disk filename format or directory layout changes in a
+/// way that older survivors would mis-key against the new hasher.
+inline constexpr std::string_view kFsCacheCurrentVersion = "2";
 
 /// Holds configuration for an FsCache instance. All fields are immutable after
 /// the FsCache is constructed.
