@@ -125,8 +125,8 @@ class FileSegment {
   /// notifyAll() helpers and drop the public mutex_/cv_.
   mutable FileSegmentMutex mutex_;
 
-  /// Collapses concurrent LRU bumps on the same segment. recordHit() callers
-  /// take this mutex with try_to_lock; losers skip the bump (LRU bump is
+  /// Collapses concurrent LRU bumps on the same segment. FsCache::recordHit()
+  /// callers take this mutex with try_to_lock; losers skip the bump (LRU bump is
   /// best-effort, and one bump per burst of concurrent hits is enough to
   /// move the segment toward MRU). Plain std::mutex (not RankedMutex)
   /// because it is acquired strictly outside any cache-level mutex chain
