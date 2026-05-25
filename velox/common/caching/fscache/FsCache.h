@@ -169,8 +169,10 @@ class FsCache {
 
   // Live atomic counters. stats() composes an FsCacheStats POD snapshot from
   // per-field relaxed loads. Per-field atomicity is enough for the
-  // observability use case; cross-field consistency between hits/misses/bytes
-  // is best-effort.
+  // observability use case. Snapshots taken concurrently with writers can
+  // observe arbitrary cross-field skew (the four loads are independent);
+  // callers needing a consistent snapshot (e.g. tests asserting hits+misses
+  // == total) must first quiesce writers (e.g. thread.join()).
   struct AtomicCounters {
     std::atomic<uint64_t> hits{0};
     std::atomic<uint64_t> misses{0};
@@ -186,7 +188,6 @@ class FsCache {
   // FileSegmentMutex lives inside each FileSegment; KeyMutex is reserved
   // for phase 2 (per-key serialization of concurrent downloads).
   mutable CachePriorityMutex priorityMutex_;
-  mutable CacheStateMutex stateMutex_;
   // Serializes evict(). Two concurrent writers calling evict() could otherwise
   // each receive the same victim from selectVictims() (which does not detach
   // entries from the LRU list), causing the second thread to dereference a

@@ -254,11 +254,12 @@ TEST_F(FsCacheTest, concurrentEvictionIsSafe) {
   EXPECT_EQ(stats.hits + stats.misses, kThreads * kIterations);
 }
 
-// Regression: Phase-2 moves stats counters to std::atomic and drops the
-// CacheStateGuard from the hit fast-path. The test pre-creates the segment
-// once so subsequent reads are pure hits, then hammers the hit path from
-// many threads; with mutex-protected counters this passes (baseline), and
-// with the relaxed-atomic refactor it must keep passing (no lost updates).
+// Phase-2 moves stats counters to std::atomic and drops the
+// CacheStateGuard from the hit fast-path. All kThreads * kPerThread
+// calls race for the same key from t=0; the implementation guarantees a
+// single writer via beginDownload(), so the race produces exactly 1
+// recordMiss with the rest going through recordHit. The hits assertion
+// then catches any lost update on the relaxed atomic counter.
 TEST_F(FsCacheTest, statsCountersIncrementAcrossThreadsWithoutLoss) {
   FsCache cache{config_};
   LocalReadFile remote{remotePath_};

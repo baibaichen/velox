@@ -281,9 +281,12 @@ void FsCache::evict(uint64_t bytesNeeded) {
     ++evictedCount;
   }
   counters_.evictions.fetch_add(evictedCount, std::memory_order_relaxed);
-  // fetch_sub does not clamp to zero; bytesOnDisk should never go negative
-  // (recordMiss always credits before evict can debit), but guard with
-  // DCHECK in debug to surface accounting bugs early.
+  // fetch_sub does not clamp to zero. Underflow cannot occur in practice:
+  // every segment in policy_ reached kDownloaded via recordMiss, which
+  // credited segmentSize == key.size to bytesOnDisk; freed sums key.size of
+  // segments actually removed from policy_, so freed <= sum of outstanding
+  // credits == bytesOnDisk at all times. The DCHECK surfaces accounting
+  // bugs in debug builds.
   const uint64_t prev =
       counters_.bytesOnDisk.fetch_sub(freed, std::memory_order_relaxed);
   VELOX_DCHECK_GE(
