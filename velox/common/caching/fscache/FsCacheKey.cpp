@@ -16,6 +16,7 @@
 
 #include "velox/common/caching/fscache/FsCacheKey.h"
 
+#include <cstring>
 #include <string_view>
 
 #include <fmt/format.h>
@@ -33,22 +34,18 @@ PathKey PathKey::fromPath(std::string_view path) {
   return key;
 }
 
-namespace {
-// SpookyHashV2 64-bit hash mixes path bytes with offset and size.
-uint64_t combinedHash(std::string_view path, uint64_t offset, uint64_t size) {
-  uint64_t hash1 = offset;
-  uint64_t hash2 = size;
-  folly::hash::SpookyHashV2::Hash128(path.data(), path.size(), &hash1, &hash2);
-  return hash1 ^ hash2;
-}
-} // namespace
-
 uint64_t FsCacheKey::hash() const noexcept {
-  return combinedHash(path, offset, size);
+  uint64_t first8{0};
+  std::memcpy(&first8, path.chars.data(), sizeof(first8));
+  return first8;
 }
 
 std::string FsCacheKey::fileName() const {
-  return fmt::format("{:016x}.{}.{}", hash(), offset, size);
+  return fmt::format(
+      "{}.{}.{}",
+      std::string_view{path.chars.data(), path.chars.size()},
+      offset,
+      size);
 }
 
 } // namespace facebook::velox::cache::fs

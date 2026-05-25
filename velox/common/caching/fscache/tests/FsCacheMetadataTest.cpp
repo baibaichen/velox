@@ -29,44 +29,59 @@ namespace facebook::velox::cache::fs::test {
 
 TEST(FsCacheMetadataTest, insertAndLookupSameKey) {
   FsCacheMetadata metadata{8};
-  auto segment = std::make_shared<FileSegment>(FsCacheKey{"p", 0, 16});
+  auto segment = std::make_shared<FileSegment>(
+      FsCacheKey{PathKey::fromPath("p"), 0, 16}, "p");
   EXPECT_TRUE(metadata.insert(segment));
 
-  auto found = metadata.lookup(FsCacheKey{"p", 0, 16});
+  auto found = metadata.lookup(FsCacheKey{PathKey::fromPath("p"), 0, 16});
   ASSERT_NE(found, nullptr);
   EXPECT_EQ(found.get(), segment.get());
 }
 
 TEST(FsCacheMetadataTest, lookupReturnsNullForMissingKey) {
   FsCacheMetadata metadata{8};
-  EXPECT_EQ(metadata.lookup(FsCacheKey{"missing", 0, 16}), nullptr);
+  EXPECT_EQ(
+      metadata.lookup(FsCacheKey{PathKey::fromPath("missing"), 0, 16}),
+      nullptr);
 }
 
 TEST(FsCacheMetadataTest, insertDuplicateReturnsFalse) {
   FsCacheMetadata metadata{8};
-  auto a = std::make_shared<FileSegment>(FsCacheKey{"p", 0, 16});
-  auto b = std::make_shared<FileSegment>(FsCacheKey{"p", 0, 16});
+  auto a = std::make_shared<FileSegment>(
+      FsCacheKey{PathKey::fromPath("p"), 0, 16}, "p");
+  auto b = std::make_shared<FileSegment>(
+      FsCacheKey{PathKey::fromPath("p"), 0, 16}, "p");
   EXPECT_TRUE(metadata.insert(a));
   EXPECT_FALSE(metadata.insert(b));
-  EXPECT_EQ(metadata.lookup(FsCacheKey{"p", 0, 16}).get(), a.get());
+  EXPECT_EQ(
+      metadata.lookup(FsCacheKey{PathKey::fromPath("p"), 0, 16}).get(),
+      a.get());
 }
 
 TEST(FsCacheMetadataTest, eraseRemovesFromBucket) {
   FsCacheMetadata metadata{8};
-  auto segment = std::make_shared<FileSegment>(FsCacheKey{"p", 0, 16});
+  auto segment = std::make_shared<FileSegment>(
+      FsCacheKey{PathKey::fromPath("p"), 0, 16}, "p");
   metadata.insert(segment);
-  EXPECT_TRUE(metadata.erase(FsCacheKey{"p", 0, 16}));
-  EXPECT_EQ(metadata.lookup(FsCacheKey{"p", 0, 16}), nullptr);
+  EXPECT_TRUE(metadata.erase(FsCacheKey{PathKey::fromPath("p"), 0, 16}));
+  EXPECT_EQ(
+      metadata.lookup(FsCacheKey{PathKey::fromPath("p"), 0, 16}), nullptr);
 }
 
 TEST(FsCacheMetadataTest, keysWithSamePathDifferentOffsetCoexist) {
   FsCacheMetadata metadata{8};
-  auto a = std::make_shared<FileSegment>(FsCacheKey{"p", 0, 16});
-  auto b = std::make_shared<FileSegment>(FsCacheKey{"p", 16, 16});
+  auto a = std::make_shared<FileSegment>(
+      FsCacheKey{PathKey::fromPath("p"), 0, 16}, "p");
+  auto b = std::make_shared<FileSegment>(
+      FsCacheKey{PathKey::fromPath("p"), 16, 16}, "p");
   EXPECT_TRUE(metadata.insert(a));
   EXPECT_TRUE(metadata.insert(b));
-  EXPECT_EQ(metadata.lookup(FsCacheKey{"p", 0, 16}).get(), a.get());
-  EXPECT_EQ(metadata.lookup(FsCacheKey{"p", 16, 16}).get(), b.get());
+  EXPECT_EQ(
+      metadata.lookup(FsCacheKey{PathKey::fromPath("p"), 0, 16}).get(),
+      a.get());
+  EXPECT_EQ(
+      metadata.lookup(FsCacheKey{PathKey::fromPath("p"), 16, 16}).get(),
+      b.get());
 }
 
 TEST(FsCacheMetadataTest, ctorRejectsNonPowerOfTwoBuckets) {
@@ -79,13 +94,13 @@ TEST(FsCacheMetadataTest, ctorRejectsNonPowerOfTwoBuckets) {
 
 TEST(FsCacheMetadataTest, snapshotReturnsAllSegments) {
   FsCacheMetadata metadata{8};
-  auto a = std::make_shared<FileSegment>(FsCacheKey{"p", 0, 16});
-  auto b = std::make_shared<FileSegment>(FsCacheKey{"q", 32, 16});
+  auto a = std::make_shared<FileSegment>(
+      FsCacheKey{PathKey::fromPath("p"), 0, 16}, "p");
+  auto b = std::make_shared<FileSegment>(
+      FsCacheKey{PathKey::fromPath("q"), 32, 16}, "q");
   metadata.insert(a);
   metadata.insert(b);
-  EXPECT_THAT(
-      metadata.snapshot(),
-      testing::UnorderedElementsAre(a, b));
+  EXPECT_THAT(metadata.snapshot(), testing::UnorderedElementsAre(a, b));
 }
 
 } // namespace facebook::velox::cache::fs::test

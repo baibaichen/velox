@@ -55,8 +55,8 @@ class EvictionPolicyTest : public ::testing::Test {
   std::unique_ptr<FileSegment> downloaded(uint64_t size) {
     const uint64_t offset = nextOffset_;
     nextOffset_ += size;
-    auto segment =
-        std::make_unique<FileSegment>(FsCacheKey{remotePath_, offset, size});
+    auto segment = std::make_unique<FileSegment>(
+        FsCacheKey{PathKey::fromPath(remotePath_), offset, size}, remotePath_);
     VELOX_CHECK(segment->beginDownload());
     LocalReadFile remote{remotePath_};
     segment->download(remote, cacheRoot_);
@@ -129,8 +129,10 @@ TEST_F(EvictionPolicyTest, onInsertRejectsNonDownloadedSegments) {
   // Tracking non-kDownloaded segments would let selectVictims return a
   // segment whose download is still in-flight, racing with the writer over
   // the on-disk file.
-  FileSegment empty{FsCacheKey{remotePath_, 0, 100}};
-  FileSegment downloading{FsCacheKey{remotePath_, 100, 100}};
+  FileSegment empty{
+      FsCacheKey{PathKey::fromPath(remotePath_), 0, 100}, remotePath_};
+  FileSegment downloading{
+      FsCacheKey{PathKey::fromPath(remotePath_), 100, 100}, remotePath_};
   ASSERT_TRUE(downloading.beginDownload());
   EXPECT_THROW(policy.onInsert(&empty), VeloxException);
   EXPECT_THROW(policy.onInsert(&downloading), VeloxException);

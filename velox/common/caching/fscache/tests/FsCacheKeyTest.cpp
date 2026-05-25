@@ -25,10 +25,10 @@
 namespace facebook::velox::cache::fs::test {
 
 TEST(FsCacheKeyTest, equalityAndInequality) {
-  FsCacheKey a{"s3://bucket/file", 0, 4096};
-  FsCacheKey b{"s3://bucket/file", 0, 4096};
-  FsCacheKey c{"s3://bucket/file", 4096, 4096};
-  FsCacheKey d{"s3://bucket/other", 0, 4096};
+  FsCacheKey a{PathKey::fromPath("s3://bucket/file"), 0, 4096};
+  FsCacheKey b{PathKey::fromPath("s3://bucket/file"), 0, 4096};
+  FsCacheKey c{PathKey::fromPath("s3://bucket/file"), 4096, 4096};
+  FsCacheKey d{PathKey::fromPath("s3://bucket/other"), 0, 4096};
 
   EXPECT_EQ(a, b);
   EXPECT_NE(a, c);
@@ -36,40 +36,40 @@ TEST(FsCacheKeyTest, equalityAndInequality) {
 }
 
 TEST(FsCacheKeyTest, hashStableAcrossInstances) {
-  FsCacheKey a{"s3://bucket/file", 0, 4096};
-  FsCacheKey b{"s3://bucket/file", 0, 4096};
+  FsCacheKey a{PathKey::fromPath("s3://bucket/file"), 0, 4096};
+  FsCacheKey b{PathKey::fromPath("s3://bucket/file"), 0, 4096};
   EXPECT_EQ(a.hash(), b.hash());
 }
 
-TEST(FsCacheKeyTest, hashDiffersWhenAnyFieldDiffers) {
-  FsCacheKey base{"s3://bucket/file", 0, 4096};
-  FsCacheKey differentPath{"s3://bucket/other", 0, 4096};
-  FsCacheKey differentOffset{"s3://bucket/file", 4096, 4096};
-  FsCacheKey differentSize{"s3://bucket/file", 0, 8192};
-
-  std::unordered_set<uint64_t> hashes{
-      base.hash(),
-      differentPath.hash(),
-      differentOffset.hash(),
-      differentSize.hash(),
-  };
-  EXPECT_EQ(hashes.size(), 4);
+TEST(FsCacheKeyTest, hashIsPathOnlyAcrossOffsets) {
+  FsCacheKey a{PathKey::fromPath("/data/x"), 0, 4096};
+  FsCacheKey b{PathKey::fromPath("/data/x"), 8192, 4096};
+  EXPECT_EQ(a.hash(), b.hash())
+      << "Phase-2: hash() depends on path only, not (offset, size)";
 }
 
-TEST(FsCacheKeyTest, fileNameContainsHexHashOffsetSize) {
-  FsCacheKey k{"s3://bucket/file", 0, 4096};
-  const std::string name = k.fileName();
-  // 64-bit hash printed as 16 hex chars, then ".0.4096".
-  EXPECT_EQ(name.size(), 16 + std::string{".0.4096"}.size());
-  EXPECT_NE(name.find(".0.4096"), std::string::npos);
+TEST(FsCacheKeyTest, hashDiffersByPath) {
+  FsCacheKey a{PathKey::fromPath("/data/x"), 0, 4096};
+  FsCacheKey b{PathKey::fromPath("/data/y"), 0, 4096};
+  EXPECT_NE(a.hash(), b.hash());
+}
+
+TEST(FsCacheKeyTest, fileNameSchemaUnchanged) {
+  FsCacheKey key{PathKey::fromPath("/data/x"), 1234, 4096};
+  const std::string name = key.fileName();
+  // "<16-hex>.<offset>.<size>"
+  EXPECT_EQ(name.size(), 16 + 1 + 4 + 1 + 4);
+  EXPECT_EQ(name[16], '.');
+  EXPECT_EQ(name.substr(17, 4), "1234");
+  EXPECT_EQ(name.substr(22), "4096");
 }
 
 TEST(FsCacheKeyTest, usableInStdUnorderedMap) {
   std::unordered_map<FsCacheKey, int, FsCacheKeyHash> m;
-  m.emplace(FsCacheKey{"p", 0, 16}, 1);
-  m.emplace(FsCacheKey{"p", 16, 16}, 2);
+  m.emplace(FsCacheKey{PathKey::fromPath("p"), 0, 16}, 1);
+  m.emplace(FsCacheKey{PathKey::fromPath("p"), 16, 16}, 2);
   EXPECT_EQ(m.size(), 2);
-  EXPECT_EQ(m.at(FsCacheKey{"p", 0, 16}), 1);
+  EXPECT_EQ(m.at(FsCacheKey{PathKey::fromPath("p"), 0, 16}), 1);
 }
 
 TEST(PathKeyTest, samePathYieldsSameHex) {

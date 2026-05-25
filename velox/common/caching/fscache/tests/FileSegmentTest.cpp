@@ -54,15 +54,15 @@ class FileSegmentTest : public ::testing::Test {
 };
 
 TEST_F(FileSegmentTest, freshSegmentStartsEmpty) {
-  FsCacheKey key{remotePath_, 0, 4'096};
-  FileSegment segment{key};
+  FsCacheKey key{PathKey::fromPath(remotePath_), 0, 4'096};
+  FileSegment segment{key, remotePath_};
   EXPECT_EQ(segment.state(), FileSegment::State::kEmpty);
   EXPECT_EQ(segment.downloadedSize(), 0);
 }
 
 TEST_F(FileSegmentTest, downloadFromLocalFileSucceeds) {
-  FsCacheKey key{remotePath_, 0, 4'096};
-  FileSegment segment{key};
+  FsCacheKey key{PathKey::fromPath(remotePath_), 0, 4'096};
+  FileSegment segment{key, remotePath_};
 
   LocalReadFile remote{remotePath_};
   ASSERT_TRUE(segment.beginDownload());
@@ -77,8 +77,8 @@ TEST_F(FileSegmentTest, downloadFromLocalFileSucceeds) {
 }
 
 TEST_F(FileSegmentTest, readReturnsExactBytes) {
-  FsCacheKey key{remotePath_, 256, 1'024};
-  FileSegment segment{key};
+  FsCacheKey key{PathKey::fromPath(remotePath_), 256, 1'024};
+  FileSegment segment{key, remotePath_};
   LocalReadFile remote{remotePath_};
   ASSERT_TRUE(segment.beginDownload());
   segment.download(remote, cacheRoot_);
@@ -98,31 +98,29 @@ TEST_F(FileSegmentTest, downloadFailureLeavesEmpty) {
   // FileSegment::download is supposed to roll state back to kEmpty and
   // remove any .tmp.
   constexpr uint64_t kTooLarge = 1UL << 20;
-  FsCacheKey key{remotePath_, 0, kTooLarge};
-  FileSegment segment{key};
+  FsCacheKey key{PathKey::fromPath(remotePath_), 0, kTooLarge};
+  FileSegment segment{key, remotePath_};
   ASSERT_TRUE(segment.beginDownload());
   LocalReadFile remote{remotePath_};
   EXPECT_THROW(segment.download(remote, cacheRoot_), std::exception);
   EXPECT_EQ(segment.state(), FileSegment::State::kEmpty);
   EXPECT_FALSE(std::filesystem::exists(segment.localPath(cacheRoot_)));
-  EXPECT_FALSE(
-      std::filesystem::exists(segment.localPath(cacheRoot_) + ".tmp"));
+  EXPECT_FALSE(std::filesystem::exists(segment.localPath(cacheRoot_) + ".tmp"));
 }
 
 TEST_F(FileSegmentTest, downloadAtomicityViaTmpRename) {
-  FsCacheKey key{remotePath_, 0, 4'096};
-  FileSegment segment{key};
+  FsCacheKey key{PathKey::fromPath(remotePath_), 0, 4'096};
+  FileSegment segment{key, remotePath_};
   LocalReadFile remote{remotePath_};
   ASSERT_TRUE(segment.beginDownload());
   segment.download(remote, cacheRoot_);
   // After a successful download, the .tmp file must have been renamed away.
-  EXPECT_FALSE(
-      std::filesystem::exists(segment.localPath(cacheRoot_) + ".tmp"));
+  EXPECT_FALSE(std::filesystem::exists(segment.localPath(cacheRoot_) + ".tmp"));
 }
 
 TEST_F(FileSegmentTest, beginDownloadIsOneShot) {
-  FsCacheKey key{remotePath_, 0, 4'096};
-  FileSegment segment{key};
+  FsCacheKey key{PathKey::fromPath(remotePath_), 0, 4'096};
+  FileSegment segment{key, remotePath_};
   EXPECT_TRUE(segment.beginDownload());
   // Subsequent callers must lose the CAS race; only the first wins.
   EXPECT_FALSE(segment.beginDownload());
@@ -130,8 +128,8 @@ TEST_F(FileSegmentTest, beginDownloadIsOneShot) {
 }
 
 TEST_F(FileSegmentTest, localPathFollowsTwoLevelLayout) {
-  FsCacheKey key{remotePath_, 0, 4'096};
-  FileSegment segment{key};
+  FsCacheKey key{PathKey::fromPath(remotePath_), 0, 4'096};
+  FileSegment segment{key, remotePath_};
   const std::string path = segment.localPath(cacheRoot_);
   // <cacheRoot>/<hex[0:2]>/<hex[2:4]>/<fileName> — verify the prefix and
   // that the leaf name matches the key.

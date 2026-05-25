@@ -50,11 +50,12 @@ struct PathKey {
   }
 };
 
-/// Identifies a single cache segment by remote file path, byte offset, and
-/// segment size. Phase 1 carries no file version — the design assumes remote
-/// files are immutable.
+/// Identifies a single cache segment by PathKey (path-only hash) + offset +
+/// size. Phase-2 splits the phase-1 (path, offset, size) composite key so that
+/// all segments of the same file share the same hash bucket, enabling
+/// per-key metadata indirection.
 struct FsCacheKey {
-  std::string path;
+  PathKey path;
   uint64_t offset{0};
   uint64_t size{0};
 
@@ -66,14 +67,12 @@ struct FsCacheKey {
     return !(*this == other);
   }
 
-  /// Returns a 64-bit hash derived from all three fields. Stable across
-  /// processes on the same architecture (folly SpookyHashV2 is fixed seed).
+  /// Returns a 64-bit hash derived from PathKey only (NOT offset/size).
+  /// Two FsCacheKeys with the same path but different offsets hash equally.
   uint64_t hash() const noexcept;
 
-  /// Returns the on-disk file name "<16-hex-hash>.<offset>.<size>". The hash
-  /// is hex (only [0-9a-f]) so the "." separator is unambiguous and the
-  /// numeric fields cannot collide with the hash. Used both for file
-  /// placement and for parsing during recovery.
+  /// Returns "<pathkey-hex>.<offset>.<size>". Schema matches phase-1 but the
+  /// hash value differs — phase-1 cache files cannot be re-keyed by phase-2.
   std::string fileName() const;
 };
 

@@ -51,13 +51,21 @@ class FileSegment {
     kDetached = 3,
   };
 
-  /// Constructs a fresh kEmpty segment. State transitions happen via
-  /// beginDownload() / download().
-  explicit FileSegment(FsCacheKey key) : key_{std::move(key)} {}
+  /// Constructs a fresh kEmpty segment for the given key. remotePath is the
+  /// original (string) path used to fetch missing bytes from remote; it is
+  /// stored alongside the (path-only-hashed) key because FsCacheKey itself no
+  /// longer carries the human-readable path.
+  FileSegment(FsCacheKey key, std::string remotePath)
+      : key_{std::move(key)}, remotePath_{std::move(remotePath)} {}
 
   /// Returns the cache key (path/offset/size) that identifies this segment.
   const FsCacheKey& key() const {
     return key_;
+  }
+
+  /// Returns the remote file path string for download() and diagnostics.
+  const std::string& remotePath() const {
+    return remotePath_;
   }
 
   /// Returns the segment size in bytes; equal to key().size.
@@ -121,6 +129,7 @@ class FileSegment {
 
  private:
   FsCacheKey key_;
+  std::string remotePath_;
   std::atomic<State> state_{State::kEmpty};
   std::atomic<uint64_t> downloadedSize_{0};
 

@@ -142,14 +142,15 @@ std::vector<FileSegmentPtr> FsCache::getOrSet(
     // fileSize, every subsequent cursor is offset + k*alignment <= alignedEnd
     // - alignment < fileSize until the loop exits).
     const uint64_t effectiveSize = std::min(segSize, fileSize - segOffset);
-    FsCacheKey key{path, segOffset, effectiveSize};
-    result.push_back(lookupOrCreate(key, remote));
+    FsCacheKey key{PathKey::fromPath(path), segOffset, effectiveSize};
+    result.push_back(lookupOrCreate(key, path, remote));
   }
   return result;
 }
 
 FileSegmentPtr FsCache::lookupOrCreate(
     const FsCacheKey& key,
+    const std::string& path,
     ::facebook::velox::ReadFile& remote) {
   // 1. Fast path: existing kDownloaded segment.
   if (auto existing = metadata_->lookup(key); existing != nullptr &&
@@ -162,7 +163,7 @@ FileSegmentPtr FsCache::lookupOrCreate(
   //    insert races with a concurrent inserter, lookup() returns the winning
   //    entry so writer/waiter coordination on the SAME FileSegment instance
   //    is preserved.
-  auto segment = std::make_shared<FileSegment>(key);
+  auto segment = std::make_shared<FileSegment>(key, path);
   if (!metadata_->insert(segment)) {
     segment = metadata_->lookup(key);
     VELOX_CHECK_NOT_NULL(segment);
@@ -218,7 +219,7 @@ FileSegmentPtr FsCache::lookupOrCreate(
     // another thread's IO failure into a CHECK-failure crash on the waiter.
     VELOX_USER_FAIL(
         "FsCache concurrent download failed for path={} offset={} size={}",
-        key.path,
+        segment->remotePath(),
         key.offset,
         key.size);
   }
@@ -268,8 +269,8 @@ void FsCache::evict(uint64_t bytesNeeded) {
       // permission change). Leave the victim in policy_ and metadata_ so a
       // later evict() can retry; better a temporary over-capacity than
       // losing the entry and leaking the file.
-      LOG(WARNING) << "FsCache evict: failed to remove " << key.path << " ["
-                   << key.offset << ".." << key.offset + key.size
+      LOG(WARNING) << "FsCache evict: failed to remove " << victim->remotePath()
+                   << " [" << key.offset << ".." << key.offset + key.size
                    << "): " << ec.message();
       continue;
     }

@@ -135,9 +135,12 @@ class FsCache {
  private:
   // Looks up an existing segment or coordinates a fresh download. Single
   // writer per key via FileSegment::beginDownload(); concurrent callers wait
-  // on FileSegment::cv_ for the writer's outcome.
+  // on FileSegment::cv_ for the writer's outcome. path is the original remote
+  // path string, passed through to FileSegment so it can be used by download()
+  // and diagnostics — the (path-only-hashed) FsCacheKey does not carry it.
   FileSegmentPtr lookupOrCreate(
       const FsCacheKey& key,
+      const std::string& path,
       ::facebook::velox::ReadFile& remote);
 
   // Evicts until bytesOnDisk + bytesNeeded <= maxBytes. Selects victims via
