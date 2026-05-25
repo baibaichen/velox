@@ -49,7 +49,12 @@ class FsCacheMetadata {
   /// existing entry is preserved.
   bool insert(FileSegmentPtr segment);
 
-  /// Returns the segment for key or nullptr if not present.
+  /// Returns the segment for key, or nullptr if not present. Best-effort
+  /// under concurrency: the bucket guard is released before the per-key
+  /// mutex is taken, so a concurrent erase racing against this lookup may
+  /// cause it to return nullptr even if a fresh insert at the same path
+  /// (under a new KeyMetadata) succeeded. The caller treats nullptr as a
+  /// cache miss and proceeds to download, which is correct.
   FileSegmentPtr lookup(const FsCacheKey& key) const;
 
   /// Removes the segment for key. Returns true if it existed. When the last

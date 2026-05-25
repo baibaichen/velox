@@ -38,16 +38,19 @@ bool FsCacheMetadata::insert(FileSegmentPtr segment) {
   VELOX_CHECK_NOT_NULL(segment);
   const auto key = segment->key();
   auto& bucket = *buckets_[bucketIndex(key.path)];
+  // Hold the bucket guard while acquiring the per-key mutex. Rank 2 -> rank 3
+  // is the legal forward direction in the lock hierarchy. This eliminates the
+  // window where a concurrent erase could drop the bucket's mapping for this
+  // path while we hold a stale KeyMetadataPtr, which would otherwise let us
+  // emplace the segment into an orphan KeyMetadata.
+  CacheMetadataGuard bucketGuard{bucket.guard};
   KeyMetadataPtr keyMeta;
-  {
-    CacheMetadataGuard bucketGuard{bucket.guard};
-    auto it = bucket.keys.find(key.path);
-    if (it == bucket.keys.end()) {
-      keyMeta = std::make_shared<KeyMetadata>();
-      bucket.keys.emplace(key.path, keyMeta);
-    } else {
-      keyMeta = it->second;
-    }
+  auto it = bucket.keys.find(key.path);
+  if (it == bucket.keys.end()) {
+    keyMeta = std::make_shared<KeyMetadata>();
+    bucket.keys.emplace(key.path, keyMeta);
+  } else {
+    keyMeta = it->second;
   }
   auto locked = keyMeta->lock();
   const auto inserted =
@@ -80,44 +83,25 @@ FileSegmentPtr FsCacheMetadata::lookup(const FsCacheKey& key) const {
 
 bool FsCacheMetadata::erase(const FsCacheKey& key) {
   auto& bucket = *buckets_[bucketIndex(key.path)];
-  KeyMetadataPtr keyMeta;
-  {
-    CacheMetadataGuard bucketGuard{bucket.guard};
-    auto it = bucket.keys.find(key.path);
-    if (it == bucket.keys.end()) {
-      return false;
-    }
-    keyMeta = it->second;
-  }
-  bool nowEmpty{false};
-  {
-    auto locked = keyMeta->lock();
-    const auto erased = locked->segments.erase(key.offset);
-    if (erased == 0) {
-      return false;
-    }
-    --locked->numSegments;
-    nowEmpty = locked->segments.empty();
-  }
-  if (!nowEmpty) {
-    return true;
-  }
-  // Re-lock the bucket, then re-check the KeyMetadata under the key lock.
-  // A concurrent insert may have re-populated it between the unlock and
-  // re-lock; in that case leave the entry in place.
+  // Hold the bucket guard while acquiring the per-key mutex. Holding both
+  // makes the empty-drop atomic with the segment erase, so no concurrent
+  // insert can have observed (path -> keyMeta) and be waiting outside the
+  // bucket on a KeyMetadata that we are about to orphan.
   CacheMetadataGuard bucketGuard{bucket.guard};
   auto it = bucket.keys.find(key.path);
   if (it == bucket.keys.end()) {
-    return true;
+    return false;
   }
-  // Use the bucket's current KeyMetadataPtr (an erase+reinsert race could
-  // have swapped the pointer); re-lock and re-check emptiness.
-  auto currentMeta = it->second;
-  auto locked = currentMeta->lock();
-  if (!locked->segments.empty()) {
-    return true;
+  auto keyMeta = it->second;
+  auto locked = keyMeta->lock();
+  const auto erased = locked->segments.erase(key.offset);
+  if (erased == 0) {
+    return false;
   }
-  bucket.keys.erase(it);
+  --locked->numSegments;
+  if (locked->segments.empty()) {
+    bucket.keys.erase(it);
+  }
   return true;
 }
 
