@@ -61,9 +61,9 @@ per-bucket 锁分配铺挂载点。
 2. **后台下载线程池**（plan-2）：`FsCacheBufferedInput::load()` 异步化；
    `FsCacheConfig.downloadExecutor` hook，nullptr 时 fallback 到
    `connector->ioExecutor()`；per-segment 任务粒度。
-3. **SLRU 淘汰策略**（plan-3）：`IFileCachePriority` 抽象提升；`SlruPolicy`
-   probationary + protected 二段实例化；配置项 `cache_policy={SLRU, LRU}`，
-   默认 SLRU。
+3. **SLRU 淘汰策略**（plan-3）：`EvictionPolicy` 抽象（phase-1 已有）保持
+   接口名不变；`SlruPolicy` probationary + protected 二段实例化；配置项
+   `cache_policy={SLRU, LRU}`，默认 SLRU。
 4. **FileCacheQueryLimit per-query 配额**（plan-4）：每 query 独立 LRU 子队列；
    `tryReserve` 阶段检查配额；hook 进 `QueryCtx`。
 5. **bypass_cache_threshold**（plan-4）：`FsCacheConfig` 加 `bypassThreshold`
@@ -92,7 +92,7 @@ per-bucket 锁分配铺挂载点。
 | 16 线程纯 hit 吞吐 (ws=0.5, sequential) | 2.27 M ops/s | ≥ 6 M ops/s（接近 1-thread 7.55 M 的 0.8×） |
 | 16 线程 hit 扩展系数 (t16 / t1) | 0.30× | ≥ 0.80× |
 | Prefetch miss → hit 比例 | 0% (prefetch 退化为同步) | ≥ 80% (R0 异步化生效后) |
-| ConcurrentStressTest 等价 gate | PASS | PASS（回归不变） |
+| 并发回归 gate | `FsCacheConcurrencyTest` PASS | `FsCacheConcurrencyTest` PASS（全套不变） |
 
 ### 非目标
 
@@ -117,16 +117,32 @@ bucket 顺序逐个锁——本 spec 不引入跨 bucket 的原子快照操作�
 
 ### 4.2 Atomic stats + try_lock LRU bump (C2)
 
-`FsCacheStats` 改为 `std::atomic<uint64_t>` 字段，hit/miss/eviction 计数走
-`fetch_add(1, std::memory_order_relaxed)`；`stats()` 用 relaxed load 装配快照
-（非原子但每字段独立原子，弱一致性可接受——观测用途）。
+**Phase-1 现状**：`FsCacheStats` 字段是裸 `uint64_t`（`FsCache.h:41`），
+由 `stateMutex_`（`FsCache.h:183` 邻近）保护；每次 `recordHit` /
+`recordMiss`（`FsCache.cpp:296-313`）都获取一次 `CacheStateGuard`。
 
-`recordHit` 路径取消 `stateMutex_`。LRU bump 通过 `FileSegment` 新增的
-`std::mutex increasePriorityMutex_` + `try_lock` 实现：
+**Phase-2 改动（结构性，列出所有受影响点）**：
+1. `FsCacheStats` 字段改为 `std::atomic<uint64_t>`（`FsCache.h:41-46`）。
+   `bytesOnDisk` 也变 atomic——`evict()` 里 `bytesOnDisk -= freed`
+   （`FsCache.cpp:287`）改为 `fetch_sub`。
+2. `recordHit` / `recordMiss` 的 `CacheStateGuard guard{stateMutex_}`
+   全部删除；hit/miss/eviction 计数走
+   `fetch_add(1, std::memory_order_relaxed)`。
+3. `stats()`（`FsCache.cpp:292-294`）用每字段 relaxed load 装配快照
+   （非原子但每字段独立原子，观测用途，弱一致性可接受）。
+4. **`stateMutex_` 字段保留**——`evict()` 里 `current = stats_.bytesOnDisk`
+   附近（`FsCache.cpp:241`）的临界区可考虑保留以串行化"reserve→evict"
+   决策；这条由 plan-1 实现时决定（保留或删除均不影响 hit-path）。
+5. **Phase-2 新增** `FileSegment::increasePriorityMutex_`（`std::mutex`）
+   字段——phase-1 `FileSegment.h` **没有**此字段。仅供 LRU bump
+   合并并发 hit 使用，不参与下载/状态机协议。
+
+LRU bump 通过 `try_lock` 合并：
 
 ```cpp
 void FsCache::recordHit(FileSegment* segment) {
   hits_.fetch_add(1, std::memory_order_relaxed);
+  // increasePriorityMutex_ 是 phase-2 新增的 per-segment 锁
   std::unique_lock<std::mutex> lk{segment->increasePriorityMutex_, std::try_to_lock};
   if (lk.owns_lock()) {
     // 同 segment 并发 hit 时只一个线程做 LRU splice，其余直接返回
@@ -190,9 +206,18 @@ struct FsCacheKey {
 查找；`(offset, size)` 进入 `KeyMetadata::segments` 的 `std::map` key（实际
 key 是 `offset`，`size` 存在 `FileSegment` 内部）。
 
-**Disk 文件名格式不变**：仍是 `<16-hex>.<offset>.<size>`（FsCacheKey.cpp 现有
-`fileName()`）。这保证 phase-1 的 `loadFromDisk` crash recovery 在 phase-2
-启动时仍然能识别既有缓存文件。
+**Disk 文件名格式 schema 不变，但 hash 值会变**：phase-1 `FsCacheKey.cpp:28-35`
+的 `combinedHash` 把 `(path, offset, size)` 三者混入 64-bit hash，渲染为
+`<16-hex>.<offset>.<size>`。phase-2 改为 PathKey-only hash（path 单独
+hash），渲染格式不变，但同一 `(path, offset, size)` 在 phase-1 / phase-2
+计算出的 hex 前缀**不一样**。后果：phase-1 留下的 cache 文件在 phase-2
+启动时，`loadFromDisk` 解析出来的 PathKey 与新 hash 函数算出的 PathKey
+不一致 → 这些文件成为孤儿。
+
+**接受弃用既有缓存**：phase-2 启动时 `loadFromDisk` 检测到 fileName 前缀
+与重算 hash 不匹配的文件直接 unlink（一次性 reformat）。这条由 plan-1
+实现时显式落地，并在 release notes 标注 "phase-2 upgrade 会丢弃所有
+现存 cache，首次启动相当于冷启动"。详见 §10 R7。
 
 ### 4.5 锁顺序更新
 
@@ -213,10 +238,16 @@ Phase-2 实例化后，每把锁不再唯一，但**rank** 不变。
 （如 `clear()`）必须按 bucket 序列化、每次只持一把。这条由 review 把关，
 不引入静态检查（CH 也是 review-based）。
 
+**Debug 增强（可选）**：`LockOrderChecker` 现仅按 rank 检查，不区分实例
+身份。两个 bucket 的 `CacheMetadataGuard` 同 rank，所以"同时持两把"
+不会触发现有断言。phase-2 实现 plan-1 时建议给 LockOrderChecker 增加
+`thread_local` "当前持有的 bucket index" 字段，在持第 2 把 bucket
+guard 时断言——这是 belt-and-suspenders，spec 不强制（W1）。
+
 ### 4.6 Per-bucket LRU + cross-bucket evict 轮询
 
 Phase-1 单条全局 LRU 链表 + 单 `CachePriorityGuard`。Phase-2 每 bucket 持有
-独立的 `IFileCachePriority` 实例（默认 `SlruPolicy`，可配 `LruPolicy`），
+独立的 `EvictionPolicy` 实例（默认 `SlruPolicy`，可配 `LruPolicy`），
 受该 bucket 的 `CachePriorityGuard` 保护。
 
 `evict(bytesNeeded)` 跨 bucket 轮询选 victim：
@@ -233,9 +264,11 @@ void FsCache::evict(uint64_t bytesNeeded) {
 ```
 
 `try_lock` 跳过繁忙 bucket 是关键——单 evict 调用不阻塞其他 bucket 的 hit
-路径。极端场景下连续 N 轮都未达 `bytesNeeded`（所有 bucket 都繁忙），
-fallback 退化为 blocking lock（spec 不规定具体重试上限，由实现选；
-推荐：N = numBuckets，之后 fallback）。
+路径。**重试语义**：**单次 `evict()` 调用内**尝试 `N = numBuckets` 轮
+（按 round-robin 顺序遍历），每轮对当前 bucket 做 `try_lock`；N 轮跑完
+仍未达 `bytesNeeded`，对剩余字节数对每个仍繁忙的 bucket 做 blocking
+`lock()` 兜底，按 round-robin 顺序逐个收 victim 直到补齐 `bytesNeeded`
+或全部 bucket 都查过。**不**跨多次 `evict()` 调用累计计数。
 
 ## 5. 数据结构（plan-1）
 
@@ -274,7 +307,7 @@ struct FsCacheMetadata::Bucket {
   std::unordered_map<PathKey, KeyMetadataPtr> keys;
   mutable CacheMetadataGuard guard;
   // per-bucket LRU 实例，默认 SlruPolicy，构造时由 FsCache 注入
-  std::unique_ptr<IFileCachePriority> priority;
+  std::unique_ptr<EvictionPolicy> priority;
   mutable CachePriorityGuard priorityMutex;
 };
 std::vector<Bucket> buckets_;  // 长度 numBuckets，构造后不变
@@ -285,20 +318,26 @@ Bucket 数组**构造后不可 resize**——`buckets_.size()` 进入 const 状�
 
 ### 5.4 LRU 容器迁移到 per-bucket
 
-`LruPolicy` / `SlruPolicy` 都满足 `IFileCachePriority`，不再被 `FsCache`
+`LruPolicy` / `SlruPolicy` 都满足 `EvictionPolicy`，不再被 `FsCache`
 直接持有，而是每 bucket 一份。`onHit` / `onInsert` / `onRemove` /
 `selectVictims` 的 segment 仅限本 bucket。
 
 跨 bucket evict 由 `FsCache::evict` 协调（§4.6）。
 
-### 5.5 fileName() 兼容性
+### 5.5 fileName() schema 不变 / hash 值变更
 
-`FsCacheKey::fileName()` 返回 `<pathkey-hex>.<offset>.<size>`，渲染逻辑不变。
-phase-1 写盘的 cache 文件在 phase-2 启动后由 `loadFromDisk` 重建索引——
-phase-1 的 `parseFileName` 解析逻辑兼容 phase-2 的写盘格式（因为格式不变）。
+`FsCacheKey::fileName()` 返回 `<pathkey-hex>.<offset>.<size>`，schema 不变；
+但 `<pathkey-hex>` 的计算方式从 phase-1 的 `combinedHash(path, offset, size)`
+（`FsCacheKey.cpp:28-35`）改为 PathKey-only hash（仅 path）。
 
-**Crash recovery 测试要回归**：phase-1 的 `LoadFromDiskTest` 必须在 phase-2
-代码下不修改即通过。
+phase-1 写盘的 cache 文件在 phase-2 启动时由 `loadFromDisk` 一次性
+reformat：解析 fileName 拿到候选 `(path?, offset, size)`，但 path 已丢失
+（hash 不可逆），所以 phase-1 文件**全部 unlink 弃用**。详见 §10 R7。
+
+**Crash recovery 测试要回归**：phase-1 的 `FsCacheRecoveryTest` 必须在
+phase-2 代码下不修改即通过——但前提是 fixture 在 phase-2 代码下用
+phase-2 hash 函数写盘 + 重启 + reload，**不是**跨版本 recovery。后者
+是有意 break 的（见 R7）。
 
 ## 6. 后台下载与 R0 异步 load（plan-2）
 
@@ -328,8 +367,13 @@ struct FsCacheConfig {
 ```
 
 `FsCacheBufferedInput` 构造时若 `config.downloadExecutor` 为 nullptr，
-通过 `Connector` 注入路径取 `connector->ioExecutor()`——本 spec 不引入
-"默认独立池"或"helper 工厂"，保持与 phase-1 同款的 zero-defaults 策略
+**回退发生在调用点**（`HiveConnectorUtil::createBufferedInput` 那一侧
+或调用方主入口），由调用点把 `connector->ioExecutor()` 注入
+`FsCacheConfig`，再构造 `FsCacheBufferedInput`。
+`FsCacheBufferedInput` 自身只持有 `folly::Executor*`，不依赖 `Connector*`
+（phase-1 ctor 签名 `(shared_ptr<ReadFile>, MemoryPool&, FsCache*)` 不变
+其参数，只新增一个 `folly::Executor*` 参数）。本 spec 不引入"默认独立池"
+或"helper 工厂"，保持与 phase-1 同款的 zero-defaults 策略
 （OQ #2-c 决策）。
 
 池大小与限流策略**完全由调用方控制**，FsCache 不引入 semaphore / token
@@ -338,7 +382,16 @@ bucket / 自适应限流。CH 默认 5 线程是其工程经验值，Velox 这�
 
 ### 6.3 任务粒度：per-segment
 
-`FsCacheBufferedInput::load()` 异步改造后伪码：
+`FsCacheBufferedInput::load()` 异步改造后伪码。**Phase-2 新增方法**
+`FileSegment::isDownloadOwnedByCurrentThread()` 和
+`FileSegment::waitForDownload()`——`FileSegment.h:114-116` 注释已显式
+预留这两个 helper 的引入点（"FileSegment can expose waitForDownload()
+/ notifyAll() helpers and drop the public mutex_/cv_"）。
+
+`input_->getReadFile()` 返回 `const std::shared_ptr<ReadFile>&`
+（`BufferedInput.h:186`），lambda 按值捕获 shared_ptr 安全持有
+remote file 生命周期，覆盖 download 期间 FsCacheBufferedInput 析构
+的场景。
 
 ```cpp
 void FsCacheBufferedInput::load(LogType /*unused*/) {
@@ -355,11 +408,17 @@ void FsCacheBufferedInput::load(LogType /*unused*/) {
         enqueued.region.offset,
         enqueued.region.length);
 
-    // 2. per-segment 派发：每个 miss segment 一个 task 进池
+    // 2. per-segment 派发：每个 miss segment 一个 task 进池。
+    //    isDownloadOwnedByCurrentThread() 是 phase-2 新增——
+    //    lookupOrCreate 内部的 beginDownload CAS 把 ownerThread 写到
+    //    FileSegment 的 phase-2 新增字段里，胜者派发下载，败者跳过
+    //    （后续在 ensureWithData 里 waitForDownload）。
     for (auto& seg : enqueued.segments) {
       if (seg->state() == FileSegment::State::kDownloading
-          && seg->isOwnedByThisCaller()) {
-        executor_->add([seg, readFile = input_->getReadFile()] {
+          && seg->isDownloadOwnedByCurrentThread()) {
+        // readFile 按值捕获 shared_ptr，保 download 期间生命周期
+        auto readFile = input_->getReadFile();
+        executor_->add([seg, readFile = std::move(readFile)] {
           seg->download(*readFile);   // 负责 read+writeCache+markDownloaded
         });
       }
@@ -390,7 +449,7 @@ void ensureWithData() {
 
   // 等待所有 segment 进入 kDownloaded（或失败）
   for (auto& seg : slot_->segments) {
-    seg->waitForDownload();  // 内部 std::condition_variable
+    seg->waitForDownload();  // phase-2 新增 helper，见下方注解
     if (seg->state() == FileSegment::State::kFailed) {
       VELOX_FAIL("FsCache segment download failed: {}", seg->describe());
     }
@@ -401,16 +460,21 @@ void ensureWithData() {
 }
 ```
 
-`FileSegment::waitForDownload()` 用 `cv.wait` 阻塞当前 reader 线程，直到
-downloader 调用 `cv.notify_all()`。**reader 阻塞在 Next() 第一次访问是
-phase-2 接受的**（OQ #1 决策）——hit-path（异步 hits）和 miss-prefetched
-（提前 enqueue 多 region，第一次访问时已下完）两条主路径都不退化；只有
-"reader 串行读一个新文件"这种 cold-start case 会等待，与 phase-1 行为
-等价（phase-1 是同步 load 等待，phase-2 是 lazy wait，总耗时相同）。
+**`FileSegment::waitForDownload()` 是 phase-2 新增 helper**——phase-1
+现状是 `FsCache.cpp:209` 手写 `segment->cv_.wait(lock, [&]{ ... })`
+直接消费 `mutex_/cv_` 公开字段；`FileSegment.h:114-116` 注释明确预留
+此 helper 引入点，并配合 `notifyAll()` helper 把 `mutex_/cv_` 转为 private。
+新 helper 内部封装 cancel-check 循环（下文）。
+
+**reader 阻塞在 Next() 第一次访问是 phase-2 接受的**（OQ #1 决策）——
+hit-path（异步 hits）和 miss-prefetched（提前 enqueue 多 region，第一次
+访问时已下完）两条主路径都不退化；只有"reader 串行读一个新文件"这种
+cold-start case 会等待，与 phase-1 行为等价（phase-1 是同步 load 等待，
+phase-2 是 lazy wait，总耗时相同）。
 
 **可中断性**：`waitForDownload()` 接受 cancel token——Velox 算子取消
 （`Driver::isTerminate()` 或 future 取消）时，wait 必须能尽快返回，
-避免泄漏线程。具体实现：`cv.wait_for(100ms)` 循环 + check cancel
+避免泄漏线程。具体实现：`cv_.wait_for(100ms)` 循环 + check cancel
 （沿用 `AsyncSource` 模式）。
 
 ### 6.5 写者合并：beginDownload CAS + insert under lock
@@ -437,9 +501,11 @@ std::vector<FileSegmentPtr> FsCache::lookupOrCreate(
     auto seg = std::make_shared<FileSegment>(
         path, segOffset, segSize, FileSegment::State::kDownloading);
     lockedKey.insertSegment(seg);
-    // CAS-style ownership：beginDownload 返回 true 表示当前 thread 拥有
-    // 下载权；其他 thread 在 lookupOrCreate 看到 kDownloading 时返回
-    // 同一 shared_ptr，进入 waitForDownload 等通知。
+    // CAS-style ownership：beginDownload 在 segment_guard 内 CAS 把
+    // currentThreadId 写到 phase-2 新增字段 downloadOwnerThread_。
+    // 胜者：beginDownload() 返回 true；isDownloadOwnedByCurrentThread()
+    // 后续也返回 true。败者（其他 thread 在 lookupOrCreate 看到
+    // kDownloading）：在 ensureWithData 走 waitForDownload 等通知。
     seg->beginDownload(/*ownerThread=*/std::this_thread::get_id());
     result.push_back(std::move(seg));
   }
@@ -449,7 +515,7 @@ std::vector<FileSegmentPtr> FsCache::lookupOrCreate(
 
 `beginDownload` 内部用 `segment_guard` 持锁 + atomic state 检查，保证
 只有第一个 reach kDownloading 的 caller 拿到 ownership。其他后到者
-`isOwnedByThisCaller()` 返回 false，跳过派发，直接 wait。
+`isDownloadOwnedByCurrentThread()` 返回 false，跳过派发，直接 wait。
 
 ### 6.6 同步 miss 路径（caller-thread download）
 
@@ -465,7 +531,7 @@ std::vector<FileSegmentPtr> FsCache::getOrSet(
   auto segments = lookupOrCreate(/* ... */);
   for (auto& seg : segments) {
     if (seg->state() == FileSegment::State::kDownloading
-        && seg->isOwnedByThisCaller()) {
+        && seg->isDownloadOwnedByCurrentThread()) {
       seg->download(readFile);              // caller 亲自下，写盘，notify
     } else {
       seg->waitForDownload();               // 别人在下，等
@@ -491,13 +557,13 @@ metadata lookup，得不偿失。
 
 ## 7. SLRU 淘汰策略（plan-3）
 
-### 7.1 IFileCachePriority 抽象提升
+### 7.1 EvictionPolicy 实例追加 SlruPolicy
 
-Phase-1 已有 `IFileCachePriority` 接口（`LruPolicy` 实现）。Phase-2 接口
+Phase-1 已有 `EvictionPolicy` 接口（`LruPolicy` 实现）。Phase-2 接口
 不变，新增 `SlruPolicy` 实现：
 
 ```cpp
-class SlruPolicy : public IFileCachePriority {
+class SlruPolicy : public EvictionPolicy {
  public:
   SlruPolicy(uint64_t probationaryBytes, uint64_t protectedBytes);
 
@@ -530,7 +596,7 @@ struct FsCacheConfig {
 ```
 
 `FsCache` 构造时按 `config.policy` 实例化每 bucket 的
-`IFileCachePriority`。
+`EvictionPolicy`。
 
 ### 7.3 升级时机
 
@@ -631,9 +697,10 @@ cache 的 reserve 阶段生效。
 ### 9.2 回归测试
 
 phase-1 测试**全部保持通过**，无修改。重点 gate：
-- `ConcurrentStressTest`（phase-1 关键回归保护）
-- `LoadFromDiskTest`（fileName 兼容性保护）
-- `FsCacheRecoveryTest`（crash recovery）
+- `FsCacheConcurrencyTest`（含 `sameSegmentMultipleReadersExactlyOneDownload`、
+  `evictionUnderConcurrentLoadIsRaceFree`，phase-1 关键回归保护）
+- `FsCacheRecoveryTest`（crash recovery + fileName 兼容性保护；见 I4 的
+  cache 文件迁移说明）
 
 ### 9.3 性能 gate
 
@@ -708,6 +775,29 @@ bypassThreshold 是粗暴 size gate（同 CH `bypass_cache_threshold`）。
 **接受**：本 spec 不实现 StarRocks `datacache_skip_read_factor` 那种
 hit/miss 反馈式 bypass。**若实测发现 bypassThreshold 误伤明显**，
 作为 phase-3 拓展独立 spec。
+
+### R7：phase-1 → phase-2 cache 文件不兼容
+
+`FsCacheKey.cpp:28` 的 `combinedHash(path, offset, size)` 把 3 元组混入
+一个 64-bit hash。phase-2 改为 PathKey-only hash 后，同一 `(path, offset,
+size)` 在 phase-1 / phase-2 生成的 fileName 前缀**不同**。phase-2 启动
+扫到 phase-1 的 cache 文件无法重建索引（因为反解只能拿到 hex 前缀
+而非 path 本身）。
+
+**接受弃用**：phase-2 启动 `loadFromDisk` 阶段一次性 unlink 所有
+"hash 前缀与重算不匹配"的文件，等价于首次启动冷启动。release notes
+中显式标注；不引入双 hash 兼容代码或迁移工具。
+
+### R8：per-bucket SLRU 稀释 scan-resistance
+
+经典 SLRU 靠**全局** probationary 抵御扫描：scan 进 prob，hot 进 prot。
+本 spec §7 分散到 1024 个 per-bucket micro-SLRU，**单 bucket 内
+probationary 窗口很小**（容量 = 全局 / 1024），扫描项可能在 bucket 内
+被错误升级到 protected。
+
+**缓解**：§9.3 加了 scan-resistance microbench（80% WS + 20% cold scan）
+作为经验 gate。若实测 SLRU 收益不显著，phase-3 可改 hybrid
+（per-bucket prob + global protected），但本 spec 不预先实现。
 
 ## 11. Out of scope：Phase 2.5（`PARTIALLY_DOWNLOADED` + 续传）
 
