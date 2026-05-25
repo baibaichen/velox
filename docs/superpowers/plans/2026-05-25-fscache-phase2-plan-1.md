@@ -733,6 +733,18 @@ class LockedKey {
   KeyMutex* mutex_{nullptr};
 };
 
+// Deviation note (applied at Task 4 implementation time): the `friend
+// class KeyMetadata;` line above conflicts with the project CLAUDE.md
+// rule "Never use `friend`, `FRIEND_TEST`, or any friend declarations."
+// The shipped code therefore makes the 2-arg ctor `public` (documented
+// as internal) and drops the friend. The invariant "holding a non-empty
+// LockedKey implies holding the matching KeyMutex" is maintained because
+// `KeyMutex` is a private member of `KeyMetadata`, so callers outside
+// the fscache module cannot obtain a reference to one, and inside the
+// module `KeyMetadata::lock()` remains the only construction site. A
+// Passkey idiom would also require one friend declaration and was
+// rejected for the same reason.
+
 /// Per-PathKey container: all FileSegments of one remote file, indexed by
 /// offset. Phase-2 introduces this indirection so the per-bucket
 /// CacheMetadataGuard can be released as soon as we obtain a KeyMetadataPtr,

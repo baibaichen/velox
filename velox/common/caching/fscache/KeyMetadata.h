@@ -42,6 +42,15 @@ class LockedKey {
   /// Internal: use KeyMetadata::lock() instead of calling this directly.
   /// Locks the given mutex on construction; the pairing of meta and mutex
   /// is assumed to be correct (mutex must belong to meta).
+  ///
+  /// This ctor is public rather than private + friend-gated (as the plan
+  /// originally sketched) because the project CLAUDE.md forbids `friend`
+  /// declarations. The Passkey idiom would also require one friend
+  /// declaration. The invariant "holding a non-empty LockedKey implies
+  /// holding the matching KeyMutex" is therefore maintained by convention:
+  /// KeyMutex is a private member of KeyMetadata, so callers outside the
+  /// fscache module cannot obtain a reference to one, and inside the module
+  /// `KeyMetadata::lock()` is the only construction site.
   LockedKey(KeyMetadata* meta, KeyMutex& mutex);
 
   LockedKey(LockedKey&& other) noexcept;
