@@ -21,44 +21,123 @@
 namespace facebook::velox::cache::fs {
 
 FsCacheMetadata::FsCacheMetadata(size_t numBuckets)
-    : bucketMask_{numBuckets - 1}, buckets_(numBuckets) {
+    : bucketMask_{numBuckets - 1} {
   VELOX_CHECK_GT(numBuckets, 0, "FsCacheMetadata requires numBuckets > 0");
   VELOX_CHECK_EQ(
       numBuckets & (numBuckets - 1),
       0,
       "FsCacheMetadata numBuckets must be a power of two, got {}",
       numBuckets);
+  buckets_.reserve(numBuckets);
+  for (size_t i{0}; i < numBuckets; ++i) {
+    buckets_.push_back(std::make_unique<Bucket>());
+  }
 }
 
 bool FsCacheMetadata::insert(FileSegmentPtr segment) {
-  CacheMetadataGuard guard{mutex_};
+  VELOX_CHECK_NOT_NULL(segment);
   const auto key = segment->key();
-  auto& bucket = buckets_[bucketIndex(key)];
-  return bucket.emplace(key, std::move(segment)).second;
+  auto& bucket = *buckets_[bucketIndex(key.path)];
+  KeyMetadataPtr keyMeta;
+  {
+    CacheMetadataGuard bucketGuard{bucket.guard};
+    auto it = bucket.keys.find(key.path);
+    if (it == bucket.keys.end()) {
+      keyMeta = std::make_shared<KeyMetadata>();
+      bucket.keys.emplace(key.path, keyMeta);
+    } else {
+      keyMeta = it->second;
+    }
+  }
+  auto locked = keyMeta->lock();
+  const auto inserted =
+      locked->segments.emplace(key.offset, std::move(segment)).second;
+  if (!inserted) {
+    return false;
+  }
+  ++locked->numSegments;
+  return true;
 }
 
 FileSegmentPtr FsCacheMetadata::lookup(const FsCacheKey& key) const {
-  CacheMetadataGuard guard{mutex_};
-  const auto& bucket = buckets_[bucketIndex(key)];
-  auto it = bucket.find(key);
-  if (it == bucket.end()) {
+  auto& bucket = *buckets_[bucketIndex(key.path)];
+  KeyMetadataPtr keyMeta;
+  {
+    CacheMetadataGuard bucketGuard{bucket.guard};
+    auto it = bucket.keys.find(key.path);
+    if (it == bucket.keys.end()) {
+      return nullptr;
+    }
+    keyMeta = it->second;
+  }
+  auto locked = keyMeta->lock();
+  auto segIt = locked->segments.find(key.offset);
+  if (segIt == locked->segments.end()) {
     return nullptr;
   }
-  return it->second;
+  return segIt->second;
 }
 
 bool FsCacheMetadata::erase(const FsCacheKey& key) {
-  CacheMetadataGuard guard{mutex_};
-  auto& bucket = buckets_[bucketIndex(key)];
-  return bucket.erase(key) > 0;
+  auto& bucket = *buckets_[bucketIndex(key.path)];
+  KeyMetadataPtr keyMeta;
+  {
+    CacheMetadataGuard bucketGuard{bucket.guard};
+    auto it = bucket.keys.find(key.path);
+    if (it == bucket.keys.end()) {
+      return false;
+    }
+    keyMeta = it->second;
+  }
+  bool nowEmpty{false};
+  {
+    auto locked = keyMeta->lock();
+    const auto erased = locked->segments.erase(key.offset);
+    if (erased == 0) {
+      return false;
+    }
+    --locked->numSegments;
+    nowEmpty = locked->segments.empty();
+  }
+  if (!nowEmpty) {
+    return true;
+  }
+  // Re-lock the bucket, then re-check the KeyMetadata under the key lock.
+  // A concurrent insert may have re-populated it between the unlock and
+  // re-lock; in that case leave the entry in place.
+  CacheMetadataGuard bucketGuard{bucket.guard};
+  auto it = bucket.keys.find(key.path);
+  if (it == bucket.keys.end()) {
+    return true;
+  }
+  // Use the bucket's current KeyMetadataPtr (an erase+reinsert race could
+  // have swapped the pointer); re-lock and re-check emptiness.
+  auto currentMeta = it->second;
+  auto locked = currentMeta->lock();
+  if (!locked->segments.empty()) {
+    return true;
+  }
+  bucket.keys.erase(it);
+  return true;
 }
 
 std::vector<FileSegmentPtr> FsCacheMetadata::snapshot() const {
-  CacheMetadataGuard guard{mutex_};
   std::vector<FileSegmentPtr> result;
-  for (const auto& bucket : buckets_) {
-    for (const auto& [_, segment] : bucket) {
-      result.push_back(segment);
+  for (const auto& bucketPtr : buckets_) {
+    auto& bucket = *bucketPtr;
+    std::vector<KeyMetadataPtr> bucketKeys;
+    {
+      CacheMetadataGuard bucketGuard{bucket.guard};
+      bucketKeys.reserve(bucket.keys.size());
+      for (const auto& [_, keyMeta] : bucket.keys) {
+        bucketKeys.push_back(keyMeta);
+      }
+    }
+    for (const auto& keyMeta : bucketKeys) {
+      auto locked = keyMeta->lock();
+      for (const auto& [_, segment] : locked->segments) {
+        result.push_back(segment);
+      }
     }
   }
   return result;

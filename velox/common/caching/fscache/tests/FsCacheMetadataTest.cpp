@@ -103,4 +103,51 @@ TEST(FsCacheMetadataTest, snapshotReturnsAllSegments) {
   EXPECT_THAT(metadata.snapshot(), testing::UnorderedElementsAre(a, b));
 }
 
+TEST(FsCacheMetadataTest, samePathSegmentsCoLocate) {
+  FsCacheMetadata md{16};
+  auto seg0 = std::make_shared<FileSegment>(
+      FsCacheKey{PathKey::fromPath("/x"), 0, 4'096}, "/x");
+  auto seg1 = std::make_shared<FileSegment>(
+      FsCacheKey{PathKey::fromPath("/x"), 4'096, 4'096}, "/x");
+  EXPECT_TRUE(md.insert(seg0));
+  EXPECT_TRUE(md.insert(seg1));
+  EXPECT_EQ(md.lookup({PathKey::fromPath("/x"), 0, 4'096}), seg0);
+  EXPECT_EQ(md.lookup({PathKey::fromPath("/x"), 4'096, 4'096}), seg1);
+}
+
+TEST(FsCacheMetadataTest, eraseLastSegmentDropsKeyMetadata) {
+  FsCacheMetadata md{16};
+  auto seg = std::make_shared<FileSegment>(
+      FsCacheKey{PathKey::fromPath("/x"), 0, 4'096}, "/x");
+  md.insert(seg);
+  EXPECT_TRUE(md.erase(FsCacheKey{PathKey::fromPath("/x"), 0, 4'096}));
+  EXPECT_EQ(md.lookup({PathKey::fromPath("/x"), 0, 4'096}), nullptr);
+  auto seg2 = std::make_shared<FileSegment>(
+      FsCacheKey{PathKey::fromPath("/x"), 0, 4'096}, "/x");
+  EXPECT_TRUE(md.insert(seg2));
+}
+
+TEST(FsCacheMetadataTest, insertDuplicateOffsetFails) {
+  FsCacheMetadata md{16};
+  auto seg0 = std::make_shared<FileSegment>(
+      FsCacheKey{PathKey::fromPath("/x"), 0, 4'096}, "/x");
+  auto seg1 = std::make_shared<FileSegment>(
+      FsCacheKey{PathKey::fromPath("/x"), 0, 4'096}, "/x");
+  EXPECT_TRUE(md.insert(seg0));
+  EXPECT_FALSE(md.insert(seg1));
+  EXPECT_EQ(md.lookup({PathKey::fromPath("/x"), 0, 4'096}), seg0);
+}
+
+TEST(FsCacheMetadataTest, snapshotReturnsAllSegmentsAcrossKeys) {
+  FsCacheMetadata md{16};
+  md.insert(std::make_shared<FileSegment>(
+      FsCacheKey{PathKey::fromPath("/x"), 0, 4'096}, "/x"));
+  md.insert(std::make_shared<FileSegment>(
+      FsCacheKey{PathKey::fromPath("/y"), 0, 4'096}, "/y"));
+  md.insert(std::make_shared<FileSegment>(
+      FsCacheKey{PathKey::fromPath("/x"), 4'096, 4'096}, "/x"));
+  const auto all = md.snapshot();
+  EXPECT_EQ(all.size(), 3u);
+}
+
 } // namespace facebook::velox::cache::fs::test
