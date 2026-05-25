@@ -16,12 +16,15 @@
 
 #pragma once
 
+#include "velox/common/caching/fscache/EvictionPolicy.h"
 #include "velox/common/caching/fscache/FileSegment.h"
 #include "velox/common/caching/fscache/FsCacheGuards.h"
 #include "velox/common/caching/fscache/FsCacheKey.h"
 #include "velox/common/caching/fscache/KeyMetadata.h"
+#include "velox/common/caching/fscache/LruPolicy.h"
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -39,9 +42,32 @@ using FileSegmentPtr = std::shared_ptr<FileSegment>;
 /// the same path co-locate and serialize on their own per-key lock.
 class FsCacheMetadata {
  public:
-  /// Constructs with numBuckets buckets. numBuckets must be a power of two so
+  /// One bucket of the two-level index. Owns the bucket-level metadata guard,
+  /// the PathKey -> KeyMetadataPtr map, the per-bucket priority mutex, and
+  /// the per-bucket EvictionPolicy instance. The map and KeyMetadata segments
+  /// are only legal to read or write under their respective locks.
+  struct Bucket {
+    mutable CacheMetadataMutex guard;
+    std::unordered_map<PathKey, KeyMetadataPtr> keys;
+    mutable CachePriorityMutex priorityMutex;
+    std::unique_ptr<EvictionPolicy> priority;
+  };
+
+  /// Factory invoked once per bucket at construction to build that bucket's
+  /// EvictionPolicy. Used by tests and by future SLRU plumbing to inject
+  /// non-default policies.
+  using PolicyFactory = std::function<std::unique_ptr<EvictionPolicy>()>;
+
+  /// Constructs with numBuckets buckets, each holding a freshly-built
+  /// EvictionPolicy from policyFactory. numBuckets must be a power of two so
   /// the hash->bucket modulo folds to a single bitwise AND in bucketIndex().
-  explicit FsCacheMetadata(size_t numBuckets);
+  FsCacheMetadata(size_t numBuckets, PolicyFactory policyFactory);
+
+  /// Convenience overload that defaults policyFactory to LruPolicy.
+  explicit FsCacheMetadata(size_t numBuckets)
+      : FsCacheMetadata(
+            numBuckets,
+            [] { return std::make_unique<LruPolicy>(); }) {}
 
   /// Inserts the segment. Returns false if a segment with the same
   /// (path, offset) is already present at that offset under the existing
@@ -71,15 +97,23 @@ class FsCacheMetadata {
     return buckets_.size();
   }
 
- private:
-  // One bucket of the two-level index. Owns the bucket-level guard and the
-  // PathKey -> KeyMetadataPtr map; the map and the KeyMetadata segments are
-  // only legal to read or write under their respective locks.
-  struct Bucket {
-    mutable CacheMetadataMutex guard;
-    std::unordered_map<PathKey, KeyMetadataPtr> keys;
-  };
+  /// Returns the Bucket housing the given path. Used by FsCache to access
+  /// per-bucket priority. The returned reference is stable for the lifetime
+  /// of this FsCacheMetadata.
+  Bucket& bucketOf(const PathKey& path) {
+    return *buckets_[bucketIndex(path)];
+  }
+  const Bucket& bucketOf(const PathKey& path) const {
+    return *buckets_[bucketIndex(path)];
+  }
 
+  /// Returns all buckets in order. Used by evict() to round-robin and by
+  /// snapshot(). Reference is stable for the FsCacheMetadata's lifetime.
+  const std::vector<std::unique_ptr<Bucket>>& buckets() const {
+    return buckets_;
+  }
+
+ private:
   // Computes the bucket index for a PathKey. numBuckets is power-of-two
   // (CHECKed in ctor) so the modulo folds to a bitmask: hash & (numBuckets -
   // 1). All segments of the same file share the same PathKey and therefore

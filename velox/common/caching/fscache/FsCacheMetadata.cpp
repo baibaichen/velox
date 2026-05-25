@@ -20,7 +20,9 @@
 
 namespace facebook::velox::cache::fs {
 
-FsCacheMetadata::FsCacheMetadata(size_t numBuckets)
+FsCacheMetadata::FsCacheMetadata(
+    size_t numBuckets,
+    PolicyFactory policyFactory)
     : bucketMask_{numBuckets - 1} {
   VELOX_CHECK_GT(numBuckets, 0, "FsCacheMetadata requires numBuckets > 0");
   VELOX_CHECK_EQ(
@@ -28,9 +30,15 @@ FsCacheMetadata::FsCacheMetadata(size_t numBuckets)
       0,
       "FsCacheMetadata numBuckets must be a power of two, got {}",
       numBuckets);
+  VELOX_CHECK(
+      static_cast<bool>(policyFactory),
+      "FsCacheMetadata policyFactory must be set");
   buckets_.reserve(numBuckets);
   for (size_t i{0}; i < numBuckets; ++i) {
-    buckets_.push_back(std::make_unique<Bucket>());
+    auto bucket = std::make_unique<Bucket>();
+    bucket->priority = policyFactory();
+    VELOX_CHECK_NOT_NULL(bucket->priority);
+    buckets_.emplace_back(std::move(bucket));
   }
 }
 

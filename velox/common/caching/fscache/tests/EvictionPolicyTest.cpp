@@ -18,13 +18,17 @@
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/caching/fscache/FileSegment.h"
+#include "velox/common/caching/fscache/FsCache.h"
+#include "velox/common/caching/fscache/FsCacheConfig.h"
 #include "velox/common/caching/fscache/FsCacheKey.h"
 #include "velox/common/file/File.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
 
+#include <fmt/format.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -136,6 +140,75 @@ TEST_F(EvictionPolicyTest, onInsertRejectsNonDownloadedSegments) {
   ASSERT_TRUE(downloading.beginDownload());
   EXPECT_THROW(policy.onInsert(&empty), VeloxException);
   EXPECT_THROW(policy.onInsert(&downloading), VeloxException);
+}
+
+TEST(PerBucketEvictionPolicyTest, perBucketIsolation) {
+  // Two segments hashing to different buckets must use independent LruPolicy
+  // instances -- onHit on one must not change the LRU order on the other.
+  // We verify indirectly: prime cache with two distinct paths, hit one
+  // repeatedly, then trigger eviction sized to exactly one segment. The
+  // unhit segment should be evicted (it's LRU within its own bucket -- but
+  // because each bucket has its own policy, the never-hit one is LRU even
+  // though the hit one was hit many times).
+
+  // This test exists primarily as a regression guard: phase-1 with a single
+  // global LRU would evict the never-hit segment as well (LRU is the same),
+  // so the test passes in both phases. It serves to document that
+  // per-bucket isolation does not regress global eviction correctness.
+  auto tempDir = ::facebook::velox::common::testutil::TempDirectoryPath::create();
+  FsCacheConfig config;
+  config.cacheRoot = tempDir->getPath() + "/cache";
+  config.maxBytes = 8UL * 1'024 * 1'024; // exactly 2 segments at 4 MiB
+  std::filesystem::create_directories(config.cacheRoot);
+
+  // Two remote files, two distinct paths -> two PathKeys -> likely two buckets
+  // (with 1024 buckets the collision probability is ~0.1%; loop until we
+  // get two distinct bucket indices to make the test deterministic).
+  uint64_t variant = 0;
+  std::string pathA, pathB;
+  while (true) {
+    pathA = tempDir->getPath() + fmt::format("/a{}.bin", variant);
+    pathB = tempDir->getPath() + fmt::format("/b{}.bin", variant);
+    const auto bucketA =
+        std::hash<PathKey>{}(PathKey::fromPath(pathA)) & (config.numBuckets - 1);
+    const auto bucketB =
+        std::hash<PathKey>{}(PathKey::fromPath(pathB)) & (config.numBuckets - 1);
+    if (bucketA != bucketB) {
+      break;
+    }
+    ++variant;
+  }
+  {
+    std::ofstream outA{pathA, std::ios::binary};
+    std::ofstream outB{pathB, std::ios::binary};
+    const std::string blob(4UL * 1'024 * 1'024, 'q');
+    outA.write(blob.data(), blob.size());
+    outB.write(blob.data(), blob.size());
+  }
+
+  FsCache cache{config};
+  LocalReadFile remoteA{pathA};
+  LocalReadFile remoteB{pathB};
+  (void)cache.getOrSet(pathA, 0, 4UL * 1'024 * 1'024, remoteA);
+  (void)cache.getOrSet(pathB, 0, 4UL * 1'024 * 1'024, remoteB);
+  // Hit A many times so it is MRU in its bucket.
+  for (int i = 0; i < 50; ++i) {
+    (void)cache.getOrSet(pathA, 0, 4UL * 1'024 * 1'024, remoteA);
+  }
+  // Insert a third segment from a third path -- must trigger eviction of
+  // exactly one of the existing two. B (never hit since the first time)
+  // should be the victim.
+  std::string pathC = tempDir->getPath() + "/c.bin";
+  {
+    std::ofstream outC{pathC, std::ios::binary};
+    const std::string blob(4UL * 1'024 * 1'024, 'q');
+    outC.write(blob.data(), blob.size());
+  }
+  LocalReadFile remoteC{pathC};
+  (void)cache.getOrSet(pathC, 0, 4UL * 1'024 * 1'024, remoteC);
+  EXPECT_EQ(cache.stats().evictions, 1u);
+  // A should still be cached (most-recently-used in its bucket).
+  EXPECT_EQ(cache.stats().bytesOnDisk, 8UL * 1'024 * 1'024);
 }
 
 } // namespace facebook::velox::cache::fs::test

@@ -17,7 +17,6 @@
 #include "velox/common/caching/fscache/FsCache.h"
 
 #include "velox/common/base/Exceptions.h"
-#include "velox/common/caching/fscache/LruPolicy.h"
 #include "velox/common/file/File.h"
 
 #include <glog/logging.h>
@@ -31,8 +30,7 @@ namespace facebook::velox::cache::fs {
 
 FsCache::FsCache(FsCacheConfig config)
     : config_{std::move(config)},
-      metadata_{std::make_unique<FsCacheMetadata>(config_.numBuckets)},
-      policy_{std::make_unique<LruPolicy>()} {
+      metadata_{std::make_unique<FsCacheMetadata>(config_.numBuckets)} {
   // splitRange relies on maxSegmentSize being a multiple of alignment so
   // chunk starts remain aligned. Validate at construction since the
   // FsCacheConfig struct itself has no constructor to enforce it.
@@ -231,12 +229,13 @@ FileSegmentPtr FsCache::lookupOrCreate(
 
 void FsCache::evict(uint64_t bytesNeeded) {
   // Serialize concurrent eviction. Without this, two writers that both miss
-  // the cache could each receive the same victim from selectVictims() (which
-  // does not detach entries from the LRU list -- detachment happens later via
-  // onRemove). The first thread's metadata_->erase() then drops the only
-  // shared_ptr to the segment, and the second thread dereferences a freed
-  // FileSegment. Holding evictionMutex_ across the whole pass guarantees at
-  // most one in-flight selectVictims+remove cycle at a time.
+  // the cache could each receive the same victim from a bucket's
+  // selectVictims() (which does not detach entries from the LRU list --
+  // detachment happens later via onRemove). The first thread's
+  // metadata_->erase() then drops the only shared_ptr to the segment, and
+  // the second thread dereferences a freed FileSegment. Holding
+  // evictionMutex_ across the whole pass guarantees at most one in-flight
+  // select+remove cycle at a time.
   std::lock_guard<std::mutex> evictGuard{evictionMutex_};
   const uint64_t current =
       counters_.bytesOnDisk.load(std::memory_order_relaxed);
@@ -245,52 +244,70 @@ void FsCache::evict(uint64_t bytesNeeded) {
   }
   const uint64_t toFree = current + bytesNeeded - config_.maxBytes;
 
-  // selectVictims is read-only: pick candidates under priorityMutex_ but do
-  // NOT yet call policy_->onRemove. Filesystem removal must succeed first;
-  // otherwise an LRU-evicted-but-still-on-disk file becomes an orphan that
-  // no future eviction pass can find (gone from policy but still consuming
-  // bytes), and metadata becomes inconsistent with the on-disk state.
-  std::vector<FileSegment*> candidates;
-  {
-    CachePriorityGuard guard{priorityMutex_};
-    candidates = policy_->selectVictims(toFree);
+  // Per-bucket candidate selection. Each bucket contributes victims under
+  // its own priorityMutex; the candidates list is filled in deterministic
+  // bucket order. Task 9 changes this to round-robin try_lock; Task 8
+  // keeps the simple full-pass behavior. Victims are only collected here --
+  // onRemove is deferred until after filesystem removal succeeds, so an
+  // LRU-evicted-but-still-on-disk file cannot leak as an orphan.
+  struct VictimEntry {
+    FileSegment* victim;
+    FsCacheMetadata::Bucket* bucket;
+  };
+  std::vector<VictimEntry> candidates;
+  uint64_t accumulated{0};
+  for (const auto& bucketPtr : metadata_->buckets()) {
+    if (accumulated >= toFree) {
+      break;
+    }
+    CachePriorityGuard guard{bucketPtr->priorityMutex};
+    auto picked = bucketPtr->priority->selectVictims(toFree - accumulated);
+    for (auto* v : picked) {
+      candidates.push_back({v, bucketPtr.get()});
+      accumulated += v->size();
+      if (accumulated >= toFree) {
+        break;
+      }
+    }
   }
 
-  uint64_t freed = 0;
-  uint32_t evictedCount = 0;
-  for (auto* victim : candidates) {
-    const auto key = victim->key();
+  uint64_t freed{0};
+  uint32_t evictedCount{0};
+  for (auto& entry : candidates) {
+    const auto key = entry.victim->key();
     std::error_code ec;
-    std::filesystem::remove(victim->localPath(config_.cacheRoot), ec);
+    std::filesystem::remove(entry.victim->localPath(config_.cacheRoot), ec);
     if (ec) {
       // Filesystem removal failed (disk error, race with manual cleanup,
-      // permission change). Leave the victim in policy_ and metadata_ so a
-      // later evict() can retry; better a temporary over-capacity than
-      // losing the entry and leaking the file.
-      LOG(WARNING) << "FsCache evict: failed to remove " << victim->remotePath()
-                   << " [" << key.offset << ".." << key.offset + key.size
-                   << "): " << ec.message();
+      // permission change). Leave the victim in its bucket's policy and in
+      // metadata_ so a later evict() can retry; better a temporary
+      // over-capacity than losing the entry and leaking the file.
+      LOG(WARNING) << "FsCache evict: failed to remove "
+                   << entry.victim->remotePath() << " [" << key.offset << ".."
+                   << key.offset + key.size << "): " << ec.message();
       continue;
     }
     {
-      CachePriorityGuard guard{priorityMutex_};
-      policy_->onRemove(victim);
+      CachePriorityGuard guard{entry.bucket->priorityMutex};
+      entry.bucket->priority->onRemove(entry.victim);
     }
     metadata_->erase(key);
     freed += key.size;
     ++evictedCount;
   }
   counters_.evictions.fetch_add(evictedCount, std::memory_order_relaxed);
-  // fetch_sub does not clamp to zero. Underflow cannot occur in practice:
-  // every segment in policy_ reached kDownloaded via recordMiss, which
-  // credited segmentSize == key.size to bytesOnDisk; freed sums key.size of
-  // segments actually removed from policy_, so freed <= sum of outstanding
-  // credits == bytesOnDisk at all times. The DCHECK surfaces accounting
-  // bugs in debug builds.
-  const uint64_t prev =
-      counters_.bytesOnDisk.fetch_sub(freed, std::memory_order_relaxed);
-  VELOX_DCHECK_GE(
-      prev, freed, "bytesOnDisk underflow: prev={} freed={}", prev, freed);
+  if (freed > 0) {
+    // fetch_sub does not clamp to zero. Underflow cannot occur in practice:
+    // every segment in a bucket's policy reached kDownloaded via
+    // recordMiss, which credited segmentSize == key.size to bytesOnDisk;
+    // freed sums key.size of segments actually removed from the policy, so
+    // freed <= sum of outstanding credits == bytesOnDisk at all times. The
+    // DCHECK surfaces accounting bugs in debug builds.
+    const uint64_t prev =
+        counters_.bytesOnDisk.fetch_sub(freed, std::memory_order_relaxed);
+    VELOX_DCHECK_GE(
+        prev, freed, "bytesOnDisk underflow: prev={} freed={}", prev, freed);
+  }
 }
 
 FsCacheStats FsCache::stats() const {
@@ -312,14 +329,16 @@ void FsCache::recordHit(FileSegment* segment) {
   if (!bumpLock.owns_lock()) {
     return;
   }
-  CachePriorityGuard guard{priorityMutex_};
-  policy_->onHit(segment);
+  auto& bucket = metadata_->bucketOf(segment->key().path);
+  CachePriorityGuard guard{bucket.priorityMutex};
+  bucket.priority->onHit(segment);
 }
 
 void FsCache::recordMiss(FileSegment* segment, uint64_t segmentSize) {
   {
-    CachePriorityGuard guard{priorityMutex_};
-    policy_->onInsert(segment);
+    auto& bucket = metadata_->bucketOf(segment->key().path);
+    CachePriorityGuard guard{bucket.priorityMutex};
+    bucket.priority->onInsert(segment);
   }
   counters_.misses.fetch_add(1, std::memory_order_relaxed);
   counters_.bytesOnDisk.fetch_add(segmentSize, std::memory_order_relaxed);

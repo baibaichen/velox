@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "velox/common/caching/fscache/EvictionPolicy.h"
 #include "velox/common/caching/fscache/FileSegment.h"
 #include "velox/common/caching/fscache/FsCacheConfig.h"
 #include "velox/common/caching/fscache/FsCacheGuards.h"
@@ -144,9 +143,11 @@ class FsCache {
       const std::string& path,
       ::facebook::velox::ReadFile& remote);
 
-  // Evicts until bytesOnDisk + bytesNeeded <= maxBytes. Selects victims via
-  // policy_, removes the on-disk file first, then drops the entry from
-  // policy_/metadata_ to avoid orphan files on filesystem-remove failure.
+  // Evicts until bytesOnDisk + bytesNeeded <= maxBytes. Selects victims from
+  // each bucket's per-bucket EvictionPolicy under that bucket's
+  // CachePriorityMutex, removes the on-disk file first, then drops the entry
+  // from the bucket policy and metadata_ to avoid orphan files on
+  // filesystem-remove failure.
   //
   // CAVEAT: this invariant is only single-writer tight. evict() reads
   // counters_.bytesOnDisk to decide whether to drain, but recordMiss() does
@@ -182,19 +183,16 @@ class FsCache {
 
   const FsCacheConfig config_;
   std::unique_ptr<FsCacheMetadata> metadata_;
-  std::unique_ptr<EvictionPolicy> policy_;
 
-  // Phase 1 lock instances. CacheMetadataMutex lives inside FsCacheMetadata;
-  // FileSegmentMutex lives inside each FileSegment; KeyMutex is reserved
-  // for phase 2 (per-key serialization of concurrent downloads).
-  mutable CachePriorityMutex priorityMutex_;
-  // Serializes evict(). Two concurrent writers calling evict() could otherwise
-  // each receive the same victim from selectVictims() (which does not detach
-  // entries from the LRU list), causing the second thread to dereference a
-  // FileSegment whose owning shared_ptr has already been dropped by the first
-  // thread's metadata_->erase(). Plain std::mutex (not RankedMutex) because
-  // it is held strictly outside the priority/state/metadata acquisitions
-  // inside the eviction loop, so no rank ordering with those locks applies.
+  // Per-bucket CachePriorityMutex and EvictionPolicy live inside
+  // FsCacheMetadata::Bucket; per-key download serialization lives inside
+  // KeyMetadata. FsCache only retains a global evictionMutex_ that serializes
+  // concurrent evict() calls so two writers cannot pick the same victim
+  // from a bucket's policy.
+  //
+  // Plain std::mutex (not RankedMutex) because evictionMutex_ is held
+  // strictly outside the priority/state/metadata acquisitions inside the
+  // eviction loop, so no rank ordering with those locks applies.
   mutable std::mutex evictionMutex_;
   AtomicCounters counters_;
 };
