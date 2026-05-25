@@ -8,6 +8,28 @@
 （phase 2.5，见 §11）；benchmark 三方对比（phase 3）；Userspace Page Cache
 RAM 层（phase 4）
 
+## 0. 本 spec 解决什么
+
+Phase-1 落地后，FsCache 在两个维度上明显落后于 ClickHouse：
+
+1. **16 线程 hit-path 退化到单线程的 0.3×**（2.1 M vs 7.6 M ops/s）——
+   命中路径串了 3 把全局锁（metadata、priority、state），并发越高越
+   排队。
+2. **Reader prefetch 信号在 FsCache 这一层被压成同步**——
+   `FsCacheBufferedInput::load()` 同步串行下载，上游所有并行预取
+   （`TableScan::preload` / Parquet `scheduleRowGroups` / DWRF 等）
+   都退化为前台 demand fetch。
+
+本 spec 通过 (a) 细化锁实例化到 per-bucket + per-key + atomic stats +
+try_lock LRU bump，把 16 线程 hit 扩展系数拉回 ≥ 0.80×；(b) 把
+`load()` 异步派发到下载池，恢复 prefetch 有效性，miss→hit 比例
+≥ 80%。
+
+SLRU 默认策略、`FileCacheQueryLimit` per-query 配额、
+`bypass_cache_threshold` 大读绕过——这三项是和 CH parity 的配套
+（默认行为对齐 + 多 query 抗压 + 大扫描抗污染），不是上面两个性能
+回归的直接修复。
+
 ## 1. 背景与触发点
 
 Phase-1 baseline (`docs/superpowers/results/2026-05-23-fscache-phase1-baseline.md`)
