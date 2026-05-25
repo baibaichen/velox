@@ -195,6 +195,12 @@ class FsCache {
   // eviction loop, so no rank ordering with those locks applies.
   mutable std::mutex evictionMutex_;
   AtomicCounters counters_;
+
+  // Rotating start offset for evict() round-robin across buckets.
+  // fetch_add(1, relaxed) per evict() call so a bucket that is "first" in
+  // one call is "last" in the next; distributes the eviction load and
+  // prevents always-evict-from-bucket-0 starvation.
+  std::atomic<size_t> evictStart_{0};
 };
 
 } // namespace facebook::velox::cache::fs

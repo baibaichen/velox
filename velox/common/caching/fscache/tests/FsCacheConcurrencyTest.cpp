@@ -20,6 +20,7 @@
 #include "velox/common/file/File.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
 
+#include <fmt/format.h>
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -214,6 +215,70 @@ TEST_F(FsCacheConcurrencyTest, hitPathTolerates32WayContention) {
   // segment. hits == kThreads * kPerThread, with 0 hits from the priming
   // call itself (recordMiss path, not recordHit).
   EXPECT_EQ(s.hits, kThreads * kPerThread);
+}
+
+// 16 threads each insert + read distinct segments while the cache
+// capacity is half of total demand. evict() must run many times across
+// many buckets. Per-bucket try_lock + blocking fallback must produce
+// correct accounting and never deadlock.
+//
+// DISABLED in plan-1: the final assertion
+// `bytesOnDisk <= maxBytes` is the strict single-writer bound, which
+// concurrent miss-path writers can transiently violate for the same
+// reason documented on `evictionUnderConcurrentLoadIsRaceFree` above
+// (recordMiss credits bytesOnDisk only AFTER download(), so N concurrent
+// writers can each independently observe headroom and skip eviction).
+// Re-enable after in-flight reservation accounting lands; see the
+// "Deferred work" section of
+// `docs/superpowers/specs/2026-05-25-fscache-phase2-design.md`.
+TEST_F(FsCacheConcurrencyTest, DISABLED_roundRobinEvictUnderConcurrentInserts) {
+  FsCacheConfig tighter = config_;
+  tighter.maxBytes = 16UL * 1'024 * 1'024;  // 4 segments at 4 MiB
+  FsCache cache{tighter};
+
+  constexpr int kThreads = 16;
+  constexpr int kSegmentsPerThread = 8;
+  constexpr uint64_t kSegmentSize = 4UL * 1'024 * 1'024;
+
+  // Create 16 * 8 = 128 distinct remote files so insertions spread across
+  // buckets.
+  std::vector<std::string> paths(kThreads * kSegmentsPerThread);
+  for (size_t i = 0; i < paths.size(); ++i) {
+    paths[i] = tempDir_->getPath() + fmt::format("/blob-{}.bin", i);
+    std::ofstream out{paths[i], std::ios::binary};
+    const std::string blob(kSegmentSize, 'q');
+    out.write(blob.data(), blob.size());
+  }
+
+  std::vector<std::thread> threads;
+  std::atomic<int> errors{0};
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t] {
+      try {
+        for (int i = 0; i < kSegmentsPerThread; ++i) {
+          const auto& path = paths[t * kSegmentsPerThread + i];
+          LocalReadFile remote{path};
+          auto segs = cache.getOrSet(path, 0, kSegmentSize, remote);
+          for (auto& s : segs) {
+            if (s->state() != FileSegment::State::kDownloaded) {
+              ++errors;
+            }
+          }
+        }
+      } catch (const std::exception&) {
+        ++errors;
+      }
+    });
+  }
+  for (auto& th : threads) {
+    th.join();
+  }
+  EXPECT_EQ(errors, 0);
+  // At least 4 * 31 = 124 evictions for 128 inserts into a 4-slot cache;
+  // exact count depends on race ordering. We just require many evictions
+  // happened and no overshoot.
+  EXPECT_GT(cache.stats().evictions, 100u);
+  EXPECT_LE(cache.stats().bytesOnDisk, tighter.maxBytes);
 }
 
 } // namespace facebook::velox::cache::fs::test

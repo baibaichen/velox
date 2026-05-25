@@ -869,3 +869,42 @@ phase 2.5 是补最后那 20 %（partial read-through）。
 plan-1 是其他 plan 的基础（所有锁/数据结构改动）；plan-2/3/4 在
 plan-1 落地之后可以并行展开，**但本仓库实际推进顺序仍由 user 决定**
 （推荐 plan-1 → plan-2 → plan-3 → plan-4，性能收益曲线最陡）。
+
+## 附录 B：Deferred work（跨 plan）
+
+下列工作不属于任何已立项 plan 的硬性范围，但会作为后续 plan 的伴生项落地。
+列在这里以便相关 PR 在落地时回头取消对应的 TODO / 重新打开被关掉的测试。
+
+### B.1 In-flight reservation accounting（在途字节预留）
+
+**Why deferred**：phase-1 / plan-1 的 `recordMiss()` 在 `download()` 完成后
+才把 segment 大小记入 `counters_.bytesOnDisk`。N 个并发 miss-path writer 因此
+都能在自己的 `evict()` 里看到 `bytesOnDisk == 0`、各自跳过淘汰，再一起把计数
+器抬过 `maxBytes`。下一次 miss 的 `evict()` 会观察到真实总量并把上限拉回，
+所以超量是瞬时且自愈的（量级：`maxBytes + N * segmentSize`，在生产 100 GiB
+cache 上 64 个 writer × 8 MiB = 512 MiB 顶到 cap 之上）。
+
+**修复方案**：引入 `counters_.reservedBytes` 原子计数器；miss-path writer 在
+`download()` 之前 `fetch_add(segmentSize)` 预占，`download()` 失败回滚、成功
+则把同等字节从 `reservedBytes` 转移到 `bytesOnDisk`。`evict()` 判定条件改为
+`bytesOnDisk + reservedBytes + bytesNeeded > maxBytes`。warm-restart 时
+`loadFromDisk` 留下的 orphan 文件也走同一个计数器（由 plan-1 Task 10
+`.fscache_version` sentinel 触发盲清后，phase-2 不再有 orphan，但接口对齐
+方便后续 phase 2.5 续传）。
+
+**承载位置**：plan-2（后台下载线程池）的自然伴生项——writer-collapse 与
+async dispatch 都要重新进出 reservation 路径，一起做改动范围最小。
+
+**TODOs to retire when this lands**：
+
+- `velox/common/caching/fscache/tests/FsCacheConcurrencyTest.cpp`
+  `DISABLED_roundRobinEvictUnderConcurrentInserts`：去掉 `DISABLED_` 前缀
+  并删除顶部的 deferred 注释。该测试的最终断言
+  `bytesOnDisk <= maxBytes` 在 reservation 落地之后才成立。
+- `evictionUnderConcurrentLoadIsRaceFree` 中的 CAVEAT block + 放宽过的上界
+  （`maxBytes + kThreads * kSegmentSize`）：收紧为
+  `<= maxBytes`，删除 CAVEAT 段。
+- `FsCache::evict()` 注释里的 "CAVEAT: only single-writer tight" 段
+  （`FsCache.h` private 区）：删除。
+- `FsCache::loadFromDisk()` 注释里关于 orphan-bytes 计数器的 phase-2 TODO
+  （`FsCache.h` public 区）：与本计数器一起落地。

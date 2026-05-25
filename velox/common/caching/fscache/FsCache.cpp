@@ -244,31 +244,97 @@ void FsCache::evict(uint64_t bytesNeeded) {
   }
   const uint64_t toFree = current + bytesNeeded - config_.maxBytes;
 
-  // Per-bucket candidate selection. Each bucket contributes victims under
-  // its own priorityMutex; the candidates list is filled in deterministic
-  // bucket order. Task 9 changes this to round-robin try_lock; Task 8
-  // keeps the simple full-pass behavior. Victims are only collected here --
-  // onRemove is deferred until after filesystem removal succeeds, so an
-  // LRU-evicted-but-still-on-disk file cannot leak as an orphan.
+  // Round-robin candidate selection across all buckets. Each bucket is
+  // visited AT MOST ONCE per evict() call (regardless of how many round-
+  // robin attempts it takes to acquire its priorityMutex), which is what
+  // makes the round-robin scheme correct: LruPolicy::selectVictims is a
+  // non-mutating peek of the LRU tail --- detachment happens later in
+  // onRemove --- so calling it twice on the same bucket would return the
+  // same head-LRU FileSegment* twice and double-count it as a victim.
+  // evictStart_ rotates the start offset so the same buckets are not
+  // always queried first; distributes eviction load across the bucket
+  // array.
+  //
+  // Phase A: up to N rounds of try_lock across all buckets. A bucket
+  // whose priorityMutex is contended on round r may succeed on round
+  // r+1; once it succeeds (or yields no victims even on success),
+  // visited[idx] flips true and that bucket is excluded from later
+  // attempts.
+  //
+  // Phase B: if Phase A still hasn't freed enough, fall back to a single
+  // blocking pass over any bucket not yet visited. This guarantees
+  // forward progress even when one bucket is permanently contended
+  // (e.g., a long-running recordHit chain).
+  //
+  // Victims are only collected here -- onRemove is deferred until after
+  // filesystem removal succeeds, so an LRU-evicted-but-still-on-disk
+  // file cannot leak as an orphan.
   struct VictimEntry {
     FileSegment* victim;
     FsCacheMetadata::Bucket* bucket;
   };
   std::vector<VictimEntry> candidates;
   uint64_t accumulated{0};
-  for (const auto& bucketPtr : metadata_->buckets()) {
-    if (accumulated >= toFree) {
-      break;
-    }
-    CachePriorityGuard guard{bucketPtr->priorityMutex};
-    auto picked = bucketPtr->priority->selectVictims(toFree - accumulated);
+
+  const auto& buckets = metadata_->buckets();
+  const size_t numBuckets = buckets.size();
+  const size_t start =
+      evictStart_.fetch_add(1, std::memory_order_relaxed) % numBuckets;
+  std::vector<bool> visited(numBuckets, false);
+
+  // Collects victims from a bucket whose priorityMutex is already held by
+  // the caller. Flips visited[idx] so the bucket is excluded from any
+  // subsequent attempt in this evict() call -- this is what enforces the
+  // at-most-once invariant described above.
+  auto collectFrom = [&](size_t idx) {
+    auto& bucket = *buckets[idx];
+    visited[idx] = true;
+    auto picked = bucket.priority->selectVictims(toFree - accumulated);
     for (auto* v : picked) {
-      candidates.push_back({v, bucketPtr.get()});
+      candidates.push_back({v, &bucket});
       accumulated += v->size();
       if (accumulated >= toFree) {
         break;
       }
     }
+  };
+
+  // Phase A: try_lock rounds. A bucket may need multiple rounds before
+  // its priorityMutex is acquirable.
+  for (size_t round = 0; round < numBuckets && accumulated < toFree;
+       ++round) {
+    bool madeProgress{false};
+    for (size_t i = 0; i < numBuckets && accumulated < toFree; ++i) {
+      const size_t idx = (start + i) % numBuckets;
+      if (visited[idx]) {
+        continue;
+      }
+      std::unique_lock<CachePriorityMutex> lk{
+          buckets[idx]->priorityMutex, std::try_to_lock};
+      if (!lk.owns_lock()) {
+        continue;
+      }
+      madeProgress = true;
+      collectFrom(idx);
+    }
+    if (!madeProgress) {
+      // No bucket was acquirable this entire round. Re-trying with the
+      // same lock state would loop forever; break out and let Phase B
+      // block on the remaining buckets.
+      break;
+    }
+  }
+
+  // Phase B: blocking fallback for buckets Phase A could not acquire.
+  // Worst case numBuckets * per-bucket lock acquisitions; spec §4.6
+  // accepts this as evict is off the hot path.
+  for (size_t i = 0; i < numBuckets && accumulated < toFree; ++i) {
+    const size_t idx = (start + i) % numBuckets;
+    if (visited[idx]) {
+      continue;
+    }
+    CachePriorityGuard guard{buckets[idx]->priorityMutex};
+    collectFrom(idx);
   }
 
   uint64_t freed{0};
