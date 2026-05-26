@@ -26,6 +26,7 @@ set(
   FsCacheMetadataTest.cpp
   FsCacheTest.cpp
   FsCacheRecoveryTest.cpp
+  FsCachePartialRecoveryTest.cpp
   FsCachePersistenceTest.cpp
   FsCacheConcurrencyTest.cpp
   KeyGeneratorTest.cpp
