@@ -2749,7 +2749,7 @@ EOF
 - Create: `velox/common/caching/fscache/FileCacheQueryLimit.cpp`
 - Create: `velox/common/caching/fscache/tests/FileCacheQueryLimitTest.cpp`
 - Create: `velox/dwio/common/tests/FsCacheBypassIntegrationTest.cpp` (new — proves bypass actually round-trips bytes via direct pread)
-- Modify: `velox/common/caching/fscache/FsCacheConfig.h` — add `bypassThresholdBytes{256ULL << 20}` (256 MiB default per spec §8.3; set to 0 to disable)
+- Modify: `velox/common/caching/fscache/FsCacheConfig.h` — add `bypassThresholdBytes{0}` (default disabled per spec §8.3, matching ClickHouse `FILECACHE_BYPASS_THRESHOLD`-disabled default; set to a positive value, e.g. `256ULL << 20`, to enable)
 - Modify: `velox/common/caching/fscache/FsCache.h` — add `getOrSet` bypass behaviour (no queryId in signature)
 - Modify: `velox/common/caching/fscache/FsCache.cpp` — bypass short-circuit
 - Modify: `velox/dwio/common/FsCacheBufferedInput.cpp` — `load()` detects empty holder (cache bypass) and one-shot preads the region into `enq.bypassBuffer`; `DeferredStream` adds a bypass branch that slices bytes directly from that buffer instead of constructing an `FsCacheInputStream`
@@ -2764,7 +2764,7 @@ EOF
 
 Two **independent** mechanisms; the wiring is intentionally asymmetric.
 
-**bypass_cache_threshold** (§8.3): size-based, lives inside `getOrSet`. If the requested region is `>= config.bypassThresholdBytes`, `getOrSet` returns an empty `FileSegmentsHolder` (no segments). This task implements both halves of the contract: (a) the cache-side short-circuit in `FsCache::getOrSet` via `shouldBypass`, and (b) the caller-side fallback in `FsCacheBufferedInput::load` + `DeferredStream`, which does a one-shot `pread` of the whole region into `EnqueuedRegion::bypassBuffer` and serves subsequent `Next()` calls directly from that buffer. No identity required — large scans should not pollute the warm working set.
+**bypass_cache_threshold** (§8.3): size-based, lives inside `getOrSet`. If `config.bypassThresholdBytes > 0` and the requested region is `>= config.bypassThresholdBytes`, `getOrSet` returns an empty `FileSegmentsHolder` (no segments). This task implements both halves of the contract: (a) the cache-side short-circuit in `FsCache::getOrSet` via `shouldBypass`, and (b) the caller-side fallback in `FsCacheBufferedInput::load` + `DeferredStream`, which does a one-shot `pread` of the whole region into `EnqueuedRegion::bypassBuffer` and serves subsequent `Next()` calls directly from that buffer. **Default is 0 (disabled), matching CH** (`FILECACHE_BYPASS_THRESHOLD` settings declaration is "Undocumented. Not recommended for use", default 0; see `src/Interpreters/FileCache/FileCacheSettings.cpp:55`). The mechanism is wired end-to-end so operators can opt in by raising the threshold; phase-1 does **not** rely on it for warm-set protection — that responsibility belongs to the per-query `QueryLimitToken` quota (caller-side wiring deferred to phase-3) plus LRU itself.
 
 The bypass-buffer model is the Velox-side equivalent of ClickHouse's `ReadType::REMOTE_FS_READ_BYPASS_CACHE` path (`src/Disks/IO/CachedOnDiskReadBufferFromFile.cpp:322`). CH chunks the bypass read at `DBMS_DEFAULT_BUFFER_SIZE` (1 MiB) because its `ReadBuffer::nextImpl` interface is pull-style and cannot know the total length; the actual network cost is still one `setReadUntilPosition`-bounded HTTP range, not N round trips (see `CachedOnDiskReadBufferFromFile.cpp:1148-1149`). Velox's `BufferedInput::enqueue(Region)` already carries the full region length, so a single `ReadFile::pread(offset, length, buf)` is the natural — and equivalent-cost — mapping.
 
@@ -3127,6 +3127,20 @@ TEST_F(FsCacheTest, shouldBypassDisabledWhenThresholdIsZero) {
   EXPECT_FALSE(cache.shouldBypass(0));
   EXPECT_FALSE(cache.shouldBypass(1ULL << 40));
 }
+
+TEST_F(FsCacheTest, totalSizeStartsAtZeroAndStaysZeroOnBypass) {
+  FsCacheConfig cfg = baseConfig();
+  cfg.bypassThresholdBytes = 4 * kMiB;
+  FsCache cache{cfg};
+  EXPECT_EQ(cache.totalSize(), 0);
+
+  auto remote = makeBlob(/*bytes=*/16 * kMiB);
+  (void)cache.getOrSet(
+      "blob", 0, 8 * kMiB, cfg, *remote, IsPrefetch::kDemand);
+  // Bypass path returns empty holder and writes nothing to disk; the
+  // counter must remain zero.
+  EXPECT_EQ(cache.totalSize(), 0);
+}
 ```
 
 Per-query enforcement is covered end-to-end in Task 14's BufferedInput integration test once `QueryLimitToken` is wired into the read path. Token-level reserve/release behaviour is already covered by `FileCacheQueryLimitTest` above.
@@ -3149,10 +3163,17 @@ Modify `velox/common/caching/fscache/FsCacheConfig.h` — add field below existi
 /// than or equal to this value. Set to 0 to disable the bypass entirely
 /// (every request enters the cache regardless of size).
 ///
-/// Default 256 MiB (spec §8.3). Rationale: very large sequential scans
-/// (e.g. full-table reads with no reuse) would otherwise evict the entire
-/// warm working set in O(disk throughput).
-uint64_t bypassThresholdBytes{256ULL << 20};
+/// Default 0 (disabled), matching ClickHouse's `FILECACHE_BYPASS_THRESHOLD`
+/// behaviour (`src/Interpreters/FileCache/FileCacheSettings.cpp:55` declares
+/// `bypass_cache_threshold` as "Undocumented. Not recommended for use" with
+/// default 0; enabling additionally requires `enable_bypass_cache_with_threshold`).
+/// Rationale: CH relies on per-query `filesystem_cache_max_download_size`
+/// quotas + LRU itself to keep large scans from evicting the warm working set;
+/// bypass is a safety valve, not the primary defence. Phase-1 ships the
+/// mechanism but defaults it off until the caller-side QueryLimitToken
+/// wiring lands in phase-3 and effectiveness can be re-validated with TPC-H
+/// and microbench under both settings (spec §8.3).
+uint64_t bypassThresholdBytes{0};
 ```
 
 Modify `velox/common/caching/fscache/FsCache.h` — update the existing `getOrSet` doc comment to mention the new bypass behaviour (signature stays at the 6-param form from Task 8; no queryId is ever added), and declare `shouldBypass` next to `getOrSet`:
@@ -3180,6 +3201,14 @@ FileSegmentsHolderPtr getOrSet(
 /// Exposed publicly so callers (e.g. metrics, debug logs) can ask the
 /// same question without re-deriving the comparison. Cheap, lock-free.
 bool shouldBypass(uint64_t size) const;
+
+/// Returns current on-disk bytes accounted by this cache instance.
+/// Approximate (relaxed atomic load); intended for tests, metrics, and
+/// debug logs. Mirrors ClickHouse's `FileCache::getUsedCacheSize()`
+/// (src/Interpreters/FileCache/FileCache.h:199), which is also a
+/// relaxed counter snapshot used for metrics. Equivalent to reading
+/// `stats().bytesOnDisk` but avoids constructing the POD snapshot.
+uint64_t totalSize() const;
 ```
 
 Modify `velox/common/caching/fscache/FsCache.cpp` — implement `shouldBypass` and call it from the top of `getOrSet`, before any lock acquisition:
@@ -3188,6 +3217,10 @@ Modify `velox/common/caching/fscache/FsCache.cpp` — implement `shouldBypass` a
 bool FsCache::shouldBypass(uint64_t size) const {
   return config_.bypassThresholdBytes > 0 &&
       size >= config_.bypassThresholdBytes;
+}
+
+uint64_t FsCache::totalSize() const {
+  return counters_.bytesOnDisk.load(std::memory_order_relaxed);
 }
 
 FileSegmentsHolderPtr FsCache::getOrSet(
@@ -3283,7 +3316,10 @@ TEST_F(FsCacheBypassIntegrationTest, regionAboveThresholdRoundTripsViaDirectPrea
   FsCacheConfig cfg;
   cfg.cacheRoot = tempDir_->getPath() + "/cache";
   cfg.bypassThresholdBytes = 4 * kMiB;
-  cfg.maxSegmentSize = 1 * kMiB;
+  // alignment / maxSegmentSize: defaults (4 MiB / 32 MiB) — bypass path
+  // never enters splitRange, so these are not exercised here. Setting
+  // a custom maxSegmentSize without also overriding alignment would
+  // trip FsCache's ctor invariant `maxSegmentSize % alignment == 0`.
   std::filesystem::create_directories(cfg.cacheRoot);
   FsCache cache{cfg};
 
@@ -3325,7 +3361,8 @@ TEST_F(FsCacheBypassIntegrationTest, regionBelowThresholdStillCaches) {
   FsCacheConfig cfg;
   cfg.cacheRoot = tempDir_->getPath() + "/cache";
   cfg.bypassThresholdBytes = 4 * kMiB;
-  cfg.maxSegmentSize = 1 * kMiB;
+  // Same defaults as above; non-bypass path does enter splitRange but
+  // 2 MiB request fits in one default 32 MiB segment.
   std::filesystem::create_directories(cfg.cacheRoot);
   FsCache cache{cfg};
 
@@ -3366,7 +3403,9 @@ Expected: `regionAboveThresholdRoundTripsViaDirectPread` aborts in `DeferredStre
 
 - [ ] **Step 11: Wire bypass fallback into FsCacheBufferedInput + DeferredStream**
 
-Modify `velox/dwio/common/FsCacheBufferedInput.cpp` in two places.
+Modify `velox/dwio/common/FsCacheBufferedInput.cpp` in two places. Add
+`#include <limits>` to the header list (used by `DeferredStream::Next`
+to clamp the bypass-buffer slice to `INT32_MAX`).
 
 First, extend `load()` to handle the empty-holder case. The latest version of `load()` is the async one from Task 11 step 4 (line 2642 above). Append the bypass branch after the `getOrSet` call, before the segment-driving loop:
 
@@ -3448,9 +3487,16 @@ bool DeferredStream::Next(const void** data, int32_t* size) {
     if (bytesConsumed_ >= slot_->bypassBuffer.size()) {
       return false;
     }
+    const uint64_t remaining = slot_->bypassBuffer.size() - bytesConsumed_;
+    // Clamp to INT32_MAX so caller drains via multiple Next() calls if
+    // the region exceeds 2 GiB. The default bypass threshold makes this
+    // unreachable, but operators can raise bypassThresholdBytes and a
+    // single int32_t cast would silently truncate the returned size.
+    const uint64_t chunk = std::min<uint64_t>(
+        remaining, static_cast<uint64_t>(std::numeric_limits<int32_t>::max()));
     *data = slot_->bypassBuffer.data() + bytesConsumed_;
-    *size = static_cast<int32_t>(slot_->bypassBuffer.size() - bytesConsumed_);
-    bytesConsumed_ = slot_->bypassBuffer.size();
+    *size = static_cast<int32_t>(chunk);
+    bytesConsumed_ += chunk;
     return true;
   }
   return inner_->Next(data, size);

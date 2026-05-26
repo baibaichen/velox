@@ -634,7 +634,13 @@ struct FsCacheStats {
   std::atomic<uint64_t> prefetchMisses{0};
   std::atomic<uint64_t> demandHits{0};
   std::atomic<uint64_t> demandMisses{0};
-  // ... 其它字段如 evictions 同样改 atomic
+  std::atomic<uint64_t> evictions{0};
+  // `bytesOnDisk` 留作 phase-1 既有字段保留：eviction loop 靠它判停
+  // (`FsCache.h:146` 的 `bytesOnDisk + bytesNeeded <= maxBytes`)；
+  // `FsCache::totalSize()` 是它的 public accessor，对齐 CH
+  // `FileCache::getUsedCacheSize()` (FileCache.h:199, 实现 cpp:2132 也是
+  // 取 priority 队列的 approximate 大小)。
+  std::atomic<uint64_t> bytesOnDisk{0};
 };
 
 enum class IsPrefetch : uint8_t { kPrefetch, kDemand };
@@ -825,9 +831,28 @@ quota 与 `getOrSet` 的耦合关系：`getOrSet` 本身**不感知 quota** —�
 
 ### 8.3 `bypass_cache_threshold`
 
-`FsCacheConfig::bypassThresholdBytes`（默认 256 MiB）。`FsCache::getOrSet`
-入口调 `shouldBypass(size)`，命中时返回 empty holder（无 segments）。
-`FsCacheBufferedInput` 看到 empty holder fallback 到直接 `remote.pread`。
+`FsCacheConfig::bypassThresholdBytes`（默认 **0 = disabled**，与
+ClickHouse 一致）。`FsCache::getOrSet` 入口调 `shouldBypass(size)`，
+命中时返回 empty holder（无 segments）。`FsCacheBufferedInput` 看到
+empty holder fallback 到直接 `remote.pread`。
+
+**为什么默认禁用：** CH 把这条路径标为 "Undocumented. Not recommended
+for use"（`src/Interpreters/FileCache/FileCacheSettings.cpp:55`），
+默认 0；启用还需要把 `enable_bypass_cache_with_threshold` 翻成 `true`
+（`FileCache.cpp:200`）。CH 默认靠 per-query quota
+（`filesystem_cache_max_download_size`）+ LRU 自身的"新数据 evict 最冷"
+来防大 scan 污染。Phase-1 沿用 CH 的默认值，承认这条路径是 safety
+valve，**不是**热数据污染的主要防线。
+
+**phase-1 现状的诚实陈述：** §8.2 的 `QueryLimitToken` 是 caller-side
+dead code，phase-3 才接 wiring。phase-1 唯一能挡大 scan 的就是
+`bypassThresholdBytes`。但默认值改 0 之后，phase-1 **没有任何活动的
+大-scan 防护**，跟 CH 默认配置一致；运维需要时显式调高
+`bypassThresholdBytes`（典型起点 256 MiB），或等 phase-3 接 query
+quota。这条权衡的实际影响（默认禁用是否会让某些 workload 在
+phase-1 下出现热数据被 evict）放到 phase-3 接 caller-side
+QueryLimitToken wiring 之后用 TPC-H + microbench 重新验证；
+phase-1 commit 不做行为验证，只保证语义和 CH 对齐。
 
 ---
 
