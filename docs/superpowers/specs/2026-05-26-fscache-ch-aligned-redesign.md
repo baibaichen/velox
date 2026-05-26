@@ -672,10 +672,10 @@ hot path (inside FsCache::getOrSet, isPrefetch from caller):
       LRU.splice(it, head); unlock
     seg->hits_.fetch_add(1, relaxed)        # per-segment 计数（SLRU 用）
     if (seg.state == kDownloaded):
-      (isPrefetch == kPrefetch ? stats_.prefetchHits : stats_.demandHits)
+      (isPrefetch == kPrefetch ? counters_.prefetchHits : counters_.demandHits)
           .fetch_add(1, relaxed)
     else:                                   # kEmpty / kDownloading
-      (isPrefetch == kPrefetch ? stats_.prefetchMisses : stats_.demandMisses)
+      (isPrefetch == kPrefetch ? counters_.prefetchMisses : counters_.demandMisses)
           .fetch_add(1, relaxed)
   unlock keyMetadata
   return holder

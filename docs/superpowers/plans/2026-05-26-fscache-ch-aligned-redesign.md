@@ -1901,7 +1901,7 @@ FileSegmentsHolderPtr FsCache::getOrSet(
         remaining -= toRead;
       }
       seg->complete();
-      recordMiss(seg.get(), seg->key().size);
+      recordMiss(seg.get(), seg->key().size); // 2-arg here; Task 14 step 5 extends to 3-arg (isPrefetch)
     } catch (...) {
       seg->abandon();
       throw;
@@ -1913,7 +1913,7 @@ FileSegmentsHolderPtr FsCache::getOrSet(
       seg->waitForDownloadedSize(seg->key().size);
     }
     if (seg->state() == FileSegment::State::kDownloaded) {
-      recordHit(seg.get());
+      recordHit(seg.get()); // 2-arg here; Task 14 step 5 extends to 3-arg (isPrefetch)
     }
   }
   return std::make_unique<FileSegmentsHolder>(std::move(slots));
@@ -4138,13 +4138,12 @@ EOF
 ## Task 14: Atomic FsCacheStats + IsPrefetch end-to-end wiring
 
 **Files:**
-- Modify: `velox/common/caching/fscache/FsCacheStats.h` — 4 atomic counters
-- Modify: `velox/common/caching/fscache/FsCache.h` — `IsPrefetch` already exists from Task 8 enum, ensure getOrSet plumbs it
-- Modify: `velox/common/caching/fscache/FsCache.cpp` — count hits/misses split by IsPrefetch
-- Modify: `velox/dwio/common/FsCacheBufferedInput.h` / `.cpp` — pass `IsPrefetch::kPrefetch` when enqueue happens before column reader pull, `kDemand` otherwise
-- Modify: `velox/common/caching/fscache/tests/FsCacheStatsTest.cpp` (new) — 4 unit tests
-- Modify: `velox/dwio/common/tests/FsCacheBufferedInputTest.cpp` — add `prefetchRatio` E2E test
-- Modify: `velox/common/caching/fscache/tests/CMakeLists.txt`
+- Modify: `velox/common/caching/fscache/FsCache.h` — replace the phase-1 4-field `FsCacheStats` POD with the spec §6.3 6-field atomic struct (`prefetchHits/prefetchMisses/demandHits/demandMisses` + retained `evictions` + `bytesOnDisk`); rename the private `AtomicCounters` fields `hits/misses` → `prefetchHits/prefetchMisses/demandHits/demandMisses` (keep `evictions` + `bytesOnDisk` untouched); declare/extend `recordHit(FileSegment*, IsPrefetch)` / `recordMiss(FileSegment*, segmentSize, IsPrefetch)` (the LRU bump stays inside these MEMBER methods); `IsPrefetch` enum already exists from Task 8.
+- Modify: `velox/common/caching/fscache/FsCache.cpp` — in `getOrSet`, forward the caller's `isPrefetch` into `recordHit` / `recordMiss` (replacing the Task 8 `/*isPrefetch*/` placeholder); inside `recordHit` flip the counter increment from `counters_.hits.fetch_add(1, …)` to the prefetch/demand-keyed atomic; same for `recordMiss` (keep its `counters_.bytesOnDisk.fetch_add(segmentSize, …)` line — that is the LRU-insert credit, not the hit/miss counter); preserve unchanged: `evict()`'s `counters_.bytesOnDisk.load(...)` drain check (line 243), `counters_.evictions.fetch_add(...)` (line 366), `counters_.bytesOnDisk.fetch_sub(...)` (line 375), and Round-5's `FsCache::totalSize()` accessor; rewrite `stats()` to compose the new 6-field POD from the 6 atomic loads (4 prefetch/demand + evictions + bytesOnDisk).
+- Modify: `velox/dwio/common/FsCacheBufferedInput.cpp` — Task 11 step 4 already passes `IsPrefetch::kPrefetch` at the `load()` callsite; this task only verifies (Step 6).
+- Create: `velox/common/caching/fscache/tests/FsCacheStatsTest.cpp` — 4 unit tests for the new 4-counter recordHit/recordMiss/snapshot/prefetchRatio surface.
+- Modify: `velox/common/caching/fscache/tests/CMakeLists.txt` — register `velox_fscache_stats_test`.
+- Modify: `velox/dwio/common/tests/FsCacheBufferedInputTest.cpp` — add `prefetchRatio` E2E test.
 
 **Spec:** §9.2 (prefetchRatio gates), §10 R5.
 
@@ -4164,7 +4163,10 @@ The wiring rule in BufferedInput: `enqueue()` is always a prefetch (the column r
 
 - [ ] **Step 1: Write failing test — FsCacheStatsTest**
 
-Create `velox/common/caching/fscache/tests/FsCacheStatsTest.cpp`:
+Create `velox/common/caching/fscache/tests/FsCacheStatsTest.cpp`. The test
+file exercises `FsCacheStats` directly (the struct lives in
+`FsCache.h` — phase-1 never split it into its own header and this task
+does not move it):
 
 ```cpp
 /*
@@ -4183,46 +4185,57 @@ Create `velox/common/caching/fscache/tests/FsCacheStatsTest.cpp`:
  * limitations under the License.
  */
 
-#include "velox/common/caching/fscache/FsCacheStats.h"
+#include "velox/common/caching/fscache/FsCache.h"
 
 #include <gtest/gtest.h>
 #include <thread>
 
 namespace facebook::velox::cache::fs {
 
+// FsCacheStats now exposes 6 atomic fields per spec §6.3
+// (prefetch/demand split + retained evictions + bytesOnDisk). The 4 tests
+// below cover only the hit/miss surface that is new to this task; the
+// `evictions` and `bytesOnDisk` fields are exercised by the existing
+// FsCache evict / lookupOrCreate tests.
+
 TEST(FsCacheStatsTest, freshStatsAreZero) {
   FsCacheStats s;
-  auto snap = s.snapshot();
-  EXPECT_EQ(snap.prefetchHits, 0);
-  EXPECT_EQ(snap.prefetchMisses, 0);
-  EXPECT_EQ(snap.demandHits, 0);
-  EXPECT_EQ(snap.demandMisses, 0);
-  EXPECT_DOUBLE_EQ(snap.prefetchRatio(), 0.0);
+  EXPECT_EQ(s.prefetchHits.load(), 0);
+  EXPECT_EQ(s.prefetchMisses.load(), 0);
+  EXPECT_EQ(s.demandHits.load(), 0);
+  EXPECT_EQ(s.demandMisses.load(), 0);
+  EXPECT_EQ(s.evictions.load(), 0);
+  EXPECT_EQ(s.bytesOnDisk.load(), 0);
+  EXPECT_DOUBLE_EQ(prefetchRatio(s), 0.0);
 }
 
-TEST(FsCacheStatsTest, snapshotsIncrementIndependently) {
+TEST(FsCacheStatsTest, recordHitMissIncrementsCorrectField) {
   FsCacheStats s;
-  s.recordHit(IsPrefetch::kPrefetch);
-  s.recordHit(IsPrefetch::kPrefetch);
-  s.recordHit(IsPrefetch::kDemand);
-  s.recordMiss(IsPrefetch::kPrefetch);
-  s.recordMiss(IsPrefetch::kDemand);
-  s.recordMiss(IsPrefetch::kDemand);
-  auto snap = s.snapshot();
-  EXPECT_EQ(snap.prefetchHits, 2);
-  EXPECT_EQ(snap.prefetchMisses, 1);
-  EXPECT_EQ(snap.demandHits, 1);
-  EXPECT_EQ(snap.demandMisses, 2);
+  recordHit(s, IsPrefetch::kPrefetch);
+  recordHit(s, IsPrefetch::kPrefetch);
+  recordHit(s, IsPrefetch::kDemand);
+  recordMiss(s, IsPrefetch::kPrefetch);
+  recordMiss(s, IsPrefetch::kDemand);
+  recordMiss(s, IsPrefetch::kDemand);
+  EXPECT_EQ(s.prefetchHits.load(), 2);
+  EXPECT_EQ(s.prefetchMisses.load(), 1);
+  EXPECT_EQ(s.demandHits.load(), 1);
+  EXPECT_EQ(s.demandMisses.load(), 2);
 }
 
 TEST(FsCacheStatsTest, prefetchRatioComputesFromPrefetchOnly) {
   FsCacheStats s;
-  // 9 prefetch hits / 1 prefetch miss = 0.9 ratio. Demand counters
-  // must not enter the calculation.
-  for (int i = 0; i < 9; ++i) s.recordHit(IsPrefetch::kPrefetch);
-  s.recordMiss(IsPrefetch::kPrefetch);
-  for (int i = 0; i < 100; ++i) s.recordMiss(IsPrefetch::kDemand);
-  EXPECT_DOUBLE_EQ(s.snapshot().prefetchRatio(), 0.9);
+  // 9 prefetch hits / 1 prefetch miss = 0.9 ratio. Demand counters must
+  // not enter the calculation — demand reads are blocking by definition,
+  // so they are not part of the prefetch effectiveness metric.
+  for (int i = 0; i < 9; ++i) {
+    recordHit(s, IsPrefetch::kPrefetch);
+  }
+  recordMiss(s, IsPrefetch::kPrefetch);
+  for (int i = 0; i < 100; ++i) {
+    recordMiss(s, IsPrefetch::kDemand);
+  }
+  EXPECT_DOUBLE_EQ(prefetchRatio(s), 0.9);
 }
 
 TEST(FsCacheStatsTest, concurrentIncrementsAreLossless) {
@@ -4233,15 +4246,16 @@ TEST(FsCacheStatsTest, concurrentIncrementsAreLossless) {
   for (int t = 0; t < kThreads; ++t) {
     ts.emplace_back([&]() {
       for (int i = 0; i < kIters; ++i) {
-        s.recordHit(IsPrefetch::kPrefetch);
-        s.recordMiss(IsPrefetch::kDemand);
+        recordHit(s, IsPrefetch::kPrefetch);
+        recordMiss(s, IsPrefetch::kDemand);
       }
     });
   }
-  for (auto& t : ts) t.join();
-  auto snap = s.snapshot();
-  EXPECT_EQ(snap.prefetchHits, kThreads * kIters);
-  EXPECT_EQ(snap.demandMisses, kThreads * kIters);
+  for (auto& t : ts) {
+    t.join();
+  }
+  EXPECT_EQ(s.prefetchHits.load(), kThreads * kIters);
+  EXPECT_EQ(s.demandMisses.load(), kThreads * kIters);
 }
 
 } // namespace facebook::velox::cache::fs
@@ -4266,97 +4280,112 @@ cmake --build /home/chang/OpenSource/velox2/cmake-build-relwithdebinfo-gcc13 \
   --target velox_fscache_stats_test -j 8
 ```
 
-Expected: compile errors on `recordHit(IsPrefetch::...)`, `snapshot()`, `prefetchRatio()`.
+Expected: compile errors on `recordHit(s, IsPrefetch::...)`,
+`recordMiss(s, IsPrefetch::...)`, `prefetchRatio(s)`,
+`s.prefetchHits/prefetchMisses/demandHits/demandMisses` (phase-1
+`FsCacheStats` only has `hits/misses/evictions/bytesOnDisk`).
 
-- [ ] **Step 3: Rewrite FsCacheStats with atomic split counters**
+- [ ] **Step 3: Rewrite `FsCacheStats` to the spec §6.3 6-field atomic struct**
 
-Replace `velox/common/caching/fscache/FsCacheStats.h` contents with:
+Replace the existing `FsCacheStats` POD in
+`velox/common/caching/fscache/FsCache.h` (currently lines 41-46, 4
+`uint64_t` fields) with the 6-field atomic struct from spec §6.3, plus
+two free-function helpers and a `prefetchRatio` derivation. Keep
+`FsCacheStats` defined in `FsCache.h` — phase-1 never split it into its
+own header, and this task does not move it.
 
 ```cpp
-/*
- * Copyright (c) Facebook, Inc. and its affiliates.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
-#pragma once
-
-#include <atomic>
-#include <cstdint>
-
-namespace facebook::velox::cache::fs {
-
-/// Whether a cache access originated as a prefetch (scheduled before the
-/// reader needed the bytes) or as a demand read (the reader is blocked
-/// waiting). Drives FsCacheStats accounting.
-enum class IsPrefetch { kDemand, kPrefetch };
-
-/// Plain snapshot of an FsCacheStats instance. Has no atomics so it
-/// arithmetic-composes freely.
-struct FsCacheStatsSnapshot {
-  uint64_t prefetchHits{0};
-  uint64_t prefetchMisses{0};
-  uint64_t demandHits{0};
-  uint64_t demandMisses{0};
-
-  /// Returns the fraction of prefetch requests that hit in the cache,
-  /// or 0.0 if there were no prefetch requests. Demand counters do not
-  /// participate; demand reads are blocking by definition.
-  double prefetchRatio() const {
-    const uint64_t total = prefetchHits + prefetchMisses;
-    return total == 0 ? 0.0 : static_cast<double>(prefetchHits) / total;
-  }
+/// Counters exposed to tests and observability. All fields are
+/// per-field relaxed atomics; callers needing a consistent snapshot
+/// (e.g. tests asserting hits+misses == total) must first quiesce
+/// writers (e.g. thread.join()). Spec §6.3.
+struct FsCacheStats {
+  std::atomic<uint64_t> prefetchHits{0};
+  std::atomic<uint64_t> prefetchMisses{0};
+  std::atomic<uint64_t> demandHits{0};
+  std::atomic<uint64_t> demandMisses{0};
+  std::atomic<uint64_t> evictions{0};
+  // Retained from phase-1: the eviction loop reads this to decide
+  // whether to drain (see `evict()` invariant in this header), and
+  // `FsCache::totalSize()` exposes it as the CH `getUsedCacheSize()`
+  // mirror. recordMiss() credits segmentSize here on the LRU-insert
+  // path.
+  std::atomic<uint64_t> bytesOnDisk{0};
 };
 
-/// Concurrent counters for FsCache hits / misses, split by IsPrefetch.
-/// All increments are relaxed atomics; snapshot() acquires once at the
-/// end of a run to publish for assertions.
-class FsCacheStats {
- public:
-  void recordHit(IsPrefetch p) {
-    if (p == IsPrefetch::kPrefetch) {
-      prefetchHits_.fetch_add(1, std::memory_order_relaxed);
-    } else {
-      demandHits_.fetch_add(1, std::memory_order_relaxed);
-    }
-  }
+/// Whether a cache access originated as a prefetch (scheduled before
+/// the reader needed the bytes) or as a demand read (reader is blocked
+/// waiting). Drives the prefetch/demand split on FsCacheStats.
+enum class IsPrefetch : uint8_t { kPrefetch, kDemand };
 
-  void recordMiss(IsPrefetch p) {
-    if (p == IsPrefetch::kPrefetch) {
-      prefetchMisses_.fetch_add(1, std::memory_order_relaxed);
-    } else {
-      demandMisses_.fetch_add(1, std::memory_order_relaxed);
-    }
-  }
+/// Bumps the hit counter on `s` keyed by `p`. Free function so test
+/// fixtures and FsCache itself share one increment site (avoids
+/// FsCacheStats becoming a wrapper class with private fields, which
+/// would re-introduce the round-6 Q1 spec/plan divergence).
+inline void recordHit(FsCacheStats& s, IsPrefetch p) {
+  auto& counter =
+      p == IsPrefetch::kPrefetch ? s.prefetchHits : s.demandHits;
+  counter.fetch_add(1, std::memory_order_relaxed);
+}
 
-  FsCacheStatsSnapshot snapshot() const {
-    return FsCacheStatsSnapshot{
-        prefetchHits_.load(std::memory_order_acquire),
-        prefetchMisses_.load(std::memory_order_acquire),
-        demandHits_.load(std::memory_order_acquire),
-        demandMisses_.load(std::memory_order_acquire),
-    };
-  }
+/// Bumps the miss counter on `s` keyed by `p`. Note: this does NOT
+/// touch `s.bytesOnDisk`; the LRU-insert credit lives in
+/// `FsCache::recordMiss(FileSegment*, segmentSize, IsPrefetch)` (the
+/// MEMBER method) because it needs the segment size and bucket lock.
+inline void recordMiss(FsCacheStats& s, IsPrefetch p) {
+  auto& counter =
+      p == IsPrefetch::kPrefetch ? s.prefetchMisses : s.demandMisses;
+  counter.fetch_add(1, std::memory_order_relaxed);
+}
 
- private:
-  std::atomic<uint64_t> prefetchHits_{0};
-  std::atomic<uint64_t> prefetchMisses_{0};
-  std::atomic<uint64_t> demandHits_{0};
-  std::atomic<uint64_t> demandMisses_{0};
-};
-
-} // namespace facebook::velox::cache::fs
+/// Fraction of prefetch requests that hit in the cache, or 0.0 if no
+/// prefetch requests have happened. Demand counters do not participate;
+/// demand reads are blocking by definition and are not part of the
+/// prefetch effectiveness metric. Spec §9.2.
+inline double prefetchRatio(const FsCacheStats& s) {
+  const uint64_t hits = s.prefetchHits.load(std::memory_order_acquire);
+  const uint64_t misses =
+      s.prefetchMisses.load(std::memory_order_acquire);
+  const uint64_t total = hits + misses;
+  return total == 0 ? 0.0 : static_cast<double>(hits) / total;
+}
 ```
+
+Also update the private `AtomicCounters` struct in `FsCache.h` (lines
+177-182) to mirror the 4-way split, keeping `evictions` and
+`bytesOnDisk` untouched:
+
+```cpp
+struct AtomicCounters {
+  std::atomic<uint64_t> prefetchHits{0};
+  std::atomic<uint64_t> prefetchMisses{0};
+  std::atomic<uint64_t> demandHits{0};
+  std::atomic<uint64_t> demandMisses{0};
+  std::atomic<uint64_t> evictions{0};
+  std::atomic<uint64_t> bytesOnDisk{0};
+};
+```
+
+Update the private member method declarations on `FsCache` (lines
+164-169) to take `IsPrefetch`:
+
+```cpp
+// Records a cache hit: best-effort LRU bump + increments
+// counters_.{prefetchHits,demandHits} based on isPrefetch.
+void recordHit(FileSegment* segment, IsPrefetch isPrefetch);
+
+// Records a fresh miss: LRU insert + increments
+// counters_.{prefetchMisses,demandMisses} based on isPrefetch +
+// credits segmentSize to counters_.bytesOnDisk.
+void recordMiss(
+    FileSegment* segment,
+    uint64_t segmentSize,
+    IsPrefetch isPrefetch);
+```
+
+Update the `recordHit` comment on `bytesOnDisk` (the existing line 153
+comment is still correct — only the counter names change, not the
+semantics).
 
 - [ ] **Step 4: Run — expected GREEN for FsCacheStatsTest**
 
@@ -4369,36 +4398,127 @@ ctest --test-dir /home/chang/OpenSource/velox2/cmake-build-relwithdebinfo-gcc13 
 
 Expected: `[  PASSED  ] 4 tests.`
 
-- [ ] **Step 5: Update FsCache to record split stats by IsPrefetch**
+- [ ] **Step 5: Forward `IsPrefetch` through `FsCache::recordHit/recordMiss` and split the counter increment**
 
 `IsPrefetch` was added to `getOrSet` in **Task 8** (the API hard-cut)
-and forwarded as `/*isPrefetch*/` (unused). This step starts using
-the parameter. Phase-1 had a single non-split counter pair; remove
-those increments entirely. There is no "non-split fallback".
+and forwarded as `/*isPrefetch*/` (unused). This step starts using the
+parameter end-to-end.
 
-In `velox/common/caching/fscache/FsCache.cpp::getOrSet`, after
-`fillHolesWithEmptyFileSegments` returns but **before**
-`lockedKey.reset()` (the per-spec §4.1 step 6 happens-before contract —
-counts MUST be visible to a concurrent snapshot() call before any
-caller observes the holder, so they have to happen while still under
-the keyMetadata lock):
+Phase-1 `FsCache::recordHit(FileSegment*)` /
+`FsCache::recordMiss(FileSegment*, segmentSize)` are MEMBER methods
+that do **two** things: (a) the LRU bump / insert under the bucket's
+priority lock (best-effort `try_lock` for `recordHit`; eager
+`onInsert` for `recordMiss`); (b) the counter increment. This task
+**keeps the LRU logic intact** and only changes the counter
+increment. The LRU bump path is hot and load-bearing for the SLRU
+work in Task 13 — do not delete or restructure it.
 
-```cpp
-for (const auto& seg : slots) {
-  if (seg->state() == FileSegment::State::kDownloaded) {
-    stats_.recordHit(isPrefetch);
-  } else {
-    // kEmpty / kDownloading both count as miss: the caller will drive
-    // the download (or wait), and the spec §6.3 contract is "miss =
-    // FsCache had to create or hand off a non-Downloaded segment".
-    stats_.recordMiss(isPrefetch);
-  }
-}
-```
+Concretely:
 
-Remove all phase-1 single-counter `recordHit()` / `recordMiss()`
-callsites. The non-split counter members on `FsCacheStats` were
-already deleted in step 3 of this task.
+1. Update the two member declarations in `FsCache.h` (already done in
+   Step 3) so they take `IsPrefetch`. Update the two member definitions
+   in `FsCache.cpp` to forward `isPrefetch` into the single increment
+   line:
+
+   ```cpp
+   // velox/common/caching/fscache/FsCache.cpp, recordHit body
+   void FsCache::recordHit(FileSegment* segment, IsPrefetch isPrefetch) {
+     // [unchanged: best-effort per-bucket LRU bump via try_lock +
+     //  segment->hits_.fetch_add — keep the existing code verbatim,
+     //  this comment is only a marker for the diff reviewer]
+     recordHit(counters_, isPrefetch);  // free function from FsCache.h
+   }
+
+   void FsCache::recordMiss(
+       FileSegment* segment,
+       uint64_t segmentSize,
+       IsPrefetch isPrefetch) {
+     // [unchanged: per-bucket LRU onInsert under priority lock — keep
+     //  existing code verbatim]
+     recordMiss(counters_, isPrefetch);  // free function from FsCache.h
+     counters_.bytesOnDisk.fetch_add(
+         segmentSize, std::memory_order_relaxed);
+   }
+   ```
+
+   The phase-1 single-counter line `counters_.hits.fetch_add(1, …)` in
+   `recordHit` and `counters_.misses.fetch_add(1, …)` in `recordMiss`
+   are replaced 1-for-1 by the free-function call. The
+   `counters_.bytesOnDisk.fetch_add(segmentSize, …)` line in
+   `recordMiss` is UNCHANGED (it's the LRU-insert credit, not a hit/miss
+   counter — see `FsCache.h:153` `evict()` invariant which depends on
+   it).
+
+2. Update `FsCache::getOrSet` to forward the caller-supplied
+   `isPrefetch` parameter into both calls (replacing the Task 8
+   `/*isPrefetch*/` placeholder comment). The increments must still
+   happen inside the keyMetadata lock window per spec §4.1 step 6 — that
+   is already the case for both phase-1 call sites:
+
+   ```cpp
+   // inside getOrSet, after fillHolesWithEmptyFileSegments returns:
+   for (const auto& seg : holder.segments()) {
+     if (seg->state() == FileSegment::State::kDownloaded) {
+       recordHit(seg.get(), isPrefetch);
+     } else {
+       // kEmpty / kDownloading both count as miss: caller will drive
+       // the download (or wait), spec §6.3 contract is "miss = FsCache
+       // had to create or hand off a non-Downloaded segment".
+       recordMiss(seg.get(), seg->key().size, isPrefetch);
+     }
+   }
+   ```
+
+   This also UPGRADES the two 2-arg callsites that Task 8 step 2
+   introduced into `getOrSet` (the writer path's `recordMiss(seg.get(),
+   seg->key().size)` near plan line ~1904 and the reader path's
+   `recordHit(seg.get())` near plan line ~1916). Add `isPrefetch` as the
+   trailing argument to both — the Task 8 signatures were intentionally
+   2-arg because `IsPrefetch` was wired but not yet consumed; this task
+   completes the wiring.
+
+3. Rewrite `FsCache::stats()` (currently `FsCache.cpp:381-388`) to
+   compose the new 6-field POD from the 6 atomic loads. The function
+   returns by value, so callers that captured the phase-1 snapshot type
+   continue to compile:
+
+   ```cpp
+   FsCacheStats FsCache::stats() const {
+     FsCacheStats snapshot;
+     snapshot.prefetchHits.store(
+         counters_.prefetchHits.load(std::memory_order_relaxed),
+         std::memory_order_relaxed);
+     snapshot.prefetchMisses.store(
+         counters_.prefetchMisses.load(std::memory_order_relaxed),
+         std::memory_order_relaxed);
+     snapshot.demandHits.store(
+         counters_.demandHits.load(std::memory_order_relaxed),
+         std::memory_order_relaxed);
+     snapshot.demandMisses.store(
+         counters_.demandMisses.load(std::memory_order_relaxed),
+         std::memory_order_relaxed);
+     snapshot.evictions.store(
+         counters_.evictions.load(std::memory_order_relaxed),
+         std::memory_order_relaxed);
+     snapshot.bytesOnDisk.store(
+         counters_.bytesOnDisk.load(std::memory_order_relaxed),
+         std::memory_order_relaxed);
+     return snapshot;
+   }
+   ```
+
+4. Preserve unchanged: `evict()`'s
+   `counters_.bytesOnDisk.load(...)` drain check
+   (`FsCache.cpp:243`), `counters_.evictions.fetch_add(...)` after
+   eviction completes (`FsCache.cpp:366`),
+   `counters_.bytesOnDisk.fetch_sub(...)` per evicted segment
+   (`FsCache.cpp:375`), and Round-5's `FsCache::totalSize()` accessor
+   (`return counters_.bytesOnDisk.load(std::memory_order_relaxed);` —
+   the underlying field name is unchanged in `AtomicCounters`).
+
+Do NOT delete the phase-1 `FsCache::recordHit` / `recordMiss` member
+methods. They are MEMBER methods that own the LRU touch; only the
+counter-increment line inside them changes.
 
 - [ ] **Step 6: Flip FsCacheBufferedInput::load to kPrefetch**
 
@@ -4441,7 +4561,11 @@ TEST_F(FsCacheBufferedInputTest, prefetchRatio) {
     drainStream(*stream); // populate cache
   }
 
-  const auto warmSnap = cache->stats().snapshot();
+  // Capture baseline before the warm pass. FsCacheStats is non-copyable
+  // (contains std::atomic members), so snapshot per-field into locals.
+  const auto warmStats = cache->stats();
+  const uint64_t baselinePrefetchHits = warmStats.prefetchHits.load();
+  const uint64_t baselinePrefetchMisses = warmStats.prefetchMisses.load();
 
   {
     FsCacheBufferedInput input{remote, *pool_, cache.get()};
@@ -4450,16 +4574,21 @@ TEST_F(FsCacheBufferedInputTest, prefetchRatio) {
     drainStream(*stream);
   }
 
-  const auto finalSnap = cache->stats().snapshot();
-  const auto added = FsCacheStatsSnapshot{
-      finalSnap.prefetchHits - warmSnap.prefetchHits,
-      finalSnap.prefetchMisses - warmSnap.prefetchMisses,
-      finalSnap.demandHits - warmSnap.demandHits,
-      finalSnap.demandMisses - warmSnap.demandMisses,
-  };
-  EXPECT_GT(added.prefetchHits, 0);
-  EXPECT_EQ(added.prefetchMisses, 0);
-  EXPECT_DOUBLE_EQ(added.prefetchRatio(), 1.0);
+  const auto finalStats = cache->stats();
+  const uint64_t addedPrefetchHits =
+      finalStats.prefetchHits.load() - baselinePrefetchHits;
+  const uint64_t addedPrefetchMisses =
+      finalStats.prefetchMisses.load() - baselinePrefetchMisses;
+  EXPECT_GT(addedPrefetchHits, 0);
+  EXPECT_EQ(addedPrefetchMisses, 0);
+  // prefetchRatio computed on the delta: all reads in the second pass
+  // must be cache hits. Note prefetchRatio(finalStats) would mix in the
+  // first pass's misses; the delta is the right per-interval rate.
+  const double ratio = addedPrefetchHits + addedPrefetchMisses == 0
+      ? 0.0
+      : static_cast<double>(addedPrefetchHits) /
+          (addedPrefetchHits + addedPrefetchMisses);
+  EXPECT_DOUBLE_EQ(ratio, 1.0);
 }
 ```
 
@@ -4478,10 +4607,8 @@ Expected: all tests pass; `prefetchRatio` reports 1.0 on the second pass.
 
 ```bash
 git add \
-  velox/common/caching/fscache/FsCacheStats.h \
   velox/common/caching/fscache/FsCache.h \
   velox/common/caching/fscache/FsCache.cpp \
-  velox/dwio/common/FsCacheBufferedInput.h \
   velox/dwio/common/FsCacheBufferedInput.cpp \
   velox/common/caching/fscache/tests/FsCacheStatsTest.cpp \
   velox/common/caching/fscache/tests/CMakeLists.txt \
@@ -4489,17 +4616,21 @@ git add \
 git commit -m "$(cat <<'EOF'
 feat(fscache): split hit/miss by IsPrefetch with atomic counters
 
-FsCacheStats now exposes prefetchHits/prefetchMisses/demandHits/
-demandMisses as relaxed atomics, with snapshot() / prefetchRatio()
-derived. FsCacheBufferedInput::load tags its getOrSet calls as
-IsPrefetch::kPrefetch (load() runs before the column reader pulls
-bytes); all other paths default to kDemand.
+FsCacheStats grows from the phase-1 4-field POD (hits/misses/evictions/
+bytesOnDisk) to the spec §6.3 6-field atomic struct: prefetchHits,
+prefetchMisses, demandHits, demandMisses, plus retained evictions and
+bytesOnDisk. recordHit / recordMiss / prefetchRatio are free functions
+on FsCacheStats; FsCache::recordHit and FsCache::recordMiss (the MEMBER
+methods that own the LRU touch) forward IsPrefetch into them and keep
+all phase-1 LRU logic intact. FsCacheBufferedInput::load tags its
+getOrSet calls as IsPrefetch::kPrefetch (load() runs before the column
+reader pulls bytes); all other paths default to kDemand.
 
 End-to-end FsCacheBufferedInputTest::prefetchRatio locks in the contract
 that re-reading a fully-cached blob drives prefetchRatio to 1.0; the
 perf gate in Task 16 keys off the same number.
 
-Spec: docs/superpowers/specs/2026-05-26-fscache-ch-aligned-redesign.md §9.2 §10 R5
+Spec: docs/superpowers/specs/2026-05-26-fscache-ch-aligned-redesign.md §6.3 §9.2 §10 R5
 
 Co-Authored-By: Claude Opus 4 <noreply@anthropic.com>
 EOF
