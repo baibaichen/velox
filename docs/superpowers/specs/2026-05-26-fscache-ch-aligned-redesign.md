@@ -236,12 +236,13 @@ class FsCache {
       const std::string& path,
       uint64_t offset,
       uint64_t size,
-      const FsCacheKey::CreateSettings& settings,
+      const FsCacheConfig& settings,
       ReadFile& remote,
       IsPrefetch isPrefetch);
 
-  // bypass_cache_threshold：单次 size >= threshold 时返回 nullptr，
-  // caller fallback 到直接读 remote（FsCacheBufferedInput 实现）。
+  // bypass_cache_threshold：单次 size >= threshold 时返回 empty
+  // holder（FileSegmentsHolder 无 segments），caller 看到 empty 时
+  // fallback 到直接读 remote。`getOrSet` 入口调用本方法做短路判断。
   bool shouldBypass(uint64_t size) const;
 };
 
@@ -808,15 +809,23 @@ class QueryLimitToken {
 };
 ```
 
-quota 耗尽时的 `getOrSet` 行为：返回的 holder 仍然有连续段列表，但
-EMPTY 段被标记 `bypass = true`，caller 看到 bypass=true 时跳过 reserve、
-直接从 remote 读到 caller 自己的 buffer 不写 cache。
+> **Phase-1 status (TODO: phase-3)**：本节描述的 `FileCacheQueryLimit`
+> + `QueryLimitToken` 在 phase-1 实现并落库（plan Task 12），但
+> **没有任何 caller** 在 phase-1 调用 `tryReserve` —— `HiveConnector` /
+> `ConnectorQueryCtx` 的 token 透传（mint at `beginQuery`, store on
+> ctx, 透传到 `FsCacheBufferedInput::enqueue`）推迟到 phase-3 一起
+> 设计（同时决策是否换回 CH 的 thread-local query_id 模型）。phase-1
+> 的 QueryLimit 类是**预留**实现，等 caller wiring 落地后才生效。
+
+quota 耗尽时的 `getOrSet` 行为：返回的 holder 仍然是合法的连续段
+列表，caller 走正常推进路径；token reserve 失败由 caller 在调
+`getOrSet` 之前感知并选择 bypass。
 
 ### 8.3 `bypass_cache_threshold`
 
 `FsCacheConfig::bypassThresholdBytes`（默认 256 MiB）。`FsCache::getOrSet`
-入口检查 `if (size >= bypassThresholdBytes) return nullptr;`。
-`FsCacheBufferedInput` 看到 nullptr fallback 到直接 `remote.pread`。
+入口调 `shouldBypass(size)`，命中时返回 empty holder（无 segments）。
+`FsCacheBufferedInput` 看到 empty holder fallback 到直接 `remote.pread`。
 
 ---
 

@@ -1753,7 +1753,7 @@ EOF
 - Modify: `velox/common/caching/fscache/tests/FsCacheScaffoldTest.cpp` (if it touches getOrSet)
 - Modify: `velox/dwio/common/tests/FsCacheBufferedInputTest.cpp`
 
-**Spec refs:** §4 (new getOrSet signature with `IsPrefetch` placeholder defaulted to `kDemand` — actual prefetch wiring is Task 14), §4.1 (time line steps 1-7 minus step 6 stats, deferred to Task 14), §10 R1 (mitigation: API hard cut goes in its own commit, no other logic changes)
+**Spec refs:** §4 (new getOrSet signature with `IsPrefetch` parameter; all callsites in this task hard-code `kDemand` — the prefetch callsite is flipped to `kPrefetch` in Task 11 step 4, and stats recording is wired in Task 14), §4.1 (time line steps 1-7 minus step 6 stats, deferred to Task 14), §10 R1 (mitigation: API hard cut goes in its own commit, no other logic changes)
 
 **Approach (R1 explicit guidance):** This task does **only** the API hard cut. Do not change semantics: every phase-1 behaviour (sync download, single-segment-only metadata population per range) must remain bit-identical. Stats counting (4-atomic prefetch/demand) is wired in Task 14. caller-driven advancement is wired in Task 9. SLRU is Task 13.
 
@@ -1773,7 +1773,7 @@ The shim is the only way to keep the test corpus green at this commit without co
 - [ ] **Step 1: Change FsCache.h signature**
 
 ```cpp
-enum class IsPrefetch : uint8_t { kPrefetch, kDemand };  // wired by Task 14
+enum class IsPrefetch : uint8_t { kPrefetch, kDemand };  // prefetch callsite flipped by Task 11 step 4; stats recording wired by Task 14
 
 /// CH-aligned entry point. Returns a holder of segments covering
 /// [offset, min(offset+size, remote.size())) — contiguous, offset-
@@ -1931,7 +1931,7 @@ void FsCacheBufferedInput::load(LogType) {
         enq.region.length,
         fsCache_->config(),
         *input_->getReadFile(),
-        cache::fs::IsPrefetch::kDemand);  // Task 14 flips to kPrefetch
+        cache::fs::IsPrefetch::kDemand);  // Task 11 step 4 flips this callsite to kPrefetch
   }
 }
 ```
@@ -2582,19 +2582,23 @@ class DownloadThreadPool {
 
 namespace facebook::velox::cache::fs {
 
+namespace {
+size_t checkedNumThreads(size_t numThreads) {
+  VELOX_CHECK_GT(numThreads, 0, "DownloadThreadPool needs at least 1 thread");
+  // Cap at 32 even if config asks for more: each thread holds an OS-level
+  // pread slot against the remote, and beyond ~32 the remote (S3, HDFS)
+  // starts throttling and we lose more to contention than we gain in
+  // parallelism. Misconfiguration that would otherwise silently regress
+  // p99 fetch latency is bounded here. If 32 turns out to be wrong, raise
+  // after measurement (see Task 16 perf gate).
+  return std::min<size_t>(numThreads, 32);
+}
+} // namespace
+
 DownloadThreadPool::DownloadThreadPool(size_t numThreads)
     : executor_{
-          // Cap at 32 even if config asks for more: each thread holds an
-          // OS-level pread slot against the remote, and beyond ~32 the
-          // remote (S3, HDFS) starts throttling and we lose more to
-          // contention than we gain in parallelism. Misconfiguration that
-          // would otherwise silently regress p99 fetch latency is bounded
-          // here. If 32 turns out to be wrong, raise after measurement
-          // (see Task 16 perf gate).
-          std::min<size_t>(numThreads, 32),
-          std::make_shared<folly::NamedThreadFactory>("FsCacheDownload")} {
-  VELOX_CHECK_GT(numThreads, 0, "DownloadThreadPool needs at least 1 thread");
-}
+          checkedNumThreads(numThreads),
+          std::make_shared<folly::NamedThreadFactory>("FsCacheDownload")} {}
 
 DownloadThreadPool::~DownloadThreadPool() {
   executor_.join();
@@ -2720,7 +2724,7 @@ EOF
 - Create: `velox/common/caching/fscache/FileCacheQueryLimit.h`
 - Create: `velox/common/caching/fscache/FileCacheQueryLimit.cpp`
 - Create: `velox/common/caching/fscache/tests/FileCacheQueryLimitTest.cpp`
-- Modify: `velox/common/caching/fscache/FsCacheConfig.h` — add `bypassCacheThreshold{0}` (0 = disabled per spec §8.3)
+- Modify: `velox/common/caching/fscache/FsCacheConfig.h` — add `bypassThresholdBytes{256ULL << 20}` (256 MiB default per spec §8.3; set to 0 to disable)
 - Modify: `velox/common/caching/fscache/FsCache.h` — add `getOrSet` bypass behaviour (no queryId in signature)
 - Modify: `velox/common/caching/fscache/FsCache.cpp` — bypass short-circuit
 - Modify: `velox/common/caching/fscache/CMakeLists.txt`
@@ -2733,11 +2737,13 @@ EOF
 
 Two **independent** mechanisms; the wiring is intentionally asymmetric.
 
-**bypass_cache_threshold** (§8.3): size-based, lives inside `getOrSet`. If the requested region is `>= config.bypassCacheThreshold`, `getOrSet` returns an empty `FileSegmentsHolder` and the caller falls through to direct remote read. No identity required — large scans should not pollute the warm working set.
+**bypass_cache_threshold** (§8.3): size-based, lives inside `getOrSet`. If the requested region is `>= config.bypassThresholdBytes`, `getOrSet` returns an empty `FileSegmentsHolder` and the caller falls through to direct remote read. No identity required — large scans should not pollute the warm working set.
 
-**FileCacheQueryLimit + QueryLimitToken** (§8.2): per-query bytes quota, **caller-held**. `QueryCtx` calls `FileCacheQueryLimit::reserveQuery(maxBytesPerQuery)` once at query start and holds the returned `QueryLimitToken` for the query's lifetime. **Before** calling `getOrSet`, the caller invokes `token.tryReserve(size)`; on `false` the caller skips `getOrSet` and reads directly from the remote.
+**FileCacheQueryLimit + QueryLimitToken** (§8.2): per-query bytes quota, **caller-held**. The intended runtime contract is: `QueryCtx` calls `FileCacheQueryLimit::reserveQuery(maxBytesPerQuery)` once at query start and holds the returned `QueryLimitToken` for the query's lifetime; **before** calling `getOrSet`, the caller invokes `token.tryReserve(size)`; on `false` the caller skips `getOrSet` and reads directly from the remote.
 
-This task ships only the budget primitive (counter + token + cache-side registry) and the bypass short-circuit. Wiring the token into a real BufferedInput call path is **Task 14's** responsibility once `ConnectorQueryCtx` plumbing exists. No `queryId` parameter is added to `getOrSet` in this or any later task — the spec puts enforcement on the caller side via the token, not on the cache side via a map lookup.
+> **TODO (phase-3): caller wiring is deferred.** This task ships only the budget primitive (counter + token + cache-side registry) and `FileCacheQueryLimitTest` direct unit tests. **No caller in phase-1 calls `tryReserve`** — `HiveConnector::beginQuery` does not mint a token, `ConnectorQueryCtx` does not store one, and `FsCacheBufferedInput::enqueue` does not consume one. The classes added here are intentional **dead code** in phase-1, awaiting connector-side wiring in phase-3 (at which point the choice between caller-held tokens and CH-style thread-local query_id can also be revisited). Do **not** add wiring as part of this plan; the implementer should only verify that the unit tests pass.
+
+The bypass short-circuit, by contrast, is live in phase-1 (`getOrSet` calls `shouldBypass` at entry; `FsCacheBufferedInput` already handles the empty-holder fallback). No `queryId` parameter is added to `getOrSet` in this or any later task — the spec puts enforcement on the caller side via the token, not on the cache side via a map lookup.
 
 - [ ] **Step 1: Write failing test — FileCacheQueryLimitTest**
 
@@ -3034,14 +3040,14 @@ ctest --test-dir /home/chang/OpenSource/velox2/cmake-build-relwithdebinfo-gcc13 
 
 Expected: `[  PASSED  ] 5 tests.`
 
-- [ ] **Step 5: Write failing test — bypassCacheThreshold in FsCacheTest**
+- [ ] **Step 5: Write failing test — bypassThresholdBytes in FsCacheTest**
 
 Add to `velox/common/caching/fscache/tests/FsCacheTest.cpp` next to existing getOrSet tests:
 
 ```cpp
 TEST_F(FsCacheTest, getOrSetReturnsEmptyHolderWhenRegionExceedsBypassThreshold) {
   FsCacheConfig cfg = baseConfig();
-  cfg.bypassCacheThreshold = 4 * kMiB;
+  cfg.bypassThresholdBytes = 4 * kMiB;
   FsCache cache{cfg};
   auto remote = makeBlob(/*bytes=*/16 * kMiB);
 
@@ -3059,7 +3065,7 @@ TEST_F(FsCacheTest, getOrSetReturnsEmptyHolderWhenRegionExceedsBypassThreshold) 
 
 TEST_F(FsCacheTest, getOrSetReturnsHolderUnderBypassThreshold) {
   FsCacheConfig cfg = baseConfig();
-  cfg.bypassCacheThreshold = 4 * kMiB;
+  cfg.bypassThresholdBytes = 4 * kMiB;
   FsCache cache{cfg};
   auto remote = makeBlob(/*bytes=*/16 * kMiB);
 
@@ -3073,6 +3079,25 @@ TEST_F(FsCacheTest, getOrSetReturnsHolderUnderBypassThreshold) {
 
   EXPECT_FALSE(holder->empty());
 }
+
+TEST_F(FsCacheTest, shouldBypassMatchesGetOrSetBoundary) {
+  FsCacheConfig cfg = baseConfig();
+  cfg.bypassThresholdBytes = 4 * kMiB;
+  FsCache cache{cfg};
+
+  EXPECT_FALSE(cache.shouldBypass(4 * kMiB - 1));
+  EXPECT_TRUE(cache.shouldBypass(4 * kMiB));
+  EXPECT_TRUE(cache.shouldBypass(8 * kMiB));
+}
+
+TEST_F(FsCacheTest, shouldBypassDisabledWhenThresholdIsZero) {
+  FsCacheConfig cfg = baseConfig();
+  cfg.bypassThresholdBytes = 0;
+  FsCache cache{cfg};
+
+  EXPECT_FALSE(cache.shouldBypass(0));
+  EXPECT_FALSE(cache.shouldBypass(1ULL << 40));
+}
 ```
 
 Per-query enforcement is covered end-to-end in Task 14's BufferedInput integration test once `QueryLimitToken` is wired into the read path. Token-level reserve/release behaviour is already covered by `FileCacheQueryLimitTest` above.
@@ -3084,7 +3109,7 @@ cmake --build /home/chang/OpenSource/velox2/cmake-build-relwithdebinfo-gcc13 \
   --target velox_fscache_test -j 8
 ```
 
-Expected: compile error on `cfg.bypassCacheThreshold` (field not yet declared).
+Expected: compile error on `cfg.bypassThresholdBytes` (field not yet declared).
 
 - [ ] **Step 7: Implement bypass short-circuit**
 
@@ -3092,26 +3117,26 @@ Modify `velox/common/caching/fscache/FsCacheConfig.h` — add field below existi
 
 ```cpp
 /// Skip the cache for any single getOrSet request whose `size` is greater
-/// than or equal to this value. 0 disables the bypass.
+/// than or equal to this value. Set to 0 to disable the bypass entirely
+/// (every request enters the cache regardless of size).
 ///
-/// Rationale: very large sequential scans (e.g. full-table reads with no
-/// reuse) would otherwise evict the entire warm working set in O(disk
-/// throughput). See spec §8.3.
-uint64_t bypassCacheThreshold{0};
+/// Default 256 MiB (spec §8.3). Rationale: very large sequential scans
+/// (e.g. full-table reads with no reuse) would otherwise evict the entire
+/// warm working set in O(disk throughput).
+uint64_t bypassThresholdBytes{256ULL << 20};
 ```
 
-Modify `velox/common/caching/fscache/FsCache.h` — update the existing `getOrSet` doc comment to mention the new bypass behaviour (signature stays at the 6-param form from Task 8; no queryId is ever added):
+Modify `velox/common/caching/fscache/FsCache.h` — update the existing `getOrSet` doc comment to mention the new bypass behaviour (signature stays at the 6-param form from Task 8; no queryId is ever added), and declare `shouldBypass` next to `getOrSet`:
 
 ```cpp
 /// Returns FileSegments covering `[offset, offset+size)` of `path`,
 /// fetching from `remote` as needed.
 ///
 /// Returns an empty holder (FileSegmentsHolder with no segments) if
-/// `size >= settings.bypassCacheThreshold` (and the threshold is
-/// non-zero). Callers must fall back to reading directly from `remote`
-/// in that case. Per-query budget enforcement is **caller-side**: the
-/// caller checks its QueryLimitToken via tryReserve() before invoking
-/// getOrSet (see spec §8.2).
+/// `shouldBypass(size)` is true. Callers must fall back to reading
+/// directly from `remote` in that case. Per-query budget enforcement is
+/// **caller-side**: the caller checks its QueryLimitToken via
+/// tryReserve() before invoking getOrSet (see spec §8.2).
 FileSegmentsHolderPtr getOrSet(
     const std::string& path,
     uint64_t offset,
@@ -3119,11 +3144,23 @@ FileSegmentsHolderPtr getOrSet(
     const FsCacheConfig& settings,
     ::facebook::velox::ReadFile& remote,
     IsPrefetch isPrefetch);
+
+/// Returns true if a single-request of `size` bytes should bypass the
+/// cache. Equivalent to
+/// `config_.bypassThresholdBytes > 0 && size >= config_.bypassThresholdBytes`.
+/// Exposed publicly so callers (e.g. metrics, debug logs) can ask the
+/// same question without re-deriving the comparison. Cheap, lock-free.
+bool shouldBypass(uint64_t size) const;
 ```
 
-Modify `velox/common/caching/fscache/FsCache.cpp` — add the bypass short-circuit at the **very top** of `getOrSet`, before any lock acquisition:
+Modify `velox/common/caching/fscache/FsCache.cpp` — implement `shouldBypass` and call it from the top of `getOrSet`, before any lock acquisition:
 
 ```cpp
+bool FsCache::shouldBypass(uint64_t size) const {
+  return config_.bypassThresholdBytes > 0 &&
+      size >= config_.bypassThresholdBytes;
+}
+
 FileSegmentsHolderPtr FsCache::getOrSet(
     const std::string& path,
     uint64_t offset,
@@ -3134,8 +3171,7 @@ FileSegmentsHolderPtr FsCache::getOrSet(
   // Bypass cache entirely for very large single-region requests. Done
   // before any lock so a misconfigured huge scan doesn't even touch the
   // bucket hierarchy.
-  if (settings.bypassCacheThreshold > 0 &&
-      size >= settings.bypassCacheThreshold) {
+  if (shouldBypass(size)) {
     return std::make_unique<FileSegmentsHolder>();
   }
   // ... existing body unchanged
@@ -3175,7 +3211,7 @@ Lands the two FsCache-side admission primitives from spec §8.2 / §8.3.
 The two mechanisms are intentionally asymmetric in how they integrate:
 
   - bypass_cache_threshold (§8.3) is size-based and lives **inside**
-    getOrSet. If config.bypassCacheThreshold > 0 and size >= threshold,
+    getOrSet. If config.bypassThresholdBytes > 0 and size >= threshold,
     getOrSet returns an empty FileSegmentsHolder before touching any
     bucket lock. Caller falls through to direct remote read. Keeps
     full-table scans from evicting the warm working set.
@@ -3186,9 +3222,14 @@ The two mechanisms are intentionally asymmetric in how they integrate:
     token.tryReserve(size) and reads direct from remote on `false`.
     getOrSet itself never sees a queryId — enforcement is the caller's.
 
-Phase-1: token and bypass are landed and unit-tested here. Task 14
-threads QueryLimitToken into FsCacheBufferedInput via ConnectorQueryCtx
-and adds the BufferedInput-level integration test.
+Phase-1 scope: the bypass short-circuit is live (getOrSet calls
+shouldBypass at entry; FsCacheBufferedInput handles the empty-holder
+fallback). FileCacheQueryLimit + QueryLimitToken land here with their
+unit tests but are **intentional dead code in phase-1** — no caller
+mints or consumes a token. Connector-side wiring (HiveConnector +
+ConnectorQueryCtx + FsCacheBufferedInput integration test) is deferred
+to phase-3, at which point we can also re-evaluate whether to keep the
+caller-held-token model or fall back to CH's thread-local query_id.
 
 Spec: docs/superpowers/specs/2026-05-26-fscache-ch-aligned-redesign.md §8.2 §8.3 §10 R7
 
@@ -3706,7 +3747,7 @@ EOF
 
 **Files:**
 - Modify: `velox/common/caching/fscache/FsCacheStats.h` — 4 atomic counters
-- Modify: `velox/common/caching/fscache/FsCache.h` — `IsPrefetch` already exists from Task 11 enum, ensure getOrSet plumbs it
+- Modify: `velox/common/caching/fscache/FsCache.h` — `IsPrefetch` already exists from Task 8 enum, ensure getOrSet plumbs it
 - Modify: `velox/common/caching/fscache/FsCache.cpp` — count hits/misses split by IsPrefetch
 - Modify: `velox/dwio/common/FsCacheBufferedInput.h` / `.cpp` — pass `IsPrefetch::kPrefetch` when enqueue happens before column reader pull, `kDemand` otherwise
 - Modify: `velox/common/caching/fscache/tests/FsCacheStatsTest.cpp` (new) — 4 unit tests
@@ -3725,7 +3766,7 @@ The existing FsCacheStats is non-atomic and counts only `hits`/`misses`. Spec §
 
 `prefetchRatio` then = `prefetchHits / (prefetchHits + prefetchMisses)` and is the metric the perf gate watches: a healthy fscache should keep prefetchRatio ≥ 0.95 for hot benchmarks (spec §9.2).
 
-`IsPrefetch` was added to the FsCache API in Task 11 with default `kDemand`. Task 14 now: (a) makes the counters atomic, (b) actually splits the increments by IsPrefetch, (c) plumbs the right value from FsCacheBufferedInput.
+`IsPrefetch` was added to the FsCache API in Task 8 (every callsite then hard-coded `kDemand`); Task 11 step 4 flipped the prefetch callsite (`FsCacheBufferedInput::load`) to `kPrefetch`. Task 14 now: (a) makes the counters atomic, (b) actually splits the increments by IsPrefetch, (c) verifies the right value flows from FsCacheBufferedInput.
 
 The wiring rule in BufferedInput: `enqueue()` is always a prefetch (the column reader has not yet pulled bytes from the returned stream); the stream's `Next()` and `seekToPosition()` are demand reads. Since segments are created inside `load()` (which is the materialization of the prefetch enqueue), `load()` carries `IsPrefetch::kPrefetch`. Future paths that bypass enqueue and call getOrSet directly carry `kDemand`. Phase-1 has only the enqueue path, so all FsCacheBufferedInput-driven traffic is kPrefetch.
 
