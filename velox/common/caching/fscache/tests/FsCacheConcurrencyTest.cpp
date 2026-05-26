@@ -70,8 +70,14 @@ TEST_F(FsCacheConcurrencyTest, sameSegmentMultipleReadersExactlyOneDownload) {
     threads.emplace_back([&] {
       try {
         LocalReadFile remote{remotePath_};
-        auto segs = cache.getOrSet(remotePath_, 0, kSegmentSize, remote);
-        for (auto& s : segs) {
+        auto holder = cache.getOrSet(
+            remotePath_,
+            0,
+            kSegmentSize,
+            cache.config(),
+            remote,
+            IsPrefetch::kDemand);
+        for (auto& s : holder->segments()) {
           if (s->state() != FileSegment::State::kDownloaded) {
             ++errors;
           }
@@ -108,7 +114,9 @@ TEST_F(FsCacheConcurrencyTest, differentSegmentsParallelDownloads) {
             remotePath_,
             static_cast<uint64_t>(i) * kSegmentSize,
             kSegmentSize,
-            remote);
+            cache.config(),
+            remote,
+            IsPrefetch::kDemand);
       } catch (const std::exception&) {
         ++errors;
       }
@@ -160,7 +168,13 @@ TEST_F(FsCacheConcurrencyTest, evictionUnderConcurrentLoadIsRaceFree) {
           const uint64_t off =
               (static_cast<uint64_t>(t) * 4 + round) * 1'024 * 1'024 %
               (12UL * 1'024 * 1'024);
-          cache.getOrSet(remotePath_, off, kSegmentSize, remote);
+          cache.getOrSet(
+              remotePath_,
+              off,
+              kSegmentSize,
+              cache.config(),
+              remote,
+              IsPrefetch::kDemand);
         }
       } catch (const std::exception&) {
         ++errors;
@@ -195,14 +209,26 @@ TEST_F(FsCacheConcurrencyTest, hitPathTolerates32WayContention) {
   // observe a hit (not a miss-cv-wait).
   {
     LocalReadFile remote{remotePath_};
-    (void)cache.getOrSet(remotePath_, 0, kSegmentSize, remote);
+    (void)cache.getOrSet(
+        remotePath_,
+        0,
+        kSegmentSize,
+        cache.config(),
+        remote,
+        IsPrefetch::kDemand);
   }
   std::vector<std::thread> threads;
   for (int t = 0; t < kThreads; ++t) {
     threads.emplace_back([&] {
       LocalReadFile remote{remotePath_};
       for (int i = 0; i < kPerThread; ++i) {
-        (void)cache.getOrSet(remotePath_, 0, kSegmentSize, remote);
+        (void)cache.getOrSet(
+            remotePath_,
+            0,
+            kSegmentSize,
+            cache.config(),
+            remote,
+            IsPrefetch::kDemand);
       }
     });
   }
@@ -258,8 +284,14 @@ TEST_F(FsCacheConcurrencyTest, DISABLED_roundRobinEvictUnderConcurrentInserts) {
         for (int i = 0; i < kSegmentsPerThread; ++i) {
           const auto& path = paths[t * kSegmentsPerThread + i];
           LocalReadFile remote{path};
-          auto segs = cache.getOrSet(path, 0, kSegmentSize, remote);
-          for (auto& s : segs) {
+          auto holder = cache.getOrSet(
+              path,
+              0,
+              kSegmentSize,
+              cache.config(),
+              remote,
+              IsPrefetch::kDemand);
+          for (auto& s : holder->segments()) {
             if (s->state() != FileSegment::State::kDownloaded) {
               ++errors;
             }

@@ -55,7 +55,9 @@ class FsCacheTest : public ::testing::Test {
 TEST_F(FsCacheTest, getOrSetFirstCallDownloads) {
   FsCache cache{config_};
   LocalReadFile remote{remotePath_};
-  const auto segments = cache.getOrSet(remotePath_, 0, 4'096, remote);
+  const auto holder = cache.getOrSet(
+      remotePath_, 0, 4'096, cache.config(), remote, IsPrefetch::kDemand);
+  const auto& segments = holder->segments();
   ASSERT_FALSE(segments.empty());
   for (const auto& segment : segments) {
     EXPECT_EQ(segment->state(), FileSegment::State::kDownloaded);
@@ -66,8 +68,11 @@ TEST_F(FsCacheTest, getOrSetFirstCallDownloads) {
 TEST_F(FsCacheTest, getOrSetSecondCallHitsCache) {
   FsCache cache{config_};
   LocalReadFile remote{remotePath_};
-  cache.getOrSet(remotePath_, 0, 4'096, remote);
-  const auto segments = cache.getOrSet(remotePath_, 0, 4'096, remote);
+  cache.getOrSet(
+      remotePath_, 0, 4'096, cache.config(), remote, IsPrefetch::kDemand);
+  const auto holder = cache.getOrSet(
+      remotePath_, 0, 4'096, cache.config(), remote, IsPrefetch::kDemand);
+  const auto& segments = holder->segments();
   ASSERT_FALSE(segments.empty());
   for (const auto& segment : segments) {
     EXPECT_EQ(segment->state(), FileSegment::State::kDownloaded);
@@ -95,8 +100,14 @@ TEST_F(FsCacheTest, getOrSetClampsToFileSizeWhenSmallerThanAlignment) {
   LocalReadFile tinyRemote{tinyPath};
   // alignedEnd would be 4096, but file size is 3072. Without the clamp,
   // FileSegment::download asks remote for 4096 bytes and crashes.
-  const auto segments =
-      cache.getOrSet(tinyPath, 0, tinyContent.size(), tinyRemote);
+  const auto holder = cache.getOrSet(
+      tinyPath,
+      0,
+      tinyContent.size(),
+      cache.config(),
+      tinyRemote,
+      IsPrefetch::kDemand);
+  const auto& segments = holder->segments();
   ASSERT_FALSE(segments.empty());
   for (const auto& segment : segments) {
     EXPECT_EQ(segment->state(), FileSegment::State::kDownloaded);
@@ -108,8 +119,18 @@ TEST_F(FsCacheTest, getOrSetReturnsEmptyAtExactEof) {
   LocalReadFile remote{remotePath_};
   // offset == size: legitimate zero-byte read at EOF must return an empty
   // vector rather than throw.
-  EXPECT_TRUE(cache.getOrSet(remotePath_, remote.size(), 0, remote).empty());
-  EXPECT_TRUE(cache.getOrSet(remotePath_, 0, 0, remote).empty());
+  EXPECT_TRUE(cache
+                  .getOrSet(
+                      remotePath_,
+                      remote.size(),
+                      0,
+                      cache.config(),
+                      remote,
+                      IsPrefetch::kDemand)
+                  ->empty());
+  EXPECT_TRUE(
+      cache.getOrSet(remotePath_, 0, 0, cache.config(), remote, IsPrefetch::kDemand)
+          ->empty());
 }
 
 TEST_F(FsCacheTest, getOrSetThrowsWhenOffsetPastEof) {
@@ -118,7 +139,13 @@ TEST_F(FsCacheTest, getOrSetThrowsWhenOffsetPastEof) {
   // offset > size: caller bug; surface immediately rather than silently
   // returning an empty range.
   EXPECT_THROW(
-      cache.getOrSet(remotePath_, remote.size() + 1, 1, remote),
+      cache.getOrSet(
+          remotePath_,
+          remote.size() + 1,
+          1,
+          cache.config(),
+          remote,
+          IsPrefetch::kDemand),
       ::facebook::velox::VeloxException);
 }
 
@@ -128,9 +155,20 @@ TEST_F(FsCacheTest, evictionRunsWhenOverCapacity) {
   FsCache cache{tiny};
   LocalReadFile remote{remotePath_};
   // Read two disjoint 4 MiB chunks. Total 8 MiB > 5 MiB -> eviction.
-  cache.getOrSet(remotePath_, 0, 4UL * 1'024 * 1'024, remote);
   cache.getOrSet(
-      remotePath_, 4UL * 1'024 * 1'024, 4UL * 1'024 * 1'024, remote);
+      remotePath_,
+      0,
+      4UL * 1'024 * 1'024,
+      cache.config(),
+      remote,
+      IsPrefetch::kDemand);
+  cache.getOrSet(
+      remotePath_,
+      4UL * 1'024 * 1'024,
+      4UL * 1'024 * 1'024,
+      cache.config(),
+      remote,
+      IsPrefetch::kDemand);
   EXPECT_LE(cache.stats().bytesOnDisk, tiny.maxBytes);
   EXPECT_GT(cache.stats().evictions, 0);
 }
@@ -177,7 +215,8 @@ TEST_F(FsCacheTest, waiterReceivesThrowWhenWriterFails) {
   for (int i = 0; i < 2; ++i) {
     threads.emplace_back([&] {
       try {
-        cache.getOrSet(remotePath_, 0, 4'096, remote);
+        cache.getOrSet(
+            remotePath_, 0, 4'096, cache.config(), remote, IsPrefetch::kDemand);
       } catch (const std::exception&) {
         ++throwCount;
       } catch (...) {
@@ -198,9 +237,11 @@ TEST_F(FsCacheTest, waiterReceivesThrowWhenWriterFails) {
 TEST_F(FsCacheTest, secondReaderOfDownloadedSegmentCountsAsHit) {
   FsCache cache{config_};
   LocalReadFile remote{remotePath_};
-  cache.getOrSet(remotePath_, 0, 4'096, remote);
+  cache.getOrSet(
+      remotePath_, 0, 4'096, cache.config(), remote, IsPrefetch::kDemand);
   const auto baseline = cache.stats();
-  cache.getOrSet(remotePath_, 0, 4'096, remote);
+  cache.getOrSet(
+      remotePath_, 0, 4'096, cache.config(), remote, IsPrefetch::kDemand);
   const auto after = cache.stats();
   EXPECT_EQ(after.misses, baseline.misses);
   EXPECT_EQ(after.hits, baseline.hits + 1);
@@ -242,7 +283,13 @@ TEST_F(FsCacheTest, concurrentEvictionIsSafe) {
         const uint64_t offset =
             (static_cast<uint64_t>(t * kIterations + i) * 256UL * 1'024) %
             (4UL * 1'024 * 1'024);
-        cache.getOrSet(remotePath_, offset, 256UL * 1'024, remote);
+        cache.getOrSet(
+            remotePath_,
+            offset,
+            256UL * 1'024,
+            cache.config(),
+            remote,
+            IsPrefetch::kDemand);
       }
     });
   }
@@ -273,7 +320,13 @@ TEST_F(FsCacheTest, statsCountersIncrementAcrossThreadsWithoutLoss) {
     threads.emplace_back([&] {
       LocalReadFile threadRemote{remotePath_};
       for (int i = 0; i < kPerThread; ++i) {
-        (void)cache.getOrSet(remotePath_, 0, kSegmentSize, threadRemote);
+        (void)cache.getOrSet(
+            remotePath_,
+            0,
+            kSegmentSize,
+            cache.config(),
+            threadRemote,
+            IsPrefetch::kDemand);
       }
     });
   }

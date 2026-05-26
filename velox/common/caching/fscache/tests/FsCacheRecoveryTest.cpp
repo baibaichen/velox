@@ -61,7 +61,13 @@ class FsCacheRecoveryTest : public ::testing::Test {
   void warmCache(uint64_t offset, uint64_t size) {
     FsCache cache{config_};
     ::facebook::velox::LocalReadFile remote{remotePath_};
-    cache.getOrSet(remotePath_, offset, size, remote);
+    cache.getOrSet(
+        remotePath_,
+        offset,
+        size,
+        cache.config(),
+        remote,
+        IsPrefetch::kDemand);
   }
 };
 

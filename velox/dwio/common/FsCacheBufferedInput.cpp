@@ -98,18 +98,18 @@ class DeferredStream final : public SeekableInputStream {
   }
 
  private:
-  // Materializes inner_ from slot_->segments (load() must have run) and
-  // replays any pre-load SkipInt64 so inner_'s position matches what
+  // Materializes inner_ from slot_->holder->segments() (load() must have run)
+  // and replays any pre-load SkipInt64 so inner_'s position matches what
   // ByteCount() has been reporting.
   void ensureWithData() {
     if (inner_ != nullptr) {
       return;
     }
     VELOX_CHECK(
-        !slot_->segments.empty(),
+        slot_->holder != nullptr,
         "Stream used before FsCacheBufferedInput::load()");
     inner_ = std::make_unique<FsCacheInputStream>(
-        slot_->segments,
+        slot_->holder->segments(),
         slot_->region.offset,
         slot_->region.length,
         cache_->config().cacheRoot);
@@ -140,20 +140,23 @@ FsCacheBufferedInput::FsCacheBufferedInput(
 std::unique_ptr<SeekableInputStream> FsCacheBufferedInput::enqueue(
     velox::common::Region region,
     const StreamIdentifier* /*sid*/) {
-  enqueuedRegions_.push_back(EnqueuedRegion{region, {}});
+  enqueuedRegions_.push_back(EnqueuedRegion{region, nullptr, {}});
   return std::make_unique<DeferredStream>(&enqueuedRegions_.back(), fsCache_);
 }
 
 void FsCacheBufferedInput::load(LogType /*unused*/) {
   for (auto& enqueued : enqueuedRegions_) {
-    if (!enqueued.segments.empty()) {
+    if (enqueued.holder != nullptr) {
       continue;
     }
-    enqueued.segments = fsCache_->getOrSet(
+    enqueued.holder = fsCache_->getOrSet(
         input_->getName(),
         enqueued.region.offset,
         enqueued.region.length,
-        *input_->getReadFile());
+        fsCache_->config(),
+        *input_->getReadFile(),
+        // Task 11 step 4 flips this callsite to kPrefetch.
+        cache::fs::IsPrefetch::kDemand);
   }
 }
 

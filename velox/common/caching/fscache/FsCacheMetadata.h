@@ -81,6 +81,10 @@ class FsCacheMetadata {
   /// cause it to return nullptr even if a fresh insert at the same path
   /// (under a new KeyMetadata) succeeded. The caller treats nullptr as a
   /// cache miss and proceeds to download, which is correct.
+  ///
+  /// TODO: replace test callsites with `lookupRange` and remove. No
+  /// production caller uses this overload post-Task 8; it stays only to
+  /// keep FsCacheMetadataTest green.
   FileSegmentPtr lookup(const FsCacheKey& key) const;
 
   /// Returns a LockedKey for `path`. Behaviour on absence depends on policy

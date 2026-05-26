@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "velox/common/caching/fscache/FileSegmentsHolder.h"
 #include "velox/common/caching/fscache/FsCache.h"
 #include "velox/dwio/common/BufferedInput.h"
 
@@ -77,7 +78,12 @@ class FsCacheBufferedInput final : public BufferedInput {
   // surface clients should rely on.
   struct EnqueuedRegion {
     velox::common::Region region;
-    std::vector<cache::fs::FileSegmentPtr> segments;
+    // Populated by load(); nullptr before load() runs.
+    cache::fs::FileSegmentsHolderPtr holder;
+    // Populated by Task 12's load() when getOrSet returns an empty holder
+    // (size >= bypassThresholdBytes). In Tasks 8-11 the holder is always
+    // non-empty, so this field stays unused/empty.
+    std::vector<char> bypassBuffer;
   };
 
  private:

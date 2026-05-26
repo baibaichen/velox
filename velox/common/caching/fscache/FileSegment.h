@@ -114,6 +114,11 @@ class FileSegment {
   /// caller won the CAS race and must follow up with download(); returns
   /// false otherwise. FsCache calls this under mutex_ during coordination;
   /// standalone callers (and tests) must call it before download().
+  ///
+  /// TODO: migrate EvictionPolicyTest off `beginDownload` / `download` to
+  /// the reserve/write/complete path and remove. Post-Task 8 production
+  /// callers no longer use this method; it stays for the LRU policy unit
+  /// test that exercises this state machine directly.
   bool beginDownload();
 
   /// Downloads the segment from remote into cacheRoot. State must be
@@ -122,6 +127,9 @@ class FileSegment {
   /// published atomically via .tmp + rename. On failure the .tmp / final
   /// path are removed, downloadedSize_ is reset, state reverts to kEmpty,
   /// and the exception is rethrown.
+  ///
+  /// TODO: migrate EvictionPolicyTest off `beginDownload` / `download` and
+  /// remove. Same rationale as `beginDownload` above.
   void download(
       ::facebook::velox::ReadFile& remote,
       const std::string& cacheRoot);

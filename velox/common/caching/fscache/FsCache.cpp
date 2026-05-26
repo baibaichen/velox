@@ -27,6 +27,7 @@
 #include <mutex>
 #include <optional>
 #include <string_view>
+#include <unordered_set>
 
 namespace facebook::velox::cache::fs {
 
@@ -140,6 +141,34 @@ void sliceHoleAndInsert(
   }
 }
 
+// Like FsCacheMetadata::lookupRange but operates directly on an already-locked
+// KeyMetadata's segments map. This avoids a deadlock: lookupRange would try to
+// re-acquire the KeyMutex that the caller already holds via LockedKey. The
+// algorithm is identical: lower_bound + prev intersection check + forward scan.
+std::vector<FileSegmentPtr> lookupRangeUnlocked(
+    const KeyMetadata& keyMeta,
+    uint64_t lo,
+    uint64_t hi) {
+  if (lo >= hi) {
+    return {};
+  }
+  const auto& segs = keyMeta.segments;
+  std::vector<FileSegmentPtr> result;
+  auto it = segs.lower_bound(lo);
+  if (it != segs.begin()) {
+    auto prev = std::prev(it);
+    const auto prevEnd = prev->second->key().offset + prev->second->key().size;
+    if (prevEnd > lo) {
+      it = prev;
+    }
+  }
+  while (it != segs.end() && it->first < hi) {
+    result.push_back(it->second);
+    ++it;
+  }
+  return result;
+}
+
 } // namespace
 
 std::vector<FileSegmentPtr> FsCache::fillHolesWithEmptyFileSegments(
@@ -191,17 +220,17 @@ std::vector<FileSegmentPtr> FsCache::fillHolesWithEmptyFileSegments(
   return result;
 }
 
-std::vector<FileSegmentPtr> FsCache::getOrSet(
+FileSegmentsHolderPtr FsCache::getOrSet(
     const std::string& path,
     uint64_t offset,
     uint64_t size,
-    ::facebook::velox::ReadFile& remote) {
-  // Clamp the requested range to the remote file's actual size. splitRange
-  // aligns the outer end outward to config_.alignment, which would otherwise
-  // overshoot EOF for files smaller than alignment (or for reads near the
-  // tail of any file) and cause LocalReadFile::preadInternal to reject the
-  // short read inside FileSegment::download. See spec
-  // 2026-05-23-fscache-vs-cbi-tpcds §7 OQ #2.
+    const FsCacheConfig& /* settings */,
+    ::facebook::velox::ReadFile& remote,
+    IsPrefetch /* isPrefetch */) {
+  // settings is unused in this commit (the in-process cache always uses
+  // config_); Task 14 wires it through to fillHoles. Keeping the parameter in
+  // the signature here avoids a second ABI break later. isPrefetch is also
+  // unused until Task 14 wires it to the stats counters.
   const uint64_t fileSize = remote.size();
   VELOX_USER_CHECK_LE(
       offset,
@@ -209,110 +238,97 @@ std::vector<FileSegmentPtr> FsCache::getOrSet(
       "FsCache::getOrSet offset past EOF, fileSize={}",
       fileSize);
   if (offset == fileSize || size == 0) {
-    return {};
+    return std::make_unique<FileSegmentsHolder>(std::vector<FileSegmentPtr>{});
   }
   const uint64_t clampedSize = std::min(size, fileSize - offset);
-  const auto ranges = splitRange(offset, clampedSize, config_);
-  std::vector<FileSegmentPtr> result;
-  result.reserve(ranges.size());
+  // Outward-aligned range matches splitRange's outer boundary contract.
+  const uint64_t alignedLo =
+      (offset / config_.alignment) * config_.alignment;
+  const uint64_t end = offset + clampedSize;
+  const uint64_t alignedHi =
+      ((end + config_.alignment - 1) / config_.alignment) * config_.alignment;
+  // Re-clamp alignedHi to file size so we don't allocate post-EOF kEmpty
+  // segments that would then refuse to download.
+  const uint64_t clampedHi = std::min(alignedHi, fileSize);
+
   const PathKey pathKey = PathKey::fromPath(path);
-  for (const auto& [segOffset, segSize] : ranges) {
-    // splitRange rounds alignedEnd outward to config_.alignment, so the LAST
-    // emitted segment's (segOffset + segSize) can exceed fileSize even though
-    // the outer clampedSize already fits. Re-clamp per segment so key.size
-    // (which names the on-disk file and is what FileSegment::download reads
-    // from remote) matches the true byte count; a mismatched key.size would
-    // otherwise re-trigger the EOF overshoot inside download. Underflow is
-    // impossible: every cursor emitted by splitRange is alignment-aligned and
-    // < alignedEnd, and the only segment whose end can exceed fileSize is the
-    // last one whose start is still < fileSize (alignedStart <= offset <
-    // fileSize, every subsequent cursor is offset + k*alignment <= alignedEnd
-    // - alignment < fileSize until the loop exits).
-    const uint64_t effectiveSize = std::min(segSize, fileSize - segOffset);
-    FsCacheKey key{pathKey, segOffset, effectiveSize};
-    result.push_back(lookupOrCreate(key, path, remote));
-  }
-  return result;
-}
+  std::vector<FileSegmentPtr> slots;
+  {
+    auto lockedKey =
+        metadata_->lockKeyMetadata(pathKey, KeyNotFoundPolicy::kCreateEmpty);
+    // Use lookupRangeUnlocked to avoid deadlock: we already hold the KeyMutex
+    // via lockedKey, and metadata_->lookupRange would try to re-acquire it.
+    auto found = lookupRangeUnlocked(*lockedKey.get(), alignedLo, clampedHi);
+    slots = fillHolesWithEmptyFileSegments(
+        std::move(found),
+        alignedLo,
+        clampedHi,
+        pathKey,
+        path,
+        lockedKey,
+        *metadata_,
+        config_);
+  } // lockedKey released here before download
 
-FileSegmentPtr FsCache::lookupOrCreate(
-    const FsCacheKey& key,
-    const std::string& path,
-    ::facebook::velox::ReadFile& remote) {
-  // 1. Fast path: existing kDownloaded segment.
-  if (auto existing = metadata_->lookup(key); existing != nullptr &&
-      existing->state() == FileSegment::State::kDownloaded) {
-    recordHit(existing.get());
-    return existing;
-  }
-
-  // 2. Insert (or pick up existing) segment under the metadata lock. If the
-  //    insert races with a concurrent inserter, lookup() returns the winning
-  //    entry so writer/waiter coordination on the SAME FileSegment instance
-  //    is preserved.
-  auto segment = std::make_shared<FileSegment>(key, path);
-  if (!metadata_->insert(segment)) {
-    segment = metadata_->lookup(key);
-    VELOX_CHECK_NOT_NULL(segment);
-  }
-
-  // 3. Coordinate download. Only the thread that wins beginDownload() does
-  //    the actual fetch; concurrent waiters block on cv_ until the writer
-  //    either completes (kDownloaded) or fails (kEmpty). On failure each
-  //    waiter throws so the caller can retry or surface the error; the
-  //    segment metadata entry stays so a subsequent caller can race for
-  //    beginDownload() again.
-  std::unique_lock<FileSegmentMutex> lock{segment->mutex_};
-  if (segment->state() == FileSegment::State::kDownloaded) {
-    // Another thread completed between fast-path lookup and metadata insert.
-    // Treat as a hit; the slow-path fall-through is not a miss.
-    lock.unlock();
-    recordHit(segment.get());
-    return segment;
-  }
-  if (segment->beginDownload()) {
-    // 3a. Writer path. Release the FileSegment mutex before evict() and
-    // download() so waiters can register on cv_ while we work.
-    lock.unlock();
-    // Reserve capacity by evicting kDownloaded victims; never touches
-    // kDownloading segments because LruPolicy only contains segments that
-    // reached kDownloaded (onInsert runs after a successful download below).
-    evict(key.size);
+  // Transitional shim: until Task 9 makes FsCacheBufferedInput the driver,
+  // run kEmpty -> kDownloaded synchronously inside getOrSet so existing
+  // phase-1 tests continue to observe kDownloaded segments. Removed by
+  // Task 9 step 1.
+  std::unordered_set<FileSegment*> downloadedByUs;
+  for (auto& seg : slots) {
+    if (seg->state() != FileSegment::State::kEmpty) {
+      continue;
+    }
+    if (!seg->reserve(seg->key().size, config_.cacheRoot)) {
+      continue; // someone else won; we will wait below if needed
+    }
+    evict(seg->key().size);
+    // Warm-restart short-circuit: a prior process already produced this exact
+    // file. Skip the remote re-download and publish the existing bytes.
+    const std::string finalPath = seg->localPath(config_.cacheRoot);
+    std::error_code existCheck;
+    if (std::filesystem::exists(finalPath, existCheck) && !existCheck &&
+        std::filesystem::file_size(finalPath, existCheck) == seg->key().size &&
+        !existCheck) {
+      seg->complete();
+      recordMiss(seg.get(), seg->key().size);
+      downloadedByUs.insert(seg.get());
+      continue;
+    }
     try {
-      segment->download(remote, config_.cacheRoot);
+      // Stream the segment in bounded chunks rather than allocating the
+      // full segment at once (mirrors phase-1 download() behaviour).
+      constexpr uint64_t kChunk = 1UL << 20;
+      std::vector<char> buf(std::min<uint64_t>(kChunk, seg->key().size));
+      uint64_t remaining = seg->key().size;
+      uint64_t cursor = seg->key().offset;
+      while (remaining > 0) {
+        const uint64_t toRead = std::min<uint64_t>(buf.size(), remaining);
+        remote.pread(cursor, toRead, buf.data());
+        seg->write(buf.data(), toRead);
+        cursor += toRead;
+        remaining -= toRead;
+      }
+      seg->complete();
+      recordMiss(seg.get(), seg->key().size);
+      downloadedByUs.insert(seg.get());
     } catch (...) {
-      // download() already reset state_ to kEmpty and removed the .tmp.
-      // Notify waiters so they can throw rather than wait forever.
-      std::lock_guard<FileSegmentMutex> resetLock{segment->mutex_};
-      segment->cv_.notify_all();
+      seg->abandon();
       throw;
     }
-    recordMiss(segment.get(), key.size);
-    std::lock_guard<FileSegmentMutex> notifyLock{segment->mutex_};
-    segment->cv_.notify_all();
-    return segment;
   }
-  // 3b. Waiter path: another thread is downloading; wait for completion or
-  //     failure. cv_ is notified on both outcomes (see writer path above).
-  segment->cv_.wait(lock, [&] {
-    return segment->state() != FileSegment::State::kDownloading;
-  });
-  const auto finalState = segment->state();
-  lock.unlock();
-  if (finalState != FileSegment::State::kDownloaded) {
-    // Writer threw. Surface as a user-level error; caller may retry by
-    // calling getOrSet again, at which point a fresh race for
-    // beginDownload() happens. Do not VELOX_CHECK here: that would turn
-    // another thread's IO failure into a CHECK-failure crash on the waiter.
-    VELOX_USER_FAIL(
-        "FsCache concurrent download failed for path={} offset={} size={}",
-        segment->remotePath(),
-        key.offset,
-        key.size);
+  for (auto& seg : slots) {
+    if (seg->state() == FileSegment::State::kDownloading) {
+      // Some other thread is writing it. Wait until they finish OR abandon.
+      seg->waitForDownloadedSize(seg->key().size);
+    }
+    // Count as hit only if we didn't download it ourselves (avoid double-count).
+    if (seg->state() == FileSegment::State::kDownloaded &&
+        downloadedByUs.find(seg.get()) == downloadedByUs.end()) {
+      recordHit(seg.get());
+    }
   }
-  // Successful concurrent download counts as a hit for this thread.
-  recordHit(segment.get());
-  return segment;
+  return std::make_unique<FileSegmentsHolder>(std::move(slots));
 }
 
 void FsCache::evict(uint64_t bytesNeeded) {
@@ -662,9 +678,9 @@ void FsCache::loadFromDisk() {
       toRemove.push_back(entry.path());
     }
     // Survivor: the next getOrSet() will hash to the same filename,
-    // FileSegment::download() short-circuits on the existence + size check,
-    // and lookupOrCreate() credits onInsert + bytesOnDisk so the segment
-    // participates in eviction.
+    // the warm-restart short-circuit detects the file exists with the
+    // expected size, and getOrSet credits recordMiss + bytesOnDisk so
+    // the segment participates in eviction.
   }
   std::error_code ignore;
   for (const auto& path : toRemove) {

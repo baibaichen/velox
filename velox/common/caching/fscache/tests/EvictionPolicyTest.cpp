@@ -189,11 +189,29 @@ TEST(PerBucketEvictionPolicyTest, perBucketIsolation) {
   FsCache cache{config};
   LocalReadFile remoteA{pathA};
   LocalReadFile remoteB{pathB};
-  (void)cache.getOrSet(pathA, 0, 4UL * 1'024 * 1'024, remoteA);
-  (void)cache.getOrSet(pathB, 0, 4UL * 1'024 * 1'024, remoteB);
+  (void)cache.getOrSet(
+      pathA,
+      0,
+      4UL * 1'024 * 1'024,
+      cache.config(),
+      remoteA,
+      IsPrefetch::kDemand);
+  (void)cache.getOrSet(
+      pathB,
+      0,
+      4UL * 1'024 * 1'024,
+      cache.config(),
+      remoteB,
+      IsPrefetch::kDemand);
   // Hit A many times so it is MRU in its bucket.
   for (int i = 0; i < 50; ++i) {
-    (void)cache.getOrSet(pathA, 0, 4UL * 1'024 * 1'024, remoteA);
+    (void)cache.getOrSet(
+        pathA,
+        0,
+        4UL * 1'024 * 1'024,
+        cache.config(),
+        remoteA,
+        IsPrefetch::kDemand);
   }
   // Insert a third segment from a third path -- must trigger eviction of
   // exactly one of the existing two. B (never hit since the first time)
@@ -205,7 +223,13 @@ TEST(PerBucketEvictionPolicyTest, perBucketIsolation) {
     outC.write(blob.data(), blob.size());
   }
   LocalReadFile remoteC{pathC};
-  (void)cache.getOrSet(pathC, 0, 4UL * 1'024 * 1'024, remoteC);
+  (void)cache.getOrSet(
+      pathC,
+      0,
+      4UL * 1'024 * 1'024,
+      cache.config(),
+      remoteC,
+      IsPrefetch::kDemand);
   EXPECT_EQ(cache.stats().evictions, 1u);
   // A should still be cached (most-recently-used in its bucket).
   EXPECT_EQ(cache.stats().bytesOnDisk, 8UL * 1'024 * 1'024);

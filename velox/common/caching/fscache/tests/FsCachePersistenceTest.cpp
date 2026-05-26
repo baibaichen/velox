@@ -51,7 +51,7 @@ class FailIfReadCalled final : public ::facebook::velox::ReadFile {
   // Must report the actual file size: FsCache::getOrSet clamps the requested
   // range to size() so the warm-restart short-circuit code path can run on a
   // key whose size matches what is on disk. Returning 0 would clamp the
-  // request to empty and bypass lookupOrCreate entirely.
+  // request to empty and bypass the writer path entirely.
   uint64_t size() const override {
     return 4UL * 1'024 * 1'024;
   }
@@ -91,7 +91,13 @@ TEST(FsCachePersistenceTest, dataSurvivesRestart) {
   {
     FsCache cache{cfg};
     ::facebook::velox::LocalReadFile remote{remotePath};
-    cache.getOrSet(remotePath, 0, 4UL * 1'024 * 1'024, remote);
+    cache.getOrSet(
+        remotePath,
+        0,
+        4UL * 1'024 * 1'024,
+        cache.config(),
+        remote,
+        IsPrefetch::kDemand);
     firstRunBytesOnDisk = cache.stats().bytesOnDisk;
     EXPECT_GT(firstRunBytesOnDisk, 0);
   }
@@ -120,7 +126,13 @@ TEST(FsCachePersistenceTest, dataSurvivesRestart) {
     // they alone would not distinguish "short-circuited" from "re-downloaded".
     FailIfReadCalled remote;
     const auto before = cache.stats();
-    cache.getOrSet(remotePath, 0, 4UL * 1'024 * 1'024, remote);
+    cache.getOrSet(
+        remotePath,
+        0,
+        4UL * 1'024 * 1'024,
+        cache.config(),
+        remote,
+        IsPrefetch::kDemand);
     const auto after = cache.stats();
     // Recovery does not pre-populate metadata_ so this counts as a miss, but
     // FileSegment::download() short-circuits because the file already exists

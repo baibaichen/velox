@@ -17,6 +17,7 @@
 #pragma once
 
 #include "velox/common/caching/fscache/FileSegment.h"
+#include "velox/common/caching/fscache/FileSegmentsHolder.h"
 #include "velox/common/caching/fscache/FsCacheConfig.h"
 #include "velox/common/caching/fscache/FsCacheGuards.h"
 #include "velox/common/caching/fscache/FsCacheKey.h"
@@ -36,6 +37,12 @@ class ReadFile;
 
 namespace facebook::velox::cache::fs {
 
+/// Selects which pair of stats counters a `FsCache::getOrSet` call bumps.
+/// Task 8 wires the parameter through the signature; Task 14 wires the
+/// actual 4-counter accounting. The prefetch callsite in FsCacheBufferedInput
+/// flips to `kPrefetch` in Task 11 step 4.
+enum class IsPrefetch : uint8_t { kPrefetch, kDemand };
+
 /// Counters exposed to tests and observability. All fields are sampled atomic
 /// totals; differences between two snapshots give per-interval rates.
 struct FsCacheStats {
@@ -53,21 +60,37 @@ class FsCache {
   explicit FsCache(FsCacheConfig config);
   ~FsCache();
 
-  /// Returns segments covering [offset, min(offset + size, remote.size()))
-  /// for the given path, downloading any missing segments synchronously from
-  /// remote. The requested range is clamped to remote.size() so reads near
-  /// EOF (or on files smaller than config.alignment) do not overshoot the
-  /// file --- the last returned segment's key.size therefore reflects the
-  /// true byte count, not the splitRange outward-alignment overshoot.
-  /// Returns an empty vector when offset == remote.size() or size == 0.
-  /// VELOX_USER_CHECKs that offset <= remote.size(). Segment boundaries
-  /// otherwise follow splitRange(offset, clampedSize, config); each returned
-  /// segment is in state kDownloaded on return.
-  std::vector<FileSegmentPtr> getOrSet(
+  /// CH-aligned entry point. Returns a holder of segments covering
+  /// [offset, min(offset + size, remote.size())) — contiguous, offset-
+  /// ascending, and (in this commit) all in state kDownloaded on return
+  /// thanks to the transitional shim documented in the implementation. The
+  /// requested range is clamped to remote.size() so reads near EOF do not
+  /// overshoot the file; the last returned segment's key.size therefore
+  /// reflects the true byte count, not the splitRange outward-alignment
+  /// overshoot. Returns a holder over an empty vector when
+  /// offset == remote.size() or size == 0.
+  ///
+  /// `settings` controls hole slicing (alignment / maxSegmentSize) per spec
+  /// §5.3 fillHoles. Phase-2 callers pass `&config_` so all callers share
+  /// the cache-level defaults; the parameter is kept separate so a future
+  /// caller can tune per-call (e.g. larger alignment for cold scans)
+  /// without touching FsCacheConfig. In this commit `settings` is accepted
+  /// for signature stability but not yet propagated (the implementation
+  /// uses `config_` directly); Task 14 forwards it through.
+  ///
+  /// `isPrefetch` selects which pair of stats counters to bump. Task 8
+  /// only forwards the value; Task 14 wires the actual prefetch/demand
+  /// counter pairs. There is intentionally no default — every caller
+  /// decides.
+  ///
+  /// VELOX_USER_CHECKs that offset <= remote.size().
+  FileSegmentsHolderPtr getOrSet(
       const std::string& path,
       uint64_t offset,
       uint64_t size,
-      ::facebook::velox::ReadFile& remote);
+      const FsCacheConfig& settings,
+      ::facebook::velox::ReadFile& remote,
+      IsPrefetch isPrefetch);
 
   /// Snapshot of counters. Cheap; intended for tests and observability.
   FsCacheStats stats() const;
@@ -129,7 +152,7 @@ class FsCache {
   /// are picked up on demand --- the next getOrSet() for the same key hashes
   /// to the same on-disk filename, FileSegment::download() short-circuits
   /// when it finds the file already present with the expected size, and
-  /// lookupOrCreate()'s writer path then performs the normal onInsert +
+  /// the new getOrSet writer path then performs the normal onInsert +
   /// bytesOnDisk accounting so the segment participates in eviction.
   /// Idempotent.
   ///
@@ -151,16 +174,6 @@ class FsCache {
   void loadFromDisk();
 
  private:
-  // Looks up an existing segment or coordinates a fresh download. Single
-  // writer per key via FileSegment::beginDownload(); concurrent callers wait
-  // on FileSegment::cv_ for the writer's outcome. path is the original remote
-  // path string, passed through to FileSegment so it can be used by download()
-  // and diagnostics — the (path-only-hashed) FsCacheKey does not carry it.
-  FileSegmentPtr lookupOrCreate(
-      const FsCacheKey& key,
-      const std::string& path,
-      ::facebook::velox::ReadFile& remote);
-
   // Evicts until bytesOnDisk + bytesNeeded <= maxBytes. Selects victims from
   // each bucket's per-bucket EvictionPolicy under that bucket's
   // CachePriorityMutex, removes the on-disk file first, then drops the entry
