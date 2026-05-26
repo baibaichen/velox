@@ -34,22 +34,36 @@ namespace facebook::velox::cache::fs {
 
 /// Single cache segment with a download state machine.
 ///
-/// Lifecycle:
-///   kEmpty --beginDownload()--> kDownloading --download() ok--> kDownloaded
-///                                            --download() throws--> kEmpty
-///   kDownloaded --evict() while readers active--> kDetached
+/// Lifecycle (per spec §5.4):
+///   kEmpty --beginDownload()--> kDownloading --complete()--> kDownloaded
+///                                            --abandon() w/ bytes--> kPartiallyDownloaded
+///   kPartiallyDownloaded --beginDownload() resume--> kDownloading
+///                        --metadata refuses resume--> kPartiallyDownloadedNoContinuation
+///   {kDownloaded, kDownloading, kPartiallyDownloaded, kPartiallyDownloadedNoContinuation}
+///       --evict() while readers active--> kDetached
 ///
 /// Phase 1: downloads are synchronous and all-or-nothing — the segment is
 /// either kEmpty or kDownloaded on disk; .tmp + rename keeps the published
-/// file atomic. Background / partial downloads return in phase 2.
+/// file atomic. The 2 partial states (kPartiallyDownloaded,
+/// kPartiallyDownloadedNoContinuation) are dead code at this commit; task 2-3
+/// wire the reserve/write/complete/abandon paths that drive transitions into
+/// them. Background / partial downloads return in phase 2.
 class FileSegment {
  public:
   /// Download lifecycle state.
   enum class State : uint8_t {
+    /// Metadata exists, no writer yet.
     kEmpty = 0,
+    /// Single writer active; downloadedSize_ advancing.
     kDownloading = 1,
+    /// Entire segment on disk.
     kDownloaded = 2,
-    kDetached = 3,
+    /// Writer abandoned with downloadedSize_ > 0; resume allowed.
+    kPartiallyDownloaded = 3,
+    /// Partial bytes on disk but metadata refused resume (phase-3 only).
+    kPartiallyDownloadedNoContinuation = 4,
+    /// Metadata removed; segment kept alive by active readers.
+    kDetached = 5,
   };
 
   /// Constructs a fresh kEmpty segment for the given key. remotePath is the
