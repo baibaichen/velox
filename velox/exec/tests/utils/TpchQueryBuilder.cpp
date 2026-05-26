@@ -84,20 +84,24 @@ void TpchQueryBuilder::readFileSchema(
       dwio::common::getReaderFactory(readerOptions.fileFormat())
           ->createReader(std::move(input), readerOptions);
   const auto fileType = reader->rowType();
-  const auto fileColumnNames = fileType->names();
-  // There can be extra columns in the file towards the end.
-  VELOX_CHECK_GE(fileColumnNames.size(), columns.size());
+  // Resolve each requested column by name against the file's row type, not
+  // by position. Spark-generated TPC-H parquet stores columns in a different
+  // order than dbgen's canonical layout (e.g. p_brand at the end of `part`),
+  // and a positional zip would mis-bind names to the wrong physical types.
   std::unordered_map<std::string, std::string> fileColumnNamesMap(
       columns.size());
-  std::transform(
-      columns.begin(),
-      columns.end(),
-      fileColumnNames.begin(),
-      std::inserter(fileColumnNamesMap, fileColumnNamesMap.begin()),
-      [](std::string a, std::string b) { return std::make_pair(a, b); });
   auto columnNames = columns;
-  auto types = fileType->children();
-  types.resize(columnNames.size());
+  std::vector<TypePtr> types;
+  types.reserve(columns.size());
+  for (const auto& column : columns) {
+    VELOX_USER_CHECK(
+        fileType->containsChild(column),
+        "TPC-H column not found in file schema: {}.{}",
+        tableName,
+        column);
+    types.push_back(fileType->findChild(column));
+    fileColumnNamesMap.emplace(column, column);
+  }
   tableMetadata_[tableName].type =
       std::make_shared<RowType>(std::move(columnNames), std::move(types));
   tableMetadata_[tableName].fileColumnNames = std::move(fileColumnNamesMap);
@@ -115,6 +119,14 @@ void TpchQueryBuilder::initialize(const std::string& dataPath) {
       }
       // Ignore hidden files.
       if (dirEntry.path().filename().c_str()[0] == '.') {
+        continue;
+      }
+      // Skip Spark-style empty marker files (e.g. _SUCCESS), which are not
+      // valid Parquet/DWRF. Use the error_code overload so a transient stat
+      // failure cannot throw past the directory_iterator error_code fallback
+      // below.
+      std::error_code sizeError;
+      if (dirEntry.file_size(sizeError) == 0) {
         continue;
       }
       if (tableMetadata_[tableName].dataFiles.empty()) {
