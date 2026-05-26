@@ -106,6 +106,32 @@ TEST_F(FsCacheBufferedInputTest, hasCacheReturnsTrue) {
   EXPECT_TRUE(input.hasCache());
 }
 
+// Regression: isBuffered() must return false so that callers like
+// StructColumnReader::loadRowGroup do NOT take the fast path that skips
+// load(). FsCache's enqueue() only registers the region; load() is what
+// populates segments. If isBuffered() ever lies and returns true, the next
+// read on the returned stream will throw "Stream used before
+// FsCacheBufferedInput::load()" from DeferredStream::ensureWithData.
+//
+// We assert BOTH the contract (returns false) AND the consequence (reading
+// without load throws) so the test still catches the regression even if
+// someone "cleans up" the boolean by inverting the constant.
+TEST_F(FsCacheBufferedInputTest, isBufferedReturnsFalseToForceLoad) {
+  auto readFile = std::make_shared<LocalReadFile>(remotePath_);
+  FsCacheBufferedInput input{readFile, *pool_, fsCache_.get()};
+
+  EXPECT_FALSE(input.isBuffered(0, 1'024));
+  EXPECT_FALSE(input.isBuffered(100, 2'048));
+
+  // Simulate the fast path: caller trusts isBuffered, enqueues, then reads
+  // WITHOUT calling load(). DeferredStream must refuse rather than silently
+  // returning empty / stale bytes.
+  auto stream = input.enqueue({0, 1'024});
+  const void* data;
+  int32_t len;
+  EXPECT_THROW(stream->Next(&data, &len), ::facebook::velox::VeloxException);
+}
+
 TEST_F(FsCacheBufferedInputTest, skipBeforeLoadPositionsCorrectly) {
   auto readFile = std::make_shared<LocalReadFile>(remotePath_);
   FsCacheBufferedInput input{readFile, *pool_, fsCache_.get()};

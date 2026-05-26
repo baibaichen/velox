@@ -160,9 +160,13 @@ void FsCacheBufferedInput::load(LogType /*unused*/) {
 bool FsCacheBufferedInput::isBuffered(
     uint64_t /*offset*/,
     uint64_t /*length*/) const {
-  // Phase 1: trust enqueue + load to bring the segment in. Phase 2 could
-  // probe metadata for already-resident segments.
-  return true;
+  // Must return false: the contract of isBuffered() is "the region is already
+  // resident and can be read without a subsequent load()". FsCache's enqueue()
+  // only registers the region; load() is what populates segments. Returning
+  // true would let StructColumnReader::loadRowGroup take the fast path that
+  // skips load(), and DeferredStream would then fail with "Stream used before
+  // FsCacheBufferedInput::load()".
+  return false;
 }
 
 std::unique_ptr<BufferedInput> FsCacheBufferedInput::clone() const {
