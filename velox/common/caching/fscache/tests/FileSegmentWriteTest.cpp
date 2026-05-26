@@ -15,7 +15,6 @@
 
 #include <gtest/gtest.h>
 
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <thread>
