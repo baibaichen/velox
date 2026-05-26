@@ -173,32 +173,34 @@ class FsCache {
   /// side-effect-free and keeps unit tests from paying directory-scan cost.
   void loadFromDisk();
 
- private:
-  // Evicts until bytesOnDisk + bytesNeeded <= maxBytes. Selects victims from
-  // each bucket's per-bucket EvictionPolicy under that bucket's
-  // CachePriorityMutex, removes the on-disk file first, then drops the entry
-  // from the bucket policy and metadata_ to avoid orphan files on
-  // filesystem-remove failure.
-  //
-  // CAVEAT: this invariant is only single-writer tight. evict() reads
-  // counters_.bytesOnDisk to decide whether to drain, but recordMiss() does
-  // not credit the in-flight reservation until AFTER download() finishes,
-  // so N concurrent miss-path writers can each independently observe
-  // headroom and skip eviction. The worst-case transient over-shoot is
-  // maxBytes + N * segmentSize before the next miss path's evict() drains
-  // it back; in production this is a tiny fraction of maxBytes (e.g. 64
-  // writers x 8 MiB segment = 512 MiB on top of a 100 GiB cache). Phase 2
-  // will fold this into the in-flight reservation accounting tracked
-  // alongside the warm-restart orphan-bytes counter (see loadFromDisk).
-  void evict(uint64_t bytesNeeded);
-
-  // Records a cache hit: touches LRU and bumps counters_.hits.
+  /// Records a cache hit: touches LRU and bumps counters_.hits.
   void recordHit(FileSegment* segment);
 
-  // Records a fresh miss: inserts into LRU and bumps counters_.misses /
-  // counters_.bytesOnDisk by segmentSize.
+  /// Records a fresh miss: inserts into LRU and bumps counters_.misses /
+  /// counters_.bytesOnDisk by segmentSize.
   void recordMiss(FileSegment* segment, uint64_t segmentSize);
 
+  /// Evicts until bytesOnDisk + bytesNeeded <= maxBytes. Selects victims from
+  /// each bucket's per-bucket EvictionPolicy under that bucket's
+  /// CachePriorityMutex, removes the on-disk file first, then drops the entry
+  /// from the bucket policy and metadata_ to avoid orphan files on
+  /// filesystem-remove failure. Public so the caller
+  /// (FsCacheBufferedInput::load / test driveSegments) can drain capacity
+  /// before reserving a fresh segment.
+  ///
+  /// CAVEAT: this invariant is only single-writer tight. evict() reads
+  /// counters_.bytesOnDisk to decide whether to drain, but recordMiss() does
+  /// not credit the in-flight reservation until AFTER download() finishes,
+  /// so N concurrent miss-path writers can each independently observe
+  /// headroom and skip eviction. The worst-case transient over-shoot is
+  /// maxBytes + N * segmentSize before the next miss path's evict() drains
+  /// it back; in production this is a tiny fraction of maxBytes (e.g. 64
+  /// writers x 8 MiB segment = 512 MiB on top of a 100 GiB cache). Phase 2
+  /// will fold this into the in-flight reservation accounting tracked
+  /// alongside the warm-restart orphan-bytes counter (see loadFromDisk).
+  void evict(uint64_t bytesNeeded);
+
+ private:
   // Live atomic counters. stats() composes an FsCacheStats POD snapshot from
   // per-field relaxed loads. Per-field atomicity is enough for the
   // observability use case. Snapshots taken concurrently with writers can

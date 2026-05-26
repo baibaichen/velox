@@ -37,6 +37,57 @@ namespace facebook::velox::cache::fs::test {
 
 using ::facebook::velox::common::testutil::TempDirectoryPath;
 
+namespace {
+// Test helper: drives all kEmpty segments to kDownloaded. After Task 9,
+// FsCache::getOrSet returns kEmpty segments and the caller (normally
+// FsCacheBufferedInput::load) is responsible for downloading.
+void driveSegments(
+    FileSegmentsHolder& holder,
+    ::facebook::velox::ReadFile& remote,
+    FsCache& cache) {
+  const auto& cacheRoot = cache.config().cacheRoot;
+  for (auto& seg : holder.segments()) {
+    if (seg->state() == FileSegment::State::kDownloaded) {
+      cache.recordHit(seg.get());
+      continue;
+    }
+    if (seg->state() != FileSegment::State::kEmpty) {
+      seg->waitForDownloadedSize(seg->key().size);
+      cache.recordHit(seg.get());
+      continue;
+    }
+    cache.evict(seg->key().size);
+    if (!seg->reserve(seg->key().size, cacheRoot)) {
+      if (seg->state() == FileSegment::State::kDownloaded) {
+        cache.recordMiss(seg.get(), seg->key().size);
+      } else {
+        seg->waitForDownloadedSize(seg->key().size);
+        cache.recordHit(seg.get());
+      }
+      continue;
+    }
+    try {
+      constexpr uint64_t kChunk = 1UL << 20;
+      std::vector<char> buf(std::min<uint64_t>(kChunk, seg->key().size));
+      uint64_t remaining = seg->key().size;
+      uint64_t cursor = seg->key().offset;
+      while (remaining > 0) {
+        const uint64_t toRead = std::min<uint64_t>(buf.size(), remaining);
+        remote.pread(cursor, toRead, buf.data());
+        seg->write(buf.data(), toRead);
+        cursor += toRead;
+        remaining -= toRead;
+      }
+      seg->complete();
+      cache.recordMiss(seg.get(), seg->key().size);
+    } catch (...) {
+      seg->abandon();
+      throw;
+    }
+  }
+}
+} // namespace
+
 class EvictionPolicyTest : public ::testing::Test {
  protected:
   std::shared_ptr<TempDirectoryPath> tempDir_;
@@ -189,29 +240,36 @@ TEST(PerBucketEvictionPolicyTest, perBucketIsolation) {
   FsCache cache{config};
   LocalReadFile remoteA{pathA};
   LocalReadFile remoteB{pathB};
-  (void)cache.getOrSet(
-      pathA,
-      0,
-      4UL * 1'024 * 1'024,
-      cache.config(),
-      remoteA,
-      IsPrefetch::kDemand);
-  (void)cache.getOrSet(
-      pathB,
-      0,
-      4UL * 1'024 * 1'024,
-      cache.config(),
-      remoteB,
-      IsPrefetch::kDemand);
-  // Hit A many times so it is MRU in its bucket.
-  for (int i = 0; i < 50; ++i) {
-    (void)cache.getOrSet(
+  {
+    auto holder = cache.getOrSet(
         pathA,
         0,
         4UL * 1'024 * 1'024,
         cache.config(),
         remoteA,
         IsPrefetch::kDemand);
+    driveSegments(*holder, remoteA, cache);
+  }
+  {
+    auto holder = cache.getOrSet(
+        pathB,
+        0,
+        4UL * 1'024 * 1'024,
+        cache.config(),
+        remoteB,
+        IsPrefetch::kDemand);
+    driveSegments(*holder, remoteB, cache);
+  }
+  // Hit A many times so it is MRU in its bucket.
+  for (int i = 0; i < 50; ++i) {
+    auto holder = cache.getOrSet(
+        pathA,
+        0,
+        4UL * 1'024 * 1'024,
+        cache.config(),
+        remoteA,
+        IsPrefetch::kDemand);
+    driveSegments(*holder, remoteA, cache);
   }
   // Insert a third segment from a third path -- must trigger eviction of
   // exactly one of the existing two. B (never hit since the first time)
@@ -223,13 +281,16 @@ TEST(PerBucketEvictionPolicyTest, perBucketIsolation) {
     outC.write(blob.data(), blob.size());
   }
   LocalReadFile remoteC{pathC};
-  (void)cache.getOrSet(
-      pathC,
-      0,
-      4UL * 1'024 * 1'024,
-      cache.config(),
-      remoteC,
-      IsPrefetch::kDemand);
+  {
+    auto holder = cache.getOrSet(
+        pathC,
+        0,
+        4UL * 1'024 * 1'024,
+        cache.config(),
+        remoteC,
+        IsPrefetch::kDemand);
+    driveSegments(*holder, remoteC, cache);
+  }
   EXPECT_EQ(cache.stats().evictions, 1u);
   // A should still be cached (most-recently-used in its bucket).
   EXPECT_EQ(cache.stats().bytesOnDisk, 8UL * 1'024 * 1'024);

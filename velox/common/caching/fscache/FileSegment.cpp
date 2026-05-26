@@ -127,6 +127,20 @@ bool FileSegment::reserve(
     return false;
   }
   const std::string finalPath = localPath(cacheRoot);
+  // Warm-restart short-circuit: a prior process already produced this exact
+  // file (same hash + offset + size). Skip the remote re-download and publish
+  // the existing bytes directly. FsCache::loadFromDisk() does not pre-credit
+  // these to bytesOnDisk, so the writer path that called us still runs
+  // onInsert + bytesOnDisk += size and the segment becomes evictable.
+  std::error_code existCheck;
+  if (std::filesystem::exists(finalPath, existCheck) && !existCheck &&
+      std::filesystem::file_size(finalPath, existCheck) == key_.size &&
+      !existCheck) {
+    downloadedSize_.store(key_.size, std::memory_order_release);
+    state_.store(State::kDownloaded, std::memory_order_release);
+    cv_.notify_all();
+    return false;
+  }
   std::filesystem::create_directories(
       std::filesystem::path{finalPath}.parent_path());
   // Spec §5.4: open O_CREAT|O_WRONLY with mode 0644, NO ftruncate.

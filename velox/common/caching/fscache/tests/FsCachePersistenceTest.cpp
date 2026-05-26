@@ -30,6 +30,59 @@ namespace facebook::velox::cache::fs::test {
 
 using ::facebook::velox::common::testutil::TempDirectoryPath;
 
+namespace {
+// Test helper: drives all kEmpty segments to kDownloaded. After Task 9,
+// FsCache::getOrSet returns kEmpty segments and the caller (normally
+// FsCacheBufferedInput::load) is responsible for downloading.
+void driveSegments(
+    FileSegmentsHolder& holder,
+    ::facebook::velox::ReadFile& remote,
+    FsCache& cache) {
+  const auto& cacheRoot = cache.config().cacheRoot;
+  for (auto& seg : holder.segments()) {
+    if (seg->state() == FileSegment::State::kDownloaded) {
+      cache.recordHit(seg.get());
+      continue;
+    }
+    if (seg->state() != FileSegment::State::kEmpty) {
+      seg->waitForDownloadedSize(seg->key().size);
+      cache.recordHit(seg.get());
+      continue;
+    }
+    cache.evict(seg->key().size);
+    if (!seg->reserve(seg->key().size, cacheRoot)) {
+      // reserve() may have taken the warm-restart short-circuit and
+      // already set the segment to kDownloaded.
+      if (seg->state() == FileSegment::State::kDownloaded) {
+        cache.recordMiss(seg.get(), seg->key().size);
+      } else {
+        seg->waitForDownloadedSize(seg->key().size);
+        cache.recordHit(seg.get());
+      }
+      continue;
+    }
+    try {
+      constexpr uint64_t kChunk = 1UL << 20;
+      std::vector<char> buf(std::min<uint64_t>(kChunk, seg->key().size));
+      uint64_t remaining = seg->key().size;
+      uint64_t cursor = seg->key().offset;
+      while (remaining > 0) {
+        const uint64_t toRead = std::min<uint64_t>(buf.size(), remaining);
+        remote.pread(cursor, toRead, buf.data());
+        seg->write(buf.data(), toRead);
+        cursor += toRead;
+        remaining -= toRead;
+      }
+      seg->complete();
+      cache.recordMiss(seg.get(), seg->key().size);
+    } catch (...) {
+      seg->abandon();
+      throw;
+    }
+  }
+}
+} // namespace
+
 // Stand-in for a remote ReadFile that ASSERTS if any read is issued. Used to
 // prove the warm-restart short-circuit short-circuited --- if download() ever
 // touches the remote, pread() fails the test immediately rather than silently
@@ -91,13 +144,14 @@ TEST(FsCachePersistenceTest, dataSurvivesRestart) {
   {
     FsCache cache{cfg};
     ::facebook::velox::LocalReadFile remote{remotePath};
-    cache.getOrSet(
+    auto holder = cache.getOrSet(
         remotePath,
         0,
         4UL * 1'024 * 1'024,
         cache.config(),
         remote,
         IsPrefetch::kDemand);
+    driveSegments(*holder, remote, cache);
     firstRunBytesOnDisk = cache.stats().bytesOnDisk;
     EXPECT_GT(firstRunBytesOnDisk, 0);
   }
@@ -120,22 +174,27 @@ TEST(FsCachePersistenceTest, dataSurvivesRestart) {
     cache.loadFromDisk();
     // Hand the second-run getOrSet a remote that ASSERTS if pread() runs.
     // This is what proves the warm-restart short-circuit in
-    // FileSegment::download() is actually taken --- without it, the
+    // FileSegment::reserve() is actually taken --- without it, the
     // bytesOnDisk and miss-count assertions below would also hold if
     // download() re-fetched and rename-overwrote the existing file, so
     // they alone would not distinguish "short-circuited" from "re-downloaded".
     FailIfReadCalled remote;
     const auto before = cache.stats();
-    cache.getOrSet(
+    auto holder = cache.getOrSet(
         remotePath,
         0,
         4UL * 1'024 * 1'024,
         cache.config(),
         remote,
         IsPrefetch::kDemand);
+    // driveSegments calls reserve() which has warm-restart short-circuit:
+    // it detects the file already exists with the correct size and
+    // transitions the segment directly to kDownloaded without calling
+    // remote.pread(). FailIfReadCalled ensures pread() is never called.
+    driveSegments(*holder, remote, cache);
     const auto after = cache.stats();
     // Recovery does not pre-populate metadata_ so this counts as a miss, but
-    // FileSegment::download() short-circuits because the file already exists
+    // FileSegment::reserve() short-circuits because the file already exists
     // with the expected size --- bytesOnDisk only reflects the recordMiss
     // accounting bump (which equals the segment size, matching what was
     // already on disk).

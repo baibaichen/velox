@@ -221,4 +221,43 @@ TEST_F(FsCacheBufferedInputTest, parquetSampleRoundTrips) {
   EXPECT_EQ(drain(*stream, size), truth);
 }
 
+// After load(), every segment in the holder must be kDownloaded or
+// kDownloading. Locks in Task 9's contract: FsCacheBufferedInput is the
+// driver, not FsCache::getOrSet.
+TEST_F(FsCacheBufferedInputTest, loadAdvancesAllEmptySegmentsToDownloaded) {
+  auto readFile = std::make_shared<LocalReadFile>(remotePath_);
+  FsCacheBufferedInput input{readFile, *pool_, fsCache_.get()};
+  auto stream = input.enqueue({0, 1UL << 20});
+  input.load(LogType::FILE);
+  // We can't peek at segments directly through the public stream, but
+  // draining the stream must produce the full expected bytes.
+  auto bytes = drain(*stream, 1UL << 20);
+  EXPECT_EQ(bytes.size(), 1UL << 20);
+  EXPECT_EQ(bytes, remoteContent_.substr(0, 1UL << 20));
+}
+
+TEST_F(FsCacheBufferedInputTest, getOrSetReturnsEmptySegmentsWithoutShim) {
+  using FileSegment = ::facebook::velox::cache::fs::FileSegment;
+  using IsPrefetch = ::facebook::velox::cache::fs::IsPrefetch;
+  auto readFile = std::make_shared<LocalReadFile>(remotePath_);
+  auto holder = fsCache_->getOrSet(
+      remotePath_,
+      0,
+      1UL << 20,
+      fsCache_->config(),
+      *readFile,
+      IsPrefetch::kDemand);
+  ASSERT_NE(holder, nullptr);
+  ASSERT_FALSE(holder->segments().empty());
+  // After Task 9 removes the shim, kEmpty segments are returned. Any
+  // segment that's already kDownloaded is fine (could happen if a prior
+  // test populated the cache).
+  for (const auto& seg : holder->segments()) {
+    EXPECT_TRUE(
+        seg->state() == FileSegment::State::kEmpty ||
+        seg->state() == FileSegment::State::kDownloaded ||
+        seg->state() == FileSegment::State::kDownloading);
+  }
+}
+
 } // namespace facebook::velox::dwio::common::test

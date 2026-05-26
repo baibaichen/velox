@@ -27,7 +27,6 @@
 #include <mutex>
 #include <optional>
 #include <string_view>
-#include <unordered_set>
 
 namespace facebook::velox::cache::fs {
 
@@ -270,64 +269,6 @@ FileSegmentsHolderPtr FsCache::getOrSet(
         config_);
   } // lockedKey released here before download
 
-  // Transitional shim: until Task 9 makes FsCacheBufferedInput the driver,
-  // run kEmpty -> kDownloaded synchronously inside getOrSet so existing
-  // phase-1 tests continue to observe kDownloaded segments. Removed by
-  // Task 9 step 1.
-  std::unordered_set<FileSegment*> downloadedByUs;
-  for (auto& seg : slots) {
-    if (seg->state() != FileSegment::State::kEmpty) {
-      continue;
-    }
-    if (!seg->reserve(seg->key().size, config_.cacheRoot)) {
-      continue; // someone else won; we will wait below if needed
-    }
-    evict(seg->key().size);
-    // Warm-restart short-circuit: a prior process already produced this exact
-    // file. Skip the remote re-download and publish the existing bytes.
-    const std::string finalPath = seg->localPath(config_.cacheRoot);
-    std::error_code existCheck;
-    if (std::filesystem::exists(finalPath, existCheck) && !existCheck &&
-        std::filesystem::file_size(finalPath, existCheck) == seg->key().size &&
-        !existCheck) {
-      seg->complete();
-      recordMiss(seg.get(), seg->key().size);
-      downloadedByUs.insert(seg.get());
-      continue;
-    }
-    try {
-      // Stream the segment in bounded chunks rather than allocating the
-      // full segment at once (mirrors phase-1 download() behaviour).
-      constexpr uint64_t kChunk = 1UL << 20;
-      std::vector<char> buf(std::min<uint64_t>(kChunk, seg->key().size));
-      uint64_t remaining = seg->key().size;
-      uint64_t cursor = seg->key().offset;
-      while (remaining > 0) {
-        const uint64_t toRead = std::min<uint64_t>(buf.size(), remaining);
-        remote.pread(cursor, toRead, buf.data());
-        seg->write(buf.data(), toRead);
-        cursor += toRead;
-        remaining -= toRead;
-      }
-      seg->complete();
-      recordMiss(seg.get(), seg->key().size);
-      downloadedByUs.insert(seg.get());
-    } catch (...) {
-      seg->abandon();
-      throw;
-    }
-  }
-  for (auto& seg : slots) {
-    if (seg->state() == FileSegment::State::kDownloading) {
-      // Some other thread is writing it. Wait until they finish OR abandon.
-      seg->waitForDownloadedSize(seg->key().size);
-    }
-    // Count as hit only if we didn't download it ourselves (avoid double-count).
-    if (seg->state() == FileSegment::State::kDownloaded &&
-        downloadedByUs.find(seg.get()) == downloadedByUs.end()) {
-      recordHit(seg.get());
-    }
-  }
   return std::make_unique<FileSegmentsHolder>(std::move(slots));
 }
 

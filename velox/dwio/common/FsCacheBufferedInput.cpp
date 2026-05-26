@@ -20,6 +20,7 @@
 #include "velox/dwio/common/FsCacheInputStream.h"
 
 #include <algorithm>
+#include <vector>
 
 namespace facebook::velox::dwio::common {
 
@@ -155,8 +156,52 @@ void FsCacheBufferedInput::load(LogType /*unused*/) {
         enqueued.region.length,
         fsCache_->config(),
         *input_->getReadFile(),
-        // Task 11 step 4 flips this callsite to kPrefetch.
         cache::fs::IsPrefetch::kDemand);
+
+    for (auto& seg : enqueued.holder->segments()) {
+      if (seg->state() == cache::fs::FileSegment::State::kDownloaded) {
+        fsCache_->recordHit(seg.get());
+        continue;
+      }
+      if (seg->state() != cache::fs::FileSegment::State::kEmpty) {
+        // Another driver is mid-download. Wait for it to publish kDownloaded
+        // (or throw on its abandon path) so subsequent FileSegment::read()
+        // sees the bytes.
+        seg->waitForDownloadedSize(seg->key().size);
+        fsCache_->recordHit(seg.get());
+        continue;
+      }
+      fsCache_->evict(seg->key().size);
+      if (!seg->reserve(seg->key().size, fsCache_->config().cacheRoot)) {
+        if (seg->state() == cache::fs::FileSegment::State::kDownloaded) {
+          // Warm-restart short-circuit inside reserve() found the file on
+          // disk and published it directly.
+          fsCache_->recordMiss(seg.get(), seg->key().size);
+        } else {
+          seg->waitForDownloadedSize(seg->key().size);
+          fsCache_->recordHit(seg.get());
+        }
+        continue;
+      }
+      try {
+        constexpr uint64_t kChunk = 1UL << 20;
+        std::vector<char> buf(std::min<uint64_t>(kChunk, seg->key().size));
+        uint64_t remaining = seg->key().size;
+        uint64_t cursor = seg->key().offset;
+        while (remaining > 0) {
+          const uint64_t toRead = std::min<uint64_t>(buf.size(), remaining);
+          input_->getReadFile()->pread(cursor, toRead, buf.data());
+          seg->write(buf.data(), toRead);
+          cursor += toRead;
+          remaining -= toRead;
+        }
+        seg->complete();
+        fsCache_->recordMiss(seg.get(), seg->key().size);
+      } catch (...) {
+        seg->abandon();
+        throw;
+      }
+    }
   }
 }
 

@@ -34,6 +34,62 @@ namespace facebook::velox::cache::fs::test {
 
 using ::facebook::velox::common::testutil::TempDirectoryPath;
 
+namespace {
+// Test helper: drives all kEmpty segments to kDownloaded. After Task 9,
+// FsCache::getOrSet returns kEmpty segments and the caller (normally
+// FsCacheBufferedInput::load) is responsible for downloading.
+void driveSegments(
+    FileSegmentsHolder& holder,
+    ::facebook::velox::ReadFile& remote,
+    FsCache& cache) {
+  const auto& cacheRoot = cache.config().cacheRoot;
+  for (auto& seg : holder.segments()) {
+    if (seg->state() == FileSegment::State::kDownloaded) {
+      cache.recordHit(seg.get());
+      continue;
+    }
+    if (seg->state() != FileSegment::State::kEmpty) {
+      // Another writer is mid-download (kDownloading) or finished with a
+      // partial outcome. Wait for it to publish kDownloaded, then count
+      // this as a hit on the existing bytes.
+      seg->waitForDownloadedSize(seg->key().size);
+      cache.recordHit(seg.get());
+      continue;
+    }
+    cache.evict(seg->key().size);
+    if (!seg->reserve(seg->key().size, cacheRoot)) {
+      if (seg->state() == FileSegment::State::kDownloaded) {
+        cache.recordMiss(seg.get(), seg->key().size);
+      } else {
+        // Lost the reserve() race: another writer is downloading. Wait for
+        // it to publish kDownloaded, then count this as a hit.
+        seg->waitForDownloadedSize(seg->key().size);
+        cache.recordHit(seg.get());
+      }
+      continue;
+    }
+    try {
+      constexpr uint64_t kChunk = 1UL << 20;
+      std::vector<char> buf(std::min<uint64_t>(kChunk, seg->key().size));
+      uint64_t remaining = seg->key().size;
+      uint64_t cursor = seg->key().offset;
+      while (remaining > 0) {
+        const uint64_t toRead = std::min<uint64_t>(buf.size(), remaining);
+        remote.pread(cursor, toRead, buf.data());
+        seg->write(buf.data(), toRead);
+        cursor += toRead;
+        remaining -= toRead;
+      }
+      seg->complete();
+      cache.recordMiss(seg.get(), seg->key().size);
+    } catch (...) {
+      seg->abandon();
+      throw;
+    }
+  }
+}
+} // namespace
+
 class FsCacheConcurrencyTest : public ::testing::Test {
  protected:
   std::shared_ptr<TempDirectoryPath> tempDir_;
@@ -77,6 +133,7 @@ TEST_F(FsCacheConcurrencyTest, sameSegmentMultipleReadersExactlyOneDownload) {
             cache.config(),
             remote,
             IsPrefetch::kDemand);
+        driveSegments(*holder, remote, cache);
         for (auto& s : holder->segments()) {
           if (s->state() != FileSegment::State::kDownloaded) {
             ++errors;
@@ -110,13 +167,14 @@ TEST_F(FsCacheConcurrencyTest, differentSegmentsParallelDownloads) {
     threads.emplace_back([&, i] {
       try {
         LocalReadFile remote{remotePath_};
-        cache.getOrSet(
+        auto holder = cache.getOrSet(
             remotePath_,
             static_cast<uint64_t>(i) * kSegmentSize,
             kSegmentSize,
             cache.config(),
             remote,
             IsPrefetch::kDemand);
+        driveSegments(*holder, remote, cache);
       } catch (const std::exception&) {
         ++errors;
       }
@@ -168,13 +226,14 @@ TEST_F(FsCacheConcurrencyTest, evictionUnderConcurrentLoadIsRaceFree) {
           const uint64_t off =
               (static_cast<uint64_t>(t) * 4 + round) * 1'024 * 1'024 %
               (12UL * 1'024 * 1'024);
-          cache.getOrSet(
+          auto holder = cache.getOrSet(
               remotePath_,
               off,
               kSegmentSize,
               cache.config(),
               remote,
               IsPrefetch::kDemand);
+          driveSegments(*holder, remote, cache);
         }
       } catch (const std::exception&) {
         ++errors;
@@ -209,26 +268,28 @@ TEST_F(FsCacheConcurrencyTest, hitPathTolerates32WayContention) {
   // observe a hit (not a miss-cv-wait).
   {
     LocalReadFile remote{remotePath_};
-    (void)cache.getOrSet(
+    auto holder = cache.getOrSet(
         remotePath_,
         0,
         kSegmentSize,
         cache.config(),
         remote,
         IsPrefetch::kDemand);
+    driveSegments(*holder, remote, cache);
   }
   std::vector<std::thread> threads;
   for (int t = 0; t < kThreads; ++t) {
     threads.emplace_back([&] {
       LocalReadFile remote{remotePath_};
       for (int i = 0; i < kPerThread; ++i) {
-        (void)cache.getOrSet(
+        auto holder = cache.getOrSet(
             remotePath_,
             0,
             kSegmentSize,
             cache.config(),
             remote,
             IsPrefetch::kDemand);
+        driveSegments(*holder, remote, cache);
       }
     });
   }
@@ -291,6 +352,7 @@ TEST_F(FsCacheConcurrencyTest, DISABLED_roundRobinEvictUnderConcurrentInserts) {
               cache.config(),
               remote,
               IsPrefetch::kDemand);
+          driveSegments(*holder, remote, cache);
           for (auto& s : holder->segments()) {
             if (s->state() != FileSegment::State::kDownloaded) {
               ++errors;

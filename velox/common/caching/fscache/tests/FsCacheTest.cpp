@@ -35,6 +35,65 @@ namespace facebook::velox::cache::fs::test {
 
 using ::facebook::velox::common::testutil::TempDirectoryPath;
 
+namespace {
+// Test helper: drives all kEmpty segments to kDownloaded. After Task 9,
+// FsCache::getOrSet returns kEmpty segments and the caller (normally
+// FsCacheBufferedInput::load) is responsible for downloading. These unit
+// tests call getOrSet directly, so they need this helper to complete the
+// download before asserting on segment state.
+//
+// `cache` is required for stats accounting: recordMiss() must be called after
+// complete() so LRU and bytesOnDisk are credited, and recordHit() for segments
+// that were already kDownloaded. Without this, stats-based tests would fail.
+void driveSegments(
+    FileSegmentsHolder& holder,
+    ::facebook::velox::ReadFile& remote,
+    FsCache& cache) {
+  const auto& cacheRoot = cache.config().cacheRoot;
+  for (auto& seg : holder.segments()) {
+    if (seg->state() == FileSegment::State::kDownloaded) {
+      cache.recordHit(seg.get());
+      continue;
+    }
+    if (seg->state() != FileSegment::State::kEmpty) {
+      seg->waitForDownloadedSize(seg->key().size);
+      cache.recordHit(seg.get());
+      continue;
+    }
+    cache.evict(seg->key().size);
+    if (!seg->reserve(seg->key().size, cacheRoot)) {
+      // reserve() may have taken the warm-restart short-circuit and
+      // already set the segment to kDownloaded.
+      if (seg->state() == FileSegment::State::kDownloaded) {
+        cache.recordMiss(seg.get(), seg->key().size);
+      } else {
+        seg->waitForDownloadedSize(seg->key().size);
+        cache.recordHit(seg.get());
+      }
+      continue;
+    }
+    try {
+      constexpr uint64_t kChunk = 1UL << 20;
+      std::vector<char> buf(std::min<uint64_t>(kChunk, seg->key().size));
+      uint64_t remaining = seg->key().size;
+      uint64_t cursor = seg->key().offset;
+      while (remaining > 0) {
+        const uint64_t toRead = std::min<uint64_t>(buf.size(), remaining);
+        remote.pread(cursor, toRead, buf.data());
+        seg->write(buf.data(), toRead);
+        cursor += toRead;
+        remaining -= toRead;
+      }
+      seg->complete();
+      cache.recordMiss(seg.get(), seg->key().size);
+    } catch (...) {
+      seg->abandon();
+      throw;
+    }
+  }
+}
+} // namespace
+
 class FsCacheTest : public ::testing::Test {
  protected:
   std::shared_ptr<TempDirectoryPath> tempDir_;
@@ -55,8 +114,9 @@ class FsCacheTest : public ::testing::Test {
 TEST_F(FsCacheTest, getOrSetFirstCallDownloads) {
   FsCache cache{config_};
   LocalReadFile remote{remotePath_};
-  const auto holder = cache.getOrSet(
+  auto holder = cache.getOrSet(
       remotePath_, 0, 4'096, cache.config(), remote, IsPrefetch::kDemand);
+  driveSegments(*holder, remote, cache);
   const auto& segments = holder->segments();
   ASSERT_FALSE(segments.empty());
   for (const auto& segment : segments) {
@@ -68,10 +128,14 @@ TEST_F(FsCacheTest, getOrSetFirstCallDownloads) {
 TEST_F(FsCacheTest, getOrSetSecondCallHitsCache) {
   FsCache cache{config_};
   LocalReadFile remote{remotePath_};
-  cache.getOrSet(
+  {
+    auto holder = cache.getOrSet(
+        remotePath_, 0, 4'096, cache.config(), remote, IsPrefetch::kDemand);
+    driveSegments(*holder, remote, cache);
+  }
+  auto holder = cache.getOrSet(
       remotePath_, 0, 4'096, cache.config(), remote, IsPrefetch::kDemand);
-  const auto holder = cache.getOrSet(
-      remotePath_, 0, 4'096, cache.config(), remote, IsPrefetch::kDemand);
+  driveSegments(*holder, remote, cache);
   const auto& segments = holder->segments();
   ASSERT_FALSE(segments.empty());
   for (const auto& segment : segments) {
@@ -100,13 +164,14 @@ TEST_F(FsCacheTest, getOrSetClampsToFileSizeWhenSmallerThanAlignment) {
   LocalReadFile tinyRemote{tinyPath};
   // alignedEnd would be 4096, but file size is 3072. Without the clamp,
   // FileSegment::download asks remote for 4096 bytes and crashes.
-  const auto holder = cache.getOrSet(
+  auto holder = cache.getOrSet(
       tinyPath,
       0,
       tinyContent.size(),
       cache.config(),
       tinyRemote,
       IsPrefetch::kDemand);
+  driveSegments(*holder, tinyRemote, cache);
   const auto& segments = holder->segments();
   ASSERT_FALSE(segments.empty());
   for (const auto& segment : segments) {
@@ -155,20 +220,26 @@ TEST_F(FsCacheTest, evictionRunsWhenOverCapacity) {
   FsCache cache{tiny};
   LocalReadFile remote{remotePath_};
   // Read two disjoint 4 MiB chunks. Total 8 MiB > 5 MiB -> eviction.
-  cache.getOrSet(
-      remotePath_,
-      0,
-      4UL * 1'024 * 1'024,
-      cache.config(),
-      remote,
-      IsPrefetch::kDemand);
-  cache.getOrSet(
-      remotePath_,
-      4UL * 1'024 * 1'024,
-      4UL * 1'024 * 1'024,
-      cache.config(),
-      remote,
-      IsPrefetch::kDemand);
+  {
+    auto holder = cache.getOrSet(
+        remotePath_,
+        0,
+        4UL * 1'024 * 1'024,
+        cache.config(),
+        remote,
+        IsPrefetch::kDemand);
+    driveSegments(*holder, remote, cache);
+  }
+  {
+    auto holder = cache.getOrSet(
+        remotePath_,
+        4UL * 1'024 * 1'024,
+        4UL * 1'024 * 1'024,
+        cache.config(),
+        remote,
+        IsPrefetch::kDemand);
+    driveSegments(*holder, remote, cache);
+  }
   EXPECT_LE(cache.stats().bytesOnDisk, tiny.maxBytes);
   EXPECT_GT(cache.stats().evictions, 0);
 }
@@ -215,8 +286,9 @@ TEST_F(FsCacheTest, waiterReceivesThrowWhenWriterFails) {
   for (int i = 0; i < 2; ++i) {
     threads.emplace_back([&] {
       try {
-        cache.getOrSet(
+        auto holder = cache.getOrSet(
             remotePath_, 0, 4'096, cache.config(), remote, IsPrefetch::kDemand);
+        driveSegments(*holder, remote, cache);
       } catch (const std::exception&) {
         ++throwCount;
       } catch (...) {
@@ -237,11 +309,17 @@ TEST_F(FsCacheTest, waiterReceivesThrowWhenWriterFails) {
 TEST_F(FsCacheTest, secondReaderOfDownloadedSegmentCountsAsHit) {
   FsCache cache{config_};
   LocalReadFile remote{remotePath_};
-  cache.getOrSet(
-      remotePath_, 0, 4'096, cache.config(), remote, IsPrefetch::kDemand);
+  {
+    auto holder = cache.getOrSet(
+        remotePath_, 0, 4'096, cache.config(), remote, IsPrefetch::kDemand);
+    driveSegments(*holder, remote, cache);
+  }
   const auto baseline = cache.stats();
-  cache.getOrSet(
-      remotePath_, 0, 4'096, cache.config(), remote, IsPrefetch::kDemand);
+  {
+    auto holder = cache.getOrSet(
+        remotePath_, 0, 4'096, cache.config(), remote, IsPrefetch::kDemand);
+    driveSegments(*holder, remote, cache);
+  }
   const auto after = cache.stats();
   EXPECT_EQ(after.misses, baseline.misses);
   EXPECT_EQ(after.hits, baseline.hits + 1);
@@ -283,13 +361,14 @@ TEST_F(FsCacheTest, concurrentEvictionIsSafe) {
         const uint64_t offset =
             (static_cast<uint64_t>(t * kIterations + i) * 256UL * 1'024) %
             (4UL * 1'024 * 1'024);
-        cache.getOrSet(
+        auto holder = cache.getOrSet(
             remotePath_,
             offset,
             256UL * 1'024,
             cache.config(),
             remote,
             IsPrefetch::kDemand);
+        driveSegments(*holder, remote, cache);
       }
     });
   }
@@ -320,13 +399,14 @@ TEST_F(FsCacheTest, statsCountersIncrementAcrossThreadsWithoutLoss) {
     threads.emplace_back([&] {
       LocalReadFile threadRemote{remotePath_};
       for (int i = 0; i < kPerThread; ++i) {
-        (void)cache.getOrSet(
+        auto holder = cache.getOrSet(
             remotePath_,
             0,
             kSegmentSize,
             cache.config(),
             threadRemote,
             IsPrefetch::kDemand);
+        driveSegments(*holder, threadRemote, cache);
       }
     });
   }
