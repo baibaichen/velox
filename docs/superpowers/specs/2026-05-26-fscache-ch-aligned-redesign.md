@@ -817,9 +817,11 @@ class QueryLimitToken {
 > 设计（同时决策是否换回 CH 的 thread-local query_id 模型）。phase-1
 > 的 QueryLimit 类是**预留**实现，等 caller wiring 落地后才生效。
 
-quota 耗尽时的 `getOrSet` 行为：返回的 holder 仍然是合法的连续段
-列表，caller 走正常推进路径；token reserve 失败由 caller 在调
-`getOrSet` 之前感知并选择 bypass。
+quota 与 `getOrSet` 的耦合关系：`getOrSet` 本身**不感知 quota** ——
+它永远返回合法的连续段列表，caller 走正常推进路径。配额检查全部
+在 caller 侧：在调 `getOrSet` 之前先 `token.tryReserve(size)`，
+返回 `false` 时 caller 跳过 `getOrSet` 直接读 remote 不缓存。
+`getOrSet` 不需要知道是否有 token、token 是否耗尽。
 
 ### 8.3 `bypass_cache_threshold`
 

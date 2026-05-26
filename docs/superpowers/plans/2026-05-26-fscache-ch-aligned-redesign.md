@@ -939,7 +939,19 @@ class FileSegmentsHolderTest : public ::testing::Test {
 
 TEST_F(FileSegmentsHolderTest, emptyHolderDestructsCleanly) {
   FileSegmentsHolder holder{{}};
+  EXPECT_TRUE(holder.empty());
   EXPECT_TRUE(holder.segments().empty());
+}
+
+TEST_F(FileSegmentsHolderTest, emptyReturnsFalseWhenSegmentsHeld) {
+  FsCacheKey key{PathKey::fromPath("/r/x"), 0, 8};
+  auto seg = std::make_shared<FileSegment>(key, "/r/x");
+  ASSERT_TRUE(seg->reserve(8, cacheRoot_));
+  std::string payload(8, 'A');
+  seg->write(payload.data(), payload.size());
+  seg->complete();
+  FileSegmentsHolder holder{{seg}};
+  EXPECT_FALSE(holder.empty());
 }
 
 TEST_F(FileSegmentsHolderTest, kDownloadedSegmentSurvivesDestructor) {
@@ -1088,6 +1100,14 @@ class FileSegmentsHolder {
 
   const std::vector<FileSegmentPtr>& segments() const {
     return segments_;
+  }
+
+  /// True if no segments are held. Returned by `FsCache::getOrSet` when
+  /// the request bypasses the cache (see spec §8.3 and Task 12
+  /// shouldBypass) — callers must fall back to reading directly from
+  /// the remote in that case.
+  bool empty() const {
+    return segments_.empty();
   }
 
   FileSegmentsHolder(const FileSegmentsHolder&) = delete;
@@ -1910,6 +1930,10 @@ In `velox/dwio/common/FsCacheBufferedInput.cpp`:
 struct EnqueuedRegion {
   velox::common::Region region;
   FileSegmentsHolderPtr holder;  // was std::vector<FileSegmentPtr> segments
+  // bypassBuffer is populated by Task 12's load() when getOrSet returns
+  // an empty holder (size >= bypassThresholdBytes). In Tasks 8-11 the
+  // holder is always non-empty, so this field stays unused/empty.
+  std::vector<char> bypassBuffer;
 };
 
 // DeferredStream constructs FsCacheInputStream from slot_->holder->segments()
@@ -2724,12 +2748,15 @@ EOF
 - Create: `velox/common/caching/fscache/FileCacheQueryLimit.h`
 - Create: `velox/common/caching/fscache/FileCacheQueryLimit.cpp`
 - Create: `velox/common/caching/fscache/tests/FileCacheQueryLimitTest.cpp`
+- Create: `velox/dwio/common/tests/FsCacheBypassIntegrationTest.cpp` (new — proves bypass actually round-trips bytes via direct pread)
 - Modify: `velox/common/caching/fscache/FsCacheConfig.h` — add `bypassThresholdBytes{256ULL << 20}` (256 MiB default per spec §8.3; set to 0 to disable)
 - Modify: `velox/common/caching/fscache/FsCache.h` — add `getOrSet` bypass behaviour (no queryId in signature)
 - Modify: `velox/common/caching/fscache/FsCache.cpp` — bypass short-circuit
+- Modify: `velox/dwio/common/FsCacheBufferedInput.cpp` — `load()` detects empty holder (cache bypass) and one-shot preads the region into `enq.bypassBuffer`; `DeferredStream` adds a bypass branch that slices bytes directly from that buffer instead of constructing an `FsCacheInputStream`
 - Modify: `velox/common/caching/fscache/CMakeLists.txt`
 - Modify: `velox/common/caching/fscache/tests/CMakeLists.txt`
 - Modify: `velox/common/caching/fscache/tests/FsCacheTest.cpp`
+- Modify: `velox/dwio/common/tests/CMakeLists.txt` (register `FsCacheBypassIntegrationTest`)
 
 **Spec:** §8.2 (FileCacheQueryLimit + QueryLimitToken — caller-held), §8.3 (bypass_cache_threshold — size-based, getOrSet-internal).
 
@@ -2737,13 +2764,15 @@ EOF
 
 Two **independent** mechanisms; the wiring is intentionally asymmetric.
 
-**bypass_cache_threshold** (§8.3): size-based, lives inside `getOrSet`. If the requested region is `>= config.bypassThresholdBytes`, `getOrSet` returns an empty `FileSegmentsHolder` and the caller falls through to direct remote read. No identity required — large scans should not pollute the warm working set.
+**bypass_cache_threshold** (§8.3): size-based, lives inside `getOrSet`. If the requested region is `>= config.bypassThresholdBytes`, `getOrSet` returns an empty `FileSegmentsHolder` (no segments). This task implements both halves of the contract: (a) the cache-side short-circuit in `FsCache::getOrSet` via `shouldBypass`, and (b) the caller-side fallback in `FsCacheBufferedInput::load` + `DeferredStream`, which does a one-shot `pread` of the whole region into `EnqueuedRegion::bypassBuffer` and serves subsequent `Next()` calls directly from that buffer. No identity required — large scans should not pollute the warm working set.
+
+The bypass-buffer model is the Velox-side equivalent of ClickHouse's `ReadType::REMOTE_FS_READ_BYPASS_CACHE` path (`src/Disks/IO/CachedOnDiskReadBufferFromFile.cpp:322`). CH chunks the bypass read at `DBMS_DEFAULT_BUFFER_SIZE` (1 MiB) because its `ReadBuffer::nextImpl` interface is pull-style and cannot know the total length; the actual network cost is still one `setReadUntilPosition`-bounded HTTP range, not N round trips (see `CachedOnDiskReadBufferFromFile.cpp:1148-1149`). Velox's `BufferedInput::enqueue(Region)` already carries the full region length, so a single `ReadFile::pread(offset, length, buf)` is the natural — and equivalent-cost — mapping.
 
 **FileCacheQueryLimit + QueryLimitToken** (§8.2): per-query bytes quota, **caller-held**. The intended runtime contract is: `QueryCtx` calls `FileCacheQueryLimit::reserveQuery(maxBytesPerQuery)` once at query start and holds the returned `QueryLimitToken` for the query's lifetime; **before** calling `getOrSet`, the caller invokes `token.tryReserve(size)`; on `false` the caller skips `getOrSet` and reads directly from the remote.
 
 > **TODO (phase-3): caller wiring is deferred.** This task ships only the budget primitive (counter + token + cache-side registry) and `FileCacheQueryLimitTest` direct unit tests. **No caller in phase-1 calls `tryReserve`** — `HiveConnector::beginQuery` does not mint a token, `ConnectorQueryCtx` does not store one, and `FsCacheBufferedInput::enqueue` does not consume one. The classes added here are intentional **dead code** in phase-1, awaiting connector-side wiring in phase-3 (at which point the choice between caller-held tokens and CH-style thread-local query_id can also be revisited). Do **not** add wiring as part of this plan; the implementer should only verify that the unit tests pass.
 
-The bypass short-circuit, by contrast, is live in phase-1 (`getOrSet` calls `shouldBypass` at entry; `FsCacheBufferedInput` already handles the empty-holder fallback). No `queryId` parameter is added to `getOrSet` in this or any later task — the spec puts enforcement on the caller side via the token, not on the cache side via a map lookup.
+The bypass short-circuit, by contrast, is live in phase-1 end-to-end: `FsCache::getOrSet` calls `shouldBypass`, `FsCacheBufferedInput::load` does the one-shot pread on empty holders, and `DeferredStream` serves bytes from the bypass buffer. No `queryId` parameter is added to `getOrSet` in this or any later task — the spec puts QueryLimit enforcement on the caller side via the token, not on the cache side via a map lookup.
 
 - [ ] **Step 1: Write failing test — FileCacheQueryLimitTest**
 
@@ -3191,7 +3220,315 @@ ctest --test-dir /home/chang/OpenSource/velox2/cmake-build-relwithdebinfo-gcc13 
 
 Expected: all FsCacheTest cases pass, including the 2 new bypass cases; FileCacheQueryLimitTest 5/5 PASS.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 9: Write failing integration test — FsCacheBypassIntegrationTest**
+
+Create `velox/dwio/common/tests/FsCacheBypassIntegrationTest.cpp`. This test exercises the full caller-side path that step 7 alone cannot reach: the `FsCacheBufferedInput::load → DeferredStream::Next` round trip when `getOrSet` returns an empty holder. **Without** the wiring added in step 11, `DeferredStream::ensureWithData` hits the existing `VELOX_CHECK(!slot_->holder->empty(), …)` and crashes.
+
+```cpp
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * (license header)
+ */
+
+#include <gtest/gtest.h>
+
+#include "velox/common/caching/fscache/FsCache.h"
+#include "velox/common/file/FileSystems.h"
+#include "velox/common/memory/Memory.h"
+#include "velox/dwio/common/FsCacheBufferedInput.h"
+#include "velox/exec/tests/utils/TempDirectoryPath.h"
+
+namespace facebook::velox::dwio::common::test {
+
+using ::facebook::velox::cache::fs::FsCache;
+using ::facebook::velox::cache::fs::FsCacheConfig;
+using ::facebook::velox::common::test::TempDirectoryPath;
+
+class FsCacheBypassIntegrationTest : public ::testing::Test {
+ protected:
+  static constexpr uint64_t kMiB = 1ULL << 20;
+
+  void SetUp() override {
+    filesystems::registerLocalFileSystem();
+    tempDir_ = TempDirectoryPath::create();
+    pool_ = memory::memoryManager()->addLeafPool();
+  }
+
+  // Writes `bytes` of deterministic content (byte = offset % 251) to a
+  // file under tempDir_ and returns its absolute path.
+  std::string writeBlob(uint64_t bytes) {
+    const auto path = tempDir_->getPath() + "/blob";
+    std::vector<char> data(bytes);
+    for (uint64_t i = 0; i < bytes; ++i) {
+      data[i] = static_cast<char>(i % 251);
+    }
+    auto fs = filesystems::getFileSystem(path, nullptr);
+    auto sink = fs->openFileForWrite(path);
+    sink->append(std::string_view{data.data(), data.size()});
+    sink->close();
+    return path;
+  }
+
+  std::shared_ptr<TempDirectoryPath> tempDir_;
+  std::shared_ptr<memory::MemoryPool> pool_;
+};
+
+// 4 MiB bypass threshold + 8 MiB region → getOrSet returns empty holder;
+// BufferedInput::load must pread the full region into bypassBuffer;
+// DeferredStream::Next must return those exact bytes (no cache file is
+// created, and no segments live in metadata).
+TEST_F(FsCacheBypassIntegrationTest, regionAboveThresholdRoundTripsViaDirectPread) {
+  FsCacheConfig cfg;
+  cfg.cacheRoot = tempDir_->getPath() + "/cache";
+  cfg.bypassThresholdBytes = 4 * kMiB;
+  cfg.maxSegmentSize = 1 * kMiB;
+  std::filesystem::create_directories(cfg.cacheRoot);
+  FsCache cache{cfg};
+
+  const auto path = writeBlob(8 * kMiB);
+  auto fs = filesystems::getFileSystem(path, nullptr);
+  auto readFile = fs->openFileForRead(path);
+  auto input = std::make_unique<FsCacheBufferedInput>(
+      std::move(readFile), *pool_, &cache);
+
+  auto stream = input->enqueue(velox::common::Region{0, 8 * kMiB}, nullptr);
+  input->load(LogType::FILE);
+
+  // Drain the stream and rebuild the bytes we saw.
+  std::vector<char> seen;
+  seen.reserve(8 * kMiB);
+  const void* buf{nullptr};
+  int32_t size{0};
+  while (stream->Next(&buf, &size)) {
+    seen.insert(
+        seen.end(),
+        static_cast<const char*>(buf),
+        static_cast<const char*>(buf) + size);
+  }
+  ASSERT_EQ(seen.size(), 8 * kMiB);
+  for (uint64_t i = 0; i < seen.size(); ++i) {
+    ASSERT_EQ(static_cast<uint8_t>(seen[i]), static_cast<uint8_t>(i % 251))
+        << "byte " << i;
+  }
+
+  // No segments were created (cache stayed cold).
+  EXPECT_EQ(cache.totalSize(), 0);
+  EXPECT_TRUE(std::filesystem::is_empty(cfg.cacheRoot));
+}
+
+// Sanity check: a region UNDER the threshold should still go through
+// the regular cache path (proves the new branch did not break the
+// non-bypass case).
+TEST_F(FsCacheBypassIntegrationTest, regionBelowThresholdStillCaches) {
+  FsCacheConfig cfg;
+  cfg.cacheRoot = tempDir_->getPath() + "/cache";
+  cfg.bypassThresholdBytes = 4 * kMiB;
+  cfg.maxSegmentSize = 1 * kMiB;
+  std::filesystem::create_directories(cfg.cacheRoot);
+  FsCache cache{cfg};
+
+  const auto path = writeBlob(8 * kMiB);
+  auto fs = filesystems::getFileSystem(path, nullptr);
+  auto readFile = fs->openFileForRead(path);
+  auto input = std::make_unique<FsCacheBufferedInput>(
+      std::move(readFile), *pool_, &cache);
+
+  auto stream = input->enqueue(velox::common::Region{0, 2 * kMiB}, nullptr);
+  input->load(LogType::FILE);
+
+  const void* buf{nullptr};
+  int32_t size{0};
+  uint64_t total = 0;
+  while (stream->Next(&buf, &size)) {
+    total += size;
+  }
+  EXPECT_EQ(total, 2 * kMiB);
+  EXPECT_GT(cache.totalSize(), 0);
+}
+
+} // namespace facebook::velox::dwio::common::test
+```
+
+Register the new binary in `velox/dwio/common/tests/CMakeLists.txt` (mirror `FsCacheBufferedInputTest`).
+
+- [ ] **Step 10: Run — expected RED (DeferredStream VELOX_CHECK fires)**
+
+```bash
+cmake --build /home/chang/OpenSource/velox2/cmake-build-relwithdebinfo-gcc13 \
+  --target velox_fs_cache_bypass_integration_test -j 8
+ctest --test-dir /home/chang/OpenSource/velox2/cmake-build-relwithdebinfo-gcc13 \
+  -R 'velox_fs_cache_bypass_integration_test' -V
+```
+
+Expected: `regionAboveThresholdRoundTripsViaDirectPread` aborts in `DeferredStream::ensureWithData` with `"Stream used before FsCacheBufferedInput::load()"` (the existing check fires because `holder->empty()` is now true). `regionBelowThresholdStillCaches` passes.
+
+- [ ] **Step 11: Wire bypass fallback into FsCacheBufferedInput + DeferredStream**
+
+Modify `velox/dwio/common/FsCacheBufferedInput.cpp` in two places.
+
+First, extend `load()` to handle the empty-holder case. The latest version of `load()` is the async one from Task 11 step 4 (line 2642 above). Append the bypass branch after the `getOrSet` call, before the segment-driving loop:
+
+```cpp
+void FsCacheBufferedInput::load(LogType) {
+  for (auto& enq : enqueuedRegions_) {
+    if (enq.holder != nullptr) {
+      continue;
+    }
+    enq.holder = fsCache_->getOrSet(
+        input_->getName(),
+        enq.region.offset,
+        enq.region.length,
+        fsCache_->config(),
+        *input_->getReadFile(),
+        IsPrefetch::kPrefetch);
+
+    if (enq.holder->empty()) {
+      // Cache bypassed this request (size >= bypassThresholdBytes). Read
+      // the full region directly from remote into the slot-owned buffer;
+      // DeferredStream serves bytes from there. One pread keeps the
+      // network cost at one HTTP range per region, matching CH's
+      // `setReadUntilPosition(file_segment.range().right + 1)` path
+      // (src/Disks/IO/CachedOnDiskReadBufferFromFile.cpp:1149).
+      enq.bypassBuffer.assign(enq.region.length, '\0');
+      input_->getReadFile()->pread(
+          enq.region.offset, enq.region.length, enq.bypassBuffer.data());
+      continue;
+    }
+
+    for (auto& seg : enq.holder->segments()) {
+      // (unchanged from Task 11 step 4 — async submit per kEmpty segment)
+      ...
+    }
+  }
+}
+```
+
+Second, teach `DeferredStream` to serve from `bypassBuffer` when the slot's holder is empty. The current shape (from Task 8 step 3) constructs an `FsCacheInputStream` inside `ensureWithData()`. Replace the unconditional `VELOX_CHECK(holder != nullptr)` + `FsCacheInputStream` construction with:
+
+```cpp
+void DeferredStream::ensureWithData() {
+  if (inner_ != nullptr || bypassActive_) {
+    return;
+  }
+  VELOX_CHECK(
+      slot_->holder != nullptr,
+      "Stream used before FsCacheBufferedInput::load()");
+  if (slot_->holder->empty()) {
+    // Bypass path. Bytes already in slot_->bypassBuffer (load() preads
+    // the full region). Drive Next() / SkipInt64 / seekToPosition from
+    // the buffer; never construct an FsCacheInputStream because no
+    // segments exist.
+    bypassActive_ = true;
+    VELOX_CHECK_EQ(
+        slot_->bypassBuffer.size(),
+        slot_->region.length,
+        "Bypass buffer size must match region length");
+    return;
+  }
+  inner_ = std::make_unique<FsCacheInputStream>(
+      slot_->holder->segments(),
+      slot_->region.offset,
+      slot_->region.length,
+      cache_->config().cacheRoot);
+  if (bytesConsumed_ > 0) {
+    const bool ok = inner_->SkipInt64(static_cast<int64_t>(bytesConsumed_));
+    VELOX_CHECK(ok, "Replaying pre-load skip past region end");
+  }
+}
+```
+
+Add the bypass branches to each `SeekableInputStream` override on `DeferredStream`:
+
+```cpp
+bool DeferredStream::Next(const void** data, int32_t* size) {
+  ensureWithData();
+  if (bypassActive_) {
+    if (bytesConsumed_ >= slot_->bypassBuffer.size()) {
+      return false;
+    }
+    *data = slot_->bypassBuffer.data() + bytesConsumed_;
+    *size = static_cast<int32_t>(slot_->bypassBuffer.size() - bytesConsumed_);
+    bytesConsumed_ = slot_->bypassBuffer.size();
+    return true;
+  }
+  return inner_->Next(data, size);
+}
+
+bool DeferredStream::SkipInt64(int64_t count) {
+  if (count < 0) {
+    return false;
+  }
+  if (bypassActive_) {
+    const uint64_t newPos = std::min<uint64_t>(
+        slot_->bypassBuffer.size(),
+        bytesConsumed_ + static_cast<uint64_t>(count));
+    const bool fits =
+        newPos == bytesConsumed_ + static_cast<uint64_t>(count);
+    bytesConsumed_ = newPos;
+    return fits;
+  }
+  if (inner_ != nullptr) {
+    return inner_->SkipInt64(count);
+  }
+  const auto unsignedCount = static_cast<uint64_t>(count);
+  const uint64_t newPos = std::min<uint64_t>(
+      slot_->region.length, bytesConsumed_ + unsignedCount);
+  const bool fits = newPos == bytesConsumed_ + unsignedCount;
+  bytesConsumed_ = newPos;
+  return fits;
+}
+
+void DeferredStream::BackUp(int32_t count) {
+  if (bypassActive_) {
+    VELOX_CHECK_GE(count, 0);
+    VELOX_CHECK_LE(static_cast<uint64_t>(count), bytesConsumed_);
+    bytesConsumed_ -= count;
+    return;
+  }
+  VELOX_CHECK_NOT_NULL(
+      inner_, "BackUp called before any Next() -- no buffer to back up");
+  inner_->BackUp(count);
+}
+
+int64_t DeferredStream::ByteCount() const {
+  if (bypassActive_ || inner_ == nullptr) {
+    return static_cast<int64_t>(bytesConsumed_);
+  }
+  return inner_->ByteCount();
+}
+
+void DeferredStream::seekToPosition(PositionProvider& position) {
+  ensureWithData();
+  if (bypassActive_) {
+    const uint64_t target = position.next();
+    VELOX_CHECK_LE(target, slot_->bypassBuffer.size());
+    bytesConsumed_ = target;
+    return;
+  }
+  inner_->seekToPosition(position);
+}
+```
+
+Add the new member to `DeferredStream`:
+
+```cpp
+bool bypassActive_{false};
+```
+
+- [ ] **Step 12: Run — expected GREEN**
+
+```bash
+cmake --build /home/chang/OpenSource/velox2/cmake-build-relwithdebinfo-gcc13 \
+  --target velox_fs_cache_bypass_integration_test velox_dwio_common_test -j 8
+ctest --test-dir /home/chang/OpenSource/velox2/cmake-build-relwithdebinfo-gcc13 \
+  -R 'velox_fs_cache_bypass_integration_test|FsCacheBufferedInputTest' -V
+```
+
+Expected: both bypass integration tests PASS and the existing `FsCacheBufferedInputTest` suite still PASSes (proves the bypass branch did not regress the cache-on path).
+
+- [ ] **Step 13: Commit**
 
 ```bash
 git add \
@@ -3203,7 +3540,10 @@ git add \
   velox/common/caching/fscache/CMakeLists.txt \
   velox/common/caching/fscache/tests/FileCacheQueryLimitTest.cpp \
   velox/common/caching/fscache/tests/FsCacheTest.cpp \
-  velox/common/caching/fscache/tests/CMakeLists.txt
+  velox/common/caching/fscache/tests/CMakeLists.txt \
+  velox/dwio/common/FsCacheBufferedInput.cpp \
+  velox/dwio/common/tests/FsCacheBypassIntegrationTest.cpp \
+  velox/dwio/common/tests/CMakeLists.txt
 git commit -m "$(cat <<'EOF'
 feat(fscache): QueryLimitToken + bypass_cache_threshold
 
@@ -3222,12 +3562,18 @@ The two mechanisms are intentionally asymmetric in how they integrate:
     token.tryReserve(size) and reads direct from remote on `false`.
     getOrSet itself never sees a queryId — enforcement is the caller's.
 
-Phase-1 scope: the bypass short-circuit is live (getOrSet calls
-shouldBypass at entry; FsCacheBufferedInput handles the empty-holder
-fallback). FileCacheQueryLimit + QueryLimitToken land here with their
-unit tests but are **intentional dead code in phase-1** — no caller
-mints or consumes a token. Connector-side wiring (HiveConnector +
-ConnectorQueryCtx + FsCacheBufferedInput integration test) is deferred
+Phase-1 scope: the bypass short-circuit is live end-to-end. getOrSet
+calls shouldBypass at entry and FsCacheBufferedInput::load detects the
+resulting empty holder, preads the full region in one shot into
+EnqueuedRegion::bypassBuffer, and DeferredStream serves subsequent
+Next() calls directly from that buffer (no FsCacheInputStream is
+constructed on the bypass path). FsCacheBypassIntegrationTest covers
+both branches: above-threshold requests round-trip bytes via direct
+pread with the cache staying cold, below-threshold requests still
+populate the cache. FileCacheQueryLimit + QueryLimitToken land here
+with their unit tests but are **intentional dead code in phase-1** —
+no caller mints or consumes a token. Connector-side wiring
+(HiveConnector + ConnectorQueryCtx + token-driven enqueue) is deferred
 to phase-3, at which point we can also re-evaluate whether to keep the
 caller-held-token model or fall back to CH's thread-local query_id.
 
