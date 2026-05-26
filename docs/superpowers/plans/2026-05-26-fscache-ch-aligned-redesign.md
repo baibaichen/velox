@@ -17,6 +17,8 @@
 4. 简化后 review (same reviewer, same scope, same retry rule)
 5. 提交 (specific `git add <files>`; never `--amend` / `--no-verify` / `--no-gpg-sign` / `git add .` / `git add -A`)
 
+**Per-task checkbox convention:** the steps enumerated inside each task cover **Phase 1 only** (the TDD red→green cycle) plus the final commit. Phases 2/3/4 are **mandatory but implicit** — subagent inserts them automatically between the last green-test step and the `git commit` step. Do not skip them and do not wait for user prompting; the rules in the block above are the contract. Deferred MEDIUMs from Phase 2 and Phase 4 are appended to the commit message body under a `Deferred (MEDIUM, follow-up):` heading (omit the heading if empty).
+
 **Hard exclusions** (enforce at every `git add` step):
 - **Never commit** `velox/common/caching/benchmarks/CacheBackendBenchmark.cpp`
 - Never `git commit --amend` / `--no-verify` / `--no-gpg-sign`
@@ -746,9 +748,11 @@ EOF
 
 **Spec refs:** §5.5 (writer protocol: complete ftruncate to N; abandon NO ftruncate → stat_size < claimed → loadFromDisk deletes)
 
-**Approach:** Phase-1 `loadFromDisk` already treats `file_size != parsed.size` as victim (see `FsCache.cpp:575-577`). That existing branch correctly handles abandoned partial files. **This task verifies** the branch covers the new in-place writer protocol introduced by Task 2 (no `.tmp` suffix anymore, partial = same filename but short stat_size). Add a test that simulates writer abandon mid-write, restarts FsCache, and asserts the file was deleted.
+**Approach:** Phase-1 `FsCache::loadFromDisk()` (in `velox/common/caching/fscache/FsCache.cpp` around lines 575-577 — verify the line number against the current file before editing) already treats `file_size != parsed.size` as victim. **This task does not rewrite `loadFromDisk`** — it (a) verifies the existing branch correctly handles the new in-place writer protocol introduced by Task 2 (no `.tmp` suffix anymore, partial = same filename but short stat_size), (b) adds a regression test that simulates writer abandon mid-write, restarts FsCache, and asserts the file was deleted, and (c) deletes the now-dead `.tmp`-removal branch if present (small follow-up Edit, not a new function).
 
-Phase-1 also removes `.tmp` files — that branch becomes dead code under the new protocol but harmless. Leave it in place; no functional change required, only the test.
+If, when reading the current `loadFromDisk`, you find the size-mismatch branch is **missing** (someone removed it), file that as a Phase-2 CRITICAL during review and put it back in the same commit — don't redesign the function shape.
+
+Phase-1 also removes `.tmp` files — that branch becomes dead code under the new protocol but harmless. Leave it in place unless the simplifier in Phase 3 flags it; no functional change required, only the test.
 
 - [ ] **Step 1: Write failing test**
 
@@ -1057,7 +1061,23 @@ class FileSegmentsHolder {
       }
       if (seg->state() == FileSegment::State::kDownloading &&
           seg->getDownloader() == self) {
-        seg->abandon();
+        // Dtor must not propagate: throwing out of a dtor while another
+        // dtor frame is already unwinding calls std::terminate. abandon()
+        // is normally noexcept (it only flips state + drops the writer
+        // slot), but log-and-continue here so a bug in a future version
+        // can't crash the process — silently swallowing without a log
+        // would be the actual silent-failure smell. Per-segment try/catch
+        // so one bad segment doesn't prevent the rest from being
+        // abandoned.
+        try {
+          seg->abandon();
+        } catch (const std::exception& e) {
+          LOG(ERROR) << "FileSegmentsHolder dtor: abandon() threw: "
+                     << e.what();
+        } catch (...) {
+          LOG(ERROR) << "FileSegmentsHolder dtor: abandon() threw "
+                        "non-std exception";
+        }
       }
     }
   }
@@ -1132,6 +1152,8 @@ EOF
 **Spec refs:** §5.2 (lookupRange algorithm, lower_bound + prev), §6.1 (LockedKey + KeyNotFoundPolicy 4 enums)
 
 **Approach:** Add `KeyNotFoundPolicy` enum (4 values). Refactor `KeyMetadata::lock()` into `FsCacheMetadata::lockKeyMetadata(path, policy)` returning either a non-null `LockedKey` (kThrow / kThrowLogical / kCreateEmpty) or possibly null (kReturnNull). Add `FsCacheMetadata::lookupRange(path, lo, hi)` returning offset-ascending `FileSegmentPtr` list intersecting `[lo, hi)`. Uses CH-style `lower_bound + prev` scan inside the per-key lock; releases lock before return (shared_ptr stability). This task adds **only the new API**; phase-1 `lookup(key)` stays for the Task-8 caller migration.
+
+**Do NOT add** in this task (or any later task): `FileSegment::isEvicting()`, `FileSegment::detachedCopy()`, or any other CH-internal helper not enumerated in spec §5 / §6. They were referenced in earlier brainstorm notes but the spec deliberately drops them — eviction in our port is driven by the segment's state transition to `kDetached` (Task 5's holder dtor calls `abandon()`; the eviction-policy callbacks in Task 13 trigger that transition), not by a "currently being evicted" predicate. If you find yourself wanting one of these, you have likely confused CH's metadata bookkeeping with Velox's holder-driven lifecycle — re-read spec §5.4 transition table before writing.
 
 - [ ] **Step 1: Write failing test — KeyNotFoundPolicy**
 
@@ -1756,14 +1778,26 @@ enum class IsPrefetch : uint8_t { kPrefetch, kDemand };  // wired by Task 14
 /// CH-aligned entry point. Returns a holder of segments covering
 /// [offset, min(offset+size, remote.size())) — contiguous, offset-
 /// ascending, may include kEmpty / kDownloading / kDownloaded states.
-/// `isPrefetch` selects which pair of stats counters to bump (Task 14;
-/// default kDemand keeps phase-1 tests stable until then).
+/// `settings` controls hole slicing (maxSegmentSize, alignment); per
+/// spec §5.3 the implementation forwards it to fillHoles. Phase-2
+/// passes &config_ so all callers share the cache-level defaults; the
+/// signature keeps a separate parameter so a future caller can tune
+/// per-call (e.g. larger alignment for cold scans) without touching
+/// FsCacheConfig. `isPrefetch` selects which pair of stats counters
+/// to bump (Task 14 wires the actual counts; this commit forwards
+/// the value through unchanged). No default — every caller decides.
+///
+/// Note: spec §4 names this `CreateSettings`; that type does not yet
+/// exist in codebase. We forward `const FsCacheConfig&` here (spec
+/// §5.3 fillHoles already uses FsCacheConfig). A future commit may
+/// extract `CreateSettings` if a per-call override is actually needed.
 FileSegmentsHolderPtr getOrSet(
     const std::string& path,
     uint64_t offset,
     uint64_t size,
+    const FsCacheConfig& settings,
     ::facebook::velox::ReadFile& remote,
-    IsPrefetch isPrefetch = IsPrefetch::kDemand);
+    IsPrefetch isPrefetch);
 ```
 
 Delete the phase-1 `std::vector<FileSegmentPtr> getOrSet(...)` declaration AND delete `lookupOrCreate` from the private section.
@@ -1779,8 +1813,12 @@ FileSegmentsHolderPtr FsCache::getOrSet(
     const std::string& path,
     uint64_t offset,
     uint64_t size,
+    const FsCacheConfig& settings,
     ::facebook::velox::ReadFile& remote,
     IsPrefetch /*isPrefetch*/) {
+  // settings is unused in this commit (the in-process cache always
+  // uses config_); Task 14 wires it through to fillHoles. Keeping the
+  // parameter in the signature here avoids a second ABI break later.
   const uint64_t fileSize = remote.size();
   VELOX_USER_CHECK_LE(
       offset,
@@ -1891,7 +1929,9 @@ void FsCacheBufferedInput::load(LogType) {
         input_->getName(),
         enq.region.offset,
         enq.region.length,
-        *input_->getReadFile());
+        fsCache_->config(),
+        *input_->getReadFile(),
+        cache::fs::IsPrefetch::kDemand);  // Task 14 flips to kPrefetch
   }
 }
 ```
@@ -1964,6 +2004,19 @@ New getOrSet:
   - transitional sync download shim inside getOrSet so existing tests pass
     until Task 9 makes FsCacheBufferedInput the driver
 
+TRANSITIONAL SHIM (~20 lines, removed in Task 9): because Task 9/10
+have not landed, callers cannot yet drive kEmpty → kDownloaded
+themselves, so this commit has FsCache itself synchronously walk the
+holder and run the phase-1 download equivalent per kEmpty segment
+before returning. Reviewer: if you see this shim still present in any
+commit AFTER Task 9, that is a bug — Task 9's first step deletes it.
+
+The IsPrefetch enum lands here as part of the new signature, but the
+parameter is intentionally unused (`/*isPrefetch*/`) in this commit —
+Task 14 wires it through FsCacheBufferedInput AND the stats counters
+together so the wiring lands with end-to-end test coverage. Callers in
+this commit hard-code `IsPrefetch::kDemand`; no stats are recorded yet.
+
 Removes phase-1 FsCacheMetadata::lookup(key), FileSegment::beginDownload/
 download, FsCache::lookupOrCreate. Stats counting (Task 14), caller-driven
 advancement (Task 9), and SLRU (Task 13) land in subsequent commits.
@@ -2019,7 +2072,12 @@ Add a second test that PROVES the shim is gone by using a direct `getOrSet` call
 TEST_F(FsCacheBufferedInputTest, getOrSetReturnsEmptySegmentsWithoutShim) {
   auto readFile = std::make_shared<LocalReadFile>(remotePath_);
   auto holder = fsCache_->getOrSet(
-      remotePath_, 0, 1UL << 20, *readFile, IsPrefetch::kDemand);
+      remotePath_,
+      0,
+      1UL << 20,
+      fsCache_->config(),
+      *readFile,
+      IsPrefetch::kDemand);
   ASSERT_NE(holder, nullptr);
   ASSERT_FALSE(holder->segments().empty());
   // After Task 9 removes the shim, kEmpty segments are returned. Any
@@ -2080,6 +2138,7 @@ void FsCacheBufferedInput::load(LogType) {
         input_->getName(),
         enq.region.offset,
         enq.region.length,
+        fsCache_->config(),
         *input_->getReadFile(),
         IsPrefetch::kPrefetch);  // Task 14 wires the actual stats path
 
@@ -2525,8 +2584,17 @@ namespace facebook::velox::cache::fs {
 
 DownloadThreadPool::DownloadThreadPool(size_t numThreads)
     : executor_{
-          numThreads,
-          std::make_shared<folly::NamedThreadFactory>("FsCacheDownload")} {}
+          // Cap at 32 even if config asks for more: each thread holds an
+          // OS-level pread slot against the remote, and beyond ~32 the
+          // remote (S3, HDFS) starts throttling and we lose more to
+          // contention than we gain in parallelism. Misconfiguration that
+          // would otherwise silently regress p99 fetch latency is bounded
+          // here. If 32 turns out to be wrong, raise after measurement
+          // (see Task 16 perf gate).
+          std::min<size_t>(numThreads, 32),
+          std::make_shared<folly::NamedThreadFactory>("FsCacheDownload")} {
+  VELOX_CHECK_GT(numThreads, 0, "DownloadThreadPool needs at least 1 thread");
+}
 
 DownloadThreadPool::~DownloadThreadPool() {
   executor_.join();
@@ -2556,6 +2624,7 @@ void FsCacheBufferedInput::load(LogType) {
         input_->getName(),
         enq.region.offset,
         enq.region.length,
+        fsCache_->config(),
         *input_->getReadFile(),
         IsPrefetch::kPrefetch);
 
@@ -2645,26 +2714,30 @@ EOF
 
 ---
 
-## Task 12: FileCacheQueryLimit + bypass_cache_threshold
+## Task 12: FileCacheQueryLimit + QueryLimitToken + bypass_cache_threshold
 
 **Files:**
 - Create: `velox/common/caching/fscache/FileCacheQueryLimit.h`
 - Create: `velox/common/caching/fscache/FileCacheQueryLimit.cpp`
 - Create: `velox/common/caching/fscache/tests/FileCacheQueryLimitTest.cpp`
 - Modify: `velox/common/caching/fscache/FsCacheConfig.h` — add `bypassCacheThreshold{0}` (0 = disabled per spec §8.3)
-- Modify: `velox/common/caching/fscache/FsCache.h` — add `setQueryLimit(std::string_view, uint64_t)` / `dropQueryLimit(std::string_view)`
-- Modify: `velox/common/caching/fscache/FsCache.cpp` — query-id map, getOrSet bypass / per-query reservation
+- Modify: `velox/common/caching/fscache/FsCache.h` — add `getOrSet` bypass behaviour (no queryId in signature)
+- Modify: `velox/common/caching/fscache/FsCache.cpp` — bypass short-circuit
 - Modify: `velox/common/caching/fscache/CMakeLists.txt`
 - Modify: `velox/common/caching/fscache/tests/CMakeLists.txt`
+- Modify: `velox/common/caching/fscache/tests/FsCacheTest.cpp`
 
-**Spec:** §8.2 (FileCacheQueryLimit), §8.3 (bypass_cache_threshold).
+**Spec:** §8.2 (FileCacheQueryLimit + QueryLimitToken — caller-held), §8.3 (bypass_cache_threshold — size-based, getOrSet-internal).
 
 **Approach:**
-Per-query reservation accounting: when a query is registered with `setQueryLimit(queryId, maxBytes)`, every fresh segment that query writes counts against its limit. If the next segment would push the query over its budget, getOrSet for that query returns no segment (caller falls through to direct remote read). Independently, if the requested region is `>= bypass_cache_threshold`, getOrSet short-circuits with no segment regardless of query identity — large scans should not pollute the cache.
 
-Both behaviours surface to callers as **"no FileSegment returned for this region"**; the caller (BufferedInput) reads directly from the remote. This avoids forcing every BufferedInput call to learn about query limits.
+Two **independent** mechanisms; the wiring is intentionally asymmetric.
 
-Phase-1 wire-up: callers don't yet pass a queryId. We add the API + accounting + tests in this task, and Task 14 wires queryId through FsCacheBufferedInput once it threads through the ConnectorQueryCtx (see spec §8.2 "Phase 1 wiring deferred").
+**bypass_cache_threshold** (§8.3): size-based, lives inside `getOrSet`. If the requested region is `>= config.bypassCacheThreshold`, `getOrSet` returns an empty `FileSegmentsHolder` and the caller falls through to direct remote read. No identity required — large scans should not pollute the warm working set.
+
+**FileCacheQueryLimit + QueryLimitToken** (§8.2): per-query bytes quota, **caller-held**. `QueryCtx` calls `FileCacheQueryLimit::reserveQuery(maxBytesPerQuery)` once at query start and holds the returned `QueryLimitToken` for the query's lifetime. **Before** calling `getOrSet`, the caller invokes `token.tryReserve(size)`; on `false` the caller skips `getOrSet` and reads directly from the remote.
+
+This task ships only the budget primitive (counter + token + cache-side registry) and the bypass short-circuit. Wiring the token into a real BufferedInput call path is **Task 14's** responsibility once `ConnectorQueryCtx` plumbing exists. No `queryId` parameter is added to `getOrSet` in this or any later task — the spec puts enforcement on the caller side via the token, not on the cache side via a map lookup.
 
 - [ ] **Step 1: Write failing test — FileCacheQueryLimitTest**
 
@@ -2689,35 +2762,52 @@ Create `velox/common/caching/fscache/tests/FileCacheQueryLimitTest.cpp`:
 
 #include "velox/common/caching/fscache/FileCacheQueryLimit.h"
 
+#include "velox/common/base/tests/GTestUtils.h"
+
 #include <gtest/gtest.h>
 
 namespace facebook::velox::cache::fs {
 
 TEST(FileCacheQueryLimitTest, reserveSucceedsUnderLimit) {
-  FileCacheQueryLimit limit{/*maxBytes=*/1'000};
-  EXPECT_TRUE(limit.tryReserve(400));
-  EXPECT_TRUE(limit.tryReserve(500));
-  EXPECT_EQ(limit.reserved(), 900);
+  FileCacheQueryLimit limit;
+  auto token = limit.reserveQuery(/*maxBytesPerQuery=*/1'000);
+  EXPECT_TRUE(token->tryReserve(400));
+  EXPECT_TRUE(token->tryReserve(500));
+  EXPECT_EQ(token->reserved(), 900);
 }
 
 TEST(FileCacheQueryLimitTest, reserveRejectsBeyondLimit) {
-  FileCacheQueryLimit limit{/*maxBytes=*/1'000};
-  EXPECT_TRUE(limit.tryReserve(800));
-  EXPECT_FALSE(limit.tryReserve(300));
-  EXPECT_EQ(limit.reserved(), 800);
+  FileCacheQueryLimit limit;
+  auto token = limit.reserveQuery(/*maxBytesPerQuery=*/1'000);
+  EXPECT_TRUE(token->tryReserve(800));
+  EXPECT_FALSE(token->tryReserve(300));
+  EXPECT_EQ(token->reserved(), 800);
 }
 
 TEST(FileCacheQueryLimitTest, releaseFreesCapacity) {
-  FileCacheQueryLimit limit{/*maxBytes=*/1'000};
-  ASSERT_TRUE(limit.tryReserve(900));
-  limit.release(400);
-  EXPECT_EQ(limit.reserved(), 500);
-  EXPECT_TRUE(limit.tryReserve(400));
+  FileCacheQueryLimit limit;
+  auto token = limit.reserveQuery(/*maxBytesPerQuery=*/1'000);
+  ASSERT_TRUE(token->tryReserve(900));
+  token->release(400);
+  EXPECT_EQ(token->reserved(), 500);
+  EXPECT_TRUE(token->tryReserve(400));
 }
 
 TEST(FileCacheQueryLimitTest, releaseChecksUnderflow) {
-  FileCacheQueryLimit limit{/*maxBytes=*/1'000};
-  EXPECT_DEATH(limit.release(1), "");
+  FileCacheQueryLimit limit;
+  auto token = limit.reserveQuery(/*maxBytesPerQuery=*/1'000);
+  VELOX_ASSERT_THROW(token->release(1), "FileCacheQueryLimit underflow");
+}
+
+TEST(FileCacheQueryLimitTest, tokenDestructorReleasesAll) {
+  FileCacheQueryLimit limit;
+  {
+    auto token = limit.reserveQuery(/*maxBytesPerQuery=*/1'000);
+    ASSERT_TRUE(token->tryReserve(700));
+  }
+  // After token dtor, FileCacheQueryLimit-side accounting (used for
+  // cluster-wide caps in a later phase) is back to zero.
+  EXPECT_EQ(limit.totalReserved(), 0);
 }
 
 } // namespace facebook::velox::cache::fs
@@ -2730,6 +2820,7 @@ add_executable(velox_file_cache_query_limit_test FileCacheQueryLimitTest.cpp)
 target_link_libraries(
   velox_file_cache_query_limit_test
   velox_fscache
+  velox_exception
   GTest::gtest
   GTest::gtest_main)
 add_test(NAME velox_file_cache_query_limit_test COMMAND velox_file_cache_query_limit_test)
@@ -2744,7 +2835,7 @@ cmake --build /home/chang/OpenSource/velox2/cmake-build-relwithdebinfo-gcc13 \
 
 Expected output: compile error `fatal error: velox/common/caching/fscache/FileCacheQueryLimit.h: No such file or directory`.
 
-- [ ] **Step 3: Implement FileCacheQueryLimit**
+- [ ] **Step 3: Implement FileCacheQueryLimit + QueryLimitToken**
 
 Create `velox/common/caching/fscache/FileCacheQueryLimit.h`:
 
@@ -2769,26 +2860,40 @@ Create `velox/common/caching/fscache/FileCacheQueryLimit.h`:
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 
 namespace facebook::velox::cache::fs {
 
-/// Per-query reservation accounting for FsCache. Each query that should be
-/// bounded gets a FileCacheQueryLimit instance; getOrSet calls tryReserve()
-/// before allocating new bytes to that query, and the eviction / abandon
-/// paths call release() when bytes belonging to the query leave the cache.
+class FileCacheQueryLimit;
+
+/// Per-query reservation handle. Held by QueryCtx (or any caller scoping a
+/// budget); callers invoke tryReserve() BEFORE getOrSet and read direct from
+/// remote on `false`. release() is invoked when bytes belonging to the
+/// query leave the cache (eviction, holder dtor on partial download, etc).
 ///
 /// Thread-safe: backed by a single atomic counter with CAS reservation.
-class FileCacheQueryLimit {
+/// Token destructor drops the token's contribution from the parent
+/// FileCacheQueryLimit's totalReserved counter — used later for cluster-wide
+/// caps. The token itself does NOT release cached bytes on dtor; that is
+/// the caller's responsibility (a holder kept alive past query end is a
+/// caller bug).
+class QueryLimitToken {
  public:
-  explicit FileCacheQueryLimit(uint64_t maxBytes) : maxBytes_{maxBytes} {}
+  QueryLimitToken(FileCacheQueryLimit* parent, uint64_t maxBytes);
+  ~QueryLimitToken();
 
-  /// Attempts to reserve `bytes` against the limit. Returns true and bumps
-  /// the counter on success; returns false unchanged if it would exceed
-  /// maxBytes.
+  QueryLimitToken(const QueryLimitToken&) = delete;
+  QueryLimitToken& operator=(const QueryLimitToken&) = delete;
+  QueryLimitToken(QueryLimitToken&&) = delete;
+  QueryLimitToken& operator=(QueryLimitToken&&) = delete;
+
+  /// Attempts to reserve `bytes` against this token's budget. Returns true
+  /// and bumps the counter on success; returns false unchanged if it would
+  /// exceed maxBytes.
   bool tryReserve(uint64_t bytes);
 
-  /// Releases `bytes` previously reserved. Aborts in debug if this would
-  /// underflow the counter.
+  /// Releases `bytes` previously reserved. Throws (via VELOX_CHECK_GE) if
+  /// this would underflow.
   void release(uint64_t bytes);
 
   uint64_t reserved() const {
@@ -2800,8 +2905,38 @@ class FileCacheQueryLimit {
   }
 
  private:
+  FileCacheQueryLimit* const parent_;
   const uint64_t maxBytes_;
   std::atomic<uint64_t> reserved_{0};
+};
+
+/// Factory + cluster-wide accounting for QueryLimitToken. One instance
+/// lives on FsCache; QueryCtx calls reserveQuery() once per query and holds
+/// the returned token.
+class FileCacheQueryLimit {
+ public:
+  /// Mints a new token with a per-query budget of `maxBytesPerQuery`.
+  std::unique_ptr<QueryLimitToken> reserveQuery(uint64_t maxBytesPerQuery);
+
+  /// Sum of `reserved()` across all live tokens. Used by future cluster
+  /// limits; exposed now to keep the dtor-release invariant testable.
+  uint64_t totalReserved() const {
+    return totalReserved_.load(std::memory_order_acquire);
+  }
+
+  /// Called by QueryLimitToken on each successful tryReserve(). Public
+  /// because we deliberately avoid `friend` (project style); the contract
+  /// is "tokens own the counter, FileCacheQueryLimit owns the sum". Tests
+  /// must not call these directly.
+  void onTokenReserve(uint64_t bytes) {
+    totalReserved_.fetch_add(bytes, std::memory_order_acq_rel);
+  }
+  void onTokenRelease(uint64_t bytes) {
+    totalReserved_.fetch_sub(bytes, std::memory_order_acq_rel);
+  }
+
+ private:
+  std::atomic<uint64_t> totalReserved_{0};
 };
 
 } // namespace facebook::velox::cache::fs
@@ -2832,7 +2967,19 @@ Create `velox/common/caching/fscache/FileCacheQueryLimit.cpp`:
 
 namespace facebook::velox::cache::fs {
 
-bool FileCacheQueryLimit::tryReserve(uint64_t bytes) {
+QueryLimitToken::QueryLimitToken(
+    FileCacheQueryLimit* parent,
+    uint64_t maxBytes)
+    : parent_{parent}, maxBytes_{maxBytes} {}
+
+QueryLimitToken::~QueryLimitToken() {
+  const auto held = reserved_.load(std::memory_order_acquire);
+  if (held > 0) {
+    parent_->onTokenRelease(held);
+  }
+}
+
+bool QueryLimitToken::tryReserve(uint64_t bytes) {
   auto cur = reserved_.load(std::memory_order_acquire);
   while (true) {
     if (cur + bytes > maxBytes_) {
@@ -2843,15 +2990,28 @@ bool FileCacheQueryLimit::tryReserve(uint64_t bytes) {
             cur + bytes,
             std::memory_order_acq_rel,
             std::memory_order_acquire)) {
+      parent_->onTokenReserve(bytes);
       return true;
     }
   }
 }
 
-void FileCacheQueryLimit::release(uint64_t bytes) {
+void QueryLimitToken::release(uint64_t bytes) {
+  // fetch_sub returns the value before subtraction. Underflow check on the
+  // pre-decrement value detects releases larger than the live reservation.
   const auto prev = reserved_.fetch_sub(bytes, std::memory_order_acq_rel);
   VELOX_CHECK_GE(
-      prev, bytes, "FileCacheQueryLimit underflow: prev={} bytes={}");
+      prev,
+      bytes,
+      "FileCacheQueryLimit underflow: prev={} bytes={}",
+      prev,
+      bytes);
+  parent_->onTokenRelease(bytes);
+}
+
+std::unique_ptr<QueryLimitToken> FileCacheQueryLimit::reserveQuery(
+    uint64_t maxBytesPerQuery) {
+  return std::make_unique<QueryLimitToken>(this, maxBytesPerQuery);
 }
 
 } // namespace facebook::velox::cache::fs
@@ -2872,9 +3032,9 @@ ctest --test-dir /home/chang/OpenSource/velox2/cmake-build-relwithdebinfo-gcc13 
   -R velox_file_cache_query_limit_test -V
 ```
 
-Expected: `[  PASSED  ] 4 tests.`
+Expected: `[  PASSED  ] 5 tests.`
 
-- [ ] **Step 5: Write failing test — bypassCacheThreshold and per-query bypass in FsCacheTest**
+- [ ] **Step 5: Write failing test — bypassCacheThreshold in FsCacheTest**
 
 Add to `velox/common/caching/fscache/tests/FsCacheTest.cpp` next to existing getOrSet tests:
 
@@ -2888,8 +3048,10 @@ TEST_F(FsCacheTest, getOrSetReturnsEmptyHolderWhenRegionExceedsBypassThreshold) 
   auto holder = cache.getOrSet(
       "blob",
       /*offset=*/0,
-      /*size=*/8 * kMiB, // exceeds threshold
-      *remote);
+      /*size=*/8 * kMiB,
+      cfg,
+      *remote,
+      IsPrefetch::kDemand);
 
   EXPECT_TRUE(holder->empty());
   EXPECT_EQ(cache.totalSize(), 0);
@@ -2902,40 +3064,18 @@ TEST_F(FsCacheTest, getOrSetReturnsHolderUnderBypassThreshold) {
   auto remote = makeBlob(/*bytes=*/16 * kMiB);
 
   auto holder = cache.getOrSet(
-      "blob", /*offset=*/0, /*size=*/2 * kMiB, *remote);
+      "blob",
+      /*offset=*/0,
+      /*size=*/2 * kMiB,
+      cfg,
+      *remote,
+      IsPrefetch::kDemand);
 
   EXPECT_FALSE(holder->empty());
 }
-
-TEST_F(FsCacheTest, getOrSetSkipsCacheWhenQueryLimitExhausted) {
-  FsCacheConfig cfg = baseConfig();
-  FsCache cache{cfg};
-  cache.setQueryLimit("q1", /*maxBytes=*/1 * kMiB);
-  auto remote = makeBlob(/*bytes=*/16 * kMiB);
-
-  auto first = cache.getOrSet(
-      "blob", /*offset=*/0, /*size=*/512 * kKiB, *remote, /*queryId=*/"q1");
-  EXPECT_FALSE(first->empty());
-  auto second = cache.getOrSet(
-      "blob",
-      /*offset=*/1 * kMiB,
-      /*size=*/2 * kMiB, // would push q1 over budget
-      *remote,
-      /*queryId=*/"q1");
-  EXPECT_TRUE(second->empty());
-
-  // Different query unaffected.
-  auto third = cache.getOrSet(
-      "blob",
-      /*offset=*/4 * kMiB,
-      /*size=*/2 * kMiB,
-      *remote,
-      /*queryId=*/"q2");
-  EXPECT_FALSE(third->empty());
-
-  cache.dropQueryLimit("q1");
-}
 ```
+
+Per-query enforcement is covered end-to-end in Task 14's BufferedInput integration test once `QueryLimitToken` is wired into the read path. Token-level reserve/release behaviour is already covered by `FileCacheQueryLimitTest` above.
 
 - [ ] **Step 6: Run — expected RED**
 
@@ -2944,9 +3084,9 @@ cmake --build /home/chang/OpenSource/velox2/cmake-build-relwithdebinfo-gcc13 \
   --target velox_fscache_test -j 8
 ```
 
-Expected: compile error on `cfg.bypassCacheThreshold` and on `getOrSet(..., queryId)` overload missing.
+Expected: compile error on `cfg.bypassCacheThreshold` (field not yet declared).
 
-- [ ] **Step 7: Implement bypass + queryId plumbing**
+- [ ] **Step 7: Implement bypass short-circuit**
 
 Modify `velox/common/caching/fscache/FsCacheConfig.h` — add field below existing maxSegmentSize:
 
@@ -2960,91 +3100,51 @@ Modify `velox/common/caching/fscache/FsCacheConfig.h` — add field below existi
 uint64_t bypassCacheThreshold{0};
 ```
 
-Modify `velox/common/caching/fscache/FsCache.h` — add overload and admin API. Replace existing `getOrSet` declaration with:
+Modify `velox/common/caching/fscache/FsCache.h` — update the existing `getOrSet` doc comment to mention the new bypass behaviour (signature stays at the 6-param form from Task 8; no queryId is ever added):
 
 ```cpp
-/// Returns FileSegments covering `[offset, offset+size)` of `path`, fetching
-/// from `remote` as needed. `queryId` participates in per-query budget
-/// accounting (see setQueryLimit); pass empty string for unbounded
-/// callers.
+/// Returns FileSegments covering `[offset, offset+size)` of `path`,
+/// fetching from `remote` as needed.
 ///
-/// Returns an empty holder (FileSegmentsHolder with no segments) if the
-/// region exceeds bypassCacheThreshold, or if reserving against the
-/// query's FileCacheQueryLimit would exceed it. Callers must fall back to
-/// reading directly from `remote` in that case.
+/// Returns an empty holder (FileSegmentsHolder with no segments) if
+/// `size >= settings.bypassCacheThreshold` (and the threshold is
+/// non-zero). Callers must fall back to reading directly from `remote`
+/// in that case. Per-query budget enforcement is **caller-side**: the
+/// caller checks its QueryLimitToken via tryReserve() before invoking
+/// getOrSet (see spec §8.2).
 FileSegmentsHolderPtr getOrSet(
-    std::string_view path,
+    const std::string& path,
     uint64_t offset,
     uint64_t size,
-    ReadFile& remote,
-    std::string_view queryId = {},
-    IsPrefetch isPrefetch = IsPrefetch::kDemand);
-
-/// Registers a per-query reservation budget. Called once per query at
-/// driver start; subsequent getOrSet calls with the same queryId bill
-/// freshly cached bytes against this limit.
-void setQueryLimit(std::string_view queryId, uint64_t maxBytes);
-
-/// Removes a query's limit and releases all bytes the cache is holding
-/// for it. Called when the query finishes.
-void dropQueryLimit(std::string_view queryId);
+    const FsCacheConfig& settings,
+    ::facebook::velox::ReadFile& remote,
+    IsPrefetch isPrefetch);
 ```
 
-Modify `velox/common/caching/fscache/FsCache.cpp` — add a private member map under the existing mutex hierarchy:
+Modify `velox/common/caching/fscache/FsCache.cpp` — add the bypass short-circuit at the **very top** of `getOrSet`, before any lock acquisition:
 
 ```cpp
-// Per-query reservation budgets keyed by queryId. Mutated by
-// setQueryLimit / dropQueryLimit (admin path) and read by getOrSet.
-// Protected by queryLimitsMutex_ to keep it out of the bucket lock
-// hierarchy.
-folly::F14FastMap<std::string, std::unique_ptr<FileCacheQueryLimit>>
-    queryLimits_;
-mutable std::mutex queryLimitsMutex_;
-```
-
-Implementation:
-
-```cpp
-void FsCache::setQueryLimit(std::string_view queryId, uint64_t maxBytes) {
-  std::lock_guard<std::mutex> lk{queryLimitsMutex_};
-  queryLimits_[std::string{queryId}] =
-      std::make_unique<FileCacheQueryLimit>(maxBytes);
-}
-
-void FsCache::dropQueryLimit(std::string_view queryId) {
-  std::lock_guard<std::mutex> lk{queryLimitsMutex_};
-  queryLimits_.erase(std::string{queryId});
-}
-```
-
-Inside `getOrSet`, **first thing after argument validation**:
-
-```cpp
-// Bypass cache entirely for very large single-region requests.
-if (config_.bypassCacheThreshold > 0 &&
-    size >= config_.bypassCacheThreshold) {
-  return std::make_unique<FileSegmentsHolder>();
-}
-
-// Per-query budget check.
-FileCacheQueryLimit* queryLimit = nullptr;
-if (!queryId.empty()) {
-  std::lock_guard<std::mutex> lk{queryLimitsMutex_};
-  auto it = queryLimits_.find(std::string{queryId});
-  if (it != queryLimits_.end()) {
-    queryLimit = it->second.get();
+FileSegmentsHolderPtr FsCache::getOrSet(
+    const std::string& path,
+    uint64_t offset,
+    uint64_t size,
+    const FsCacheConfig& settings,
+    ::facebook::velox::ReadFile& remote,
+    IsPrefetch isPrefetch) {
+  // Bypass cache entirely for very large single-region requests. Done
+  // before any lock so a misconfigured huge scan doesn't even touch the
+  // bucket hierarchy.
+  if (settings.bypassCacheThreshold > 0 &&
+      size >= settings.bypassCacheThreshold) {
+    return std::make_unique<FileSegmentsHolder>();
   }
+  // ... existing body unchanged
 }
-if (queryLimit != nullptr && !queryLimit->tryReserve(size)) {
-  return std::make_unique<FileSegmentsHolder>();
-}
-// On any early return below, queryLimit->release(size) must run; track
-// with a folly::ScopeGuard.
 ```
 
 Update `velox/common/caching/fscache/CMakeLists.txt` `velox_fscache` SOURCES to include `FileCacheQueryLimit.cpp` (also added in Step 3).
 
-- [ ] **Step 8: Run — expected GREEN for FsCacheTest bypass + query-limit cases**
+- [ ] **Step 8: Run — expected GREEN for FsCacheTest bypass cases + FileCacheQueryLimitTest**
 
 ```bash
 cmake --build /home/chang/OpenSource/velox2/cmake-build-relwithdebinfo-gcc13 \
@@ -3053,7 +3153,7 @@ ctest --test-dir /home/chang/OpenSource/velox2/cmake-build-relwithdebinfo-gcc13 
   -R 'velox_fscache_test|velox_file_cache_query_limit_test' -V
 ```
 
-Expected: all FsCacheTest cases pass, including the 3 new ones.
+Expected: all FsCacheTest cases pass, including the 2 new bypass cases; FileCacheQueryLimitTest 5/5 PASS.
 
 - [ ] **Step 9: Commit**
 
@@ -3069,24 +3169,26 @@ git add \
   velox/common/caching/fscache/tests/FsCacheTest.cpp \
   velox/common/caching/fscache/tests/CMakeLists.txt
 git commit -m "$(cat <<'EOF'
-feat(fscache): per-query reservation + bypass_cache_threshold
+feat(fscache): QueryLimitToken + bypass_cache_threshold
 
-Adds FileCacheQueryLimit (atomic CAS-based reservation counter) and two
-new getOrSet behaviours per spec §8.2 / §8.3:
+Lands the two FsCache-side admission primitives from spec §8.2 / §8.3.
+The two mechanisms are intentionally asymmetric in how they integrate:
 
-  - If config.bypassCacheThreshold > 0 and size >= threshold, getOrSet
-    returns an empty FileSegmentsHolder. Callers fall through to reading
-    directly from `remote`. Keeps full-table scans from evicting the
-    warm working set.
+  - bypass_cache_threshold (§8.3) is size-based and lives **inside**
+    getOrSet. If config.bypassCacheThreshold > 0 and size >= threshold,
+    getOrSet returns an empty FileSegmentsHolder before touching any
+    bucket lock. Caller falls through to direct remote read. Keeps
+    full-table scans from evicting the warm working set.
 
-  - If the request carries a queryId registered via setQueryLimit, the
-    request's size is tryReserve'd against that limit; on failure
-    getOrSet returns an empty holder.
+  - FileCacheQueryLimit + QueryLimitToken (§8.2) is per-query and lives
+    on the **caller** side. QueryCtx calls reserveQuery() once and
+    holds the QueryLimitToken; before each getOrSet the caller invokes
+    token.tryReserve(size) and reads direct from remote on `false`.
+    getOrSet itself never sees a queryId — enforcement is the caller's.
 
-Phase-1: queryId is plumbed through the API but FsCacheBufferedInput
-still passes "" (no per-query enforcement) until Task 14 threads the
-ConnectorQueryCtx through. The accounting + tests land now so the wiring
-in Task 14 has nothing to design.
+Phase-1: token and bypass are landed and unit-tested here. Task 14
+threads QueryLimitToken into FsCacheBufferedInput via ConnectorQueryCtx
+and adds the BufferedInput-level integration test.
 
 Spec: docs/superpowers/specs/2026-05-26-fscache-ch-aligned-redesign.md §8.2 §8.3 §10 R7
 
@@ -3834,37 +3936,59 @@ ctest --test-dir /home/chang/OpenSource/velox2/cmake-build-relwithdebinfo-gcc13 
 
 Expected: `[  PASSED  ] 4 tests.`
 
-- [ ] **Step 5: Update FsCache to record split stats and accept IsPrefetch**
+- [ ] **Step 5: Update FsCache to record split stats by IsPrefetch**
 
-In `velox/common/caching/fscache/FsCache.cpp`, inside `getOrSet`, after determining whether each segment is `kDownloaded` (hit) or `kEmpty` (miss):
+`IsPrefetch` was added to `getOrSet` in **Task 8** (the API hard-cut)
+and forwarded as `/*isPrefetch*/` (unused). This step starts using
+the parameter. Phase-1 had a single non-split counter pair; remove
+those increments entirely. There is no "non-split fallback".
+
+In `velox/common/caching/fscache/FsCache.cpp::getOrSet`, after
+`fillHolesWithEmptyFileSegments` returns but **before**
+`lockedKey.reset()` (the per-spec §4.1 step 6 happens-before contract —
+counts MUST be visible to a concurrent snapshot() call before any
+caller observes the holder, so they have to happen while still under
+the keyMetadata lock):
 
 ```cpp
-for (const auto& seg : segments) {
+for (const auto& seg : slots) {
   if (seg->state() == FileSegment::State::kDownloaded) {
     stats_.recordHit(isPrefetch);
   } else {
+    // kEmpty / kDownloading both count as miss: the caller will drive
+    // the download (or wait), and the spec §6.3 contract is "miss =
+    // FsCache had to create or hand off a non-Downloaded segment".
     stats_.recordMiss(isPrefetch);
   }
 }
 ```
 
-Remove any old non-split increments. Confirm getOrSet's signature already takes `IsPrefetch isPrefetch = IsPrefetch::kDemand` (added in Task 11). If not, add it now.
+Remove all phase-1 single-counter `recordHit()` / `recordMiss()`
+callsites. The non-split counter members on `FsCacheStats` were
+already deleted in step 3 of this task.
 
-- [ ] **Step 6: Plumb kPrefetch through FsCacheBufferedInput::load**
+- [ ] **Step 6: Flip FsCacheBufferedInput::load to kPrefetch**
 
-In `velox/dwio/common/FsCacheBufferedInput.cpp::load`:
+Task 11 step 4 already wired `IsPrefetch::kPrefetch` into the load
+callsite (see plan line 2573). This step is a no-op verification:
 
-```cpp
-enqueued.segments = fsCache_->getOrSet(
-    input_->getName(),
-    enqueued.region.offset,
-    enqueued.region.length,
-    *input_->getReadFile(),
-    /*queryId=*/{},
-    /*isPrefetch=*/cache::fs::IsPrefetch::kPrefetch);
+```bash
+grep -n "IsPrefetch::kPrefetch" \
+  /home/chang/OpenSource/velox2/velox/dwio/common/FsCacheBufferedInput.cpp
 ```
 
-(Holder unwrapping: `enqueued.segments = std::move(*holder)` if getOrSet returns FileSegmentsHolderPtr — adjust per the Task 8 signature.)
+Expected: one match in `load()`. If absent (because step 4 of Task 11
+was edited later), patch the callsite to:
+
+```cpp
+enq.holder = fsCache_->getOrSet(
+    input_->getName(),
+    enq.region.offset,
+    enq.region.length,
+    fsCache_->config(),
+    *input_->getReadFile(),
+    cache::fs::IsPrefetch::kPrefetch);
+```
 
 - [ ] **Step 7: Write failing E2E test — prefetchRatio**
 
@@ -3951,108 +4075,382 @@ EOF
 
 ---
 
-## Task 15: FsCacheEquivalenceTest + TPC-H q1–q22 end-to-end
+## Task 15: FsCacheTpchEquivalenceTest + TPC-H q1–q22 end-to-end
 
 **Files:**
-- Modify: `velox/dwio/common/tests/FsCacheEquivalenceTest.cpp` — extend existing 22-query loop to flip enableSlru on/off and assert byte-identical scan output
-- Modify: `velox/exec/benchmarks/QueryBenchmarkBase.cpp` or equivalent test runner — accept `--fscache_mode=off|on|slru` flag (only if already present; otherwise add to FsCacheEquivalenceTest fixture)
-- Modify: `velox/dwio/common/tests/CMakeLists.txt`
-- Verify: `docs/superpowers/results/2026-05-26-fscache-tpch22-equivalence.md` (created by run)
+- Create: `velox/dwio/parquet/tests/FsCacheTpchEquivalenceTest.cpp` (new — patterned on `ParquetTpchTest.cpp`)
+- Modify: `velox/dwio/parquet/tests/CMakeLists.txt` — add new binary
+- Create: `docs/superpowers/results/2026-05-26-fscache-tpch22-equivalence.md` (created by run)
 
 **Spec:** §9.3 (equivalence), §10 R8 (TPC-H end-to-end).
 
 **Approach:**
-The existing `FsCacheEquivalenceTest` already proves bytes match for synthetic blobs (commit `f5d212829`). Task 15 extends it to drive TPC-H q1-q22 through three FsCache modes — `off` (current behaviour, no FsCache), `on` (FsCache enabled, single-LRU), `slru` (FsCache enabled, SlruPolicy) — and assert all three produce **identical row-and-column output**.
 
-This is the gate that catches subtle silent bugs introduced by partial-readable reads, async load races, or eviction edge cases. The cost is one-time TPC-H SF1 generation (already wired through `make tpch_test`), so the loop runs in CI.
+`velox/dwio/parquet/tests/ParquetTpchTest.cpp` already runs all 22 TPC-H queries against an in-process TpchConnector-generated SF=0.01 parquet dataset (no `make tpch_test` target exists — the test generates its own data in `SetUpTestSuite`). Task 15 lifts that fixture, parameterises it by **FsCache mode** (`kOff`, `kOn`, `kSlru`), runs the same 22 queries through each mode, and asserts row-identical output.
 
-This task does **not** rewrite the per-query test infra — it leans on whatever already exists (likely `TpchQueryRunner` or similar) and just parameterises the fixture by `FsCacheMode`.
+Three modes:
+- `kOff`: today's `BufferedInput` (no FsCache) — this is the baseline.
+- `kOn`: `FsCacheBufferedInput` with `FsCacheConfig{}` (single-LRU eviction, no SLRU, no QueryLimitToken, no bypass).
+- `kSlru`: `FsCacheBufferedInput` with `FsCacheConfig{ enableSlru = true }` (Task 13's SlruPolicy active).
+
+The fixture builds a `HiveConnector` whose `Configs` includes a custom `BufferedInputFactory` that returns the right `BufferedInput` subclass per mode. (If `BufferedInputFactory` doesn't yet exist as a pluggable knob, this task adds a minimal hook in `HiveConnector::createBufferedInput` keyed off a session property `fscache.mode`.)
+
+Equality check is row-by-row via `BaseVector::equalValueAt` after sorting (when needed), exactly as `ParquetTpchTest::assertQuery` already does against DuckDB. Here both sides are Velox so DuckDB is dropped — we compare the two Velox runs to each other.
 
 - [ ] **Step 1: Inspect existing TPC-H test infra**
 
+Read `velox/dwio/parquet/tests/ParquetTpchTest.cpp:40-159` to confirm the data-generation pattern (TpchConnector → tableScan SF 0.01 → write parquet via TableWriter into a `TempDirectoryPath`, then `TpchQueryBuilder::initialize(path)`). Reuse it verbatim — do not invent a new data source.
+
+Confirm the `BufferedInputFactory` plumbing. Search:
+
 ```bash
-grep -rn "TPCH" /home/chang/OpenSource/velox2/velox/exec/tests/ | head -40
-grep -rn "TpchQuery" /home/chang/OpenSource/velox2/velox/ | head -20
+grep -rn "BufferedInputFactory\|createBufferedInput\|class BufferedInput " \
+  /home/chang/OpenSource/velox2/velox/dwio/common/ \
+  /home/chang/OpenSource/velox2/velox/connectors/hive/
 ```
 
-Identify the runner class (e.g. `TpchQueryRunner`, `TpchPlanBuilder`) and how it's currently invoked from tests. **Do not guess** — record the actual class/method names before writing the fixture.
+If a session-property-driven factory hook already exists, use it. If not, add a minimal hook in this task before the parameterised test (extra step 2.5 below).
 
-- [ ] **Step 2: Write failing parameterised test — FsCacheTpchEquivalenceTest**
+- [ ] **Step 2: Write failing test — FsCacheTpchEquivalenceTest**
 
-Append to `velox/dwio/common/tests/FsCacheEquivalenceTest.cpp` (or create `FsCacheTpchEquivalenceTest.cpp` if existing file is for unit scope):
+Create `velox/dwio/parquet/tests/FsCacheTpchEquivalenceTest.cpp` patterned on `ParquetTpchTest.cpp`:
 
 ```cpp
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <folly/init/Init.h>
+#include <vector>
+
+#include "velox/common/caching/fscache/FsCache.h"
+#include "velox/common/file/FileSystems.h"
+#include "velox/common/testutil/TempDirectoryPath.h"
+#include "velox/connectors/ConnectorRegistry.h"
+#include "velox/connectors/hive/HiveConnector.h"
+#include "velox/connectors/tpch/TpchConnector.h"
+#include "velox/dwio/parquet/RegisterParquetReader.h"
+#include "velox/dwio/parquet/RegisterParquetWriter.h"
+#include "velox/exec/tests/utils/AssertQueryBuilder.h"
+#include "velox/exec/tests/utils/HiveConnectorTestBase.h"
+#include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/exec/tests/utils/TpchQueryBuilder.h"
+#include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
+#include "velox/functions/prestosql/registration/RegistrationFunctions.h"
+#include "velox/parse/TypeResolver.h"
+
+using namespace facebook::velox;
+using namespace facebook::velox::exec;
+using namespace facebook::velox::exec::test;
+using namespace facebook::velox::common::testutil;
+
+namespace {
+
+enum class FsCacheMode { kOff, kOn, kSlru };
+
+std::string modeName(FsCacheMode m) {
+  switch (m) {
+    case FsCacheMode::kOff:
+      return "Off";
+    case FsCacheMode::kOn:
+      return "On";
+    case FsCacheMode::kSlru:
+      return "Slru";
+  }
+  VELOX_UNREACHABLE();
+}
+
+} // namespace
+
 class FsCacheTpchEquivalenceTest
     : public ::testing::TestWithParam<FsCacheMode> {
  protected:
-  void SetUp() override {
-    // <use the existing TPC-H SF1 dataset path discovered in step 1>
-    setupTpchData();
+  static void SetUpTestSuite() {
+    // Mirror ParquetTpchTest::SetUpTestSuite verbatim except for the
+    // HiveConnector — that one is rebuilt per-mode inside each TEST_P so
+    // the FsCache factory hook can be parameterised.
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
+    duckDb_ = std::make_shared<DuckDbQueryRunner>();
+    tempDirectory_ = TempDirectoryPath::create();
+    tpchBuilder_ =
+        std::make_shared<TpchQueryBuilder>(dwio::common::FileFormat::PARQUET);
+
+    functions::prestosql::registerAllScalarFunctions();
+    aggregate::prestosql::registerAllAggregateFunctions();
+    parse::registerTypeResolver();
+    filesystems::registerLocalFileSystem();
+    dwio::common::registerFileSinks();
+    parquet::registerParquetReaderFactory();
+    parquet::registerParquetWriterFactory();
+
+    connector::tpch::TpchConnectorFactory tpchFactory;
+    auto tpchConnector = tpchFactory.newConnector(
+        kTpchConnectorId,
+        std::make_shared<config::ConfigBase>(
+            std::unordered_map<std::string, std::string>{}));
+    connector::ConnectorRegistry::global().insert(
+        tpchConnector->connectorId(), tpchConnector);
+
+    saveTpchTablesAsParquet();
+    tpchBuilder_->initialize(tempDirectory_->getPath());
   }
+
+  static void TearDownTestSuite() {
+    connector::ConnectorRegistry::global().erase(kTpchConnectorId);
+    parquet::unregisterParquetReaderFactory();
+    parquet::unregisterParquetWriterFactory();
+  }
+
+  void SetUp() override {
+    // Install a Hive connector wired to the mode under test. The mode
+    // selects which BufferedInputFactory the connector hands to the
+    // ParquetReader.
+    const auto mode = GetParam();
+    std::unordered_map<std::string, std::string> hiveCfg;
+    switch (mode) {
+      case FsCacheMode::kOff:
+        hiveCfg["fscache.mode"] = "off";
+        break;
+      case FsCacheMode::kOn:
+        hiveCfg["fscache.mode"] = "on";
+        break;
+      case FsCacheMode::kSlru:
+        hiveCfg["fscache.mode"] = "on";
+        hiveCfg["fscache.enable_slru"] = "true";
+        break;
+    }
+    connector::hive::HiveConnectorFactory hiveFactory;
+    auto hiveConnector = hiveFactory.newConnector(
+        kHiveConnectorId,
+        std::make_shared<config::ConfigBase>(std::move(hiveCfg)));
+    connector::ConnectorRegistry::global().insert(
+        hiveConnector->connectorId(), hiveConnector);
+  }
+
+  void TearDown() override {
+    connector::ConnectorRegistry::global().erase(kHiveConnectorId);
+  }
+
+  // Mirrors ParquetTpchTest::saveTpchTablesAsParquet — copied verbatim
+  // because it is the canonical TPC-H Parquet generator path. Do not
+  // rewrite it; if upstream changes, mirror the change here too.
+  static void saveTpchTablesAsParquet() {
+    std::shared_ptr<memory::MemoryPool> rootPool{
+        memory::memoryManager()->addRootPool()};
+    std::shared_ptr<memory::MemoryPool> pool{rootPool->addLeafChild("leaf")};
+
+    for (const auto& table : tpch::tables) {
+      auto tableName = toTableName(table);
+      auto tableDirectory =
+          fmt::format("{}/{}", tempDirectory_->getPath(), tableName);
+      auto tableSchema = tpch::getTableSchema(table);
+      auto columnNames = tableSchema->names();
+      auto plan = PlanBuilder()
+                      .tpchTableScan(table, std::move(columnNames), 0.01)
+                      .planNode();
+      auto split = exec::Split(
+          std::make_shared<connector::tpch::TpchConnectorSplit>(
+              kTpchConnectorId, /*cacheable=*/true, 1, 0));
+      auto rows =
+          AssertQueryBuilder(plan).splits({split}).copyResults(pool.get());
+      duckDb_->createTable(tableName.data(), {rows});
+      plan = PlanBuilder()
+                 .values({rows})
+                 .tableWrite(tableDirectory, dwio::common::FileFormat::PARQUET)
+                 .planNode();
+      AssertQueryBuilder(plan).copyResults(pool.get());
+    }
+  }
+
+  std::vector<RowVectorPtr> runQuery(int queryId) {
+    auto tpchPlan = tpchBuilder_->getQueryPlan(queryId);
+    constexpr int kNumSplits = 10;
+    constexpr int kNumDrivers = 4;
+    auto addSplits = [&](TaskCursor* taskCursor) {
+      if (taskCursor->noMoreSplits()) {
+        return;
+      }
+      auto& task = taskCursor->task();
+      for (const auto& entry : tpchPlan.dataFiles) {
+        for (const auto& path : entry.second) {
+          const auto splits = HiveConnectorTestBase::makeHiveConnectorSplits(
+              path, kNumSplits, tpchPlan.dataFileFormat);
+          for (const auto& split : splits) {
+            task->addSplit(entry.first, Split(split));
+          }
+        }
+        task->noMoreSplits(entry.first);
+      }
+      taskCursor->setNoMoreSplits();
+    };
+    CursorParameters params;
+    params.maxDrivers = kNumDrivers;
+    params.planNode = tpchPlan.plan;
+    std::vector<RowVectorPtr> results;
+    auto cursor = TaskCursor::create(params);
+    while (cursor->moveNext()) {
+      results.push_back(cursor->current());
+    }
+    addSplits(cursor.get());
+    while (cursor->moveNext()) {
+      results.push_back(cursor->current());
+    }
+    return results;
+  }
+
+  static bool rowsEqual(
+      const std::vector<RowVectorPtr>& a,
+      const std::vector<RowVectorPtr>& b) {
+    if (a.size() != b.size()) {
+      return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+      if (a[i]->size() != b[i]->size()) {
+        return false;
+      }
+      for (vector_size_t r = 0; r < a[i]->size(); ++r) {
+        if (!a[i]->equalValueAt(b[i].get(), r, r)) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  static std::shared_ptr<DuckDbQueryRunner> duckDb_;
+  static std::shared_ptr<TempDirectoryPath> tempDirectory_;
+  static std::shared_ptr<TpchQueryBuilder> tpchBuilder_;
 };
 
-TEST_P(FsCacheTpchEquivalenceTest, allQueriesMatchBaseline) {
+std::shared_ptr<DuckDbQueryRunner> FsCacheTpchEquivalenceTest::duckDb_;
+std::shared_ptr<TempDirectoryPath> FsCacheTpchEquivalenceTest::tempDirectory_;
+std::shared_ptr<TpchQueryBuilder> FsCacheTpchEquivalenceTest::tpchBuilder_;
+
+// One TEST_P generates 22 queries × 3 modes = 66 cases (3 instantiations
+// below). For each non-Off mode we compare against the same query run
+// under kOff, captured fresh each call to keep the test stateless.
+TEST_P(FsCacheTpchEquivalenceTest, allQueriesMatchOffMode) {
   const auto mode = GetParam();
+  if (mode == FsCacheMode::kOff) {
+    // Off-vs-Off would be trivially equal; skipping keeps gtest output
+    // honest (only meaningful comparisons are recorded as PASS).
+    GTEST_SKIP() << "kOff is the baseline";
+  }
+
   for (int q = 1; q <= 22; ++q) {
-    SCOPED_TRACE("TPC-H q" + std::to_string(q));
-    const auto baseline = runQueryWithMode(q, FsCacheMode::kOff);
-    const auto candidate = runQueryWithMode(q, mode);
-    ASSERT_EQ(baseline.size(), candidate.size())
-        << "row count differs for q" << q;
-    for (size_t i = 0; i < baseline.size(); ++i) {
-      EXPECT_TRUE(baseline[i]->equalValueAt(candidate[i].get(), 0, 0))
-          << "row " << i << " differs for q" << q;
-    }
+    SCOPED_TRACE("TPC-H q" + std::to_string(q) + " mode=" + modeName(mode));
+
+    // Rebuild the HiveConnector under kOff to capture the baseline.
+    connector::ConnectorRegistry::global().erase(kHiveConnectorId);
+    connector::hive::HiveConnectorFactory hiveFactory;
+    auto offConnector = hiveFactory.newConnector(
+        kHiveConnectorId,
+        std::make_shared<config::ConfigBase>(
+            std::unordered_map<std::string, std::string>{
+                {"fscache.mode", "off"}}));
+    connector::ConnectorRegistry::global().insert(
+        offConnector->connectorId(), offConnector);
+    const auto baseline = runQuery(q);
+
+    // Re-install the parameterised connector (SetUp's mode) and run.
+    connector::ConnectorRegistry::global().erase(kHiveConnectorId);
+    SetUp();
+    const auto candidate = runQuery(q);
+
+    ASSERT_TRUE(rowsEqual(baseline, candidate))
+        << "q" << q << " differs under mode=" << modeName(mode);
   }
 }
 
 INSTANTIATE_TEST_SUITE_P(
     Modes,
     FsCacheTpchEquivalenceTest,
-    ::testing::Values(FsCacheMode::kOn, FsCacheMode::kSlru),
-    [](const auto& info) {
-      switch (info.param) {
-        case FsCacheMode::kOn:
-          return std::string{"On"};
-        case FsCacheMode::kSlru:
-          return std::string{"Slru"};
-        default:
-          return std::string{"Unknown"};
-      }
-    });
+    ::testing::Values(FsCacheMode::kOff, FsCacheMode::kOn, FsCacheMode::kSlru),
+    [](const auto& info) { return modeName(info.param); });
 ```
 
-Add `enum class FsCacheMode { kOff, kOn, kSlru };` and helper `runQueryWithMode` in the same TU. The helper builds a `FsCacheConfig` per mode and constructs/uses a `FsCacheBufferedInput` (or skips one entirely when `kOff`).
+Add to `velox/dwio/parquet/tests/CMakeLists.txt`:
+
+```cmake
+add_executable(velox_dwio_parquet_fscache_tpch_equivalence_test
+  FsCacheTpchEquivalenceTest.cpp)
+target_link_libraries(
+  velox_dwio_parquet_fscache_tpch_equivalence_test
+  velox_aggregates
+  velox_dwio_common_exception
+  velox_dwio_parquet_reader
+  velox_dwio_parquet_writer
+  velox_exec
+  velox_exec_test_lib
+  velox_fscache
+  velox_functions_prestosql
+  velox_hive_connector
+  velox_parse_parser
+  velox_tpch_connector
+  velox_tpch_gen
+  velox_vector_test_lib
+  GTest::gtest
+  GTest::gtest_main)
+add_test(NAME velox_dwio_parquet_fscache_tpch_equivalence_test
+  COMMAND velox_dwio_parquet_fscache_tpch_equivalence_test)
+```
+
+(Mirror the link list from `velox_dwio_parquet_tpch_test` above it in the same `CMakeLists.txt` — exact deps may differ; copy what's there and add `velox_fscache`.)
 
 - [ ] **Step 3: Run — expected RED (test does not compile, or asserts fire)**
 
 ```bash
 cmake --build /home/chang/OpenSource/velox2/cmake-build-relwithdebinfo-gcc13 \
-  --target velox_fscache_equivalence_test -j 8
+  --target velox_dwio_parquet_fscache_tpch_equivalence_test -j 8
 ```
 
-Expected: compile errors on missing helpers, OR if compile succeeds, RED on at least one query showing where partial-readable / async load breaks parity.
+Expected: compile errors on `fscache.mode` session property (factory hook missing), OR if Hive already routes by `fscache.mode`, RED on at least one query showing where partial-readable / async load breaks parity.
 
-- [ ] **Step 4: Iterate — implement the missing helpers, debug query mismatches**
+- [ ] **Step 4: Iterate — implement the missing factory hook, debug query mismatches**
+
+If the `fscache.mode` property is not yet honoured, add a minimal hook in `velox/connectors/hive/HiveConnector.{h,cpp}` that:
+- Reads `fscache.mode` and (optional) `fscache.enable_slru` from its config.
+- When `off`, returns the current `BufferedInput`.
+- When `on`, returns `FsCacheBufferedInput` constructed against a process-wide `FsCache` singleton built from the config flags.
+
+The singleton is created the first time mode != `off` is requested. Subsequent connector instances reuse it (we want the cache to persist across queries within the test process).
 
 For each RED query, the debug recipe:
-1. Run the query under `mode=kOn` with `--gtest_filter=*q<n>*` and `LOG_LEVEL=INFO`.
-2. Re-run with `mode=kOff` and capture both row dumps.
+1. Run the query under `mode=On` with `--gtest_filter=*On*Q<n>*` and `LOG_LEVEL=INFO`.
+2. Re-run with `mode=Off` and capture both row dumps.
 3. Diff. The first divergent row reveals which segment / offset is wrong.
 4. Bisect by toggling: async load off (synchronous getOrSet), eviction off (capacity=huge), partial-readable off (full-segment write only). Whichever toggle hides the bug names the culprit.
 
 Bugs found here must be fixed in the corresponding Task 2-14 code paths, then re-tested. Re-add a unit test in the relevant task's test file to lock in the regression.
 
-- [ ] **Step 5: Run — expected GREEN for all 44 cases (22 q × 2 modes)**
+- [ ] **Step 5: Run — expected GREEN for all 44 non-Off cases (22 q × 2 modes; kOff cases SKIPPED)**
 
 ```bash
 cmake --build /home/chang/OpenSource/velox2/cmake-build-relwithdebinfo-gcc13 \
-  --target velox_fscache_equivalence_test -j 8
+  --target velox_dwio_parquet_fscache_tpch_equivalence_test -j 8
 ctest --test-dir /home/chang/OpenSource/velox2/cmake-build-relwithdebinfo-gcc13 \
-  -R velox_fscache_equivalence_test -V
+  -R velox_dwio_parquet_fscache_tpch_equivalence_test -V
 ```
 
-Expected: 44 / 44 PASSED. Capture the raw output to `/tmp/fscache-equivalence.txt`.
+Expected: `[  PASSED  ] 44 tests. [  SKIPPED ] 22 tests.` Capture raw output to `/tmp/fscache-equivalence.txt`.
+
+Particular focus for the implicit Phase-2 review on this task:
+- Connector lifetime: the per-mode HiveConnector swap inside `TEST_P` must not leak the previous one's state into the next iteration (FsCache singleton should be ok; metadata, splits, etc. must be torn down).
+- `runQuery`'s `moveNext` loop: confirm it actually drains the cursor — `ParquetTpchTest` uses `exec::test::assertQuery` which does this internally; the bespoke loop here is easy to get wrong.
+
+Particular note for Phase-3 simplification on this task: do **not** delete the verbatim `saveTpchTablesAsParquet` copy; the comment above it documents the deliberate duplication of upstream's canonical generator.
 
 - [ ] **Step 6: Write summary file**
 
@@ -4061,7 +4459,7 @@ Create `docs/superpowers/results/2026-05-26-fscache-tpch22-equivalence.md`:
 ```markdown
 # FsCache TPC-H q1–q22 Equivalence Results — 2026-05-26
 
-| Query | Mode `off` rows | Mode `on` rows | Mode `slru` rows | Bytes-equal |
+| Query | Mode `Off` rows | Mode `On` rows | Mode `Slru` rows | Bytes-equal |
 | ----- | --------------- | -------------- | ---------------- | ----------- |
 | q1    | <n>             | <n>            | <n>              | YES         |
 | ...   |                 |                |                  |             |
@@ -4069,12 +4467,14 @@ Create `docs/superpowers/results/2026-05-26-fscache-tpch22-equivalence.md`:
 
 ## Methodology
 
-- Dataset: TPC-H SF1, parquet, generated via `make tpch_test`.
+- Dataset: TPC-H SF 0.01, parquet, generated in-process via TpchConnector
+  + TableWriter, identical to `velox_dwio_parquet_tpch_test`.
 - Three modes share the same plan, plan options, and per-row equality
   via `BaseVector::equalValueAt`.
-- Mode `off`: FsCache disabled (BufferedInput as today).
-- Mode `on`: FsCache enabled, single-LRU eviction.
-- Mode `slru`: FsCache enabled, SlruPolicy eviction.
+- Mode `Off`: HiveConnector with `fscache.mode=off` (plain BufferedInput).
+- Mode `On`: HiveConnector with `fscache.mode=on` (FsCacheBufferedInput,
+  single-LRU).
+- Mode `Slru`: HiveConnector with `fscache.mode=on, fscache.enable_slru=true`.
 
 ## Bugs surfaced
 
@@ -4088,22 +4488,29 @@ Fill row counts from the captured ctest output.
 
 ```bash
 git add \
-  velox/dwio/common/tests/FsCacheEquivalenceTest.cpp \
-  velox/dwio/common/tests/CMakeLists.txt \
+  velox/dwio/parquet/tests/FsCacheTpchEquivalenceTest.cpp \
+  velox/dwio/parquet/tests/CMakeLists.txt \
   docs/superpowers/results/2026-05-26-fscache-tpch22-equivalence.md
-# Only add fix commits to Task 2-14 files if step 4 found bugs; commit
-# those separately so each fix has its own diff.
+# If step 4 had to add the HiveConnector fscache.mode hook, also stage
+# velox/connectors/hive/HiveConnector.{h,cpp}. If step 4 had to fix any
+# Task 2-14 production code, commit those fixes SEPARATELY before this
+# commit so each fix has its own diff.
 git commit -m "$(cat <<'EOF'
 test(fscache): TPC-H q1-q22 byte-equivalence across off/on/slru
 
-Drives FsCacheEquivalenceTest over the full TPC-H SF1 query set in three
-modes (no cache, FsCache single-LRU, FsCache SLRU) and asserts row-
-identical output per BaseVector::equalValueAt. 44 / 44 PASSED — see
+Adds FsCacheTpchEquivalenceTest in velox/dwio/parquet/tests/. Lifts the
+TPC-H SF 0.01 in-process generator from ParquetTpchTest, then runs all
+22 queries through three HiveConnector configurations — fscache.mode=off
+(baseline), fscache.mode=on (single-LRU), fscache.mode=on +
+fscache.enable_slru=true — and asserts row-identical output per
+BaseVector::equalValueAt.
+
+44 / 44 PASSED (22 SKIPPED for the trivial Off-vs-Off case). See
 docs/superpowers/results/2026-05-26-fscache-tpch22-equivalence.md.
 
 Any production fixes needed to reach parity were committed separately
-ahead of this test; this commit only adds the gating test + results
-record.
+ahead of this test; this commit only adds the gating test + the minimal
+HiveConnector `fscache.mode` factory hook + results record.
 
 Spec: docs/superpowers/specs/2026-05-26-fscache-ch-aligned-redesign.md §9.3 §10 R8
 
