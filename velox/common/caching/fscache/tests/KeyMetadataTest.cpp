@@ -16,7 +16,9 @@
 
 #include "velox/common/caching/fscache/KeyMetadata.h"
 
+#include "velox/common/base/Exceptions.h"
 #include "velox/common/caching/fscache/FileSegment.h"
+#include "velox/common/caching/fscache/FsCacheMetadata.h"
 
 #include <gtest/gtest.h>
 
@@ -68,6 +70,43 @@ TEST(KeyMetadataTest, secondLockBlocksUntilFirstReleased) {
   first = LockedKey{};
   t.join();
   EXPECT_TRUE(secondAcquired);
+}
+
+TEST(KeyMetadataTest, lockKeyMetadataThrowsWhenAbsent) {
+  FsCacheMetadata md{4};
+  PathKey path = PathKey::fromPath("/nope");
+  EXPECT_THROW(
+      md.lockKeyMetadata(path, KeyNotFoundPolicy::kThrow),
+      ::facebook::velox::VeloxException);
+}
+
+TEST(KeyMetadataTest, lockKeyMetadataReturnsEmptyLockedKeyWhenAbsent) {
+  FsCacheMetadata md{4};
+  PathKey path = PathKey::fromPath("/nope");
+  auto locked = md.lockKeyMetadata(path, KeyNotFoundPolicy::kReturnNull);
+  EXPECT_EQ(locked.get(), nullptr);
+}
+
+TEST(KeyMetadataTest, lockKeyMetadataCreatesEmptyWhenAbsent) {
+  FsCacheMetadata md{4};
+  PathKey path = PathKey::fromPath("/new");
+  {
+    auto locked = md.lockKeyMetadata(path, KeyNotFoundPolicy::kCreateEmpty);
+    ASSERT_NE(locked.get(), nullptr);
+    EXPECT_TRUE(locked->segments.empty());
+    // LockedKey dtor releases the per-key lock here; second call below
+    // must not deadlock.
+  }
+  auto again = md.lockKeyMetadata(path, KeyNotFoundPolicy::kReturnNull);
+  EXPECT_NE(again.get(), nullptr);
+}
+
+TEST(KeyMetadataTest, lockKeyMetadataThrowLogicalAlsoThrows) {
+  FsCacheMetadata md{4};
+  PathKey path = PathKey::fromPath("/nope");
+  EXPECT_THROW(
+      md.lockKeyMetadata(path, KeyNotFoundPolicy::kThrowLogical),
+      ::facebook::velox::VeloxException);
 }
 
 } // namespace facebook::velox::cache::fs::test

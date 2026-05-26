@@ -30,6 +30,18 @@ using FileSegmentPtr = std::shared_ptr<FileSegment>;
 
 class KeyMetadata;
 
+/// Behavior when `FsCacheMetadata::lockKeyMetadata` does not find the key:
+///   - kThrow:        VELOX_USER_FAIL (user-facing miss expected to be impossible).
+///   - kThrowLogical: VELOX_FAIL (programming error: invariant violated).
+///   - kCreateEmpty:  insert empty KeyMetadata and return a non-empty LockedKey.
+///   - kReturnNull:   return an empty LockedKey (caller checks `locked.get()`).
+enum class KeyNotFoundPolicy : uint8_t {
+  kThrow,
+  kThrowLogical,
+  kCreateEmpty,
+  kReturnNull,
+};
+
 /// RAII handle that owns a KeyGuard on a specific KeyMetadata. While alive,
 /// the holder may read and write the KeyMetadata's segments / numSegments.
 /// Non-copyable; movable. An empty (default-constructed) LockedKey holds no

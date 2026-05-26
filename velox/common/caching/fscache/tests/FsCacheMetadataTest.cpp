@@ -178,4 +178,69 @@ TEST(FsCacheMetadataTest, concurrentEraseAndInsertSamePathNoOrphan) {
   }
 }
 
+TEST(FsCacheMetadataTest, lookupRangeEmptyMetadataReturnsEmpty) {
+  FsCacheMetadata md{4};
+  auto result = md.lookupRange(PathKey::fromPath("/r/x"), 0, 1'024);
+  EXPECT_TRUE(result.empty());
+}
+
+TEST(FsCacheMetadataTest, lookupRangeSingleSegmentFullyInside) {
+  FsCacheMetadata md{4};
+  PathKey path = PathKey::fromPath("/r/x");
+  auto seg = std::make_shared<FileSegment>(FsCacheKey{path, 100, 200}, "/r/x");
+  ASSERT_TRUE(md.insert(seg));
+  auto result = md.lookupRange(path, 0, 1'024);
+  ASSERT_EQ(result.size(), 1UL);
+  EXPECT_EQ(result[0]->key().offset, 100UL);
+}
+
+TEST(FsCacheMetadataTest, lookupRangePrevSegmentIntersects) {
+  // CH-style lower_bound + prev check: a segment that starts BEFORE
+  // [lo, hi) but whose end crosses into [lo, hi) must be returned.
+  FsCacheMetadata md{4};
+  PathKey path = PathKey::fromPath("/r/x");
+  auto seg = std::make_shared<FileSegment>(FsCacheKey{path, 50, 100}, "/r/x");
+  ASSERT_TRUE(md.insert(seg));
+  // Query [100, 200) -- lower_bound returns end(), prev is the seg at 50
+  // ending at 150 (intersects).
+  auto result = md.lookupRange(path, 100, 200);
+  ASSERT_EQ(result.size(), 1UL);
+  EXPECT_EQ(result[0]->key().offset, 50UL);
+}
+
+TEST(FsCacheMetadataTest, lookupRangePrevSegmentNonIntersecting) {
+  FsCacheMetadata md{4};
+  PathKey path = PathKey::fromPath("/r/x");
+  // Segment at [0, 100) ends BEFORE the query window.
+  auto seg = std::make_shared<FileSegment>(FsCacheKey{path, 0, 100}, "/r/x");
+  ASSERT_TRUE(md.insert(seg));
+  auto result = md.lookupRange(path, 100, 200);
+  EXPECT_TRUE(result.empty());
+}
+
+TEST(FsCacheMetadataTest, lookupRangeMultipleSegmentsOrdered) {
+  FsCacheMetadata md{4};
+  PathKey path = PathKey::fromPath("/r/x");
+  ASSERT_TRUE(md.insert(
+      std::make_shared<FileSegment>(FsCacheKey{path, 0, 100}, "/r/x")));
+  ASSERT_TRUE(md.insert(
+      std::make_shared<FileSegment>(FsCacheKey{path, 200, 100}, "/r/x")));
+  ASSERT_TRUE(md.insert(
+      std::make_shared<FileSegment>(FsCacheKey{path, 400, 100}, "/r/x")));
+  auto result = md.lookupRange(path, 50, 350);
+  ASSERT_EQ(result.size(), 2UL);
+  EXPECT_EQ(result[0]->key().offset, 0UL);
+  EXPECT_EQ(result[1]->key().offset, 200UL);
+}
+
+TEST(FsCacheMetadataTest, lookupRangeEmptyIntervalReturnsEmpty) {
+  // Half-open [lo, hi) with lo == hi must yield empty even if a
+  // segment straddles `lo`.
+  FsCacheMetadata md{4};
+  PathKey path = PathKey::fromPath("/r/x");
+  ASSERT_TRUE(md.insert(
+      std::make_shared<FileSegment>(FsCacheKey{path, 0, 200}, "/r/x")));
+  EXPECT_TRUE(md.lookupRange(path, 100, 100).empty());
+}
+
 } // namespace facebook::velox::cache::fs::test

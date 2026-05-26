@@ -89,6 +89,76 @@ FileSegmentPtr FsCacheMetadata::lookup(const FsCacheKey& key) const {
   return segIt->second;
 }
 
+LockedKey FsCacheMetadata::lockKeyMetadata(
+    const PathKey& path,
+    KeyNotFoundPolicy policy) {
+  auto& bucket = *buckets_[bucketIndex(path)];
+  KeyMetadataPtr keyMeta;
+  {
+    CacheMetadataGuard bucketGuard{bucket.guard};
+    auto it = bucket.keys.find(path);
+    if (it == bucket.keys.end()) {
+      switch (policy) {
+        case KeyNotFoundPolicy::kThrow:
+          VELOX_USER_FAIL(
+              "FsCacheMetadata::lockKeyMetadata: path not found: {:016x}",
+              std::hash<PathKey>{}(path));
+        case KeyNotFoundPolicy::kThrowLogical:
+          VELOX_FAIL(
+              "FsCacheMetadata::lockKeyMetadata: path not found (logical): {:016x}",
+              std::hash<PathKey>{}(path));
+        case KeyNotFoundPolicy::kCreateEmpty: {
+          keyMeta = std::make_shared<KeyMetadata>();
+          bucket.keys.emplace(path, keyMeta);
+          break;
+        }
+        case KeyNotFoundPolicy::kReturnNull:
+          return LockedKey{};
+      }
+    } else {
+      keyMeta = it->second;
+    }
+  }
+  return keyMeta->lock();
+}
+
+std::vector<FileSegmentPtr> FsCacheMetadata::lookupRange(
+    const PathKey& path,
+    uint64_t lo,
+    uint64_t hi) const {
+  // Half-open [lo, hi): empty range yields empty result. Reject early so the
+  // prev-segment intersection check below cannot mis-include a segment that
+  // straddles `lo` when there is no actual query window.
+  if (lo >= hi) {
+    return {};
+  }
+  // const_cast: lockKeyMetadata with kReturnNull does not mutate metadata
+  // (it only reads bucket.keys). The non-const lockKeyMetadata signature
+  // covers kCreateEmpty which DOES mutate; here we use kReturnNull so the
+  // cast is sound. Matches CH FileCache::getImpl which uses the same
+  // non-const helper for its const read paths.
+  auto locked = const_cast<FsCacheMetadata*>(this)->lockKeyMetadata(
+      path, KeyNotFoundPolicy::kReturnNull);
+  if (locked.get() == nullptr) {
+    return {};
+  }
+  const auto& segs = locked->segments;
+  std::vector<FileSegmentPtr> result;
+  auto it = segs.lower_bound(lo);
+  if (it != segs.begin()) {
+    auto prev = std::prev(it);
+    const auto prevEnd = prev->second->key().offset + prev->second->key().size;
+    if (prevEnd > lo) {
+      it = prev;
+    }
+  }
+  while (it != segs.end() && it->first < hi) {
+    result.push_back(it->second);
+    ++it;
+  }
+  return result;
+}
+
 bool FsCacheMetadata::erase(const FsCacheKey& key) {
   auto& bucket = *buckets_[bucketIndex(key.path)];
   // Hold the bucket guard while acquiring the per-key mutex. Holding both

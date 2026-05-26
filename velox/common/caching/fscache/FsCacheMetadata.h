@@ -83,6 +83,27 @@ class FsCacheMetadata {
   /// cache miss and proceeds to download, which is correct.
   FileSegmentPtr lookup(const FsCacheKey& key) const;
 
+  /// Returns a LockedKey for `path`. Behaviour on absence depends on policy
+  /// (see KeyNotFoundPolicy). When the policy is kCreateEmpty, an empty
+  /// KeyMetadata is inserted under the bucket guard, then the per-key lock is
+  /// acquired before return. The returned LockedKey owns the per-key mutex;
+  /// the bucket guard is released before return so concurrent lookups under
+  /// other paths in the same bucket are not blocked while the caller holds
+  /// the LockedKey.
+  LockedKey lockKeyMetadata(const PathKey& path, KeyNotFoundPolicy policy);
+
+  /// Returns the segments under `path` whose ranges intersect [lo, hi),
+  /// ordered by ascending offset. Empty result on missing key or no
+  /// intersection. Uses CH-style lower_bound + prev: the segment just
+  /// before lower_bound(lo) may straddle `lo`, so it is checked and
+  /// included if its end > lo. The per-key lock is acquired via
+  /// lockKeyMetadata(kReturnNull) and released on return; the returned
+  /// shared_ptrs keep the segments alive independent of subsequent erases.
+  std::vector<FileSegmentPtr> lookupRange(
+      const PathKey& path,
+      uint64_t lo,
+      uint64_t hi) const;
+
   /// Removes the segment for key. Returns true if it existed. When the last
   /// segment of a KeyMetadata is removed, the KeyMetadata entry is dropped
   /// from the bucket map.
