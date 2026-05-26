@@ -141,6 +141,14 @@ DEFINE_uint64(
     seed_base,
     42,
     "Base seed; per-thread seed = seed_base + tid.");
+DEFINE_double(
+    min_wall_seconds,
+    0.0,
+    "If > 0 and a cell's main-loop wall time falls below this, re-run the "
+    "main loop once with ops scaled up so the wall time reaches the "
+    "threshold. Used to suppress sampling noise on high-throughput hit "
+    "cells where the default --ops finishes in <100 ms. Capped at "
+    "1000 * --ops to bound the worst case.");
 
 namespace {
 
@@ -377,7 +385,8 @@ CellResult runCell(
     uint64_t warmupOps,
     uint64_t ops,
     uint64_t seedBase,
-    int cellIdx) {
+    int cellIdx,
+    double minWallSeconds) {
   const uint64_t wsKeys = static_cast<uint64_t>(
       key.wsMult * static_cast<double>(kMaxCacheBytes) /
       static_cast<double>(kSegmentBytes));
@@ -406,22 +415,57 @@ CellResult runCell(
   // Baseline snapshot AFTER warmup so deltas exclude warmup counters.
   // Without this reset, hit% can exceed 100% because warmup misses count
   // against the main loop's op total.
-  const auto statsBase = driver.fsCache().stats();
+  auto statsBase = driver.fsCache().stats();
   driver.sleepyReadFile().resetBytesRead();
 
+  uint64_t effectiveOps = ops;
   std::vector<std::vector<uint64_t>> mainLat;
-  const auto wallStart = std::chrono::steady_clock::now();
+  auto wallStart = std::chrono::steady_clock::now();
   parallelRun(
       driver,
       key.workload,
       key.threads,
-      ops / key.threads,
+      effectiveOps / key.threads,
       /*recordLatency=*/true,
       seedBase + key.threads,
       &mainLat);
-  const double wallSec = std::chrono::duration<double>(
-                             std::chrono::steady_clock::now() - wallStart)
-                             .count();
+  double wallSec = std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - wallStart)
+                       .count();
+
+  // Adaptive re-run: if the first pass finished too fast for stable
+  // quantiles (e.g. high-throughput hit cells where 200k ops complete in
+  // <100 ms), scale ops up to hit `minWallSeconds` and re-run once.
+  // Capped at 1000x to bound worst case. The driver / FsCache state is
+  // reused; we reset the baseline so the recorded deltas correspond only
+  // to the longer pass.
+  if (minWallSeconds > 0.0 && wallSec > 0.0 && wallSec < minWallSeconds) {
+    const double scale = std::min<double>(1000.0, minWallSeconds / wallSec);
+    uint64_t scaledOps =
+        static_cast<uint64_t>(static_cast<double>(effectiveOps) * scale);
+    // Round up to a multiple of threads so the per-thread slice is whole.
+    scaledOps =
+        ((scaledOps + key.threads - 1) / key.threads) * key.threads;
+    LOG(INFO) << "cell " << cellIdx << " wall=" << wallSec
+              << "s < min=" << minWallSeconds << "s; re-running with ops="
+              << scaledOps;
+    statsBase = driver.fsCache().stats();
+    driver.sleepyReadFile().resetBytesRead();
+    mainLat.clear();
+    effectiveOps = scaledOps;
+    wallStart = std::chrono::steady_clock::now();
+    parallelRun(
+        driver,
+        key.workload,
+        key.threads,
+        effectiveOps / key.threads,
+        /*recordLatency=*/true,
+        seedBase + 2 * key.threads,
+        &mainLat);
+    wallSec = std::chrono::duration<double>(
+                  std::chrono::steady_clock::now() - wallStart)
+                  .count();
+  }
 
   const auto statsFinal = driver.fsCache().stats();
   const uint64_t hitsDelta = statsFinal.hits - statsBase.hits;
@@ -441,9 +485,9 @@ CellResult runCell(
   const auto& cfg = driver.fsCache().config();
   CellResult r;
   r.key = key;
-  r.opsPerSec = static_cast<double>(ops) / wallSec;
-  r.hitRatePct =
-      100.0 * static_cast<double>(hitsDelta) / static_cast<double>(ops);
+  r.opsPerSec = static_cast<double>(effectiveOps) / wallSec;
+  r.hitRatePct = 100.0 * static_cast<double>(hitsDelta) /
+      static_cast<double>(effectiveOps);
   r.bytesDlMB = bytesReadDelta / (1ULL << 20);
   r.evicCount = evictionsDelta;
   // stats_.evictions is a COUNT of segments, not bytes. Multiply before
@@ -535,7 +579,12 @@ int main(int argc, char** argv) {
                     << " threads=" << th << " ws_mult=" << mult
                     << " lat_us=" << lat;
           rows.push_back(runCell(
-              k, FLAGS_warmup_ops, FLAGS_ops, FLAGS_seed_base, cellIdx));
+              k,
+              FLAGS_warmup_ops,
+              FLAGS_ops,
+              FLAGS_seed_base,
+              cellIdx,
+              FLAGS_min_wall_seconds));
           ++cellIdx;
         }
       }
