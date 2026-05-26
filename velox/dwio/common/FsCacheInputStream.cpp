@@ -47,6 +47,13 @@ void FsCacheInputStream::loadCurrentSegmentBuffer() {
       std::min(regionOffset_ + regionLength_, segStart + segSize);
   VELOX_CHECK_LT(rangeStart, rangeEnd);
   const uint64_t length = rangeEnd - rangeStart;
+  // Block until the writer (another thread driving the same shared segment
+  // through reserve/write/complete) has made enough bytes durable. `needed`
+  // is measured from segStart and equals the highest byte offset this read
+  // touches. If the writer abandons, waitForDownloadedSize() throws so the
+  // reader surfaces the failure instead of reading past the partial boundary.
+  const uint64_t needed = (rangeStart - segStart) + length;
+  segment->waitForDownloadedSize(needed);
   buffer_.assign(length, '\0');
   segment->read(rangeStart - segStart, length, buffer_.data(), cacheRoot_);
   cursor_ = 0;
