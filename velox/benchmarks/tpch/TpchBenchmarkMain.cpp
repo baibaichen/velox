@@ -14,16 +14,23 @@
  * limitations under the License.
  */
 
+#include <memory>
+
 #include <folly/init/Init.h>
 #include <gflags/gflags.h>
 
+#include "velox/benchmarks/AbBenchmarkMain.h"
 #include "velox/benchmarks/tpch/TpchBenchmark.h"
 
 int main(int argc, char** argv) {
   std::string kUsage(
-      "This program benchmarks TPC-H queries. Run 'velox_tpch_benchmark -helpon=TpchBenchmark' for available options.\n");
+      "This program benchmarks TPC-H queries. With --input_source={cbi,fscache} "
+      "runs the FsCache-vs-CBI A/B sweep (spec 2026-05-23-fscache-vs-cbi-tpcds). "
+      "Without it, runs the legacy folly::runBenchmarks() flow.\n");
   gflags::SetUsageMessage(kUsage);
   folly::Init init{&argc, &argv, false};
+
   benchmark = std::make_unique<TpchBenchmark>();
-  tpchBenchmarkMain();
+  return facebook::velox::benchmarks::dispatchAbMain(
+      *benchmark, tpchBenchmarkMain);
 }
