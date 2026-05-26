@@ -19,6 +19,7 @@ velox_add_library(
   FsCacheKey.cpp
   FsCacheMetadata.cpp
   DownloadThreadPool.cpp
+  FileCacheQueryLimit.cpp
   FileSegment.cpp
   KeyMetadata.cpp
   LruPolicy.cpp
@@ -29,6 +30,7 @@ velox_add_library(
   FsCacheKey.h
   FsCacheMetadata.h
   DownloadThreadPool.h
+  FileCacheQueryLimit.h
   EvictionPolicy.h
   FileSegment.h
   KeyMetadata.h

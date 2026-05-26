@@ -232,6 +232,13 @@ FileSegmentsHolderPtr FsCache::getOrSet(
   // config_); Task 14 wires it through to fillHoles. Keeping the parameter in
   // the signature here avoids a second ABI break later. isPrefetch is also
   // unused until Task 14 wires it to the stats counters.
+  //
+  // bypass_cache_threshold (spec §8.3): an empty holder tells the caller to
+  // read the full region directly from `remote`. Done before any lock so a
+  // misconfigured huge scan does not even touch the bucket hierarchy.
+  if (shouldBypass(size)) {
+    return std::make_unique<FileSegmentsHolder>(std::vector<FileSegmentPtr>{});
+  }
   const uint64_t fileSize = remote.size();
   VELOX_USER_CHECK_LE(
       offset,
@@ -430,6 +437,15 @@ FsCacheStats FsCache::stats() const {
   snapshot.evictions = counters_.evictions.load(std::memory_order_relaxed);
   snapshot.bytesOnDisk = counters_.bytesOnDisk.load(std::memory_order_relaxed);
   return snapshot;
+}
+
+uint64_t FsCache::totalSize() const {
+  return counters_.bytesOnDisk.load(std::memory_order_relaxed);
+}
+
+bool FsCache::shouldBypass(uint64_t size) const {
+  return config_.bypassThresholdBytes > 0 &&
+      size >= config_.bypassThresholdBytes;
 }
 
 void FsCache::recordHit(FileSegment* segment) {

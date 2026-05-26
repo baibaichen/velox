@@ -441,4 +441,70 @@ TEST(FsCacheSingletonTest, setInstanceRoundTrip) {
   EXPECT_EQ(FsCache::getInstance(), nullptr);
 }
 
+// bypass_cache_threshold (spec §8.3).
+
+TEST_F(FsCacheTest, getOrSetReturnsEmptyHolderWhenRegionExceedsBypassThreshold) {
+  FsCacheConfig cfg = config_;
+  cfg.bypassThresholdBytes = 4UL * 1'024 * 1'024;
+  FsCache cache{cfg};
+  LocalReadFile remote{remotePath_};
+  auto holder = cache.getOrSet(
+      remotePath_,
+      0,
+      8UL * 1'024 * 1'024,
+      cache.config(),
+      remote,
+      IsPrefetch::kDemand);
+  EXPECT_TRUE(holder->empty());
+  EXPECT_EQ(cache.totalSize(), 0u);
+}
+
+TEST_F(FsCacheTest, getOrSetReturnsHolderUnderBypassThreshold) {
+  FsCacheConfig cfg = config_;
+  cfg.bypassThresholdBytes = 4UL * 1'024 * 1'024;
+  FsCache cache{cfg};
+  LocalReadFile remote{remotePath_};
+  auto holder = cache.getOrSet(
+      remotePath_,
+      0,
+      2UL * 1'024 * 1'024,
+      cache.config(),
+      remote,
+      IsPrefetch::kDemand);
+  EXPECT_FALSE(holder->empty());
+}
+
+TEST_F(FsCacheTest, shouldBypassMatchesGetOrSetBoundary) {
+  FsCacheConfig cfg = config_;
+  cfg.bypassThresholdBytes = 4UL * 1'024 * 1'024;
+  FsCache cache{cfg};
+  EXPECT_FALSE(cache.shouldBypass(4UL * 1'024 * 1'024 - 1));
+  EXPECT_TRUE(cache.shouldBypass(4UL * 1'024 * 1'024));
+  EXPECT_TRUE(cache.shouldBypass(8UL * 1'024 * 1'024));
+}
+
+TEST_F(FsCacheTest, shouldBypassDisabledWhenThresholdIsZero) {
+  FsCacheConfig cfg = config_;
+  cfg.bypassThresholdBytes = 0;
+  FsCache cache{cfg};
+  EXPECT_FALSE(cache.shouldBypass(0));
+  EXPECT_FALSE(cache.shouldBypass(1ULL << 40));
+}
+
+TEST_F(FsCacheTest, totalSizeStartsAtZeroAndStaysZeroOnBypass) {
+  FsCacheConfig cfg = config_;
+  cfg.bypassThresholdBytes = 4UL * 1'024 * 1'024;
+  FsCache cache{cfg};
+  EXPECT_EQ(cache.totalSize(), 0u);
+  LocalReadFile remote{remotePath_};
+  (void)cache.getOrSet(
+      remotePath_,
+      0,
+      8UL * 1'024 * 1'024,
+      cache.config(),
+      remote,
+      IsPrefetch::kDemand);
+  EXPECT_EQ(cache.totalSize(), 0u);
+}
+
 } // namespace facebook::velox::cache::fs::test

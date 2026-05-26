@@ -67,6 +67,21 @@ struct FsCacheConfig {
   /// must not share with Velox's CPU executor (spec §7.1 / §10 R4). Capped at
   /// 32 inside DownloadThreadPool to bound per-remote-pread contention.
   size_t downloadThreads{8};
+
+  /// Skip the cache for any single getOrSet request whose `size` is greater
+  /// than or equal to this value. Set to 0 to disable the bypass entirely
+  /// (every request enters the cache regardless of size).
+  ///
+  /// Default 0 (disabled), matching ClickHouse's `FILECACHE_BYPASS_THRESHOLD`
+  /// behaviour (src/Interpreters/FileCache/FileCacheSettings.cpp declares
+  /// `bypass_cache_threshold` as "Undocumented. Not recommended for use" with
+  /// default 0). Rationale: CH relies on per-query
+  /// `filesystem_cache_max_download_size` quotas + LRU itself to keep large
+  /// scans from evicting the warm working set; bypass is a safety valve, not
+  /// the primary defence. Phase-1 ships the mechanism but defaults it off
+  /// until the caller-side QueryLimitToken wiring lands in phase-3 and
+  /// effectiveness can be re-validated with TPC-H and microbench (spec §8.3).
+  uint64_t bypassThresholdBytes{0};
 };
 
 } // namespace facebook::velox::cache::fs

@@ -96,6 +96,21 @@ class FsCache {
   /// Snapshot of counters. Cheap; intended for tests and observability.
   FsCacheStats stats() const;
 
+  /// Returns current on-disk bytes accounted by this cache instance.
+  /// Approximate (relaxed atomic load); intended for tests, metrics, and
+  /// debug logs. Mirrors ClickHouse's `FileCache::getUsedCacheSize()`
+  /// (src/Interpreters/FileCache/FileCache.h), which is also a relaxed
+  /// counter snapshot used for metrics. Equivalent to reading
+  /// `stats().bytesOnDisk` but avoids constructing the POD snapshot.
+  uint64_t totalSize() const;
+
+  /// Returns true if a single-request of `size` bytes should bypass the
+  /// cache. Equivalent to
+  /// `config_.bypassThresholdBytes > 0 && size >= config_.bypassThresholdBytes`.
+  /// Exposed publicly so callers (e.g. metrics, debug logs) can ask the
+  /// same question without re-deriving the comparison. Cheap, lock-free.
+  bool shouldBypass(uint64_t size) const;
+
   /// Returns the immutable config (cacheRoot, maxBytes, segmentSize,
   /// numBuckets). Public so callers like FsCacheBufferedInput can resolve
   /// cacheRoot when constructing input streams over downloaded segments.

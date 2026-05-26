@@ -20,6 +20,7 @@
 #include "velox/dwio/common/FsCacheInputStream.h"
 
 #include <algorithm>
+#include <limits>
 #include <vector>
 
 namespace facebook::velox::dwio::common {
@@ -52,20 +53,51 @@ class DeferredStream final : public SeekableInputStream {
 
   bool Next(const void** data, int32_t* size) override {
     ensureWithData();
+    if (bypassActive_) {
+      if (bytesConsumed_ >= slot_->bypassBuffer.size()) {
+        return false;
+      }
+      const uint64_t remaining =
+          slot_->bypassBuffer.size() - bytesConsumed_;
+      // Clamp to INT32_MAX so callers drain via multiple Next() calls if
+      // a bypass region exceeds 2 GiB. The default disabled threshold
+      // makes this unreachable in practice, but a misconfigured threshold
+      // would otherwise silently truncate the returned size.
+      const uint64_t chunk = std::min<uint64_t>(
+          remaining,
+          static_cast<uint64_t>(std::numeric_limits<int32_t>::max()));
+      *data = slot_->bypassBuffer.data() + bytesConsumed_;
+      *size = static_cast<int32_t>(chunk);
+      bytesConsumed_ += chunk;
+      return true;
+    }
     return inner_->Next(data, size);
   }
 
   void BackUp(int32_t count) override {
+    if (bypassActive_) {
+      VELOX_CHECK_GE(count, 0);
+      VELOX_CHECK_LE(static_cast<uint64_t>(count), bytesConsumed_);
+      bytesConsumed_ -= static_cast<uint64_t>(count);
+      return;
+    }
     VELOX_CHECK_NOT_NULL(
         inner_, "BackUp called before any Next() -- no buffer to back up");
     inner_->BackUp(count);
   }
 
   bool SkipInt64(int64_t count) override {
-    // Skip is allowed pre-load: the caller is positioning the stream without
-    // needing bytes yet. Once inner_ exists, forward unchanged.
     if (count < 0) {
       return false;
+    }
+    if (bypassActive_) {
+      const uint64_t newPos = std::min<uint64_t>(
+          slot_->bypassBuffer.size(),
+          bytesConsumed_ + static_cast<uint64_t>(count));
+      const bool fits =
+          newPos == bytesConsumed_ + static_cast<uint64_t>(count);
+      bytesConsumed_ = newPos;
+      return fits;
     }
     if (inner_ != nullptr) {
       return inner_->SkipInt64(count);
@@ -80,13 +112,20 @@ class DeferredStream final : public SeekableInputStream {
   }
 
   int64_t ByteCount() const override {
-    return inner_ != nullptr
-        ? inner_->ByteCount()
-        : static_cast<int64_t>(bytesConsumed_);
+    if (bypassActive_ || inner_ == nullptr) {
+      return static_cast<int64_t>(bytesConsumed_);
+    }
+    return inner_->ByteCount();
   }
 
   void seekToPosition(PositionProvider& position) override {
     ensureWithData();
+    if (bypassActive_) {
+      const uint64_t target = position.next();
+      VELOX_CHECK_LE(target, slot_->bypassBuffer.size());
+      bytesConsumed_ = target;
+      return;
+    }
     inner_->seekToPosition(position);
   }
 
@@ -101,14 +140,24 @@ class DeferredStream final : public SeekableInputStream {
  private:
   // Materializes inner_ from slot_->holder->segments() (load() must have run)
   // and replays any pre-load SkipInt64 so inner_'s position matches what
-  // ByteCount() has been reporting.
+  // ByteCount() has been reporting. If the cache bypassed this region
+  // (holder->empty()), instead activates the bypass branch which serves
+  // bytes directly from slot_->bypassBuffer populated by load().
   void ensureWithData() {
-    if (inner_ != nullptr) {
+    if (inner_ != nullptr || bypassActive_) {
       return;
     }
     VELOX_CHECK(
         slot_->holder != nullptr,
         "Stream used before FsCacheBufferedInput::load()");
+    if (slot_->holder->empty()) {
+      bypassActive_ = true;
+      VELOX_CHECK_EQ(
+          slot_->bypassBuffer.size(),
+          slot_->region.length,
+          "Bypass buffer size must match region length");
+      return;
+    }
     inner_ = std::make_unique<FsCacheInputStream>(
         slot_->holder->segments(),
         slot_->region.offset,
@@ -124,8 +173,12 @@ class DeferredStream final : public SeekableInputStream {
   cache::fs::FsCache* const cache_;
   std::unique_ptr<FsCacheInputStream> inner_;
   // Skip distance accumulated while inner_ is still null; replayed onto
-  // inner_ the first time we need real bytes.
+  // inner_ the first time we need real bytes. On the bypass path this is
+  // the cursor into slot_->bypassBuffer.
   uint64_t bytesConsumed_{0};
+  // Set once ensureWithData() observes an empty holder; switches every
+  // override to serve bytes from slot_->bypassBuffer instead of inner_.
+  bool bypassActive_{false};
 };
 
 } // namespace
@@ -161,6 +214,21 @@ void FsCacheBufferedInput::load(LogType /*unused*/) {
         // this work is asynchronous prefetch. The reader synchronises
         // through FsCacheInputStream::waitForDownloadedSize, not here.
         cache::fs::IsPrefetch::kPrefetch);
+
+    if (enqueued.holder->empty()) {
+      // Cache bypassed this region (size >= bypassThresholdBytes). Read
+      // the full region directly from remote into the slot-owned buffer;
+      // DeferredStream serves bytes from there. One pread keeps the
+      // network cost at one HTTP range per region, matching CH's
+      // setReadUntilPosition(file_segment.range().right + 1) path
+      // (src/Disks/IO/CachedOnDiskReadBufferFromFile.cpp).
+      enqueued.bypassBuffer.assign(enqueued.region.length, '\0');
+      input_->getReadFile()->pread(
+          enqueued.region.offset,
+          enqueued.region.length,
+          enqueued.bypassBuffer.data());
+      continue;
+    }
 
     for (auto& seg : enqueued.holder->segments()) {
       if (seg->state() == cache::fs::FileSegment::State::kDownloaded) {
