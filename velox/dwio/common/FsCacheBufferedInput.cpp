@@ -156,7 +156,11 @@ void FsCacheBufferedInput::load(LogType /*unused*/) {
         enqueued.region.length,
         fsCache_->config(),
         *input_->getReadFile(),
-        cache::fs::IsPrefetch::kDemand);
+        // load() submits the actual download to DownloadThreadPool and
+        // returns immediately, so from the cache's accounting perspective
+        // this work is asynchronous prefetch. The reader synchronises
+        // through FsCacheInputStream::waitForDownloadedSize, not here.
+        cache::fs::IsPrefetch::kPrefetch);
 
     for (auto& seg : enqueued.holder->segments()) {
       if (seg->state() == cache::fs::FileSegment::State::kDownloaded) {
@@ -164,10 +168,9 @@ void FsCacheBufferedInput::load(LogType /*unused*/) {
         continue;
       }
       if (seg->state() != cache::fs::FileSegment::State::kEmpty) {
-        // Another driver is mid-download. Wait for it to publish kDownloaded
-        // (or throw on its abandon path) so subsequent FileSegment::read()
-        // sees the bytes.
-        seg->waitForDownloadedSize(seg->key().size);
+        // Another driver is mid-download. The reader will block in
+        // FsCacheInputStream::loadCurrentSegmentBuffer via
+        // waitForDownloadedSize, so load() does not need to wait here.
         fsCache_->recordHit(seg.get());
         continue;
       }
@@ -178,29 +181,48 @@ void FsCacheBufferedInput::load(LogType /*unused*/) {
           // disk and published it directly.
           fsCache_->recordMiss(seg.get(), seg->key().size);
         } else {
-          seg->waitForDownloadedSize(seg->key().size);
+          // Lost the reserve() race. The reader will sync via
+          // waitForDownloadedSize; just count this as a hit on the
+          // in-flight bytes.
           fsCache_->recordHit(seg.get());
         }
         continue;
       }
-      try {
-        constexpr uint64_t kChunk = 1UL << 20;
-        std::vector<char> buf(std::min<uint64_t>(kChunk, seg->key().size));
-        uint64_t remaining = seg->key().size;
-        uint64_t cursor = seg->key().offset;
-        while (remaining > 0) {
-          const uint64_t toRead = std::min<uint64_t>(buf.size(), remaining);
-          input_->getReadFile()->pread(cursor, toRead, buf.data());
-          seg->write(buf.data(), toRead);
-          cursor += toRead;
-          remaining -= toRead;
-        }
-        seg->complete();
-        fsCache_->recordMiss(seg.get(), seg->key().size);
-      } catch (...) {
-        seg->abandon();
-        throw;
-      }
+      // Move the per-segment work onto the download pool. The closure
+      // captures shared_ptrs (segCapture, readFile) and the FsCache raw
+      // pointer (its lifetime exceeds this BufferedInput, see
+      // QueryCtx::fsCache_). load() returns as soon as the reserve loop
+      // finishes; readers synchronise via FileSegment::waitForDownloadedSize.
+      auto segCapture = seg;
+      auto readFile = input_->getReadFile();
+      auto* cache = fsCache_;
+      fsCache_->downloadPool().submit(
+          [segCapture, readFile, cache]() mutable {
+            try {
+              constexpr uint64_t kChunk = 1UL << 20;
+              std::vector<char> buf(
+                  std::min<uint64_t>(kChunk, segCapture->key().size));
+              uint64_t remaining = segCapture->key().size;
+              uint64_t cursor = segCapture->key().offset;
+              while (remaining > 0) {
+                const uint64_t toRead =
+                    std::min<uint64_t>(buf.size(), remaining);
+                readFile->pread(cursor, toRead, buf.data());
+                segCapture->write(buf.data(), toRead);
+                cursor += toRead;
+                remaining -= toRead;
+              }
+              segCapture->complete();
+              cache->recordMiss(segCapture.get(), segCapture->key().size);
+            } catch (...) {
+              // No re-throw: the task runs detached on the pool. The
+              // abandon() call moves the segment to kPartiallyDownloaded
+              // and notifies cv_, so a reader blocked in
+              // waitForDownloadedSize wakes up and surfaces the failure
+              // to its query.
+              segCapture->abandon();
+            }
+          });
     }
   }
 }

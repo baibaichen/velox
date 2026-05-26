@@ -32,7 +32,9 @@ namespace facebook::velox::cache::fs {
 
 FsCache::FsCache(FsCacheConfig config)
     : config_{std::move(config)},
-      metadata_{std::make_unique<FsCacheMetadata>(config_.numBuckets)} {
+      metadata_{std::make_unique<FsCacheMetadata>(config_.numBuckets)},
+      downloadPool_{
+          std::make_unique<DownloadThreadPool>(config_.downloadThreads)} {
   // splitRange relies on maxSegmentSize being a multiple of alignment so
   // chunk starts remain aligned. Validate at construction since the
   // FsCacheConfig struct itself has no constructor to enforce it.

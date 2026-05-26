@@ -31,6 +31,7 @@ set(
   FsCachePartialRecoveryTest.cpp
   FsCachePersistenceTest.cpp
   FsCacheConcurrencyTest.cpp
+  DownloadThreadPoolTest.cpp
   KeyGeneratorTest.cpp
   KeyMetadataTest.cpp
 )

@@ -275,11 +275,27 @@ void FileSegment::read(
     uint64_t length,
     char* outBuf,
     const std::string& cacheRoot) const {
+  // Spec §4.2 partial-readable: caller is expected to have called
+  // waitForDownloadedSize(offsetInSegment + length) first, so the bytes
+  // exist on disk even if the segment is still kDownloading. Allow read
+  // from kDownloading + kDownloaded + kDetached; reject only states where
+  // the file may have been removed (kEmpty, kPartiallyDownloaded* with
+  // pending eviction).
+  const auto currentState = state();
   VELOX_CHECK(
-      state() == State::kDownloaded || state() == State::kDetached,
+      currentState == State::kDownloaded || currentState == State::kDetached ||
+          currentState == State::kDownloading,
       "FileSegment::read called in state {}",
-      static_cast<int>(state()));
+      static_cast<int>(currentState));
   VELOX_CHECK_LE(offsetInSegment + length, key_.size);
+  const auto downloaded =
+      downloadedSize_.load(std::memory_order_acquire);
+  VELOX_CHECK_LE(
+      offsetInSegment + length,
+      downloaded,
+      "FileSegment::read past durable byte boundary; caller must waitForDownloadedSize first: end={} downloadedSize={}",
+      offsetInSegment + length,
+      downloaded);
 
   // Go through Velox's LocalReadFile rather than std::ifstream so the read
   // follows the same FileIoContext / pread semantics every other Velox path

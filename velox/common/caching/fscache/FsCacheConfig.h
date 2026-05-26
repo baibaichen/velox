@@ -62,6 +62,11 @@ struct FsCacheConfig {
   /// without blowing up the metadata array. Bucket count should be a power of
   /// two for the hash → bucket modulo to fold cleanly.
   size_t numBuckets{1024};
+
+  /// Number of threads dedicated to asynchronous segment downloads. IO-bound;
+  /// must not share with Velox's CPU executor (spec §7.1 / §10 R4). Capped at
+  /// 32 inside DownloadThreadPool to bound per-remote-pread contention.
+  size_t downloadThreads{8};
 };
 
 } // namespace facebook::velox::cache::fs

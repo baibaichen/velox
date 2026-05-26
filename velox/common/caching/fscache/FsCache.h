@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "velox/common/caching/fscache/DownloadThreadPool.h"
 #include "velox/common/caching/fscache/FileSegment.h"
 #include "velox/common/caching/fscache/FileSegmentsHolder.h"
 #include "velox/common/caching/fscache/FsCacheConfig.h"
@@ -200,6 +201,12 @@ class FsCache {
   /// alongside the warm-restart orphan-bytes counter (see loadFromDisk).
   void evict(uint64_t bytesNeeded);
 
+  /// Asynchronous download executor shared by every FsCacheBufferedInput::load
+  /// call. Owned by FsCache so its lifetime matches the cache's; never null.
+  DownloadThreadPool& downloadPool() {
+    return *downloadPool_;
+  }
+
  private:
   // Live atomic counters. stats() composes an FsCacheStats POD snapshot from
   // per-field relaxed loads. Per-field atomicity is enough for the
@@ -234,6 +241,14 @@ class FsCache {
   // one call is "last" in the next; distributes the eviction load and
   // prevents always-evict-from-bucket-0 starvation.
   std::atomic<size_t> evictStart_{0};
+
+  // MUST be declared LAST so it is destroyed FIRST. Its dtor calls
+  // executor_.join() which drains every in-flight download task before
+  // any other member (counters_, metadata_, evictionMutex_) is torn down.
+  // Re-ordering this above counters_ or metadata_ silently introduces UAF
+  // in the recordMiss / evict closure bodies dispatched from
+  // FsCacheBufferedInput::load.
+  std::unique_ptr<DownloadThreadPool> downloadPool_;
 };
 
 } // namespace facebook::velox::cache::fs
