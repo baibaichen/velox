@@ -21,6 +21,7 @@ set(
   FileSegmentTest.cpp
   FileSegmentStateTest.cpp
   FileSegmentWriteTest.cpp
+  FileSegmentPartialReadTest.cpp
   FsCacheSplitRangeTest.cpp
   FsCacheMetadataTest.cpp
   FsCacheTest.cpp

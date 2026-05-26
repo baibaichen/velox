@@ -153,6 +153,14 @@ class FileSegment {
   /// "this thread owns a leaked DOWNLOADING segment".
   std::thread::id getDownloader() const noexcept;
 
+  /// Blocks the calling reader until downloadedSize_ >= needed OR the
+  /// segment transitions out of kDownloading. If the segment ends in
+  /// kPartiallyDownloaded / kPartiallyDownloadedNoContinuation / kDetached
+  /// AND downloadedSize_ < needed, throws VeloxRuntimeError so the reader
+  /// surfaces the writer's abandon instead of reading past the partial
+  /// boundary. kDownloaded is always a clean wake.
+  void waitForDownloadedSize(uint64_t needed);
+
   /// Reads bytes [offsetInSegment, offsetInSegment + length) from the local
   /// file into outBuf. State must be kDownloaded or kDetached.
   void read(

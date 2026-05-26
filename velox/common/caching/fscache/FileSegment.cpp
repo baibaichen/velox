@@ -235,6 +235,27 @@ std::thread::id FileSegment::getDownloader() const noexcept {
   return downloader_.load(std::memory_order_acquire);
 }
 
+void FileSegment::waitForDownloadedSize(uint64_t needed) {
+  std::unique_lock<FileSegmentMutex> lk{mutex_};
+  cv_.wait(lk, [&]() {
+    return downloadedSize_.load(std::memory_order_acquire) >= needed ||
+        state_.load(std::memory_order_acquire) != State::kDownloading;
+  });
+  const auto have = downloadedSize_.load(std::memory_order_acquire);
+  if (have >= needed) {
+    return;
+  }
+  // State exited kDownloading short of needed: writer abandoned. Reader
+  // must surface the failure rather than reading garbage past the
+  // partial boundary.
+  const auto finalState = state_.load(std::memory_order_acquire);
+  VELOX_FAIL(
+      "FileSegment writer abandoned with downloadedSize={} < needed={}, finalState={}",
+      have,
+      needed,
+      static_cast<int>(finalState));
+}
+
 void FileSegment::read(
     uint64_t offsetInSegment,
     uint64_t length,
