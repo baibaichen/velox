@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace facebook::velox {
@@ -73,6 +74,11 @@ class FileSegment {
   FileSegment(FsCacheKey key, std::string remotePath)
       : key_{std::move(key)}, remotePath_{std::move(remotePath)} {}
 
+  /// Closes a leaked writer fd if a kDownloading segment is dropped without
+  /// complete() or abandon(). Normal paths close fd_ explicitly; this is a
+  /// safety net for exception-throwing tests and future error paths.
+  ~FileSegment();
+
   /// Returns the cache key (path/offset/size) that identifies this segment.
   const FsCacheKey& key() const {
     return key_;
@@ -120,6 +126,33 @@ class FileSegment {
       ::facebook::velox::ReadFile& remote,
       const std::string& cacheRoot);
 
+  /// Atomically transitions kEmpty -> kDownloading, opens the local cache
+  /// file (O_CREAT|O_WRONLY, NO ftruncate), and records the calling thread
+  /// as the writer. Returns false if the segment was not kEmpty (another
+  /// writer already won or segment already kDownloaded).
+  /// reservedBytes is the declared size; complete() will ftruncate to this.
+  bool reserve(uint64_t reservedBytes, const std::string& cacheRoot);
+
+  /// Appends `len` bytes at current downloadedSize_ via pwrite, advances
+  /// downloadedSize_ release-store, notify_all on cv_. Must be called by
+  /// the thread that won reserve(). Throws if downloadedSize_ + len would
+  /// exceed reservedBytes.
+  void write(const char* buf, uint64_t len);
+
+  /// CAS kDownloading -> kDownloaded, ftruncate(fd_, key().size),
+  /// fsync, close(fd_), notify_all. Must be called by the writer thread.
+  void complete();
+
+  /// CAS kDownloading -> kPartiallyDownloaded; close(fd_) without
+  /// ftruncate (partial stat_size lets loadFromDisk delete the file on
+  /// next restart per spec §5.5).
+  void abandon();
+
+  /// Returns the thread id of the current writer or a default-constructed
+  /// id if no writer is active. Used by FileSegmentsHolder dtor to detect
+  /// "this thread owns a leaked DOWNLOADING segment".
+  std::thread::id getDownloader() const noexcept;
+
   /// Reads bytes [offsetInSegment, offsetInSegment + length) from the local
   /// file into outBuf. State must be kDownloaded or kDetached.
   void read(
@@ -155,6 +188,16 @@ class FileSegment {
   std::string remotePath_;
   std::atomic<State> state_{State::kEmpty};
   std::atomic<uint64_t> downloadedSize_{0};
+
+  // Thread that won reserve(). Default-constructed when no writer is active.
+  std::atomic<std::thread::id> downloader_{};
+
+  // Open file descriptor for the writer path; -1 when no writer is active.
+  int fd_{-1};
+
+  // Bytes promised by reserve(); complete() ftruncates to key().size and
+  // write() checks downloadedSize_ + len <= reservedBytes_.
+  uint64_t reservedBytes_{0};
 
   // Phase 1: hits_ is recorded but not consumed; SLRU promotion lands in
   // phase 2.
