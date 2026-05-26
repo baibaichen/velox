@@ -100,6 +100,24 @@ class FsCache {
       uint64_t size,
       const FsCacheConfig& config);
 
+  /// Given `found` (from FsCacheMetadata::lookupRange) and the requested range
+  /// [lo, hi), returns a continuous list covering [lo, hi) where every gap is
+  /// filled with newly inserted kEmpty segments sliced by cfg.maxSegmentSize.
+  /// Caller MUST already hold `lockedKey` for `path`; new segments are
+  /// inserted directly into `lockedKey->segments` (not via
+  /// FsCacheMetadata::insert, which would re-acquire the same per-key mutex
+  /// and deadlock). The `metadata` parameter is reserved for future per-bucket
+  /// accounting and currently only documents the contract.
+  static std::vector<FileSegmentPtr> fillHolesWithEmptyFileSegments(
+      std::vector<FileSegmentPtr> found,
+      uint64_t lo,
+      uint64_t hi,
+      const PathKey& path,
+      const std::string& remotePath,
+      LockedKey& lockedKey,
+      FsCacheMetadata& metadata,
+      const FsCacheConfig& cfg);
+
   /// Scans cacheRoot for cache files left over from a previous run. Removes
   /// .tmp files and size-mismatched files, then rmdirs any subdirectory left
   /// empty afterwards. Does NOT repopulate metadata_ (the on-disk filename

@@ -105,6 +105,92 @@ std::vector<std::pair<uint64_t, uint64_t>> FsCache::splitRange(
   return result;
 }
 
+namespace {
+
+// Splits [lo, hi) into kEmpty segments of size <= maxSegmentSize and
+// emplaces them into lockedKey.segments(). Pushes the new shared_ptrs onto
+// `out` in offset-ascending order. Caller must hold `lockedKey`; this is
+// what makes the segments-map mutation race-free.
+void sliceHoleAndInsert(
+    uint64_t lo,
+    uint64_t hi,
+    const PathKey& path,
+    const std::string& remotePath,
+    LockedKey& lockedKey,
+    const FsCacheConfig& cfg,
+    std::vector<FileSegmentPtr>& out) {
+  auto* keyMeta = lockedKey.get();
+  VELOX_CHECK_NOT_NULL(
+      keyMeta, "sliceHoleAndInsert requires a non-empty LockedKey");
+  uint64_t cursor{lo};
+  while (cursor < hi) {
+    const uint64_t size = std::min(cfg.maxSegmentSize, hi - cursor);
+    auto seg = std::make_shared<FileSegment>(
+        FsCacheKey{path, cursor, size}, remotePath);
+    const auto inserted = keyMeta->segments.emplace(cursor, seg).second;
+    // Caller holds the per-key lock and lookupRange already showed no segment
+    // at `cursor`; a duplicate here is therefore a programming error.
+    VELOX_CHECK(
+        inserted,
+        "fillHolesWithEmptyFileSegments: duplicate insert at offset={}",
+        cursor);
+    ++keyMeta->numSegments;
+    out.push_back(std::move(seg));
+    cursor += size;
+  }
+}
+
+} // namespace
+
+std::vector<FileSegmentPtr> FsCache::fillHolesWithEmptyFileSegments(
+    std::vector<FileSegmentPtr> found,
+    uint64_t lo,
+    uint64_t hi,
+    const PathKey& path,
+    const std::string& remotePath,
+    LockedKey& lockedKey,
+    FsCacheMetadata& /* metadata */,
+    const FsCacheConfig& cfg) {
+  std::vector<FileSegmentPtr> result;
+  if (found.empty()) {
+    sliceHoleAndInsert(lo, hi, path, remotePath, lockedKey, cfg, result);
+    return result;
+  }
+
+  // Leading hole.
+  if (lo < found.front()->key().offset) {
+    sliceHoleAndInsert(
+        lo,
+        found.front()->key().offset,
+        path,
+        remotePath,
+        lockedKey,
+        cfg,
+        result);
+  }
+
+  for (size_t i{0}; i < found.size(); ++i) {
+    result.push_back(found[i]);
+    if (i + 1 < found.size()) {
+      const uint64_t gapStart = found[i]->key().offset + found[i]->key().size;
+      const uint64_t gapEnd = found[i + 1]->key().offset;
+      if (gapStart < gapEnd) {
+        sliceHoleAndInsert(
+            gapStart, gapEnd, path, remotePath, lockedKey, cfg, result);
+      }
+    }
+  }
+
+  // Trailing hole.
+  const uint64_t lastEnd =
+      found.back()->key().offset + found.back()->key().size;
+  if (lastEnd < hi) {
+    sliceHoleAndInsert(
+        lastEnd, hi, path, remotePath, lockedKey, cfg, result);
+  }
+  return result;
+}
+
 std::vector<FileSegmentPtr> FsCache::getOrSet(
     const std::string& path,
     uint64_t offset,
