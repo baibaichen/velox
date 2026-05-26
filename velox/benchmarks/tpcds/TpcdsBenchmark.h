@@ -18,7 +18,7 @@
 #include <string>
 #include <string_view>
 
-#include "velox/benchmarks/QueryBenchmarkBase.h"
+#include "velox/benchmarks/AbBenchmarkBase.h"
 #include "velox/exec/tests/utils/TpcdsQueryBuilder.h"
 
 DECLARE_string(plan_path);
@@ -28,7 +28,7 @@ inline constexpr std::string_view kPrestoHiveConnectorId = "hive";
 inline constexpr std::string_view kPrestoFunctionNamespacePrefix =
     "presto.default.";
 
-class TpcdsBenchmark : public facebook::velox::QueryBenchmarkBase {
+class TpcdsBenchmark : public facebook::velox::benchmarks::AbBenchmarkBase {
  public:
   void initialize() override;
 
@@ -37,15 +37,6 @@ class TpcdsBenchmark : public facebook::velox::QueryBenchmarkBase {
   void runMain(std::ostream& out, facebook::velox::RunStats& runStats) override;
 
   void runQuery(int32_t queryId);
-
-  /// Runs the spec 2026-05-23-fscache-vs-cbi-tpcds A/B sweep:
-  /// FLAGS_rounds outer iterations x 99 queries, plan construction
-  /// hoisted once before the round loop. Per-query wall_ms is measured
-  /// by std::chrono::steady_clock around QueryBenchmarkBase::run().
-  /// Writes one CSV row per (round, query) to FLAGS_out. Returns the
-  /// number of failed queries (rows with non-empty error column) so
-  /// the caller can set a non-zero exit code without re-reading the CSV.
-  int32_t runAb();
 
   /// Override to stamp splits with the plan's connector ID (e.g. "hive")
   /// instead of the default "test-hive" used by the base class.
@@ -59,8 +50,15 @@ class TpcdsBenchmark : public facebook::velox::QueryBenchmarkBase {
   /// Override to create a different query builder (e.g. CudfTpcdsQueryBuilder).
   virtual void initQueryBuilder();
 
+  int32_t numQueries() const override {
+    return 99;
+  }
+
+  facebook::velox::exec::test::TpchPlan buildPlan(int32_t queryId) override {
+    return queryBuilder_->getQueryPlan(queryId, planDir_, pool_.get());
+  }
+
   std::unique_ptr<facebook::velox::exec::test::TpcdsQueryBuilder> queryBuilder_;
-  std::unordered_map<std::string, std::string> queryConfigs_;
   std::string planDir_;
   std::shared_ptr<facebook::velox::memory::MemoryPool> pool_;
 };

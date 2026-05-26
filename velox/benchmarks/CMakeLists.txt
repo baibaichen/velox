@@ -63,6 +63,19 @@ if(${VELOX_BUILD_TEST_UTILS})
     Folly::follybenchmark
     fmt::fmt
   )
+
+  add_library(velox_benchmark_ab AbBenchmarkBase.cpp)
+  velox_add_test_headers(velox_benchmark_ab AbBenchmarkBase.h)
+
+  target_link_libraries(
+    velox_benchmark_ab
+    velox_query_benchmark
+    velox_caching
+    velox_fscache
+    Folly::folly
+    fmt::fmt
+    gflags::gflags
+  )
 endif()
 
 if(${VELOX_ENABLE_BENCHMARKS_BASIC})

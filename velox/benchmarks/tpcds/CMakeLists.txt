@@ -18,6 +18,7 @@ velox_add_test_headers(velox_tpcds_benchmark_lib TpcdsBenchmark.h)
 target_link_libraries(
   velox_tpcds_benchmark_lib
   velox_query_benchmark
+  velox_benchmark_ab
   velox_aggregates
   velox_window
   velox_exec
