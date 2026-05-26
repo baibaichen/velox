@@ -149,6 +149,17 @@ DEFINE_double(
     "threshold. Used to suppress sampling noise on high-throughput hit "
     "cells where the default --ops finishes in <100 ms. Capped at "
     "1000 * --ops to bound the worst case.");
+DEFINE_uint64(
+    num_files,
+    1,
+    "Number of distinct virtual path strings the benchmark routes through. "
+    "Each path string hashes to a different PathKey and therefore a "
+    "different per-bucket lock in FsCacheMetadata, so raising this above 1 "
+    "disperses recordHit() contention across buckets. The working set "
+    "(wsKeys) is split evenly across files. All virtual paths read from the "
+    "same on-disk blob via the shared SleepyReadFile, so disk IO behavior "
+    "is unchanged. Default 1 preserves prior behavior (all threads hit the "
+    "same bucket).");
 
 namespace {
 
@@ -330,6 +341,7 @@ void parallelRun(
     Workload workload,
     uint64_t threads,
     uint64_t opsPerThread,
+    uint64_t numFiles,
     bool recordLatency,
     uint64_t seedBase,
     std::vector<std::vector<uint64_t>>* perThreadLatencies) {
@@ -343,19 +355,31 @@ void parallelRun(
   workers.reserve(threads);
   for (uint64_t t = 0; t < threads; ++t) {
     workers.emplace_back([&, t] {
-      // Sequential: each thread owns a disjoint slice of
-      // [0, workingSetKeys) by giving KeyGenerator universe = slice and
-      // adding keyOffset to every output. KeyGenerator stays
+      // Pick a virtual file for this thread. Each fileId maps to a
+      // distinct path string ("<kRemotePath>#<fileId>") whose PathKey
+      // hashes to a different FsCacheMetadata bucket. With numFiles >=
+      // threads, every thread routes to its own bucket and the per-bucket
+      // recordHit() lock no longer serializes the hit path.
+      const uint64_t fileId = t % numFiles;
+      const std::string pathStr = numFiles == 1
+          ? std::string{kRemotePath}
+          : std::string{kRemotePath} + "#" + std::to_string(fileId);
+      // Sequential: each thread owns a disjoint slice of the per-file
+      // keyspace [0, wsKeys / numFiles) by giving KeyGenerator
+      // universe = slice and adding keyOffset. KeyGenerator stays
       // workload-agnostic; the per-thread offset lives here in the driver.
-      // Zipfian / uniform: shared keyspace, no offset.
+      // Zipfian / uniform: shared per-file keyspace, no offset.
+      const uint64_t threadsPerFile = (threads + numFiles - 1) / numFiles;
+      const uint64_t threadIndexInFile = t / numFiles;
+      const uint64_t wsKeysPerFile = driver.workingSetKeys() / numFiles;
       uint64_t universe;
       uint64_t keyOffset;
       if (workload == Workload::kSequential) {
-        const uint64_t slice = driver.workingSetKeys() / threads;
+        const uint64_t slice = wsKeysPerFile / threadsPerFile;
         universe = slice;
-        keyOffset = t * slice;
+        keyOffset = threadIndexInFile * slice;
       } else {
-        universe = driver.workingSetKeys();
+        universe = wsKeysPerFile;
         keyOffset = 0;
       }
       KeyGenerator gen{workload, universe, seedBase + t};
@@ -364,7 +388,7 @@ void parallelRun(
         const uint64_t offset = (keyOffset + gen.next()) * kSegmentBytes;
         const auto start = std::chrono::steady_clock::now();
         auto segs = driver.fsCache().getOrSet(
-            kRemotePath, offset, kSegmentBytes, driver.sleepyReadFile());
+            pathStr, offset, kSegmentBytes, driver.sleepyReadFile());
         const auto end = std::chrono::steady_clock::now();
         (void)segs;
         if (lat != nullptr) {
@@ -386,7 +410,8 @@ CellResult runCell(
     uint64_t ops,
     uint64_t seedBase,
     int cellIdx,
-    double minWallSeconds) {
+    double minWallSeconds,
+    uint64_t numFiles) {
   const uint64_t wsKeys = static_cast<uint64_t>(
       key.wsMult * static_cast<double>(kMaxCacheBytes) /
       static_cast<double>(kSegmentBytes));
@@ -397,6 +422,26 @@ CellResult runCell(
       "ops {} must divide cleanly by threads {}",
       ops,
       key.threads);
+  VELOX_USER_CHECK_GT(numFiles, 0, "num_files must be > 0");
+  VELOX_USER_CHECK_GT(
+      wsKeys / numFiles,
+      0,
+      "wsKeys {} too small to split across num_files {}",
+      wsKeys,
+      numFiles);
+  if (key.workload == Workload::kSequential) {
+    const uint64_t threadsPerFile =
+        (key.threads + numFiles - 1) / numFiles;
+    VELOX_USER_CHECK_GT(
+        (wsKeys / numFiles) / threadsPerFile,
+        0,
+        "Sequential per-thread slice is 0; wsKeysPerFile {} too small "
+        "for threadsPerFile {} (threads {} / num_files {})",
+        wsKeys / numFiles,
+        threadsPerFile,
+        key.threads,
+        numFiles);
+  }
 
   FsCacheDriver driver(wsKeys, key.latencyUs, cellIdx);
 
@@ -408,6 +453,7 @@ CellResult runCell(
       key.workload,
       key.threads,
       warmupOps / key.threads,
+      numFiles,
       /*recordLatency=*/false,
       seedBase,
       &dummyLat);
@@ -426,6 +472,7 @@ CellResult runCell(
       key.workload,
       key.threads,
       effectiveOps / key.threads,
+      numFiles,
       /*recordLatency=*/true,
       seedBase + key.threads,
       &mainLat);
@@ -459,6 +506,7 @@ CellResult runCell(
         key.workload,
         key.threads,
         effectiveOps / key.threads,
+        numFiles,
         /*recordLatency=*/true,
         seedBase + 2 * key.threads,
         &mainLat);
@@ -552,6 +600,7 @@ int main(int argc, char** argv) {
   VELOX_USER_CHECK(!threadsList.empty(), "--threads_list is empty");
   VELOX_USER_CHECK(!wsMultList.empty(), "--ws_mult_list is empty");
   VELOX_USER_CHECK(!latencyList.empty(), "--remote_latency_us_list is empty");
+  VELOX_USER_CHECK_GT(FLAGS_num_files, 0, "--num_files must be > 0");
   for (auto t : threadsList) {
     VELOX_USER_CHECK_GT(t, 0, "threads must be > 0");
     VELOX_USER_CHECK_EQ(
@@ -584,7 +633,8 @@ int main(int argc, char** argv) {
               FLAGS_ops,
               FLAGS_seed_base,
               cellIdx,
-              FLAGS_min_wall_seconds));
+              FLAGS_min_wall_seconds,
+              FLAGS_num_files));
           ++cellIdx;
         }
       }
