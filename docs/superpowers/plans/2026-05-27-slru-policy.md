@@ -460,3 +460,26 @@ In `docs/superpowers/specs/2026-05-26-fscache-ch-aligned-redesign.md`:
    (`FileSegment.h:221`) was added under the assumption SLRU would use it
    (spec §8.1 old text). With CH-aligned SLRU it is unused for promotion.
    Keep for stats / observability, or remove in a follow-up?
+
+---
+
+## 9. Task F outcome (2026-05-28)
+
+**Decision: B — keep `enableSlru = false` default.** See
+`docs/superpowers/results/2026-05-27-fscache-slru-vs-lru.md` for the 3
+data tables.
+
+- Microbench: SLRU wins +90 % on zipfian-eviction (ws_mult=2, t=16), loses
+  -29 % on sequential-eviction and -14 % on t=1 uniform hot path.
+- SF=0.01 equivalence: 22/22 PASS under SLRU (correctness clean).
+- SF=100 sweep: SLRU 0.4 – 1.7 % faster on q01/q06/q14/q19/q22 medians,
+  inside noise. Working set fits in cache → 0 eviction → SLRU's mechanism
+  never engages.
+
+**Deferred** (not blocking phase-1):
+
+- Cache-level SLRU (vs per-bucket) — required for SLRU to protect a
+  meaningful hot tail. Per-bucket protected ≈ 1 segment at 1024 buckets,
+  64 GiB cap, ratio 0.6.
+- Hit-path SLRU cost (-13.7 % t=1 uniform) — fold `isProtected_` into
+  LruPolicy map entry to drop one hash lookup off `onHit`.

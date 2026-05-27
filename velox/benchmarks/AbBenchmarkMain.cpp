@@ -32,6 +32,19 @@ DECLARE_int32(fscache_disk_gib);
 DECLARE_string(fscache_root);
 DECLARE_int32(cache_gb);
 
+DEFINE_bool(
+    enable_slru,
+    false,
+    "If true and --input_source=fscache, construct the FsCache with "
+    "FsCacheConfig::enableSlru=true (SlruPolicy per bucket). Used by the "
+    "Task F SF=100 LRU-vs-SLRU sweep (docs/superpowers/plans/"
+    "2026-05-27-slru-policy.md).");
+DEFINE_double(
+    slru_protected_ratio,
+    0.6,
+    "Protected-list fraction when --enable_slru. Forwarded into "
+    "FsCacheConfig::slruProtectedRatio.");
+
 namespace facebook::velox::benchmarks {
 namespace {
 
@@ -59,6 +72,8 @@ std::unique_ptr<facebook::velox::cache::fs::FsCache> installFsCache() {
   FsCacheConfig cfg;
   cfg.cacheRoot = FLAGS_fscache_root;
   cfg.maxBytes = static_cast<uint64_t>(FLAGS_fscache_disk_gib) << 30;
+  cfg.enableSlru = FLAGS_enable_slru;
+  cfg.slruProtectedRatio = FLAGS_slru_protected_ratio;
   auto cache = std::make_unique<FsCache>(cfg);
   FsCache::setInstance(cache.get());
   return cache;

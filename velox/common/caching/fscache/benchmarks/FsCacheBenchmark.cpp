@@ -149,6 +149,18 @@ DEFINE_double(
     "threshold. Used to suppress sampling noise on high-throughput hit "
     "cells where the default --ops finishes in <100 ms. Capped at "
     "1000 * --ops to bound the worst case.");
+DEFINE_bool(
+    enable_slru,
+    false,
+    "If true, construct the FsCache with FsCacheConfig::enableSlru=true so the "
+    "per-bucket eviction policy is SlruPolicy instead of LruPolicy. Used by "
+    "the Task F LRU-vs-SLRU A/B sweep (docs/superpowers/plans/"
+    "2026-05-27-slru-policy.md).");
+DEFINE_double(
+    slru_protected_ratio,
+    0.6,
+    "Protected-list fraction when --enable_slru. Forwarded into "
+    "FsCacheConfig::slruProtectedRatio. Ignored when --enable_slru=false.");
 DEFINE_uint64(
     num_files,
     1,
@@ -302,6 +314,8 @@ class FsCacheDriver {
     cfg.maxBytes = kMaxCacheBytes;
     cfg.alignment = kSegmentBytes;
     cfg.maxSegmentSize = kSegmentBytes;
+    cfg.enableSlru = FLAGS_enable_slru;
+    cfg.slruProtectedRatio = FLAGS_slru_protected_ratio;
     fsCache_ = std::make_unique<FsCache>(cfg);
   }
 
