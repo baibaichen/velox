@@ -150,8 +150,10 @@ ws_mult=0.5 + lat=0 是**全命中纯 hit-path**，理想扩展系数应 ≥ 0.8
   per-key。`KeyMetadata` 引入 `LockedKey` RAII（phase-1 已有原型，本
   spec 跟 CH `Metadata::lockKeyMetadata` 行为对齐，含 `KeyNotFoundPolicy`
   4 态枚举）。
-- **atomic stats + try_lock LRU bump**：`hits/misses/evictions/bytesOnDisk`
-  全部 `std::atomic` 操作；`recordHit` 用 `try_to_lock` 拿 LRU 锁，
+- **atomic stats + try_lock LRU bump**：内部 `AtomicCounters` 6 字段
+  `prefetchHits/prefetchMisses/demandHits/demandMisses/evictions/bytesOnDisk`
+  写路径全部 `std::atomic` 操作（POD `FsCacheStats` snapshot 由
+  `FsCache::stats()` 一次性拷出，见 §6.3）；`recordHit` 用 `try_to_lock` 拿 LRU 锁，
   失败即跳过 LRU 提升（best-effort）。
 - **`DownloadThreadPool` + async load**：`load()` 把每段 EMPTY 投递到
   下载池，`FsCacheBufferedInput::load()` 立即返回；reader 第一次 `Next()`

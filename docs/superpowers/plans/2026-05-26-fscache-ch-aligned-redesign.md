@@ -4604,14 +4604,76 @@ TEST_F(FsCacheBufferedInputTest, prefetchHitRateOnWarmReread) {
       finalStats.prefetchMisses - baselinePrefetchMisses;
   EXPECT_GT(addedPrefetchHits, 0u);
   EXPECT_EQ(addedPrefetchMisses, 0u);
-  // prefetchHitRate computed on the delta — Task 16 perf gate watches
-  // this number. prefetchHitRate(finalStats) would mix in the first
-  // pass's misses; the delta is the right per-interval rate.
+  // prefetchHitRate computed on the delta — spec §9.2 gate is ≥ 0.95.
+  // Use GE rather than DOUBLE_EQ(1.0) so future SLRU / drainer races
+  // that legally let a couple of prefetches miss do not spurious-fail
+  // this case; the spurious-miss budget is bounded below.
   const double rate = addedPrefetchHits + addedPrefetchMisses == 0
       ? 0.0
       : static_cast<double>(addedPrefetchHits) /
           static_cast<double>(addedPrefetchHits + addedPrefetchMisses);
-  EXPECT_DOUBLE_EQ(rate, 1.0);
+  EXPECT_GE(rate, 0.95);
+  // Sanity: even with the 5% slack on `rate`, the absolute miss count
+  // must stay small (≤ 5% of total prefetch traffic from the warm
+  // pass). Without this, a degenerate case where addedPrefetchMisses
+  // dominates could still slip past the ratio check at very low
+  // throughput.
+  EXPECT_LE(
+      addedPrefetchMisses,
+      (addedPrefetchHits + addedPrefetchMisses) / 20);
+}
+```
+
+- [ ] **Step 7.5: Write failing E2E test — prefetchMissShare (spec §3 / §9.2 gate)**
+
+Append a second TEST_F to `velox/dwio/common/tests/FsCacheBufferedInputTest.cpp`.
+This is the §3 quantitative target's E2E gate: prefetch path must
+absorb ≥ 80% of all misses so demand miss stays ≤ 20% of total miss.
+
+```cpp
+TEST_F(FsCacheBufferedInputTest, prefetchMissShare) {
+  // Mock workload: prefetch a large region (N cold misses on the
+  // prefetch path), then issue a few demand reads at random offsets
+  // that hit the just-warmed cache (≈ 0 demand misses). The resulting
+  // prefetchMissShare should be near 1.0; spec §3 / §9.2 gate is
+  // ≥ 0.80.
+  auto cache = makeCache(/*capacity=*/64 * kMiB);
+  auto remote = makeRemoteFile("blob", /*bytes=*/16 * kMiB);
+
+  // Prefetch the whole file — every segment is a fresh prefetch miss.
+  {
+    FsCacheBufferedInput input{remote, *pool_, cache.get()};
+    auto stream =
+        input.enqueue({/*offset=*/0, /*length=*/16 * kMiB}, nullptr);
+    input.load(LogType::kFile);
+    drainStream(*stream);
+  }
+
+  // Now read 32 small random regions through a DEMAND path (e.g.,
+  // direct getOrSet with IsPrefetch::kDemand). All bytes should be
+  // resident → zero demand misses.
+  for (int i = 0; i < 32; ++i) {
+    const uint64_t offset = (i * 503ULL * 1024) % (16 * kMiB - 64 * 1024);
+    auto holder = cache->getOrSet(
+        "blob",
+        offset,
+        /*size=*/64 * 1024,
+        cache->config(),
+        *remote,
+        cache::fs::IsPrefetch::kDemand);
+    // Caller-driven advancement is not needed here: every segment is
+    // already kDownloaded from the prefetch above, and getOrSet records
+    // the hit. (See FsCacheBufferedInputTest::secondReaderOfDownloaded
+    // for the same pattern.)
+    (void)holder;
+  }
+
+  const auto s = cache->stats();
+  // The prefetch first pass produced all the misses; the demand pass
+  // produced none. prefetchMissShare ≈ 1.0; gate is ≥ 0.80.
+  EXPECT_GE(prefetchMissShare(s), 0.80);
+  EXPECT_GT(s.prefetchMisses, 0u);
+  EXPECT_EQ(s.demandMisses, 0u);
 }
 ```
 
@@ -5116,7 +5178,7 @@ EOF
 
 ---
 
-## Task 16: Perf gate — ≥7.0 M ops/s single-thread, ≥0.80× at 16 threads
+## Task 16: Perf gate — ≥7.0 M ops/s single-thread, ≥0.80× at 16 threads, prefetchHitRate ≥ 0.95, prefetchMissShare ≥ 0.80
 
 **Files:**
 - Modify: `velox/common/caching/fscache/benchmarks/FsCacheMicroBench.cpp` — extend existing microbench to emit single-thread M ops/s + 16-thread efficiency
@@ -5126,12 +5188,14 @@ EOF
 **Spec:** §9.4 (perf gate thresholds), §10 R9.
 
 **Approach:**
-Task 9 of the microbench plan already produces the 36-cell phase-1 baseline. Task 16 here re-runs that same microbench against the post-redesign code and **asserts**:
+Task 9 of the microbench plan already produces the 36-cell phase-1 baseline. Task 16 here re-runs that same microbench against the post-redesign code and **asserts four metrics** (all spec-defined hard gates):
 
-1. Single-thread cell `{8k, hot, prefetch}` reports ≥ **7.0 M ops/s** (spec §9.4 threshold).
-2. 16-thread cell `{8k, hot, prefetch}` reports ≥ **0.80 ×** single-thread (i.e. ≥ 5.6 M ops/s × 16 threads = 89.6 M ops/s aggregate, accepting up to 20% scaling loss from lock contention).
+1. Single-thread cell `{8k, hot, prefetch}` reports ≥ **7.0 M ops/s** (spec §9.4 throughput threshold).
+2. 16-thread cell `{8k, hot, prefetch}` reports ≥ **0.80 ×** single-thread (spec §9.4 scaling threshold; ≥ 5.6 M ops/s × 16 threads = 89.6 M ops/s aggregate, accepting up to 20% scaling loss from lock contention).
+3. `prefetchHitRate ≥ 0.95` on the hot cell (spec §9.2 — prefetch path's own hit rate when the working set is warm).
+4. `prefetchMissShare ≥ 0.80` end-of-run (spec §3 — demand miss ≤ 20% of total miss, i.e. user threads almost never block on cold reads).
 
-If either threshold misses, **do not** lower the bar — investigate. The thresholds were set on validated CH measurements + 20% margin for partial-readable overhead.
+If any threshold misses, **do not** lower the bar — investigate. The thresholds were set on validated CH measurements + 20% margin for partial-readable overhead. Per-metric gates are independent: a run that hits 7.0 M/s but demand-misses 30% of reads is **not** a pass.
 
 The microbench harness is the same one written in the (already committed) microbench plan `docs/superpowers/plans/2026-05-23-fscache-microbench.md`; this task just adds two assertion lines to its results script and writes the after-numbers down.
 
@@ -5153,14 +5217,25 @@ Expected output: 36-row Markdown table in `/tmp/fscache-after.md` matching the c
 Hand-extract from `/tmp/fscache-after.md`:
 - Row where `block=8k`, `dataset=hot`, `kind=prefetch`, `threads=1`. Record `M_ops_per_sec` as `single_thread_ops`.
 - Row where `block=8k`, `dataset=hot`, `kind=prefetch`, `threads=16`. Record `M_ops_per_sec` as `sixteen_thread_ops_total`.
+- The two prefetch metrics emitted alongside each cell (microbench plan §9 column schema includes `prefetch_hit_rate` and `prefetch_miss_share` populated from `cache->stats()` at end-of-cell). Record both.
 
 Compute `efficiency = sixteen_thread_ops_total / (single_thread_ops * 16)`.
 
-Assert:
+Assert (all four, **any miss = stop and report**, do not paper over):
 - `single_thread_ops >= 7.0`
 - `efficiency >= 0.80`
+- `prefetch_hit_rate >= 0.95` (spec §9.2 — prefetch path effectiveness)
+- `prefetch_miss_share >= 0.80` (spec §3 — demand miss ≤ 20% of total miss)
 
-If either misses, **stop and report**. Do not push through a regression.
+The prefetch metrics matter as much as raw throughput: a perf number
+that hits 7.0 M/s while demand-missing 30% of reads is **not** a pass
+in the spec's terms (user threads blocking on cold reads is the
+behaviour the redesign is supposed to eliminate). If the microbench
+binary does not yet emit the two metrics, this step's first deliverable
+is wiring `cache->stats()` snapshot into the result table; do that
+before the perf rerun rather than skipping the assertion.
+
+If any threshold misses, **stop and report**. Do not push through a regression.
 
 - [ ] **Step 3: Compare to phase-1 baseline**
 
@@ -5184,6 +5259,8 @@ Create `docs/superpowers/results/2026-05-26-fscache-perf-gate.md`:
 | --------------------------------- | --------- | -------- | ---- |
 | {8k, hot, prefetch, t=1}          | ≥ 7.0 M/s | <X.X>    | YES  |
 | {8k, hot, prefetch, t=16} effic.  | ≥ 0.80×   | <0.YY>   | YES  |
+| {8k, hot, prefetch, t=16} prefetchHitRate | ≥ 0.95 | <0.YY> | YES |
+| End-of-run prefetchMissShare     | ≥ 0.80   | <0.YY>   | YES  |
 
 ## Full 36-cell Comparison vs Phase-1 Baseline
 

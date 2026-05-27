@@ -99,6 +99,55 @@ def extract_cpp_blocks(text: str) -> list[tuple[int, int, str]]:
     return blocks
 
 
+def extract_test_names_from_spec(text: str) -> set[str]:
+    """Returns set of `SuiteName::testName` mentioned in the spec.
+
+    Round-7 R6 / Round-8 W7: catch the case where spec § 9.x lists a
+    test name but the plan never writes the TEST_F block. Matches both
+    plain `FooTest::bar` markdown prose and `TEST_F(FooTest, bar)` /
+    `TEST(FooTest, bar)` blocks. The exact prose mention in §3 / §9.x
+    table cells is what we mostly care about.
+    """
+    names: set[str] = set()
+    # `FooTest::bar` form, anywhere in prose.
+    for m in re.finditer(r"\b([A-Z][A-Za-z0-9_]*Test)::([a-z][A-Za-z0-9_]*)\b", text):
+        names.add(f"{m.group(1)}::{m.group(2)}")
+    # TEST_F(FooTest, bar) form (rare in spec but legal).
+    for m in re.finditer(
+        r"TEST(?:_F)?\(\s*([A-Z][A-Za-z0-9_]*Test)\s*,\s*([a-z][A-Za-z0-9_]*)\s*\)", text
+    ):
+        names.add(f"{m.group(1)}::{m.group(2)}")
+    return names
+
+
+def extract_test_names_from_plan(text: str) -> set[str]:
+    """Returns set of `SuiteName::testName` that the plan promises to
+    write — meaning either an actual TEST_F / TEST block in a code
+    fence, OR a `FooTest::bar` prose mention (the plan also describes
+    cases in narrative form before the cpp block).
+    """
+    names: set[str] = set()
+    for m in re.finditer(
+        r"TEST(?:_F)?\(\s*([A-Z][A-Za-z0-9_]*Test)\s*,\s*([a-z][A-Za-z0-9_]*)\s*\)", text
+    ):
+        names.add(f"{m.group(1)}::{m.group(2)}")
+    for m in re.finditer(r"\b([A-Z][A-Za-z0-9_]*Test)::([a-z][A-Za-z0-9_]*)\b", text):
+        names.add(f"{m.group(1)}::{m.group(2)}")
+    return names
+
+
+def cross_check_tests(spec_text: str, plan_text: str) -> list[str]:
+    """Returns descriptions of tests named in the spec but missing from
+    the plan. Empty list = clean."""
+    spec_names = extract_test_names_from_spec(spec_text)
+    plan_names = extract_test_names_from_plan(plan_text)
+    missing = sorted(spec_names - plan_names)
+    return [
+        f"spec names {name} but plan has no matching TEST/TEST_F or prose mention"
+        for name in missing
+    ]
+
+
 def scan(path: Path) -> list[tuple[int, str, str]]:
     text = path.read_text()
     problems: list[tuple[int, str, str]] = []
@@ -136,6 +185,17 @@ def main() -> int:
         for ln, desc, ctx in problems:
             print(f"  L{ln:5d}  {desc}")
             print(f"          context: {ctx}")
+    # Round-8 W7: spec→plan tests cross-check.
+    spec_text = SPEC.read_text()
+    plan_text = PLAN.read_text()
+    missing = cross_check_tests(spec_text, plan_text)
+    if missing:
+        rc = 1
+        print(f"spec→plan tests cross-check: {len(missing)} missing")
+        for m in missing:
+            print(f"  {m}")
+    else:
+        print("spec→plan tests cross-check: clean")
     return rc
 
 
