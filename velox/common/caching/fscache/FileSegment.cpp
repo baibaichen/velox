@@ -212,10 +212,15 @@ void FileSegment::complete() {
     const int err = errno;
     VELOX_FAIL("ftruncate failed: errno={} fd={} size={}", err, fd_, key_.size);
   }
-  if (::fsync(fd_) != 0) {
-    const int err = errno;
-    VELOX_FAIL("fsync failed: errno={} fd={}", err, fd_);
-  }
+  // No fsync here. ClickHouse FileCache does not fsync segment files
+  // either (grep -rn 'fsync' src/Interpreters/FileCache returns nothing);
+  // crash recovery relies on size-mismatch detection in loadFromDisk()
+  // rather than durability of every chunk write. Fsync-per-segment would
+  // add ~5-10 ms per op on local SSD, dominating the hit-path budget for
+  // microbenchmarks and bottlenecking the prefetch pool in production
+  // (every kPrefetch download would block on jbd2 commit). OS page cache
+  // flushes asynchronously; if the host crashes mid-write, the partial
+  // file is detected at restart and reclaimed.
   if (::close(fd_) != 0) {
     const int err = errno;
     VELOX_FAIL("close failed: errno={} fd={}", err, fd_);

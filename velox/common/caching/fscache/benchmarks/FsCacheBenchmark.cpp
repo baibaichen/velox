@@ -211,6 +211,7 @@ void onSigint(int /*signo*/) {
   raise(SIGINT);
 }
 
+using ::facebook::velox::cache::fs::FileSegment;
 using ::facebook::velox::cache::fs::FsCache;
 using ::facebook::velox::cache::fs::FsCacheConfig;
 using ::facebook::velox::cache::fs::IsPrefetch;
@@ -395,6 +396,53 @@ void parallelRun(
             driver.fsCache().config(),
             driver.sleepyReadFile(),
             IsPrefetch::kDemand);
+        // Task 9 protocol: getOrSet returns kEmpty holders; caller is
+        // responsible for advancing them through reserve/write/complete
+        // (mirrors FsCacheBufferedInput::load). Without this, every cell
+        // reports hit% = 0 because recordHit / recordMiss never fire.
+        for (auto& seg : segs->segments()) {
+          if (seg->state() == FileSegment::State::kDownloaded) {
+            driver.fsCache().recordHit(seg.get(), IsPrefetch::kDemand);
+            continue;
+          }
+          if (seg->state() != FileSegment::State::kEmpty) {
+            seg->waitForDownloadedSize(seg->key().size);
+            driver.fsCache().recordHit(seg.get(), IsPrefetch::kDemand);
+            continue;
+          }
+          driver.fsCache().evict(seg->key().size);
+          if (!seg->reserve(
+                  seg->key().size, driver.fsCache().config().cacheRoot)) {
+            if (seg->state() == FileSegment::State::kDownloaded) {
+              driver.fsCache().recordMiss(
+                  seg.get(), seg->key().size, IsPrefetch::kDemand);
+            } else {
+              seg->waitForDownloadedSize(seg->key().size);
+              driver.fsCache().recordHit(seg.get(), IsPrefetch::kDemand);
+            }
+            continue;
+          }
+          try {
+            constexpr uint64_t kChunkBench = 1UL << 20;
+            std::vector<char> buf(
+                std::min<uint64_t>(kChunkBench, seg->key().size));
+            uint64_t remaining = seg->key().size;
+            uint64_t cursor = seg->key().offset;
+            while (remaining > 0) {
+              const uint64_t toRead = std::min<uint64_t>(buf.size(), remaining);
+              driver.sleepyReadFile().pread(cursor, toRead, buf.data());
+              seg->write(buf.data(), toRead);
+              cursor += toRead;
+              remaining -= toRead;
+            }
+            seg->complete();
+            driver.fsCache().recordMiss(
+                seg.get(), seg->key().size, IsPrefetch::kDemand);
+          } catch (...) {
+            seg->abandon();
+            throw;
+          }
+        }
         const auto end = std::chrono::steady_clock::now();
         (void)segs;
         if (lat != nullptr) {
