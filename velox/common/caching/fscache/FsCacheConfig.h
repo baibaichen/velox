@@ -68,6 +68,21 @@ struct FsCacheConfig {
   /// 32 inside DownloadThreadPool to bound per-remote-pread contention.
   size_t downloadThreads{8};
 
+  /// Eviction policy. false (default) uses LruPolicy — single global LRU
+  /// per bucket. true uses SlruPolicy — two-list segmented LRU per bucket
+  /// with promote-on-first-hit-from-probationary, mirroring ClickHouse
+  /// FileCachePolicy::SLRU (FileCache_fwd.h:21 + SLRUFileCachePriority).
+  /// CH's default is SLRU; phase-1 keeps LRU until Task F validates no
+  /// regression.
+  bool enableSlru{false};
+
+  /// Size split between protected and probationary lists when enableSlru
+  /// is true. Protected gets `capacity * slruProtectedRatio`, probationary
+  /// gets the rest. Mirrors CH's `slru_size_ratio` setting
+  /// (FileCacheSettings.cpp:43, FILECACHE_DEFAULT_SLRU_RATIO = 0.6 in
+  /// FileCache_fwd.h:26). Ignored when enableSlru is false.
+  double slruProtectedRatio{0.6};
+
   /// Skip the cache for any single getOrSet request whose `size` is greater
   /// than or equal to this value. Set to 0 to disable the bypass entirely
   /// (every request enters the cache regardless of size).
