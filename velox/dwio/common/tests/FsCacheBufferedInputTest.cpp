@@ -23,12 +23,14 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <string>
+#include <thread>
 
 namespace facebook::velox::dwio::common::test {
 
@@ -79,6 +81,30 @@ class FsCacheBufferedInputTest : public ::testing::Test {
     }
     buf.resize(copied);
     return buf;
+  }
+
+  // Waits for the DownloadThreadPool's recordMiss bumps to drain into the
+  // counters. The download closure calls recordMiss AFTER FileSegment::
+  // complete() releases drain() waiters, so stats() sampled right after
+  // drain can race against the still-pending recordMiss. Polls until
+  // (prefetchMisses + prefetchHits) reaches at least `expected`, or fails
+  // the calling test after a generous timeout.
+  static void waitForPrefetchCounters(
+      FsCache& cache,
+      uint64_t expectedTotal,
+      std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+      const auto s = cache.stats();
+      if (s.prefetchHits + s.prefetchMisses >= expectedTotal) {
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const auto s = cache.stats();
+    FAIL() << "Timed out waiting for prefetch counters to reach "
+           << expectedTotal << "; got hits=" << s.prefetchHits
+           << " misses=" << s.prefetchMisses;
   }
 };
 
@@ -258,6 +284,130 @@ TEST_F(FsCacheBufferedInputTest, getOrSetReturnsEmptySegmentsWithoutShim) {
         seg->state() == FileSegment::State::kDownloaded ||
         seg->state() == FileSegment::State::kDownloading);
   }
+}
+
+// Locks in the §9.2 prefetchHitRate gate: a warm reread of an already-
+// populated region should drive the delta prefetchHitRate to ~1.0. Two
+// FsCacheBufferedInputs are constructed over the same file; the second
+// one's load() must turn every segment lookup into a prefetchHit.
+TEST_F(FsCacheBufferedInputTest, prefetchHitRateOnWarmReread) {
+  using ::facebook::velox::cache::fs::prefetchHitRate;
+  // Use a tighter cache config so the 8 MiB read splits into multiple
+  // segments and the prefetchHitRate gate sees real warm-traffic volume.
+  // Default maxSegmentSize is 32 MiB → 8 MiB request collapses to one
+  // segment and the delta-hit sanity check loses meaning.
+  FsCacheConfig tightCfg;
+  tightCfg.cacheRoot = tempDir_->getPath() + "/cache_hitrate";
+  tightCfg.maxBytes = 64UL * 1'024 * 1'024;
+  tightCfg.alignment = 1UL * 1'024 * 1'024;
+  tightCfg.maxSegmentSize = 2UL * 1'024 * 1'024;
+  std::filesystem::create_directories(tightCfg.cacheRoot);
+  auto cache = std::make_unique<FsCache>(tightCfg);
+
+  auto readFile = std::make_shared<LocalReadFile>(remotePath_);
+  const uint64_t length = 8UL * 1'024 * 1'024;
+  {
+    FsCacheBufferedInput input{readFile, *pool_, cache.get()};
+    auto stream = input.enqueue({0, length});
+    input.load(LogType::FILE);
+    (void)drain(*stream, length);
+  }
+  // 4 segments at 2 MiB max-segment-size over an 8 MiB request; wait for
+  // the pool to publish all 4 recordMiss bumps before sampling.
+  waitForPrefetchCounters(*cache, /*expectedTotal=*/4u);
+
+  // Capture baseline before the warm pass. FsCacheStats is a copyable POD
+  // (spec §6.3 Shape β); read fields directly, no .load() needed.
+  const auto warmStats = cache->stats();
+  const uint64_t baselinePrefetchHits = warmStats.prefetchHits;
+  const uint64_t baselinePrefetchMisses = warmStats.prefetchMisses;
+
+  {
+    FsCacheBufferedInput input{readFile, *pool_, cache.get()};
+    auto stream = input.enqueue({0, length});
+    input.load(LogType::FILE);
+    (void)drain(*stream, length);
+  }
+  // Second pass — all 4 segments resident, recordHit is synchronous so
+  // no further wait is strictly required, but the helper makes the
+  // intent explicit (and tolerates any future move of recordHit into a
+  // closure).
+  waitForPrefetchCounters(
+      *cache, /*expectedTotal=*/baselinePrefetchHits + baselinePrefetchMisses + 4u);
+
+  const auto finalStats = cache->stats();
+  const uint64_t addedPrefetchHits =
+      finalStats.prefetchHits - baselinePrefetchHits;
+  const uint64_t addedPrefetchMisses =
+      finalStats.prefetchMisses - baselinePrefetchMisses;
+  EXPECT_GT(addedPrefetchHits, 0u);
+  EXPECT_EQ(addedPrefetchMisses, 0u);
+  // prefetchHitRate on the delta — spec §9.2 gate is >= 0.95. GE rather
+  // than DOUBLE_EQ(1.0) so future SLRU / drainer races that legally let a
+  // couple of prefetches miss do not spurious-fail this case.
+  const double rate = addedPrefetchHits + addedPrefetchMisses == 0
+      ? 0.0
+      : static_cast<double>(addedPrefetchHits) /
+          static_cast<double>(addedPrefetchHits + addedPrefetchMisses);
+  EXPECT_GE(rate, 0.95);
+  // Sanity: require enough warm traffic so the rate isn't computed off a
+  // degenerate zero-traffic delta. At 1 MiB alignment / 2 MiB maxSegmentSize
+  // an 8 MiB warm reread produces 4 distinct segments.
+  (void)prefetchHitRate; // ODR-keep the free fn referenced in this test.
+  EXPECT_GE(addedPrefetchHits, 4u);
+}
+
+// §3 quantitative target: prefetch path must absorb >= 80% of all misses.
+// Prefetch a large region (cold misses on the prefetch path), then issue
+// 32 small reads through a direct demand getOrSet that finds everything
+// resident (zero demand misses). prefetchMissShare should be ~1.0.
+TEST_F(FsCacheBufferedInputTest, prefetchMissShare) {
+  using ::facebook::velox::cache::fs::IsPrefetch;
+  using ::facebook::velox::cache::fs::prefetchMissShare;
+  auto readFile = std::make_shared<LocalReadFile>(remotePath_);
+  const uint64_t length = 8UL * 1'024 * 1'024;
+  // Prefetch the whole file — every segment is a fresh prefetch miss. The
+  // default cache config produces 1 segment at 32 MiB max-segment-size /
+  // 4 MiB alignment for an 8 MiB request, so wait for at least 1 prefetch
+  // counter event before sampling.
+  {
+    FsCacheBufferedInput input{readFile, *pool_, fsCache_.get()};
+    auto stream = input.enqueue({0, length});
+    input.load(LogType::FILE);
+    (void)drain(*stream, length);
+  }
+  waitForPrefetchCounters(*fsCache_, /*expectedTotal=*/1u);
+
+  // Now read 32 small windows through a DEMAND getOrSet. All bytes are
+  // resident (kDownloaded) -> every call lands as a demand hit, not a
+  // demand miss.
+  for (int i = 0; i < 32; ++i) {
+    const uint64_t offset =
+        (static_cast<uint64_t>(i) * 503ULL * 1'024) % (length - 64UL * 1'024);
+    auto holder = fsCache_->getOrSet(
+        remotePath_,
+        offset,
+        64UL * 1'024,
+        fsCache_->config(),
+        *readFile,
+        IsPrefetch::kDemand);
+    // Drive segment recording the same way load() does so the demand
+    // counters move: any kDownloaded segment counts as a demand hit; if
+    // for any reason a segment is mid-flight, treat it as a hit too
+    // (waitForDownloadedSize would block here and the read is well-known
+    // to be cached).
+    for (auto& seg : holder->segments()) {
+      ASSERT_NE(seg->state(), ::facebook::velox::cache::fs::FileSegment::State::kEmpty);
+      fsCache_->recordHit(seg.get(), IsPrefetch::kDemand);
+    }
+  }
+
+  const auto s = fsCache_->stats();
+  // First pass produced all misses on the prefetch path; demand pass
+  // produced none. prefetchMissShare ~= 1.0; gate is >= 0.80.
+  EXPECT_GE(prefetchMissShare(s), 0.80);
+  EXPECT_GT(s.prefetchMisses, 0u);
+  EXPECT_EQ(s.demandMisses, 0u);
 }
 
 } // namespace facebook::velox::dwio::common::test

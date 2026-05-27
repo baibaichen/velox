@@ -52,12 +52,12 @@ void driveSegments(
   const auto& cacheRoot = cache.config().cacheRoot;
   for (auto& seg : holder.segments()) {
     if (seg->state() == FileSegment::State::kDownloaded) {
-      cache.recordHit(seg.get());
+      cache.recordHit(seg.get(), IsPrefetch::kDemand);
       continue;
     }
     if (seg->state() != FileSegment::State::kEmpty) {
       seg->waitForDownloadedSize(seg->key().size);
-      cache.recordHit(seg.get());
+      cache.recordHit(seg.get(), IsPrefetch::kDemand);
       continue;
     }
     cache.evict(seg->key().size);
@@ -65,10 +65,10 @@ void driveSegments(
       // reserve() may have taken the warm-restart short-circuit and
       // already set the segment to kDownloaded.
       if (seg->state() == FileSegment::State::kDownloaded) {
-        cache.recordMiss(seg.get(), seg->key().size);
+        cache.recordMiss(seg.get(), seg->key().size, IsPrefetch::kDemand);
       } else {
         seg->waitForDownloadedSize(seg->key().size);
-        cache.recordHit(seg.get());
+        cache.recordHit(seg.get(), IsPrefetch::kDemand);
       }
       continue;
     }
@@ -85,7 +85,7 @@ void driveSegments(
         remaining -= toRead;
       }
       seg->complete();
-      cache.recordMiss(seg.get(), seg->key().size);
+      cache.recordMiss(seg.get(), seg->key().size, IsPrefetch::kDemand);
     } catch (...) {
       seg->abandon();
       throw;
@@ -122,7 +122,7 @@ TEST_F(FsCacheTest, getOrSetFirstCallDownloads) {
   for (const auto& segment : segments) {
     EXPECT_EQ(segment->state(), FileSegment::State::kDownloaded);
   }
-  EXPECT_EQ(cache.stats().misses, 1);
+  EXPECT_EQ(cache.stats().demandMisses, 1);
 }
 
 TEST_F(FsCacheTest, getOrSetSecondCallHitsCache) {
@@ -141,7 +141,7 @@ TEST_F(FsCacheTest, getOrSetSecondCallHitsCache) {
   for (const auto& segment : segments) {
     EXPECT_EQ(segment->state(), FileSegment::State::kDownloaded);
   }
-  EXPECT_GT(cache.stats().hits, 0);
+  EXPECT_GT(cache.stats().demandHits, 0);
 }
 
 // Regression: when remote file size < cache alignment, splitRange's outward
@@ -304,8 +304,8 @@ TEST_F(FsCacheTest, waiterReceivesThrowWhenWriterFails) {
 }
 
 // Regression: a segment that already reached kDownloaded must increment
-// stats.hits on re-read so it participates in eviction policy and does not
-// leak.
+// stats.demandHits on re-read so it participates in eviction policy and does
+// not leak.
 TEST_F(FsCacheTest, secondReaderOfDownloadedSegmentCountsAsHit) {
   FsCache cache{config_};
   LocalReadFile remote{remotePath_};
@@ -321,8 +321,8 @@ TEST_F(FsCacheTest, secondReaderOfDownloadedSegmentCountsAsHit) {
     driveSegments(*holder, remote, cache);
   }
   const auto after = cache.stats();
-  EXPECT_EQ(after.misses, baseline.misses);
-  EXPECT_EQ(after.hits, baseline.hits + 1);
+  EXPECT_EQ(after.demandMisses, baseline.demandMisses);
+  EXPECT_EQ(after.demandHits, baseline.demandHits + 1);
   EXPECT_EQ(after.bytesOnDisk, baseline.bytesOnDisk);
 }
 
@@ -375,9 +375,10 @@ TEST_F(FsCacheTest, concurrentEvictionIsSafe) {
   for (auto& thread : threads) {
     thread.join();
   }
-  // Survives stats() with consistent counters: hits + misses == total calls.
+  // Survives stats() with consistent counters: demandHits + demandMisses ==
+  // total calls.
   const auto stats = cache.stats();
-  EXPECT_EQ(stats.hits + stats.misses, kThreads * kIterations);
+  EXPECT_EQ(stats.demandHits + stats.demandMisses, kThreads * kIterations);
 }
 
 // Phase-2 moves stats counters to std::atomic and drops the
@@ -414,8 +415,8 @@ TEST_F(FsCacheTest, statsCountersIncrementAcrossThreadsWithoutLoss) {
     thread.join();
   }
   const auto snapshot = cache.stats();
-  EXPECT_EQ(snapshot.misses, 1u);
-  EXPECT_EQ(snapshot.hits, kThreads * kPerThread - 1u);
+  EXPECT_EQ(snapshot.demandMisses, 1u);
+  EXPECT_EQ(snapshot.demandHits, kThreads * kPerThread - 1u);
 }
 
 TEST(FsCacheSingletonTest, defaultsToNullptr) {

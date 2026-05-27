@@ -48,21 +48,21 @@ void driveSegments(
   const auto& cacheRoot = cache.config().cacheRoot;
   for (auto& seg : holder.segments()) {
     if (seg->state() == FileSegment::State::kDownloaded) {
-      cache.recordHit(seg.get());
+      cache.recordHit(seg.get(), IsPrefetch::kDemand);
       continue;
     }
     if (seg->state() != FileSegment::State::kEmpty) {
       seg->waitForDownloadedSize(seg->key().size);
-      cache.recordHit(seg.get());
+      cache.recordHit(seg.get(), IsPrefetch::kDemand);
       continue;
     }
     cache.evict(seg->key().size);
     if (!seg->reserve(seg->key().size, cacheRoot)) {
       if (seg->state() == FileSegment::State::kDownloaded) {
-        cache.recordMiss(seg.get(), seg->key().size);
+        cache.recordMiss(seg.get(), seg->key().size, IsPrefetch::kDemand);
       } else {
         seg->waitForDownloadedSize(seg->key().size);
-        cache.recordHit(seg.get());
+        cache.recordHit(seg.get(), IsPrefetch::kDemand);
       }
       continue;
     }
@@ -79,7 +79,7 @@ void driveSegments(
         remaining -= toRead;
       }
       seg->complete();
-      cache.recordMiss(seg.get(), seg->key().size);
+      cache.recordMiss(seg.get(), seg->key().size, IsPrefetch::kDemand);
     } catch (...) {
       seg->abandon();
       throw;

@@ -516,7 +516,8 @@ CellResult runCell(
   }
 
   const auto statsFinal = driver.fsCache().stats();
-  const uint64_t hitsDelta = statsFinal.hits - statsBase.hits;
+  const uint64_t hitsDelta = (statsFinal.prefetchHits + statsFinal.demandHits) -
+      (statsBase.prefetchHits + statsBase.demandHits);
   const uint64_t evictionsDelta = statsFinal.evictions - statsBase.evictions;
   const uint64_t bytesReadDelta = driver.sleepyReadFile().bytesRead();
 

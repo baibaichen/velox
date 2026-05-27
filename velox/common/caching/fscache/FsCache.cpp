@@ -432,8 +432,13 @@ void FsCache::evict(uint64_t bytesNeeded) {
 
 FsCacheStats FsCache::stats() const {
   FsCacheStats snapshot;
-  snapshot.hits = counters_.hits.load(std::memory_order_relaxed);
-  snapshot.misses = counters_.misses.load(std::memory_order_relaxed);
+  snapshot.prefetchHits =
+      counters_.prefetchHits.load(std::memory_order_relaxed);
+  snapshot.prefetchMisses =
+      counters_.prefetchMisses.load(std::memory_order_relaxed);
+  snapshot.demandHits = counters_.demandHits.load(std::memory_order_relaxed);
+  snapshot.demandMisses =
+      counters_.demandMisses.load(std::memory_order_relaxed);
   snapshot.evictions = counters_.evictions.load(std::memory_order_relaxed);
   snapshot.bytesOnDisk = counters_.bytesOnDisk.load(std::memory_order_relaxed);
   return snapshot;
@@ -448,8 +453,11 @@ bool FsCache::shouldBypass(uint64_t size) const {
       size >= config_.bypassThresholdBytes;
 }
 
-void FsCache::recordHit(FileSegment* segment) {
-  counters_.hits.fetch_add(1, std::memory_order_relaxed);
+void FsCache::recordHit(FileSegment* segment, IsPrefetch isPrefetch) {
+  auto& counter = isPrefetch == IsPrefetch::kPrefetch
+      ? counters_.prefetchHits
+      : counters_.demandHits;
+  counter.fetch_add(1, std::memory_order_relaxed);
   // increasePriorityMutex_ collapses concurrent LRU bumps on the same
   // segment. Losers drop the bump entirely -- one bump per burst is enough
   // to move the segment toward MRU (CH FileSegment.cpp:1196-1223 pattern).
@@ -463,13 +471,19 @@ void FsCache::recordHit(FileSegment* segment) {
   bucket.priority->onHit(segment);
 }
 
-void FsCache::recordMiss(FileSegment* segment, uint64_t segmentSize) {
+void FsCache::recordMiss(
+    FileSegment* segment,
+    uint64_t segmentSize,
+    IsPrefetch isPrefetch) {
   {
     auto& bucket = metadata_->bucketOf(segment->key().path);
     CachePriorityGuard guard{bucket.priorityMutex};
     bucket.priority->onInsert(segment);
   }
-  counters_.misses.fetch_add(1, std::memory_order_relaxed);
+  auto& counter = isPrefetch == IsPrefetch::kPrefetch
+      ? counters_.prefetchMisses
+      : counters_.demandMisses;
+  counter.fetch_add(1, std::memory_order_relaxed);
   counters_.bytesOnDisk.fetch_add(segmentSize, std::memory_order_relaxed);
 }
 

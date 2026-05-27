@@ -44,14 +44,48 @@ namespace facebook::velox::cache::fs {
 /// flips to `kPrefetch` in Task 11 step 4.
 enum class IsPrefetch : uint8_t { kPrefetch, kDemand };
 
-/// Counters exposed to tests and observability. All fields are sampled atomic
-/// totals; differences between two snapshots give per-interval rates.
+/// Copyable POD snapshot of the cache counters. `FsCache::stats()` takes 6
+/// relaxed loads off the internal `AtomicCounters` and returns this value.
+/// Cross-field consistency is not guaranteed; tests asserting
+/// `hits + misses == total` must first quiesce writers (e.g. `thread.join()`).
+/// Spec §6.3 (Shape β): snapshot stays plain `uint64_t` so callers can do
+/// `const auto s = cache.stats(); s.prefetchHits;` without `.load()` calls.
 struct FsCacheStats {
-  uint64_t hits{0};
-  uint64_t misses{0};
+  uint64_t prefetchHits{0};
+  uint64_t prefetchMisses{0};
+  uint64_t demandHits{0};
+  uint64_t demandMisses{0};
   uint64_t evictions{0};
+  // Retained from phase-1: the eviction loop reads this to decide whether to
+  // drain (see `evict()` invariant in this header), and `FsCache::totalSize()`
+  // exposes it as the CH `getUsedCacheSize()` mirror.
   uint64_t bytesOnDisk{0};
 };
+
+/// Fraction of prefetch requests that hit in the cache, or 0.0 when no
+/// prefetch traffic has happened yet. Spec §9.2 / Task 14 UT gate
+/// (`FsCacheBufferedInputTest::prefetchHitRateOnWarmReread`) requires this to
+/// stay >= 0.95 on warm reread. Demand counters do not participate — demand
+/// reads are blocking by definition, so they are not part of the prefetch
+/// *effectiveness* metric.
+inline double prefetchHitRate(const FsCacheStats& s) {
+  const uint64_t total = s.prefetchHits + s.prefetchMisses;
+  return total == 0
+      ? 0.0
+      : static_cast<double>(s.prefetchHits) / static_cast<double>(total);
+}
+
+/// Share of ALL misses absorbed by the prefetch path rather than the demand
+/// path. Spec §3 quantitative target / Task 14 UT gate
+/// (`FsCacheBufferedInputTest::prefetchMissShare`) requires this to stay
+/// >= 0.80 so demand miss stays <= 20% of total miss. Returns 0.0 when there
+/// have been no misses at all.
+inline double prefetchMissShare(const FsCacheStats& s) {
+  const uint64_t total = s.prefetchMisses + s.demandMisses;
+  return total == 0
+      ? 0.0
+      : static_cast<double>(s.prefetchMisses) / static_cast<double>(total);
+}
 
 /// Top-level entry point of the FsCache module. Owns the metadata index and
 /// eviction policy; downloads missing segments synchronously through a
@@ -79,10 +113,13 @@ class FsCache {
   /// for signature stability but not yet propagated (the implementation
   /// uses `config_` directly); Task 14 forwards it through.
   ///
-  /// `isPrefetch` selects which pair of stats counters to bump. Task 8
-  /// only forwards the value; Task 14 wires the actual prefetch/demand
-  /// counter pairs. There is intentionally no default — every caller
-  /// decides.
+  /// `isPrefetch` selects which pair of stats counters the caller-driven
+  /// recordHit / recordMiss bump (FsCacheBufferedInput::load passes
+  /// kPrefetch; direct demand-read callers pass kDemand). Reserved on
+  /// `getOrSet` itself for forward-compatibility with spec §6.3 hot-path
+  /// accounting; phase-1 callers thread the value to the recordHit /
+  /// recordMiss member methods. There is intentionally no default — every
+  /// caller decides.
   ///
   /// VELOX_USER_CHECKs that offset <= remote.size().
   FileSegmentsHolderPtr getOrSet(
@@ -189,12 +226,17 @@ class FsCache {
   /// side-effect-free and keeps unit tests from paying directory-scan cost.
   void loadFromDisk();
 
-  /// Records a cache hit: touches LRU and bumps counters_.hits.
-  void recordHit(FileSegment* segment);
+  /// Records a cache hit: best-effort LRU bump + increments
+  /// `counters_.{prefetchHits,demandHits}` based on `isPrefetch`.
+  void recordHit(FileSegment* segment, IsPrefetch isPrefetch);
 
-  /// Records a fresh miss: inserts into LRU and bumps counters_.misses /
-  /// counters_.bytesOnDisk by segmentSize.
-  void recordMiss(FileSegment* segment, uint64_t segmentSize);
+  /// Records a fresh miss: LRU insert + increments
+  /// `counters_.{prefetchMisses,demandMisses}` based on `isPrefetch`, and
+  /// credits `segmentSize` to `counters_.bytesOnDisk`.
+  void recordMiss(
+      FileSegment* segment,
+      uint64_t segmentSize,
+      IsPrefetch isPrefetch);
 
   /// Evicts until bytesOnDisk + bytesNeeded <= maxBytes. Selects victims from
   /// each bucket's per-bucket EvictionPolicy under that bucket's
@@ -230,8 +272,10 @@ class FsCache {
   // callers needing a consistent snapshot (e.g. tests asserting hits+misses
   // == total) must first quiesce writers (e.g. thread.join()).
   struct AtomicCounters {
-    std::atomic<uint64_t> hits{0};
-    std::atomic<uint64_t> misses{0};
+    std::atomic<uint64_t> prefetchHits{0};
+    std::atomic<uint64_t> prefetchMisses{0};
+    std::atomic<uint64_t> demandHits{0};
+    std::atomic<uint64_t> demandMisses{0};
     std::atomic<uint64_t> evictions{0};
     std::atomic<uint64_t> bytesOnDisk{0};
   };

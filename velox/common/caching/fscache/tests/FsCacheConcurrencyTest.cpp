@@ -45,7 +45,7 @@ void driveSegments(
   const auto& cacheRoot = cache.config().cacheRoot;
   for (auto& seg : holder.segments()) {
     if (seg->state() == FileSegment::State::kDownloaded) {
-      cache.recordHit(seg.get());
+      cache.recordHit(seg.get(), IsPrefetch::kDemand);
       continue;
     }
     if (seg->state() != FileSegment::State::kEmpty) {
@@ -53,18 +53,18 @@ void driveSegments(
       // partial outcome. Wait for it to publish kDownloaded, then count
       // this as a hit on the existing bytes.
       seg->waitForDownloadedSize(seg->key().size);
-      cache.recordHit(seg.get());
+      cache.recordHit(seg.get(), IsPrefetch::kDemand);
       continue;
     }
     cache.evict(seg->key().size);
     if (!seg->reserve(seg->key().size, cacheRoot)) {
       if (seg->state() == FileSegment::State::kDownloaded) {
-        cache.recordMiss(seg.get(), seg->key().size);
+        cache.recordMiss(seg.get(), seg->key().size, IsPrefetch::kDemand);
       } else {
         // Lost the reserve() race: another writer is downloading. Wait for
         // it to publish kDownloaded, then count this as a hit.
         seg->waitForDownloadedSize(seg->key().size);
-        cache.recordHit(seg.get());
+        cache.recordHit(seg.get(), IsPrefetch::kDemand);
       }
       continue;
     }
@@ -81,7 +81,7 @@ void driveSegments(
         remaining -= toRead;
       }
       seg->complete();
-      cache.recordMiss(seg.get(), seg->key().size);
+      cache.recordMiss(seg.get(), seg->key().size, IsPrefetch::kDemand);
     } catch (...) {
       seg->abandon();
       throw;
@@ -148,7 +148,7 @@ TEST_F(FsCacheConcurrencyTest, sameSegmentMultipleReadersExactlyOneDownload) {
     t.join();
   }
   EXPECT_EQ(errors, 0);
-  EXPECT_EQ(cache.stats().misses, 1);
+  EXPECT_EQ(cache.stats().demandMisses, 1);
 }
 
 // Eight threads each download a disjoint 4 MiB region in parallel. Offsets
@@ -184,7 +184,7 @@ TEST_F(FsCacheConcurrencyTest, differentSegmentsParallelDownloads) {
     t.join();
   }
   EXPECT_EQ(errors, 0);
-  EXPECT_EQ(cache.stats().misses, kThreads);
+  EXPECT_EQ(cache.stats().demandMisses, kThreads);
 }
 
 // Four threads each request four overlapping 1 MiB segments rotating through
@@ -297,11 +297,11 @@ TEST_F(FsCacheConcurrencyTest, hitPathTolerates32WayContention) {
     th.join();
   }
   const auto s = cache.stats();
-  EXPECT_EQ(s.misses, 1u);
+  EXPECT_EQ(s.demandMisses, 1u);
   // The priming call is one miss; every racing getOrSet hits the cached
   // segment. hits == kThreads * kPerThread, with 0 hits from the priming
   // call itself (recordMiss path, not recordHit).
-  EXPECT_EQ(s.hits, kThreads * kPerThread);
+  EXPECT_EQ(s.demandHits, kThreads * kPerThread);
 }
 
 // 16 threads each insert + read distinct segments while the cache

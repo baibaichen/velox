@@ -232,14 +232,14 @@ void FsCacheBufferedInput::load(LogType /*unused*/) {
 
     for (auto& seg : enqueued.holder->segments()) {
       if (seg->state() == cache::fs::FileSegment::State::kDownloaded) {
-        fsCache_->recordHit(seg.get());
+        fsCache_->recordHit(seg.get(), cache::fs::IsPrefetch::kPrefetch);
         continue;
       }
       if (seg->state() != cache::fs::FileSegment::State::kEmpty) {
         // Another driver is mid-download. The reader will block in
         // FsCacheInputStream::loadCurrentSegmentBuffer via
         // waitForDownloadedSize, so load() does not need to wait here.
-        fsCache_->recordHit(seg.get());
+        fsCache_->recordHit(seg.get(), cache::fs::IsPrefetch::kPrefetch);
         continue;
       }
       fsCache_->evict(seg->key().size);
@@ -247,12 +247,15 @@ void FsCacheBufferedInput::load(LogType /*unused*/) {
         if (seg->state() == cache::fs::FileSegment::State::kDownloaded) {
           // Warm-restart short-circuit inside reserve() found the file on
           // disk and published it directly.
-          fsCache_->recordMiss(seg.get(), seg->key().size);
+          fsCache_->recordMiss(
+              seg.get(),
+              seg->key().size,
+              cache::fs::IsPrefetch::kPrefetch);
         } else {
           // Lost the reserve() race. The reader will sync via
           // waitForDownloadedSize; just count this as a hit on the
           // in-flight bytes.
-          fsCache_->recordHit(seg.get());
+          fsCache_->recordHit(seg.get(), cache::fs::IsPrefetch::kPrefetch);
         }
         continue;
       }
@@ -281,7 +284,10 @@ void FsCacheBufferedInput::load(LogType /*unused*/) {
                 remaining -= toRead;
               }
               segCapture->complete();
-              cache->recordMiss(segCapture.get(), segCapture->key().size);
+              cache->recordMiss(
+                  segCapture.get(),
+                  segCapture->key().size,
+                  cache::fs::IsPrefetch::kPrefetch);
             } catch (...) {
               // No re-throw: the task runs detached on the pool. The
               // abandon() call moves the segment to kPartiallyDownloaded
