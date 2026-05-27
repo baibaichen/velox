@@ -213,6 +213,7 @@ void onSigint(int /*signo*/) {
 
 using ::facebook::velox::cache::fs::FsCache;
 using ::facebook::velox::cache::fs::FsCacheConfig;
+using ::facebook::velox::cache::fs::IsPrefetch;
 using ::facebook::velox::cache::fs::bench::KeyGenerator;
 using ::facebook::velox::cache::fs::bench::Workload;
 
@@ -388,7 +389,12 @@ void parallelRun(
         const uint64_t offset = (keyOffset + gen.next()) * kSegmentBytes;
         const auto start = std::chrono::steady_clock::now();
         auto segs = driver.fsCache().getOrSet(
-            pathStr, offset, kSegmentBytes, driver.sleepyReadFile());
+            pathStr,
+            offset,
+            kSegmentBytes,
+            driver.fsCache().config(),
+            driver.sleepyReadFile(),
+            IsPrefetch::kDemand);
         const auto end = std::chrono::steady_clock::now();
         (void)segs;
         if (lat != nullptr) {
