@@ -46,6 +46,24 @@ target_link_libraries(
   ${TEST_LINK_LIBS}
 )
 
+add_executable(
+  velox_dwio_parquet_fscache_tpch_equivalence_test
+  FsCacheTpchEquivalenceTest.cpp
+)
+add_test(
+  NAME velox_dwio_parquet_fscache_tpch_equivalence_test
+  COMMAND velox_dwio_parquet_fscache_tpch_equivalence_test
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(
+  velox_dwio_parquet_fscache_tpch_equivalence_test
+  velox_fscache
+  velox_tpch_connector
+  velox_aggregates
+  velox_tpch_gen
+  ${TEST_LINK_LIBS}
+)
+
 file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/examples DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
 
 velox_add_library(velox_dwio_parquet_test_base INTERFACE HEADERS ParquetTestBase.h)
