@@ -72,7 +72,13 @@ bool FsCacheMetadata::insert(FileSegmentPtr segment) {
 
 FileSegmentPtr FsCacheMetadata::lookup(const FsCacheKey& key) const {
   auto& bucket = *buckets_[bucketIndex(key.path)];
+  // Hand off bucket.guard -> KeyMutex without an intermediate release: acquire
+  // the per-key mutex while still under bucket.guard (rank 2 -> 3 forward),
+  // then bucket.guard is dropped by the guard dtor on return-by-value. This
+  // closes the window where a concurrent erase could orphan keyMeta between
+  // the two acquisitions.
   KeyMetadataPtr keyMeta;
+  LockedKey locked;
   {
     CacheMetadataGuard bucketGuard{bucket.guard};
     auto it = bucket.keys.find(key.path);
@@ -80,8 +86,8 @@ FileSegmentPtr FsCacheMetadata::lookup(const FsCacheKey& key) const {
       return nullptr;
     }
     keyMeta = it->second;
+    locked = keyMeta->lock();
   }
-  auto locked = keyMeta->lock();
   auto segIt = locked->segments.find(key.offset);
   if (segIt == locked->segments.end()) {
     return nullptr;
@@ -93,33 +99,35 @@ LockedKey FsCacheMetadata::lockKeyMetadata(
     const PathKey& path,
     KeyNotFoundPolicy policy) {
   auto& bucket = *buckets_[bucketIndex(path)];
-  KeyMetadataPtr keyMeta;
-  {
-    CacheMetadataGuard bucketGuard{bucket.guard};
-    auto it = bucket.keys.find(path);
-    if (it == bucket.keys.end()) {
-      switch (policy) {
-        case KeyNotFoundPolicy::kThrow:
-          VELOX_USER_FAIL(
-              "FsCacheMetadata::lockKeyMetadata: path not found: {:016x}",
-              std::hash<PathKey>{}(path));
-        case KeyNotFoundPolicy::kThrowLogical:
-          VELOX_FAIL(
-              "FsCacheMetadata::lockKeyMetadata: path not found (logical): {:016x}",
-              std::hash<PathKey>{}(path));
-        case KeyNotFoundPolicy::kCreateEmpty: {
-          keyMeta = std::make_shared<KeyMetadata>();
-          bucket.keys.emplace(path, keyMeta);
-          break;
-        }
-        case KeyNotFoundPolicy::kReturnNull:
-          return LockedKey{};
+  // Hot-path lock collapse (R1, profile doc 2026-05-27): acquire bucket.guard
+  // only long enough to find/insert the KeyMetadata entry, then promote to
+  // KeyMutex BEFORE releasing bucket.guard. Lock-order is rank 2 -> rank 3 so
+  // the forward acquire is legal. Keeping the entry pinned by bucket.guard
+  // while we take its KeyMutex eliminates the prior race window where a
+  // concurrent erase could drop the entry between unlock(bucket) and
+  // lock(keyMeta) and leave us holding an orphan KeyMetadata.
+  CacheMetadataGuard bucketGuard{bucket.guard};
+  auto it = bucket.keys.find(path);
+  if (it == bucket.keys.end()) {
+    switch (policy) {
+      case KeyNotFoundPolicy::kThrow:
+        VELOX_USER_FAIL(
+            "FsCacheMetadata::lockKeyMetadata: path not found: {:016x}",
+            std::hash<PathKey>{}(path));
+      case KeyNotFoundPolicy::kThrowLogical:
+        VELOX_FAIL(
+            "FsCacheMetadata::lockKeyMetadata: path not found (logical): {:016x}",
+            std::hash<PathKey>{}(path));
+      case KeyNotFoundPolicy::kCreateEmpty: {
+        auto keyMeta = std::make_shared<KeyMetadata>();
+        it = bucket.keys.emplace(path, std::move(keyMeta)).first;
+        break;
       }
-    } else {
-      keyMeta = it->second;
+      case KeyNotFoundPolicy::kReturnNull:
+        return LockedKey{};
     }
   }
-  return keyMeta->lock();
+  return it->second->lock();
 }
 
 std::vector<FileSegmentPtr> FsCacheMetadata::lookupRange(

@@ -75,12 +75,10 @@ class FsCacheMetadata {
   /// existing entry is preserved.
   bool insert(FileSegmentPtr segment);
 
-  /// Returns the segment for key, or nullptr if not present. Best-effort
-  /// under concurrency: the bucket guard is released before the per-key
-  /// mutex is taken, so a concurrent erase racing against this lookup may
-  /// cause it to return nullptr even if a fresh insert at the same path
-  /// (under a new KeyMetadata) succeeded. The caller treats nullptr as a
-  /// cache miss and proceeds to download, which is correct.
+  /// Returns the segment for key, or nullptr if not present. The bucket guard
+  /// is held across the per-key mutex acquisition (rank 2 -> 3 forward
+  /// hand-off) so a concurrent erase cannot orphan the KeyMetadata between
+  /// the two acquires; bucket.guard is released before the segment-map lookup.
   ///
   /// TODO: replace test callsites with `lookupRange` and remove. No
   /// production caller uses this overload post-Task 8; it stays only to
@@ -89,11 +87,13 @@ class FsCacheMetadata {
 
   /// Returns a LockedKey for `path`. Behaviour on absence depends on policy
   /// (see KeyNotFoundPolicy). When the policy is kCreateEmpty, an empty
-  /// KeyMetadata is inserted under the bucket guard, then the per-key lock is
-  /// acquired before return. The returned LockedKey owns the per-key mutex;
-  /// the bucket guard is released before return so concurrent lookups under
-  /// other paths in the same bucket are not blocked while the caller holds
-  /// the LockedKey.
+  /// KeyMetadata is inserted under the bucket guard. The per-key mutex is
+  /// acquired while the bucket guard is still held (legal rank 2 -> rank 3
+  /// forward acquisition) so the entry cannot be erased between the find/
+  /// insert and the KeyMutex lock; bucket.guard is then released and the
+  /// returned LockedKey owns only the per-key mutex. Holding bucket.guard
+  /// across the KeyMutex acquire also collapses the hot-path lock cost — see
+  /// docs/superpowers/results/2026-05-27-fscache-hot-path-profile.md R1.
   LockedKey lockKeyMetadata(const PathKey& path, KeyNotFoundPolicy policy);
 
   /// Returns the segments under `path` whose ranges intersect [lo, hi),
