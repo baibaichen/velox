@@ -23,6 +23,20 @@ PLAN = Path("docs/superpowers/plans/2026-05-26-fscache-ch-aligned-redesign.md")
 SPEC = Path("docs/superpowers/specs/2026-05-26-fscache-ch-aligned-redesign.md")
 REPO_ROOT = Path(".")
 
+# Round-10 U5: forward-reference whitelist. These build targets are
+# legitimately named by the plan (each in a task that itself adds the
+# CMakeLists.txt entry); scan should not warn on them every run. Drop
+# entries once the matching task has landed and `add_executable(...)`
+# exists in the tree.
+EXPECTED_FORWARD_TARGETS: set[str] = {
+    "velox_file_cache_query_limit_test",  # Task 12 (landed in Round-9 commit)
+    "velox_fs_cache_bypass_integration_test",  # Task 12 (planned, not yet)
+    "velox_slru_policy_test",  # Task 13 (skipped, opt-in for phase-2)
+    "velox_fscache_stats_test",  # Task 14 (in progress)
+    "velox_fscache_buffered_input_test",  # Task 14 step 7 (in progress)
+    "velox_dwio_parquet_fscache_tpch_equivalence_test",  # Task 15
+}
+
 # Patterns that indicate the Shape α FsCacheStats contract was violated
 # somewhere in plan/spec. Add new patterns when a future round-N finds a
 # similar mismatch; each addition is a permanent guard.
@@ -206,6 +220,9 @@ def check_binary_target_existence(text: str, root: Path) -> list[str]:
         if name in seen:
             continue
         seen.add(name)
+        # Round-10 U5: drop forward-references the plan itself will add.
+        if name in EXPECTED_FORWARD_TARGETS:
+            continue
         # Accept either an exact match or a grouped-prefix match
         # (`velox_fscache_test` covers `velox_fscache_test_group0/1`).
         if name in declared:
@@ -217,6 +234,83 @@ def check_binary_target_existence(text: str, root: Path) -> list[str]:
         # Allow prefix-style hits (a planned target referenced by its
         # prefix only).
         if any(d.startswith(name) for d in declared):
+            continue
+        missing.append(name)
+    return missing
+
+
+def check_cli_flag_existence(text: str, root: Path) -> list[str]:
+    """Round-10 R-11: every `--flag_name` mentioned in plan that names
+    a velox-side binary's argument must appear in some C++ source as a
+    `DEFINE_{string,bool,int32,int64,uint64,double}(flag_name, ...)`.
+    Catches Round-10 U1 (plan invented `--bench_seconds` for
+    FsCacheBenchmark).
+
+    Excludes common gflags built-ins and shell tooling flags so the
+    scan stays focused on velox-defined flags.
+    """
+    builtin_flags = {
+        # gflags + glog stock flags that show up in any binary.
+        "help",
+        "helpfull",
+        "helpshort",
+        "version",
+        "logtostderr",
+        "v",
+        "vmodule",
+        "minloglevel",
+        # Common cmake / shell / gh CLI bits the plan legitimately uses.
+        "target",
+        "build",
+        "out",  # `--out` is used by FsCacheBenchmark itself; we whitelist it
+        "rerun-failed",
+        "output-on-failure",
+        "test-dir",
+        # Full gtest CLI surface.
+        "gtest_filter",
+        "gtest_repeat",
+        "gtest_break_on_failure",
+        "gtest_list_tests",
+        "gtest_recreate_environments_when_repeating_tests",
+        "gtest_color",
+        "gtest_shuffle",
+        "gtest_random_seed",
+        "gtest_throw_on_failure",
+        "gtest_output",
+        # git / gh / bash conventions referenced in plan workflows.
+        "amend",
+        "no-edit",
+        "no-verify",
+        "no-gpg-sign",
+        "oneline",
+        "pretty",
+        "format",
+        "test",  # `git test` / `cmake --test` etc.
+        "no",  # tail of compound flags like `--no-foo` getting split.
+        # Anti-pattern names that plan/spec explicitly documents as
+        # "this flag does NOT exist". Whitelisted so the scan does not
+        # round-trip the warning the doc itself is trying to give.
+        "bench_seconds",
+    }
+    # Harvest velox DEFINE_* flags across the tree once.
+    declared: set[str] = set()
+    for cpp in root.glob("velox/**/*.cpp"):
+        try:
+            for m in re.finditer(
+                r"DEFINE_(?:string|bool|int32|int64|uint64|double|uint32)\(\s*([a-z_][a-z0-9_]*)\s*,",
+                cpp.read_text(),
+            ):
+                declared.add(m.group(1))
+        except OSError:
+            pass
+    missing: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r"--([a-z_][a-z0-9_]*)\b", text):
+        name = m.group(1)
+        if name in seen or name in builtin_flags:
+            continue
+        seen.add(name)
+        if name in declared:
             continue
         missing.append(name)
     return missing
@@ -279,6 +373,7 @@ def main() -> int:
     for label, text in (("plan", plan_text), ("spec", spec_text)):
         missing_files = check_file_path_existence(text, REPO_ROOT)
         missing_targets = check_binary_target_existence(text, REPO_ROOT)
+        missing_flags = check_cli_flag_existence(text, REPO_ROOT)
         # Filter out paths the plan/spec explicitly marks as `Create:`.
         # Cheap heuristic: a missing path that appears on a line starting
         # with `- Create:` is a planned addition, not drift.
@@ -313,6 +408,20 @@ def main() -> int:
                 rc = 1
         else:
             print(f"{label}: build-target existence clean")
+        if missing_flags:
+            # Flag existence is a hard fail by default — Round-10 U1
+            # showed that "soft warning" is too easy to ignore for the
+            # CLI-args class of drift (reader runs the command and
+            # gets "unknown flag" before any test even compiles).
+            print(
+                f"{label}: {len(missing_flags)} CLI flag(s) named but not "
+                "DEFINE_*'d in any velox C++ source"
+            )
+            for f in missing_flags:
+                print(f"  --{f}")
+            rc = 1
+        else:
+            print(f"{label}: CLI-flag existence clean")
     return rc
 
 
