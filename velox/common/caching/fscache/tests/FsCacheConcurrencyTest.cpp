@@ -261,7 +261,8 @@ TEST_F(FsCacheConcurrencyTest, evictionUnderConcurrentLoadIsRaceFree) {
 // The counter we can observe through public API is FsCacheStats::hits,
 // which still reflects every hit -- what we're proving here is that the
 // test does not deadlock and produces consistent hit counts under
-// concurrent contention on increasePriorityMutex_.
+// concurrent contention on the LRU bump path (R3: now an atomic fetch_add
+// on FileSegment::hits_ + windowed try_lock on bucket priorityMutex).
 TEST_F(FsCacheConcurrencyTest, hitPathTolerates32WayContention) {
   FsCache cache{config_};
   constexpr int kThreads = 32;

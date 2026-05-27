@@ -458,17 +458,29 @@ void FsCache::recordHit(FileSegment* segment, IsPrefetch isPrefetch) {
       ? counters_.prefetchHits
       : counters_.demandHits;
   counter.fetch_add(1, std::memory_order_relaxed);
-  // increasePriorityMutex_ collapses concurrent LRU bumps on the same
-  // segment. Losers drop the bump entirely -- one bump per burst is enough
-  // to move the segment toward MRU (CH FileSegment.cpp:1196-1223 pattern).
-  std::unique_lock<std::mutex> bumpLock{
-      segment->increasePriorityMutex_, std::try_to_lock};
-  if (!bumpLock.owns_lock()) {
+  // R3 (profile doc 2026-05-27): sequence-windowed LRU bump dedup. Every
+  // recordHit() relaxed-increments segment->hits_; only every Nth hit
+  // forwards to LruPolicy::onHit (which would otherwise take the bucket
+  // priorityMutex). A hot segment hit thousands of times in a burst
+  // collapses to ~1/N splice-to-MRU calls; LRU order stays correct within
+  // an order of magnitude. kLruBumpEveryNHits must be a power of two so
+  // the gate compiles to a single AND.
+  constexpr uint64_t kLruBumpEveryNHits = 16;
+  static_assert(
+      (kLruBumpEveryNHits & (kLruBumpEveryNHits - 1)) == 0,
+      "kLruBumpEveryNHits must be a power of two");
+  const uint64_t prevHits =
+      segment->hits_.fetch_add(1, std::memory_order_relaxed);
+  if ((prevHits & (kLruBumpEveryNHits - 1)) != 0) {
     return;
   }
   auto& bucket = metadata_->bucketOf(segment->key().path);
-  CachePriorityGuard guard{bucket.priorityMutex};
-  bucket.priority->onHit(segment);
+  if (CachePriorityGuard guard{bucket.priorityMutex, std::try_to_lock};
+      guard.owns_lock()) {
+    bucket.priority->onHit(segment);
+  }
+  // Contention -> drop the bump; the next hit on this segment (or the next
+  // burst) will land within the window and try again.
 }
 
 void FsCache::recordMiss(

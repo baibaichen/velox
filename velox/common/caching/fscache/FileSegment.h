@@ -205,16 +205,20 @@ class FileSegment {
   /// notifyAll() helpers and drop the public mutex_/cv_.
   mutable FileSegmentMutex mutex_;
 
-  /// Collapses concurrent LRU bumps on the same segment. FsCache::recordHit()
-  /// callers take this mutex with try_to_lock; losers skip the bump (LRU bump is
-  /// best-effort, and one bump per burst of concurrent hits is enough to
-  /// move the segment toward MRU). Plain std::mutex (not RankedMutex)
-  /// because it is acquired strictly outside any cache-level mutex chain
-  /// and held only across a single onHit() call.
-  mutable std::mutex increasePriorityMutex_;
-
   /// Notifies waiters when state_ leaves kDownloading. Paired with mutex_.
   mutable std::condition_variable_any cv_;
+
+  /// Monotonic per-segment hit counter. FsCache::recordHit() relaxed-
+  /// increments this on every hit and only forwards to LruPolicy::onHit()
+  /// every Nth hit (R3, kLruBumpEveryNHits in FsCache.cpp). Replaces the
+  /// prior per-segment increasePriorityMutex_ try_lock pattern: an atomic
+  /// RMW + branch is ~5 ns versus a mutex pair, and the windowed bump keeps
+  /// LRU order correct within an order of magnitude (a segment hit 1k times
+  /// still sits MRU vs one hit 5 times). Exposed publicly for the same
+  /// reason mutex_/cv_ are: FsCache orchestrates the synchronization; an
+  /// accessor would just push FsCache logic into FileSegment. Also reused
+  /// as the SLRU promotion source in phase 2.
+  std::atomic<uint64_t> hits_{0};
 
  private:
   FsCacheKey key_;
@@ -232,9 +236,6 @@ class FileSegment {
   // write() checks downloadedSize_ + len <= reservedBytes_.
   uint64_t reservedBytes_{0};
 
-  // Phase 1: hits_ is recorded but not consumed; SLRU promotion lands in
-  // phase 2.
-  std::atomic<uint64_t> hits_{0};
   std::atomic<uint64_t> refCount_{0};
 };
 

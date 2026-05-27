@@ -107,9 +107,27 @@ class RankedGuard {
     mutex_->lock();
   }
 
-  /// Unlocks the mutex.
+  /// Non-blocking constructor: attempts to acquire `mutex` via try_lock.
+  /// Mirrors std::unique_lock(mutex, std::try_to_lock). owns_lock() reports
+  /// whether the acquire succeeded; if it failed, the dtor is a no-op. Used
+  /// by best-effort hot-path callers (e.g., FsCache::recordHit LRU bump)
+  /// that would rather drop work than block.
+  RankedGuard(RankedMutex<kRank>& mutex, std::try_to_lock_t) : mutex_{&mutex} {
+    if (!mutex_->try_lock()) {
+      mutex_ = nullptr;
+    }
+  }
+
+  /// Returns true iff this guard currently holds the mutex.
+  bool owns_lock() const {
+    return mutex_ != nullptr;
+  }
+
+  /// Unlocks the mutex iff this guard owns it.
   ~RankedGuard() {
-    mutex_->unlock();
+    if (mutex_ != nullptr) {
+      mutex_->unlock();
+    }
   }
 
   RankedGuard(const RankedGuard&) = delete;

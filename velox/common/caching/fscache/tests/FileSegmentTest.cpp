@@ -140,21 +140,22 @@ TEST_F(FileSegmentTest, localPathFollowsTwoLevelLayout) {
   EXPECT_EQ(path, expected);
 }
 
-TEST_F(FileSegmentTest, increasePriorityMutexIsAccessible) {
+TEST_F(FileSegmentTest, hitsCounterStartsAtZero) {
   FsCacheKey key{PathKey::fromPath("/x"), 0, 4'096};
   FileSegment segment{key, "/x"};
-  std::unique_lock<std::mutex> lk{
-      segment.increasePriorityMutex_, std::try_to_lock};
-  EXPECT_TRUE(lk.owns_lock());
+  // R3: hits_ replaces the prior increasePriorityMutex_ try_lock dedup.
+  // recordHit() in FsCache.cpp reads-modify-writes this counter and only
+  // forwards to LruPolicy::onHit() when (prev & 15) == 0.
+  EXPECT_EQ(segment.hits_.load(), 0U);
 }
 
-TEST_F(FileSegmentTest, increasePriorityMutexExcludesConcurrentTryLock) {
+TEST_F(FileSegmentTest, hitsCounterIsRelaxedAtomicallyIncrementable) {
   FsCacheKey key{PathKey::fromPath("/x"), 0, 4'096};
   FileSegment segment{key, "/x"};
-  std::unique_lock<std::mutex> first{segment.increasePriorityMutex_};
-  std::unique_lock<std::mutex> second{
-      segment.increasePriorityMutex_, std::try_to_lock};
-  EXPECT_FALSE(second.owns_lock());
+  const uint64_t prev =
+      segment.hits_.fetch_add(1, std::memory_order_relaxed);
+  EXPECT_EQ(prev, 0U);
+  EXPECT_EQ(segment.hits_.load(), 1U);
 }
 
 } // namespace facebook::velox::cache::fs::test
