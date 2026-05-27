@@ -192,18 +192,29 @@ ws_mult=0.5 + lat=0 是**全命中纯 hit-path**，理想扩展系数应 ≥ 0.8
 - **性能**：
   - ws_mult=0.5 全命中 16 线程扩展系数 ≥ 0.80×（phase-1 baseline 0.28×）。
   - dwio TPC-H prefetch 路径不应被 miss 主导。**接口契约**：
-    `FsCacheStats` 拆 4 个 atomic 字段
-    `prefetchHits / prefetchMisses / demandHits / demandMisses`；
+    POD `FsCacheStats` 暴露 4 个 hit/miss 字段
+    `prefetchHits / prefetchMisses / demandHits / demandMisses`，
+    snapshot 由 `FsCache::stats()` 从内部 `AtomicCounters` 6 次 relaxed
+    load 拷出（内部 AtomicCounters 提供 atomic 写，外部 snapshot 保持
+    可拷贝；spec §6.3 design note 解释 Shape β 决策）；
     每次 `FsCache::getOrSet` 调用方传入 `IsPrefetch` 枚举
     `kPrefetch | kDemand` 决定计入哪对计数器（计数发生在 getOrSet
     内、lookupRange + fillHoles 之后；lookupRange 自身不接收
     IsPrefetch，见 §5.2 / §6.3）。UT 在
     `FsCacheStatsTest.cpp` 精确覆盖 4 个字段递增（§9.1）。
-  - **E2E 验证**：`FsCacheBufferedInputTest::prefetchRatio` 用 mock
-    workload（先 enqueue 多个 region 触发 prefetch，再随机 read 触发
-    demand）验证 `prefetchMisses / (prefetchMisses + demandMisses)
-    ≥ 0.80`（§9.2）。TPC-H 端到端只用来旁证趋势，不作硬 gate（workload
-    本身可能 prefetch-friendly 程度不同）。
+  - **E2E 验证**：两个 derive metric 分担两件不同的事，**两条都是
+    Task 16 perf gate 的硬指标**：
+    - `prefetchHitRate(stats) = prefetchHits / (prefetchHits + prefetchMisses)`
+      —— prefetch 路径自身的命中率；目标 ≥ 0.95（hot blob 热再读应该
+      接近 1.0）。`FsCacheBufferedInputTest::prefetchHitRateOnWarmReread`
+      用 mock workload（先 enqueue 后再 enqueue 同 region）锁定。
+    - `prefetchMissShare(stats) = prefetchMisses / (prefetchMisses + demandMisses)`
+      —— 所有 miss 中 prefetch 承担的比例；目标 ≥ 0.80（demand miss
+      占比 ≤ 20% 表示用户线程极少阻塞在冷读上）。仍由
+      `FsCacheBufferedInputTest` 的 prefetch-then-demand workload 验证
+      （§9.2）。
+    TPC-H 端到端只用来旁证趋势，不作硬 gate（workload 本身可能
+    prefetch-friendly 程度不同）。
 - **测试覆盖**：每个新公共 API 至少 1 个 unit test；新增 prod 文件 ≥
   对应 test 文件；3 层 UT 全部落地（§9）。
 
@@ -298,7 +309,7 @@ caller: FsCache::getOrSet(path, off, size, settings, remote, isPrefetch)
      state == kEmpty 或 kDownloading       → prefetchMisses / demandMisses
    prefetch* vs demand* 由参数 isPrefetch 决定。计数完成后再 unlock
    keyMetadata（计数本身无锁，但要在 caller 看到 holder 之前完成以保
-   证 §9.2 prefetchRatio 测试的 happens-before）。
+   证 §9.2 prefetchHitRate / prefetchMissShare 测试的 happens-before）。
 7. unlock keyMetadata
 8. return holder
 
@@ -625,31 +636,89 @@ rank 4: FileSegment::mutex_                       (per-segment, state CAS / cv_ 
 
 ### 6.3 Atomic stats
 
-`FsCacheStats` 内部字段全部改 `std::atomic<uint64_t>`，按 prefetch/demand
-拆 4 个字段：
+`FsCacheStats` 是公开的 **POD snapshot**（plain `uint64_t` 字段，**不** atomic）；
+真正存放数据的是 `FsCache` 内部的 `AtomicCounters`，每字段
+`std::atomic<uint64_t>`。`FsCache::stats()` 把 `AtomicCounters` 的 6 个 relaxed
+load 拷进 POD 返回。两者均按 prefetch/demand 拆 4 个 hit/miss 字段：
 
 ```cpp
+// Public snapshot. Copyable; callers can do `const auto s = cache.stats();`
+// then read fields directly.
 struct FsCacheStats {
-  std::atomic<uint64_t> prefetchHits{0};
-  std::atomic<uint64_t> prefetchMisses{0};
-  std::atomic<uint64_t> demandHits{0};
-  std::atomic<uint64_t> demandMisses{0};
-  std::atomic<uint64_t> evictions{0};
+  uint64_t prefetchHits{0};
+  uint64_t prefetchMisses{0};
+  uint64_t demandHits{0};
+  uint64_t demandMisses{0};
+  uint64_t evictions{0};
   // `bytesOnDisk` 留作 phase-1 既有字段保留：eviction loop 靠它判停
   // (`FsCache.h:146` 的 `bytesOnDisk + bytesNeeded <= maxBytes`)；
   // `FsCache::totalSize()` 是它的 public accessor，对齐 CH
   // `FileCache::getUsedCacheSize()` (FileCache.h:199, 实现 cpp:2132 也是
   // 取 priority 队列的 approximate 大小)。
-  std::atomic<uint64_t> bytesOnDisk{0};
+  uint64_t bytesOnDisk{0};
 };
 
+// Internal: each field std::atomic<uint64_t>, same names.
+// recordHit / recordMiss fetch_add(1, relaxed) here; stats() snapshots
+// to the POD above via 6 per-field relaxed loads (no cross-field
+// consistency — callers needing one must quiesce writers).
+struct AtomicCounters { /* same field names, std::atomic<uint64_t> */ };
+
 enum class IsPrefetch : uint8_t { kPrefetch, kDemand };
+
+// Two derived metrics keyed off the perf gate (§3 / §9.2):
+//
+// `prefetchHitRate` — prefetch path's own hit rate. Task 16 gate
+// requires ≥ 0.95 on hot reread (a warm cache should hit nearly
+// every prefetch). Demand counters do not enter — demand reads are
+// blocking by definition, not part of the prefetch *effectiveness*
+// metric.
+inline double prefetchHitRate(const FsCacheStats& s) {
+  const auto total = s.prefetchHits + s.prefetchMisses;
+  return total == 0
+      ? 0.0
+      : static_cast<double>(s.prefetchHits) / static_cast<double>(total);
+}
+
+// `prefetchMissShare` — share of ALL misses that were taken by the
+// prefetch path rather than the demand path. Task 16 gate / §3
+// quantitative target requires ≥ 0.80 (demand miss ≤ 20% of total
+// miss). High prefetchMissShare means "most cache pain is absorbed by
+// background prefetch before user threads need the bytes" — the
+// user-visible win.
+inline double prefetchMissShare(const FsCacheStats& s) {
+  const auto total = s.prefetchMisses + s.demandMisses;
+  return total == 0
+      ? 0.0
+      : static_cast<double>(s.prefetchMisses) /
+          static_cast<double>(total);
+}
 ```
 
+**Design note — snapshot 为何是 POD 而不是 atomic struct**：
+
+ClickHouse FileCache 完全不拆 prefetch/demand，也不暴露 hit/miss counter
+（只在 ProfileEvents 里数 operation 次数 / 时长，
+`src/Common/ProfileEvents.cpp:797-835`；FileCache 内部对 `prefetch` 无感知）。
+Velox spec §9.2 要两个 metric（`prefetchHitRate` 和 `prefetchMissShare`）作为 Task 16 perf gate 的 acceptance
+指标，所以拆 4 字段是 **Velox 自创的指标，不是抄 CH**。
+
+但拆字段不需要让 snapshot 自身也 atomic：
+- **原子性**：由内部 `AtomicCounters` 的 `fetch_add(1, relaxed)` 单独保证；
+  写不丢、不撕。
+- **可拷贝**：snapshot 是 POD `uint64_t`，下游测试可以
+  `const auto s = cache.stats(); EXPECT_EQ(s.prefetchHits, 1);`
+  正常写——atomic struct 不可拷贝且必须处处 `.load()`，下游 15+ 处既有
+  测试会 ABI break，且对正确性零增益。
+
+Round-6 patch 曾尝试 atomic snapshot 形态，回退到本节定义的 POD 形态。
+本节是终态。
+
 `FsCache::getOrSet` 在公共入口处接收 `IsPrefetch isPrefetch`（§4 唯一
-带该参数的 API）；`fetch_add(1, std::memory_order_relaxed)`
-（observability 不要求 seq_cst）。端到端的 prefetch ratio 由 caller
-自己用 4 字段算（见 §3 量化目标 + §9.2 `prefetchRatio` 测试）。
+带该参数的 API）；内部 `AtomicCounters`
+`fetch_add(1, std::memory_order_relaxed)`（observability 不要求 seq_cst）。
+端到端的两个 prefetch metric 由 `prefetchHitRate()` 和 `prefetchMissShare()`
+自由函数计算（见 §3 量化目标 + §9.2 prefetch metric 测试）。
 
 `recordHit` 当前路径：
 ```
@@ -657,7 +726,7 @@ hot path:
   metadata_->lookup(key)        // 1 把全局锁 ← 改 per-key
   recordHit(segment):
     LRU.splice(it, head)        // 1 把全局锁 ← 改 try_lock per-bucket
-    ++stats.hits                // 改 atomic
+    ++stats.hits                // 改 atomic（在 AtomicCounters 上）
 ```
 
 改造后（与 §4.1 step 6 严格一致；计数在 `getOrSet` 内、
@@ -887,7 +956,8 @@ UT 三层 + TDD-first（用户决策）。每个新公共 API 至少 1 个 unit 
 | `FsCacheInputStreamTest.cpp` (新) | 边写边可读语义专门测试跨 partial 段的 Next() 行为；read 等到 downloadedSize 推进；writer abandon 时 read throw |
 | `FsCacheEquivalenceTest.cpp` 扩展 | 跟现有 LocalReadFile 字节级一致性 — CH 对齐后必须仍然 pass，否则证明改动破坏了语义 |
 | `FsCacheBypassTest.cpp` (新) | `size >= bypassThresholdBytes` 走 direct pread；不进 metadata；不计入 hits/misses |
-| `FsCacheBufferedInputTest::prefetchRatio` (新增 case) | mock workload：先 enqueue N 个 region 走 `IsPrefetch::kPrefetch` 触发 prefetch；再随机 read 走 `IsPrefetch::kDemand` 触发 demand miss；断言 `prefetchMisses / (prefetchMisses + demandMisses) ≥ 0.80`，覆盖 §3 量化目标的 E2E 验证手段 |
+| `FsCacheBufferedInputTest::prefetchHitRateOnWarmReread` (新增 case) | 两次 enqueue 同 region：第一次 cold prefetch 全 miss，第二次全 hit；断言 `prefetchHitRate ≥ 0.95`（delta 上）。Task 16 perf gate 主 hot-path 指标。 |
+| `FsCacheBufferedInputTest::prefetchMissShare` (新增 case) | mock workload：先 enqueue N 个 region 走 `IsPrefetch::kPrefetch` 触发 prefetch miss；再随机 read 走 `IsPrefetch::kDemand` 触发少量 demand miss；断言 `prefetchMissShare ≥ 0.80`，覆盖 §3 量化目标（demand miss ≤ 20% of total miss）。 |
 
 ### 9.3 第 3 层：concurrency UT
 
@@ -1027,7 +1097,7 @@ scan（每个段只命中一次）时 protected list 长期空。
 | 11 | `DownloadThreadPool` + async load + 测试 | 9 |
 | 12 | `FileCacheQueryLimit` + `bypass_cache_threshold` + 测试 | 11 |
 | 13 | `SlruPolicy` + 测试 | — |
-| 14 | atomic stats（4 字段 `prefetchHits/Misses + demandHits/Misses` + `IsPrefetch` 枚举）+ try_lock LRU bump；**同 commit 内**在 `FsCacheBufferedInput::load` 传 `kPrefetch`、在 `FsCacheInputStream` 同步 read 路径传 `kDemand`，并跑通 §9.2 `FsCacheBufferedInputTest::prefetchRatio` | 8, 9, 10 |
+| 14 | POD `FsCacheStats` 暴露 4 字段 hit/miss split（`prefetchHits/Misses + demandHits/Misses`）+ 内部 `AtomicCounters` 提供 atomic 写 + `IsPrefetch` 枚举 + `prefetchHitRate` / `prefetchMissShare` derive metric + try_lock LRU bump；**同 commit 内**在 `FsCacheBufferedInput::load` 传 `kPrefetch`、在 `FsCacheInputStream` 同步 read 路径传 `kDemand`，并跑通 §9.2 `prefetchHitRateOnWarmReread` + `prefetchMissShare` 双测试 | 8, 9, 10 |
 | 15 | `FsCacheEquivalenceTest` / TPC-H q1-q22 端到端验证 | 12, 13, 14 |
 | 16 | 性能 gate 跑通（≥ 7.0 M / ≥ 0.80×） | 15 |
 
@@ -1120,8 +1190,9 @@ scan（每个段只命中一次）时 protected list 长期空。
   loadFromDisk 识别删除）；`getDownloader()` 已在 §4 FileSegment 接口
   和 §5.4 状态转移表显式声明；`kPartiallyDownloadedNoContinuation →
   reserve()` 明确为"抛 VeloxRuntimeError + state 不变"；
-  `KeyNotFoundPolicy` 4 个枚举统一 k 前缀 camelCase；prefetch ratio
-  目标拆为 "接口契约 (4-atomic FsCacheStats) + E2E `prefetchRatio`
+  `KeyNotFoundPolicy` 4 个枚举统一 k 前缀 camelCase；prefetch 指标
+  目标拆为 "接口契约 (POD `FsCacheStats` + 内部 atomic) + E2E
+  `prefetchHitRate` / `prefetchMissShare`
   test" 双轨；**`IsPrefetch` 只在 §4 `FsCache::getOrSet` 公共入口出现**
   （`lookupRange` 不接收，避免 stats 计数点多处冲突）；§4.1 时序步骤
   6 显式给出 stats 4 字段计数点（segment-level，atomic 不加锁）；§11

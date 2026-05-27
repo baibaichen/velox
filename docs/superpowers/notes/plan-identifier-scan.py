@@ -37,6 +37,29 @@ PATTERNS: list[tuple[str, str]] = [
     (r"FsCacheStats\.h", "FsCacheStats.h — Shape α did NOT create this header"),
     (r"\bsnapshot\.hits\b", "snapshot.hits — Shape α removed unsplit hits/misses"),
     (r"\bsnapshot\.misses\b", "snapshot.misses — Shape α removed unsplit hits/misses"),
+    # Round-7 R6: POD snapshot fields treated as atomic — Shape α residue
+    (
+        r"\b(?:s|stats|snap|warmStats|finalStats|baseline\w*|snapshot)\.(?:prefetchHits|prefetchMisses|demandHits|demandMisses|evictions|bytesOnDisk)\.(?:load|fetch_add|fetch_sub|store)\b",
+        "POD FsCacheStats field accessed as atomic — Shape β snapshot is plain uint64_t",
+    ),
+    # Round-7 R6: free-fn recordHit/recordMiss on FsCacheStats (spec §6.3
+    # only declares prefetchHitRate / prefetchMissShare free fns).
+    (
+        r"\brecord(?:Hit|Miss)\s*\(\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*&\s*)?(?:s|stats|counters_)\b\s*,",
+        "recordHit/recordMiss free-fn on FsCacheStats — spec §6.3 only declares prefetchHitRate / prefetchMissShare free fns",
+    ),
+    # Round-7 R6: stale "non-copyable / contains atomic" prose contradicting
+    # §6.3 design note.
+    (
+        r"FsCacheStats is non-copyable|contains std::atomic members?",
+        "prose says FsCacheStats contains atomic — contradicts §6.3 design note (POD snapshot)",
+    ),
+    # Round-7 R6: prefetchRatio name removed (split into prefetchHitRate +
+    # prefetchMissShare per spec §6.3 to disambiguate the two metrics).
+    (
+        r"\bprefetchRatio\b",
+        "prefetchRatio — renamed in Round-7 to prefetchHitRate (§9.2 perf gate) and prefetchMissShare (§3 quantitative target)",
+    ),
 ]
 
 # 2-arg recordHit/recordMiss callsites are valid INSIDE Task 8's getOrSet
