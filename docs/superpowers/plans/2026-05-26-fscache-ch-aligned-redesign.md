@@ -2614,7 +2614,7 @@ size_t checkedNumThreads(size_t numThreads) {
   // starts throttling and we lose more to contention than we gain in
   // parallelism. Misconfiguration that would otherwise silently regress
   // p99 fetch latency is bounded here. If 32 turns out to be wrong, raise
-  // after measurement (see Task 16 perf gate).
+  // after measurement (see Task 16 throughput/scaling gate).
   return std::min<size_t>(numThreads, 32);
 }
 } // namespace
@@ -4155,7 +4155,7 @@ The existing FsCacheStats is non-atomic and counts only `hits`/`misses`. Spec §
 - `demandHits` — segment found in cache AND request was a demand read
 - `demandMisses` — segment had to be created/written AND request was a demand read
 
-`prefetchHitRate(s)` = `prefetchHits / (prefetchHits + prefetchMisses)` is the Task 16 perf gate's hot-path metric: a healthy fscache should keep `prefetchHitRate ≥ 0.95` for warm benchmarks. `prefetchMissShare(s)` = `prefetchMisses / (prefetchMisses + demandMisses)` is the §3 quantitative target: demand miss should stay ≤ 20% of total miss (i.e. `prefetchMissShare ≥ 0.80`). Both metrics live as free functions next to `FsCacheStats`.
+`prefetchHitRate(s)` = `prefetchHits / (prefetchHits + prefetchMisses)` is the Task 14 UT gate's hot-path metric (`FsCacheBufferedInputTest::prefetchHitRateOnWarmReread`): a healthy fscache should keep `prefetchHitRate ≥ 0.95` for warm benchmarks. `prefetchMissShare(s)` = `prefetchMisses / (prefetchMisses + demandMisses)` is the §3 quantitative target enforced by `FsCacheBufferedInputTest::prefetchMissShare`: demand miss should stay ≤ 20% of total miss (i.e. `prefetchMissShare ≥ 0.80`). Both metrics live as free functions next to `FsCacheStats`. Task 14 is the sole gate authority for prefetchHitRate / prefetchMissShare; Task 16 only handles throughput/scaling per Round-10 retreat.
 
 `IsPrefetch` was added to the FsCache API in Task 8 (every callsite then hard-coded `kDemand`); Task 11 step 4 flipped the prefetch callsite (`FsCacheBufferedInput::load`) to `kPrefetch`. Task 14 now: (a) makes the counters atomic, (b) actually splits the increments by IsPrefetch, (c) verifies the right value flows from FsCacheBufferedInput.
 
@@ -4312,7 +4312,8 @@ Extend the existing `FsCacheStats` POD in
 metrics. **Shape β**: `FsCacheStats` itself stays plain `uint64_t`
 (copyable snapshot); only the private `AtomicCounters` is atomic. See
 spec §6.3 design note for the rationale (CH FileCache does not split
-hit/miss at all; Velox needs the split for Task 16 perf gate but does
+hit/miss at all; Velox needs the split for the Task 14 UT gate
+(prefetchHitRate / prefetchMissShare) but does
 not need to break snapshot copyability).
 
 ```cpp
@@ -4340,8 +4341,10 @@ struct FsCacheStats {
 enum class IsPrefetch : uint8_t { kPrefetch, kDemand };
 
 /// Fraction of prefetch requests that hit in the cache, or 0.0 if no
-/// prefetch traffic yet. The Task 16 perf gate watches this number;
-/// healthy hot-path fscache should keep it ≥ 0.95 (§9.2). Demand
+/// prefetch traffic yet. The Task 14 UT gate
+/// (FsCacheBufferedInputTest::prefetchHitRateOnWarmReread) watches
+/// this number; healthy hot-path fscache should keep it ≥ 0.95
+/// (§9.2). Demand
 /// counters do not participate — demand reads are blocking by
 /// definition, so they are not part of the prefetch *effectiveness*
 /// metric.
@@ -4704,10 +4707,12 @@ demandHits, demandMisses, plus retained evictions and bytesOnDisk. The
 public snapshot stays plain uint64_t (copyable); only the private
 FsCache::AtomicCounters is std::atomic<uint64_t>. Two derive metrics
 land as free functions next to FsCacheStats:
-  - prefetchHitRate (prefetchHits / total prefetch) — Task 16 hot-path
-    gate, target ≥ 0.95 on warm reread.
+  - prefetchHitRate (prefetchHits / total prefetch) — Task 14 UT
+    gate (FsCacheBufferedInputTest::prefetchHitRateOnWarmReread),
+    target ≥ 0.95 on warm reread.
   - prefetchMissShare (prefetchMisses / total misses) — §3 quantitative
-    target, ≥ 0.80 so demand miss stays ≤ 20% of total miss.
+    target enforced by FsCacheBufferedInputTest::prefetchMissShare,
+    ≥ 0.80 so demand miss stays ≤ 20% of total miss.
 
 FsCache::recordHit and FsCache::recordMiss (MEMBER methods that own the
 LRU touch) gain an IsPrefetch parameter and increment the matching

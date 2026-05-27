@@ -8,6 +8,7 @@ mode in plan/spec patches:
 | 7     | spec §6.3 Shape α/β identifier drift | spec single-edit didn't sync plan Task 14 |
 | 9     | Task 16 file/binary name typo (`FsCacheMicroBench` → `FsCacheBenchmark`) | plan invented `--bench_seconds`, `block=8k`, `kind=prefetch` — none exist |
 | 10    | plan Task 16 CLI flags + column names + workload axis | (none yet — scan R-11 will catch) |
+| 11    | Task 16 retreat (4 perf gates → 2) — moved prefetchHitRate/prefetchMissShare to Task 14 UT level | single-edit retreat introduced 11 stale "Task 16 perf gate" cross-refs across spec + plan Task 14; class 8 below added |
 
 Scan script (`plan-identifier-scan.py`) catches drift **after** the patch
 lands. This SOP catches it **before**.
@@ -47,6 +48,22 @@ If the change introduces a new …
    spec section that defines the math. If the proposed name has a
    different formula, you are introducing semantic drift and ALL three
    downstream consumers (UT, perf gate, results doc) will disagree.
+
+8. **Task ownership retreat / migration** — when a single edit moves a
+   responsibility from Task X to Task Y (e.g. Round-11 moved
+   prefetchHitRate / prefetchMissShare gates from Task 16 to Task 14),
+   you MUST sweep every stale cross-reference before committing:
+
+   ```bash
+   grep -nE 'Task X.*gate|Task X owns|gate.*Task X' \
+     docs/superpowers/plans/*.md docs/superpowers/specs/*.md
+   ```
+
+   Update or delete every hit. A retreat is the highest-risk class of
+   single-edit drift because the task that *kept* the responsibility
+   reads correct on its own — only the now-orphaned cross-refs lie.
+   Round-11 V1 caught 11 such cross-refs missed by a single-edit
+   retreat in Round-10.
 
 ## Verification order
 

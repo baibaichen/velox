@@ -205,7 +205,8 @@ ws_mult=0.5 + lat=0 是**全命中纯 hit-path**，理想扩展系数应 ≥ 0.8
     IsPrefetch，见 §5.2 / §6.3）。UT 在
     `FsCacheStatsTest.cpp` 精确覆盖 4 个字段递增（§9.1）。
   - **E2E 验证**：两个 derive metric 分担两件不同的事，**两条都是
-    Task 16 perf gate 的硬指标**：
+    Task 14 UT gate 的硬指标**（`FsCacheBufferedInputTest::prefetchHitRateOnWarmReread`
+    / `::prefetchMissShare`；Round-10 retreat 将 §9.2 owner 从 Task 16 移给 Task 14）：
     - `prefetchHitRate(stats) = prefetchHits / (prefetchHits + prefetchMisses)`
       —— prefetch 路径自身的命中率；目标 ≥ 0.95（hot blob 热再读应该
       接近 1.0）。`FsCacheBufferedInputTest::prefetchHitRateOnWarmReread`
@@ -670,9 +671,10 @@ enum class IsPrefetch : uint8_t { kPrefetch, kDemand };
 
 // Two derived metrics keyed off the perf gate (§3 / §9.2):
 //
-// `prefetchHitRate` — prefetch path's own hit rate. Task 16 gate
-// requires ≥ 0.95 on hot reread (a warm cache should hit nearly
-// every prefetch). Demand counters do not enter — demand reads are
+// `prefetchHitRate` — prefetch path's own hit rate. Task 14 UT gate
+// (FsCacheBufferedInputTest::prefetchHitRateOnWarmReread) requires
+// ≥ 0.95 on hot reread (a warm cache should hit nearly every
+// prefetch). Demand counters do not enter — demand reads are
 // blocking by definition, not part of the prefetch *effectiveness*
 // metric.
 inline double prefetchHitRate(const FsCacheStats& s) {
@@ -683,9 +685,10 @@ inline double prefetchHitRate(const FsCacheStats& s) {
 }
 
 // `prefetchMissShare` — share of ALL misses that were taken by the
-// prefetch path rather than the demand path. Task 16 gate / §3
-// quantitative target requires ≥ 0.80 (demand miss ≤ 20% of total
-// miss). High prefetchMissShare means "most cache pain is absorbed by
+// prefetch path rather than the demand path. Task 14 UT gate
+// (FsCacheBufferedInputTest::prefetchMissShare) / §3 quantitative
+// target requires ≥ 0.80 (demand miss ≤ 20% of total miss). High
+// prefetchMissShare means "most cache pain is absorbed by
 // background prefetch before user threads need the bytes" — the
 // user-visible win.
 inline double prefetchMissShare(const FsCacheStats& s) {
@@ -702,8 +705,8 @@ inline double prefetchMissShare(const FsCacheStats& s) {
 ClickHouse FileCache 完全不拆 prefetch/demand，也不暴露 hit/miss counter
 （只在 ProfileEvents 里数 operation 次数 / 时长，
 `src/Common/ProfileEvents.cpp:797-835`；FileCache 内部对 `prefetch` 无感知）。
-Velox spec §9.2 要两个 metric（`prefetchHitRate` 和 `prefetchMissShare`）作为 Task 16 perf gate 的 acceptance
-指标，所以拆 4 字段是 **Velox 自创的指标，不是抄 CH**。
+Velox spec §9.2 要两个 metric（`prefetchHitRate` 和 `prefetchMissShare`）作为 Task 14 UT gate 的 acceptance
+指标（`FsCacheBufferedInputTest::prefetchHitRateOnWarmReread` / `::prefetchMissShare`；Round-10 retreat 将 §9.2 owner 从 Task 16 移给 Task 14），所以拆 4 字段是 **Velox 自创的指标，不是抄 CH**。
 
 但拆字段不需要让 snapshot 自身也 atomic：
 - **原子性**：由内部 `AtomicCounters` 的 `fetch_add(1, relaxed)` 单独保证；
@@ -958,7 +961,7 @@ UT 三层 + TDD-first（用户决策）。每个新公共 API 至少 1 个 unit 
 | `FsCacheInputStreamTest.cpp` (新) | 边写边可读语义专门测试跨 partial 段的 Next() 行为；read 等到 downloadedSize 推进；writer abandon 时 read throw |
 | `FsCacheEquivalenceTest.cpp` 扩展 | 跟现有 LocalReadFile 字节级一致性 — CH 对齐后必须仍然 pass，否则证明改动破坏了语义 |
 | `FsCacheBypassTest.cpp` (新) | `size >= bypassThresholdBytes` 走 direct pread；不进 metadata；不计入 hits/misses |
-| `FsCacheBufferedInputTest::prefetchHitRateOnWarmReread` (新增 case) | 两次 enqueue 同 region：第一次 cold prefetch 全 miss，第二次全 hit；断言 `prefetchHitRate ≥ 0.95`（delta 上）。Task 16 perf gate 主 hot-path 指标。 |
+| `FsCacheBufferedInputTest::prefetchHitRateOnWarmReread` (新增 case) | 两次 enqueue 同 region：第一次 cold prefetch 全 miss，第二次全 hit；断言 `prefetchHitRate ≥ 0.95`（delta 上）。Task 14 UT gate 主 hot-path 指标（Round-10 retreat 之后 owner 不再是 Task 16）。 |
 | `FsCacheBufferedInputTest::prefetchMissShare` (新增 case) | mock workload：先 enqueue N 个 region 走 `IsPrefetch::kPrefetch` 触发 prefetch miss；再随机 read 走 `IsPrefetch::kDemand` 触发少量 demand miss；断言 `prefetchMissShare ≥ 0.80`，覆盖 §3 量化目标（demand miss ≤ 20% of total miss）。 |
 
 ### 9.3 第 3 层：concurrency UT

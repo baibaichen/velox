@@ -37,6 +37,22 @@ EXPECTED_FORWARD_TARGETS: set[str] = {
     "velox_dwio_parquet_fscache_tpch_equivalence_test",  # Task 15
 }
 
+# Round-11 V4: mirror of EXPECTED_FORWARD_TARGETS for file paths that
+# the plan/spec legitimately names before they exist on disk. Each
+# entry must carry a comment stating why the path is expected to be
+# absent — either a permanent sentinel ("never committed") or a
+# transient forward-ref ("Task N creates it"). Drop entries once the
+# matching task has landed.
+EXPECTED_FORWARD_FILES: set[str] = {
+    # Permanent sentinel: plan §Verification line 5358 references this
+    # path as the file that must NOT be committed (microbench harness
+    # is local-only). Will never exist in the tree.
+    "velox/common/caching/benchmarks/CacheBackendBenchmark.cpp",
+    # Transient forward-reference: Task 13 (SlruPolicy) creates this
+    # inline header; currently skipped / opt-in for phase-2.
+    "velox/common/caching/fscache/SlruPolicy-inl.h",
+}
+
 # Patterns that indicate the Shape α FsCacheStats contract was violated
 # somewhere in plan/spec. Add new patterns when a future round-N finds a
 # similar mismatch; each addition is a permanent guard.
@@ -94,6 +110,22 @@ ARITY_TOLERANCE = "Task 14 step 5 extends"
 
 def extract_cpp_blocks(text: str) -> list[tuple[int, int, str]]:
     """Returns list of (start_line, end_line, body) for each ```cpp block."""
+    return _extract_blocks_by_lang(text, {"cpp"})
+
+
+def extract_bash_blocks(text: str) -> list[tuple[int, int, str]]:
+    """Returns list of (start_line, end_line, body) for each ```bash /
+    ```sh block. Used by Round-11 V2's block-scoped CLI flag check —
+    prose paragraphs mentioning `--flag` are anti-pattern documentation
+    and must not trip the scan, but the same flag appearing inside a
+    runnable bash block is a real drift signal.
+    """
+    return _extract_blocks_by_lang(text, {"bash", "sh", "shell"})
+
+
+def _extract_blocks_by_lang(
+    text: str, langs: set[str]
+) -> list[tuple[int, int, str]]:
     blocks: list[tuple[int, int, str]] = []
     cur_lang: str | None = None
     cur_start = 0
@@ -102,7 +134,7 @@ def extract_cpp_blocks(text: str) -> list[tuple[int, int, str]]:
         m = re.match(r"^```(\w*)\s*$", line)
         if m:
             if cur_lang is not None:
-                if cur_lang == "cpp":
+                if cur_lang in langs:
                     blocks.append((cur_start, i, "\n".join(cur_lines)))
                 cur_lang = None
                 cur_lines = []
@@ -183,6 +215,10 @@ def check_file_path_existence(text: str, root: Path) -> list[str]:
         if rel in seen:
             continue
         seen.add(rel)
+        # Round-11 V4: skip explicit forward-references the plan/spec
+        # legitimately names before the matching file exists on disk.
+        if rel in EXPECTED_FORWARD_FILES:
+            continue
         if not (root / rel).exists():
             missing.append(rel)
     return missing
@@ -246,6 +282,13 @@ def check_cli_flag_existence(text: str, root: Path) -> list[str]:
     Catches Round-10 U1 (plan invented `--bench_seconds` for
     FsCacheBenchmark).
 
+    Round-11 V2: scope this check to ```cpp / ```bash / ```sh code
+    fences only. Prose paragraphs legitimately discuss anti-patterns
+    like "do NOT introduce --bench_seconds" — those are documentation,
+    not commands a reader will copy-paste, and silencing them via a
+    whitelist let new runnable blocks reintroduce the same drift
+    undetected.
+
     Excludes common gflags built-ins and shell tooling flags so the
     scan stays focused on velox-defined flags.
     """
@@ -287,10 +330,6 @@ def check_cli_flag_existence(text: str, root: Path) -> list[str]:
         "format",
         "test",  # `git test` / `cmake --test` etc.
         "no",  # tail of compound flags like `--no-foo` getting split.
-        # Anti-pattern names that plan/spec explicitly documents as
-        # "this flag does NOT exist". Whitelisted so the scan does not
-        # round-trip the warning the doc itself is trying to give.
-        "bench_seconds",
     }
     # Harvest velox DEFINE_* flags across the tree once.
     declared: set[str] = set()
@@ -305,14 +344,17 @@ def check_cli_flag_existence(text: str, root: Path) -> list[str]:
             pass
     missing: list[str] = []
     seen: set[str] = set()
-    for m in re.finditer(r"--([a-z_][a-z0-9_]*)\b", text):
-        name = m.group(1)
-        if name in seen or name in builtin_flags:
-            continue
-        seen.add(name)
-        if name in declared:
-            continue
-        missing.append(name)
+    # Round-11 V2: only scan flags inside runnable code fences.
+    blocks = extract_cpp_blocks(text) + extract_bash_blocks(text)
+    for _start, _end, body in blocks:
+        for m in re.finditer(r"--([a-z_][a-z0-9_]*)\b", body):
+            name = m.group(1)
+            if name in seen or name in builtin_flags:
+                continue
+            seen.add(name)
+            if name in declared:
+                continue
+            missing.append(name)
     return missing
 
 
