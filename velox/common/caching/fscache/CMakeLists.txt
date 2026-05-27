@@ -23,6 +23,7 @@ velox_add_library(
   FileSegment.cpp
   KeyMetadata.cpp
   LruPolicy.cpp
+  SlruPolicy.cpp
   HEADERS
   FsCache.h
   FsCacheConfig.h
@@ -35,6 +36,7 @@ velox_add_library(
   FileSegment.h
   KeyMetadata.h
   LruPolicy.h
+  SlruPolicy.h
 )
 
 velox_link_libraries(

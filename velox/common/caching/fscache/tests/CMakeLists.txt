@@ -18,6 +18,7 @@ set(
   FsCacheKeyTest.cpp
   FsCacheGuardsTest.cpp
   EvictionPolicyTest.cpp
+  SlruPolicyTest.cpp
   FileSegmentTest.cpp
   FileSegmentStateTest.cpp
   FileSegmentWriteTest.cpp
