@@ -54,23 +54,27 @@ void FsCacheInputStream::loadCurrentSegmentBuffer() {
   // reader surfaces the failure instead of reading past the partial boundary.
   const uint64_t needed = (rangeStart - segStart) + length;
   segment->waitForDownloadedSize(needed);
-  buffer_.assign(length, '\0');
-  segment->read(rangeStart - segStart, length, buffer_.data(), cacheRoot_);
+  // make_unique_for_overwrite skips the zero-fill that segment->read()
+  // would immediately overwrite. CH's CachedOnDiskReadBufferFromFile uses
+  // Memory<>+Buffer::resize for the same reason (BufferBase.h:42).
+  buffer_ = std::make_unique_for_overwrite<char[]>(length);
+  bufferSize_ = length;
+  segment->read(rangeStart - segStart, length, buffer_.get(), cacheRoot_);
   cursor_ = 0;
 }
 
 bool FsCacheInputStream::Next(const void** data, int32_t* size) {
-  if (cursor_ >= buffer_.size()) {
+  if (cursor_ >= bufferSize_) {
     if (index_ + 1 >= segments_.size()) {
       return false;
     }
     ++index_;
     loadCurrentSegmentBuffer();
   }
-  *data = buffer_.data() + cursor_;
-  *size = static_cast<int32_t>(buffer_.size() - cursor_);
+  *data = buffer_.get() + cursor_;
+  *size = static_cast<int32_t>(bufferSize_ - cursor_);
   byteCount_ += *size;
-  cursor_ = buffer_.size();
+  cursor_ = bufferSize_;
   return true;
 }
 
@@ -85,13 +89,13 @@ bool FsCacheInputStream::SkipInt64(int64_t count) {
   VELOX_CHECK_GE(count, 0);
   while (count > 0) {
     const int64_t available =
-        static_cast<int64_t>(buffer_.size()) - static_cast<int64_t>(cursor_);
+        static_cast<int64_t>(bufferSize_) - static_cast<int64_t>(cursor_);
     if (count <= available) {
       cursor_ += count;
       byteCount_ += count;
       return true;
     }
-    cursor_ = buffer_.size();
+    cursor_ = bufferSize_;
     byteCount_ += available;
     count -= available;
     if (index_ + 1 >= segments_.size()) {

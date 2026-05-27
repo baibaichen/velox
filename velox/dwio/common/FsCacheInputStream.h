@@ -21,6 +21,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -65,9 +66,16 @@ class FsCacheInputStream final : public SeekableInputStream {
   // Total bytes returned to callers via Next() (less any BackUp / pre-Next
   // SkipInt64). Reported by ByteCount().
   uint64_t byteCount_{0};
-  // Buffer holding the slice of the current segment that intersects the
-  // requested region.
-  std::string buffer_;
+  // Owned read buffer for the current segment slice. NOT zero-initialised;
+  // segment->read() overwrites every byte. Allocated fresh per
+  // loadCurrentSegmentBuffer() call (size matches the segment-clipped
+  // region). Avoids the std::string::assign(N, '\0') memset that was 11pp of
+  // self-time in TPC-H q17 hot path
+  // (docs/superpowers/results/2026-05-28-fscache-tpch-profile.md).
+  std::unique_ptr<char[]> buffer_;
+  // Allocated length of buffer_; tracked separately since unique_ptr<char[]>
+  // does not expose size.
+  size_t bufferSize_{0};
   // Offset within buffer_ of the next byte to deliver from Next().
   size_t cursor_{0};
 };
