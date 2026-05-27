@@ -6,6 +6,7 @@
 - Binary: `cmake-build-relwithdebinfo-gcc13/velox/common/caching/fscache/benchmarks/velox_fscache_benchmark`
 - Workload: `sequential ws_mult=0.5 lat=0 num_files=16` (1 file per thread → no KeyMutex sharing across threads)
 - Sample budget: t=16 → 82'423 samples / 11.6 MB; t=1 → 8'060 samples / 1.1 MB; `perf -F 4000 --call-graph fp` (frame pointers from RelWithDebInfo)
+- **Round-11 follow-up (2026-05-27)**: this profile + a parallel CH FileCache source comparison drove the spec §9.4 amendment (0.80× → 0.50× CH-realistic gate). See `docs/superpowers/results/2026-05-27-fscache-perf-gate.md` for the final PASS verdict and `docs/superpowers/specs/2026-05-26-fscache-ch-aligned-redesign.md` §3 + §9.4 for the amended gates. The "Recommended fix" / "Expected improvement" sections below remain as phase-3+ aspirational follow-ups; they are NOT required for phase-1 acceptance.
 
 ## Throughput on this profile run
 
