@@ -24,7 +24,9 @@
 #include "velox/common/caching/fscache/FsCacheKey.h"
 #include "velox/common/caching/fscache/FsCacheMetadata.h"
 
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -265,19 +267,53 @@ class FsCache {
   }
 
  private:
-  // Live atomic counters. stats() composes an FsCacheStats POD snapshot from
-  // per-field relaxed loads. Per-field atomicity is enough for the
-  // observability use case. Snapshots taken concurrently with writers can
-  // observe arbitrary cross-field skew (the four loads are independent);
-  // callers needing a consistent snapshot (e.g. tests asserting hits+misses
-  // == total) must first quiesce writers (e.g. thread.join()).
+  // R2 (profile doc 2026-05-27): shard the two HOT counters (prefetchHits,
+  // demandHits) across kShards cache-line-padded slots to break the
+  // true-sharing bottleneck observed at t>=4. Every recordHit() on the
+  // unsharded counter forced a cross-core invalidation on the single cache
+  // line holding all 6 atomics, which capped scaling at ~0.2x efficiency
+  // at t=16. Each thread picks its shard via a thread_local id % kShards,
+  // so steady-state hits hit distinct cache lines. stats() sums across
+  // shards (O(kShards) relaxed loads). Cold counters (prefetchMisses,
+  // demandMisses, evictions, bytesOnDisk) stay un-sharded: they only fire
+  // on miss/evict, and evict() needs an O(1) load of bytesOnDisk. Each
+  // cold counter is alignas(64) so it does not false-share with the hot
+  // shards or with each other.
+  struct ShardedAtomic {
+    static constexpr size_t kShards = 32;
+    struct alignas(64) Slot {
+      std::atomic<uint64_t> value{0};
+    };
+    std::array<Slot, kShards> shards{};
+
+    void increment() {
+      shards[shardIndex()].value.fetch_add(1, std::memory_order_relaxed);
+    }
+    uint64_t load() const {
+      uint64_t sum = 0;
+      for (const auto& s : shards) {
+        sum += s.value.load(std::memory_order_relaxed);
+      }
+      return sum;
+    }
+
+   private:
+    static size_t shardIndex();
+  };
+
+  // Live atomic counters. stats() composes an FsCacheStats POD snapshot
+  // from per-field loads (sharded fields sum across shards, plain fields
+  // do a single relaxed load). Per-field atomicity is enough for the
+  // observability use case; cross-field skew is allowed (see FsCacheStats
+  // contract). Callers needing a consistent snapshot must first quiesce
+  // writers (e.g. thread.join()).
   struct AtomicCounters {
-    std::atomic<uint64_t> prefetchHits{0};
-    std::atomic<uint64_t> prefetchMisses{0};
-    std::atomic<uint64_t> demandHits{0};
-    std::atomic<uint64_t> demandMisses{0};
-    std::atomic<uint64_t> evictions{0};
-    std::atomic<uint64_t> bytesOnDisk{0};
+    ShardedAtomic prefetchHits;
+    ShardedAtomic demandHits;
+    alignas(64) std::atomic<uint64_t> prefetchMisses{0};
+    alignas(64) std::atomic<uint64_t> demandMisses{0};
+    alignas(64) std::atomic<uint64_t> evictions{0};
+    alignas(64) std::atomic<uint64_t> bytesOnDisk{0};
   };
 
   const FsCacheConfig config_;

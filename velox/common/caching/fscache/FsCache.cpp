@@ -430,13 +430,24 @@ void FsCache::evict(uint64_t bytesNeeded) {
   }
 }
 
+size_t FsCache::ShardedAtomic::shardIndex() {
+  // Per-thread shard id assigned on first call. Threads are spread across
+  // kShards via modulo, so two threads can still collide once
+  // thread-count > kShards; at that point cross-core invalidation falls
+  // back to the (still cheap) intra-shard atomic RMW. The global counter
+  // increments only once per thread, so its contention is negligible.
+  static std::atomic<size_t> nextId{0};
+  thread_local const size_t id =
+      nextId.fetch_add(1, std::memory_order_relaxed);
+  return id % kShards;
+}
+
 FsCacheStats FsCache::stats() const {
   FsCacheStats snapshot;
-  snapshot.prefetchHits =
-      counters_.prefetchHits.load(std::memory_order_relaxed);
+  snapshot.prefetchHits = counters_.prefetchHits.load();
   snapshot.prefetchMisses =
       counters_.prefetchMisses.load(std::memory_order_relaxed);
-  snapshot.demandHits = counters_.demandHits.load(std::memory_order_relaxed);
+  snapshot.demandHits = counters_.demandHits.load();
   snapshot.demandMisses =
       counters_.demandMisses.load(std::memory_order_relaxed);
   snapshot.evictions = counters_.evictions.load(std::memory_order_relaxed);
@@ -457,7 +468,7 @@ void FsCache::recordHit(FileSegment* segment, IsPrefetch isPrefetch) {
   auto& counter = isPrefetch == IsPrefetch::kPrefetch
       ? counters_.prefetchHits
       : counters_.demandHits;
-  counter.fetch_add(1, std::memory_order_relaxed);
+  counter.increment();
   // R3 (profile doc 2026-05-27): sequence-windowed LRU bump dedup. Every
   // recordHit() relaxed-increments segment->hits_; only every Nth hit
   // forwards to LruPolicy::onHit (which would otherwise take the bucket
