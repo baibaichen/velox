@@ -119,7 +119,26 @@ f0c820e06 feat(fscache): atomic FsCacheStats split + IsPrefetch (Task 14)
 
 ## Next-step 建议（按当前判断）
 
-1. **现在**：先保留 commit `1c64f9b1c`，但**不**对外宣布 phase-1 PASS
-2. **跑 #179 TPC-H A/B sweep on SF-100**（用户提到的 plan）
-3. **如果 #179 数据显示 fscache 模式真实 workload p99 不比 CBI 差**：选 A，phase-1 真 PASS（real workload evidence-driven）
-4. **如果 #179 数据显示 fscache 真有显著退化**：撤销 amendment（选 D），转去做 #179 数据导出的具体优化（不是猜想的非-CH 优化）
+**2026-05-27 更新——#179 阻塞**：尝试在
+`/home/chang/test/tpch/tpch-generated-100.0-parquet` 上跑 #179 sweep，q1
+plan 构造时抛 `VeloxUserError: Scalar function signature is not
+supported: minus(DOUBLE, DECIMAL(12, 2))`（数据集 spec-compliant
+DECIMAL(12,2)，TpchQueryBuilder.cpp:230-237 用 `1.0 - l_discount`）。
+详见 [`docs/superpowers/results/2026-05-27-fscache-tpch-ab-sweep-blocked.md`](../results/2026-05-27-fscache-tpch-ab-sweep-blocked.md)。
+
+含义：
+
+1. Real-workload p99 证据采集需要 unblock 工作（重新生成 DOUBLE 数据集
+   ~34 GB write-amp，**或** 给 TpchQueryBuilder 加 DECIMAL→DOUBLE
+   coercion 并重新生成 reference output），两条路都在 fscache 范围之外。
+2. 因此 amendment（0.80× → 0.50×）在本 session **不能被 #179 确认或推翻**。
+3. **建议**：phase-1 以当前 amended-spec PASS basis 收尾（保留 commit
+   `1c64f9b1c`，但在 spec/results 显式标注"awaiting real-workload
+   validation"）；把 "regenerate DOUBLE dataset 或 add DECIMAL coercion
+   in TpchQueryBuilder" 列为 **phase-2 prerequisite**，phase-2 启动后第一件
+   事是 unblock #179 跑出真实 p99 证据，再回头复审 amendment。
+4. 历史建议（pre-#179-attempt，保留供参考）：
+   - 若 #179 真跑出"fscache 不比 CBI 差"——选 A，phase-1 真 PASS。
+   - 若 #179 真跑出"fscache 显著退化"——撤销 amendment（选 D），转做
+     #179 数据导出的具体优化。
+   这两条都需要先解 #179 数据 schema 阻塞。
