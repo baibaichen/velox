@@ -4722,8 +4722,10 @@ bytes); all other paths default to kDemand.
 
 End-to-end FsCacheBufferedInputTest::prefetchHitRateOnWarmReread locks
 in the contract that re-reading a fully-cached blob drives the delta
-prefetchHitRate to 1.0; the perf gate in Task 16 keys off both
-prefetchHitRate and prefetchMissShare.
+prefetchHitRate to 1.0. FsCacheBufferedInputTest::prefetchMissShare
+covers the §3 quantitative target. Both are UT-level gates owned by
+Task 14 — Task 16 only runs the microbench throughput/scaling gates
+(see Round-10 retreat).
 
 Spec: docs/superpowers/specs/2026-05-26-fscache-ch-aligned-redesign.md §6.3 §9.2 §10 R5
 
