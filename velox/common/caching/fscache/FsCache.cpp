@@ -47,7 +47,8 @@ FsCache::FsCache(FsCacheConfig config)
             // buckets share the global maxBytes evenly, so the natural
             // per-bucket capacity is maxBytes / numBuckets. CH semantics
             // (promote-on-first-hit, demote-on-protected-overflow) are honored
-            // within each bucket — see SLRUFileCachePriority.cpp:81 (increment).
+            // within each bucket — see SLRUFileCachePriority::tryIncreasePriority
+            // (SLRUFileCachePriority.cpp:586, move-to-protected at :705).
             const uint64_t perBucketCapacity =
                 config.maxBytes / config.numBuckets;
             return std::make_unique<SlruPolicy>(
