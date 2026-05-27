@@ -17,6 +17,8 @@
 #include "velox/common/caching/fscache/FsCache.h"
 
 #include "velox/common/base/Exceptions.h"
+#include "velox/common/caching/fscache/LruPolicy.h"
+#include "velox/common/caching/fscache/SlruPolicy.h"
 #include "velox/common/file/File.h"
 
 #include <glog/logging.h>
@@ -32,7 +34,25 @@ namespace facebook::velox::cache::fs {
 
 FsCache::FsCache(FsCacheConfig config)
     : config_{std::move(config)},
-      metadata_{std::make_unique<FsCacheMetadata>(config_.numBuckets)},
+      metadata_{std::make_unique<FsCacheMetadata>(
+          config_.numBuckets,
+          [&config = std::as_const(config_)]()
+              -> std::unique_ptr<EvictionPolicy> {
+            if (!config.enableSlru) {
+              return std::make_unique<LruPolicy>();
+            }
+            // Per-bucket SLRU mirrors the per-bucket LruPolicy layout: each
+            // bucket owns its own protected/probationary pair sized to the
+            // average per-bucket budget. CH does not shard, but Velox's 1024
+            // buckets share the global maxBytes evenly, so the natural
+            // per-bucket capacity is maxBytes / numBuckets. CH semantics
+            // (promote-on-first-hit, demote-on-protected-overflow) are honored
+            // within each bucket — see SLRUFileCachePriority.cpp:81 (increment).
+            const uint64_t perBucketCapacity =
+                config.maxBytes / config.numBuckets;
+            return std::make_unique<SlruPolicy>(
+                perBucketCapacity, config.slruProtectedRatio);
+          })},
       downloadPool_{
           std::make_unique<DownloadThreadPool>(config_.downloadThreads)} {
   // splitRange relies on maxSegmentSize being a multiple of alignment so

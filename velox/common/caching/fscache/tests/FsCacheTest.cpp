@@ -336,6 +336,28 @@ TEST_F(FsCacheTest, ctorRejectsInvalidConfig) {
   EXPECT_THROW(FsCache{bad}, ::facebook::velox::VeloxException);
 }
 
+// Smoke test for the Task E factory branch: enableSlru=true must construct
+// successfully and drive a getOrSet round-trip identical to the LruPolicy
+// default. Behavioural validation of SLRU promotion semantics lives in
+// SlruPolicyTest; here we only assert the factory wiring is reachable.
+TEST_F(FsCacheTest, enableSlruConstructsAndServesRequests) {
+  FsCacheConfig cfg = config_;
+  cfg.enableSlru = true;
+  cfg.slruProtectedRatio = 0.6;
+  FsCache cache{cfg};
+  LocalReadFile remote{remotePath_};
+  {
+    auto holder = cache.getOrSet(
+        remotePath_, 0, 4'096, cache.config(), remote, IsPrefetch::kDemand);
+    driveSegments(*holder, remote, cache);
+  }
+  auto holder = cache.getOrSet(
+      remotePath_, 0, 4'096, cache.config(), remote, IsPrefetch::kDemand);
+  driveSegments(*holder, remote, cache);
+  EXPECT_EQ(cache.stats().demandMisses, 1);
+  EXPECT_GT(cache.stats().demandHits, 0);
+}
+
 // Regression: two concurrent writers that both trigger evict() must not race
 // on the LRU victim list. Without serialization in evict(), selectVictims()
 // can return the same victim to both threads, and the first thread's metadata
