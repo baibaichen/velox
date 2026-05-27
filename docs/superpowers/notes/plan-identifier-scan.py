@@ -14,12 +14,14 @@ key off it later).
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
 
 PLAN = Path("docs/superpowers/plans/2026-05-26-fscache-ch-aligned-redesign.md")
 SPEC = Path("docs/superpowers/specs/2026-05-26-fscache-ch-aligned-redesign.md")
+REPO_ROOT = Path(".")
 
 # Patterns that indicate the Shape α FsCacheStats contract was violated
 # somewhere in plan/spec. Add new patterns when a future round-N finds a
@@ -148,6 +150,78 @@ def cross_check_tests(spec_text: str, plan_text: str) -> list[str]:
     ]
 
 
+def check_file_path_existence(text: str, root: Path) -> list[str]:
+    """Round-9 R-10: every `velox/.../file.{cpp,h}` mentioned in plan/spec
+    prose or code fences should refer to an actual file in the tree.
+    Catches Round-9 T3 (plan mentioned `FsCacheMicroBench.cpp` but the
+    file is `FsCacheBenchmark.cpp`).
+
+    Tolerated: paths inside cpp examples that are clearly the new file
+    the task is creating (matched by checking the same paragraph for
+    `Create:` markers — skipped to keep the regex simple, instead we
+    rely on the missing-path list being short enough for a human to
+    triage).
+    """
+    missing: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r"`(velox/[^`\s]+\.(?:cpp|h|cc|hpp))`", text):
+        rel = m.group(1)
+        if rel in seen:
+            continue
+        seen.add(rel)
+        if not (root / rel).exists():
+            missing.append(rel)
+    return missing
+
+
+def check_binary_target_existence(text: str, root: Path) -> list[str]:
+    """Round-9 R-10: every `velox_*_test` / `velox_*_benchmark` / etc.
+    target named in plan/spec should appear in some CMakeLists.txt.
+    Greps the entire velox/ tree once for `add_executable(NAME` to
+    confirm. Tolerated: targets the plan itself promises to add (those
+    show up under a `target` line and are matched against
+    `add_executable(<NAME>` regardless of CMake file location).
+    """
+    declared: set[str] = set()
+    for cml in root.glob("velox/**/CMakeLists.txt"):
+        try:
+            for m in re.finditer(
+                r"add_executable\(\s*([A-Za-z_][A-Za-z0-9_]*)", cml.read_text()
+            ):
+                declared.add(m.group(1))
+            for m in re.finditer(
+                r"velox_add_grouped_tests\([^)]*PREFIX\s+([A-Za-z_][A-Za-z0-9_]*)",
+                cml.read_text(),
+                re.DOTALL,
+            ):
+                # Grouped tests produce `<PREFIX>_groupN` binaries; we
+                # accept the prefix as a usable target.
+                declared.add(m.group(1))
+        except OSError:
+            pass
+    missing: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r"\b(velox_[a-z0-9_]+(?:_test|_benchmark|_bench))\b", text):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        # Accept either an exact match or a grouped-prefix match
+        # (`velox_fscache_test` covers `velox_fscache_test_group0/1`).
+        if name in declared:
+            continue
+        # Allow grouped suffixes like `_group0`.
+        stripped = re.sub(r"_group\d+$", "", name)
+        if stripped in declared:
+            continue
+        # Allow prefix-style hits (a planned target referenced by its
+        # prefix only).
+        if any(d.startswith(name) for d in declared):
+            continue
+        missing.append(name)
+    return missing
+
+
 def scan(path: Path) -> list[tuple[int, str, str]]:
     text = path.read_text()
     problems: list[tuple[int, str, str]] = []
@@ -196,6 +270,49 @@ def main() -> int:
             print(f"  {m}")
     else:
         print("spec→plan tests cross-check: clean")
+
+    # Round-9 R-10: file path + binary target existence checks.
+    # Tolerated: a file may not yet exist if the same task creates it,
+    # so we report misses without setting rc=1 by default. Override via
+    # FSCACHE_SCAN_STRICT_PATHS=1 to escalate to a hard fail.
+    strict = os.environ.get("FSCACHE_SCAN_STRICT_PATHS") == "1"
+    for label, text in (("plan", plan_text), ("spec", spec_text)):
+        missing_files = check_file_path_existence(text, REPO_ROOT)
+        missing_targets = check_binary_target_existence(text, REPO_ROOT)
+        # Filter out paths the plan/spec explicitly marks as `Create:`.
+        # Cheap heuristic: a missing path that appears on a line starting
+        # with `- Create:` is a planned addition, not drift.
+        create_lines = {
+            m.group(1)
+            for m in re.finditer(
+                r"^- Create:\s*`(velox/[^`\s]+\.(?:cpp|h|cc|hpp))`",
+                text,
+                re.MULTILINE,
+            )
+        }
+        unexpected_files = [p for p in missing_files if p not in create_lines]
+        if unexpected_files:
+            print(
+                f"{label}: {len(unexpected_files)} referenced file path(s) "
+                "do not exist on disk and are not declared as Create:"
+            )
+            for p in unexpected_files:
+                print(f"  {p}")
+            if strict:
+                rc = 1
+        else:
+            print(f"{label}: file-path existence clean")
+        if missing_targets:
+            print(
+                f"{label}: {len(missing_targets)} build target(s) named but "
+                "not found in any CMakeLists.txt"
+            )
+            for t in missing_targets:
+                print(f"  {t}")
+            if strict:
+                rc = 1
+        else:
+            print(f"{label}: build-target existence clean")
     return rc
 
 
