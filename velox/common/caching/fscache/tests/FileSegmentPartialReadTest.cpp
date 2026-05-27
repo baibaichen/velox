@@ -39,7 +39,7 @@ class FileSegmentPartialReadTest : public ::testing::Test {
 TEST_F(FileSegmentPartialReadTest, readerWakesAfterEnoughBytesWritten) {
   FsCacheKey key{PathKey::fromPath("/r/x"), 0, 1024};
   FileSegment seg{key, "/r/x"};
-  ASSERT_TRUE(seg.reserve(1024, cacheRoot_));
+  ASSERT_EQ(seg.reserve(1024, cacheRoot_), FileSegment::ReserveResult::kReserved);
 
   std::atomic<bool> readerDone{false};
   std::thread reader{[&]() {
@@ -67,7 +67,7 @@ TEST_F(FileSegmentPartialReadTest, readerWakesAfterEnoughBytesWritten) {
 TEST_F(FileSegmentPartialReadTest, readerWokenByCompleteWhenNeededEqualsSize) {
   FsCacheKey key{PathKey::fromPath("/r/x"), 0, 128};
   FileSegment seg{key, "/r/x"};
-  ASSERT_TRUE(seg.reserve(128, cacheRoot_));
+  ASSERT_EQ(seg.reserve(128, cacheRoot_), FileSegment::ReserveResult::kReserved);
 
   std::atomic<bool> readerDone{false};
   std::thread reader{[&]() {
@@ -85,7 +85,7 @@ TEST_F(FileSegmentPartialReadTest, readerWokenByCompleteWhenNeededEqualsSize) {
 TEST_F(FileSegmentPartialReadTest, readerThrowsWhenWriterAbandonsShortOfNeeded) {
   FsCacheKey key{PathKey::fromPath("/r/x"), 0, 1024};
   FileSegment seg{key, "/r/x"};
-  ASSERT_TRUE(seg.reserve(1024, cacheRoot_));
+  ASSERT_EQ(seg.reserve(1024, cacheRoot_), FileSegment::ReserveResult::kReserved);
 
   std::thread reader{[&]() {
     EXPECT_THROW(
@@ -102,7 +102,7 @@ TEST_F(FileSegmentPartialReadTest, readerThrowsWhenWriterAbandonsShortOfNeeded) 
 TEST_F(FileSegmentPartialReadTest, readerWokenByAbandonWhenDownloadedExceedsNeeded) {
   FsCacheKey key{PathKey::fromPath("/r/x"), 0, 1024};
   FileSegment seg{key, "/r/x"};
-  ASSERT_TRUE(seg.reserve(1024, cacheRoot_));
+  ASSERT_EQ(seg.reserve(1024, cacheRoot_), FileSegment::ReserveResult::kReserved);
 
   std::string chunk(256, 'D');
   seg.write(chunk.data(), chunk.size());

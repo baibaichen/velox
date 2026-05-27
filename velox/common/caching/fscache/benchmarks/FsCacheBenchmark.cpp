@@ -411,15 +411,22 @@ void parallelRun(
             continue;
           }
           driver.fsCache().evict(seg->key().size);
-          if (!seg->reserve(
-                  seg->key().size, driver.fsCache().config().cacheRoot)) {
-            if (seg->state() == FileSegment::State::kDownloaded) {
-              driver.fsCache().recordMiss(
-                  seg.get(), seg->key().size, IsPrefetch::kDemand);
-            } else {
-              seg->waitForDownloadedSize(seg->key().size);
-              driver.fsCache().recordHit(seg.get(), IsPrefetch::kDemand);
-            }
+          const auto reserveResult = seg->reserve(
+              seg->key().size, driver.fsCache().config().cacheRoot);
+          if (reserveResult == FileSegment::ReserveResult::kLostRace) {
+            // Another writer is mid-download or already completed it.
+            // The winner will recordMiss; we wait and count a hit.
+            seg->waitForDownloadedSize(seg->key().size);
+            driver.fsCache().recordHit(seg.get(), IsPrefetch::kDemand);
+            continue;
+          }
+          if (reserveResult ==
+              FileSegment::ReserveResult::kWarmRestartPublished) {
+            // We won the CAS and the warm-restart short-circuit republished
+            // the on-disk file as kDownloaded. We are the publisher and
+            // must recordMiss exactly once.
+            driver.fsCache().recordMiss(
+                seg.get(), seg->key().size, IsPrefetch::kDemand);
             continue;
           }
           try {

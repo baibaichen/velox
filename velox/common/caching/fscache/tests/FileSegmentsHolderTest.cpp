@@ -44,7 +44,7 @@ TEST_F(FileSegmentsHolderTest, emptyHolderDestructsCleanly) {
 TEST_F(FileSegmentsHolderTest, emptyReturnsFalseWhenSegmentsHeld) {
   FsCacheKey key{PathKey::fromPath("/r/x"), 0, 8};
   auto seg = std::make_shared<FileSegment>(key, "/r/x");
-  ASSERT_TRUE(seg->reserve(8, cacheRoot_));
+  ASSERT_EQ(seg->reserve(8, cacheRoot_), FileSegment::ReserveResult::kReserved);
   std::string payload(8, 'A');
   seg->write(payload.data(), payload.size());
   seg->complete();
@@ -55,7 +55,7 @@ TEST_F(FileSegmentsHolderTest, emptyReturnsFalseWhenSegmentsHeld) {
 TEST_F(FileSegmentsHolderTest, kDownloadedSegmentSurvivesDestructor) {
   FsCacheKey key{PathKey::fromPath("/r/x"), 0, 8};
   auto seg = std::make_shared<FileSegment>(key, "/r/x");
-  ASSERT_TRUE(seg->reserve(8, cacheRoot_));
+  ASSERT_EQ(seg->reserve(8, cacheRoot_), FileSegment::ReserveResult::kReserved);
   std::string payload(8, 'A');
   seg->write(payload.data(), payload.size());
   seg->complete();
@@ -70,7 +70,7 @@ TEST_F(FileSegmentsHolderTest, kDownloadedSegmentSurvivesDestructor) {
 TEST_F(FileSegmentsHolderTest, holderAbandonsDownloadingSegmentOwnedByThisThread) {
   FsCacheKey key{PathKey::fromPath("/r/x"), 0, 1024};
   auto seg = std::make_shared<FileSegment>(key, "/r/x");
-  ASSERT_TRUE(seg->reserve(1024, cacheRoot_));
+  ASSERT_EQ(seg->reserve(1024, cacheRoot_), FileSegment::ReserveResult::kReserved);
   ASSERT_EQ(seg->state(), FileSegment::State::kDownloading);
   ASSERT_EQ(seg->getDownloader(), std::this_thread::get_id());
   {
@@ -84,7 +84,7 @@ TEST_F(FileSegmentsHolderTest, holderDoesNotAbandonSegmentOwnedByOtherThread) {
   auto seg = std::make_shared<FileSegment>(key, "/r/x");
 
   std::thread other{[&]() {
-    ASSERT_TRUE(seg->reserve(1024, cacheRoot_));
+    ASSERT_EQ(seg->reserve(1024, cacheRoot_), FileSegment::ReserveResult::kReserved);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     seg->complete();
   }};
@@ -108,7 +108,7 @@ TEST_F(FileSegmentsHolderTest, holderDoesNotAbandonSegmentOwnedByOtherThread) {
 TEST_F(FileSegmentsHolderTest, moveSemantics) {
   FsCacheKey key{PathKey::fromPath("/r/x"), 0, 8};
   auto seg = std::make_shared<FileSegment>(key, "/r/x");
-  ASSERT_TRUE(seg->reserve(8, cacheRoot_));
+  ASSERT_EQ(seg->reserve(8, cacheRoot_), FileSegment::ReserveResult::kReserved);
   std::string payload(8, 'A');
   seg->write(payload.data(), payload.size());
   seg->complete();

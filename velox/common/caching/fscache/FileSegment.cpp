@@ -118,20 +118,28 @@ void FileSegment::download(
   }
 }
 
-bool FileSegment::reserve(
+FileSegment::ReserveResult FileSegment::reserve(
     uint64_t reservedBytes,
     const std::string& cacheRoot) {
   State expected = State::kEmpty;
   if (!state_.compare_exchange_strong(
           expected, State::kDownloading, std::memory_order_acq_rel)) {
-    return false;
+    // Another writer already advanced state past kEmpty (kDownloading or
+    // kDownloaded). The caller must wait + recordHit; recordMiss is the
+    // winner's responsibility, not ours.
+    return ReserveResult::kLostRace;
   }
   const std::string finalPath = localPath(cacheRoot);
   // Warm-restart short-circuit: a prior process already produced this exact
   // file (same hash + offset + size). Skip the remote re-download and publish
   // the existing bytes directly. FsCache::loadFromDisk() does not pre-credit
-  // these to bytesOnDisk, so the writer path that called us still runs
-  // onInsert + bytesOnDisk += size and the segment becomes evictable.
+  // these to bytesOnDisk, so this caller -- which won the CAS -- still owes
+  // recordMiss + bytesOnDisk += size and is signalled via
+  // kWarmRestartPublished. Distinguishing this from kLostRace is what
+  // prevents the duplicate LruPolicy::onInsert race observed under zipfian +
+  // heavy eviction (the loser of the CAS would otherwise see state==
+  // kDownloaded after reserve()==false and incorrectly re-recordMiss the
+  // segment the winner already inserted).
   std::error_code existCheck;
   if (std::filesystem::exists(finalPath, existCheck) && !existCheck &&
       std::filesystem::file_size(finalPath, existCheck) == key_.size &&
@@ -139,7 +147,7 @@ bool FileSegment::reserve(
     downloadedSize_.store(key_.size, std::memory_order_release);
     state_.store(State::kDownloaded, std::memory_order_release);
     cv_.notify_all();
-    return false;
+    return ReserveResult::kWarmRestartPublished;
   }
   std::filesystem::create_directories(
       std::filesystem::path{finalPath}.parent_path());
@@ -155,7 +163,7 @@ bool FileSegment::reserve(
   fd_ = fd;
   reservedBytes_ = reservedBytes;
   downloader_.store(std::this_thread::get_id(), std::memory_order_release);
-  return true;
+  return ReserveResult::kReserved;
 }
 
 void FileSegment::write(const char* buf, uint64_t len) {

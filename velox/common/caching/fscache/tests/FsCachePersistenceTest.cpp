@@ -50,15 +50,17 @@ void driveSegments(
       continue;
     }
     cache.evict(seg->key().size);
-    if (!seg->reserve(seg->key().size, cacheRoot)) {
-      // reserve() may have taken the warm-restart short-circuit and
-      // already set the segment to kDownloaded.
-      if (seg->state() == FileSegment::State::kDownloaded) {
-        cache.recordMiss(seg.get(), seg->key().size, IsPrefetch::kDemand);
-      } else {
-        seg->waitForDownloadedSize(seg->key().size);
-        cache.recordHit(seg.get(), IsPrefetch::kDemand);
-      }
+    const auto reserveResult =
+        seg->reserve(seg->key().size, cacheRoot);
+    if (reserveResult == FileSegment::ReserveResult::kLostRace) {
+      seg->waitForDownloadedSize(seg->key().size);
+      cache.recordHit(seg.get(), IsPrefetch::kDemand);
+      continue;
+    }
+    if (reserveResult == FileSegment::ReserveResult::kWarmRestartPublished) {
+      // Warm-restart short-circuit inside reserve() found the file on disk
+      // and published it; we are the publisher and owe one recordMiss.
+      cache.recordMiss(seg.get(), seg->key().size, IsPrefetch::kDemand);
       continue;
     }
     try {

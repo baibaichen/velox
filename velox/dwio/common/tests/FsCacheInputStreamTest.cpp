@@ -55,7 +55,7 @@ TEST_F(FsCacheInputStreamTest, readerBlocksUntilWriterCompletesDownloadingSegmen
   constexpr uint64_t kSize = 1024;
   FsCacheKey key{PathKey::fromPath("/r/x"), 0, kSize};
   auto seg = std::make_shared<FileSegment>(key, "/r/x");
-  ASSERT_TRUE(seg->reserve(kSize, cacheRoot_));
+  ASSERT_EQ(seg->reserve(kSize, cacheRoot_), FileSegment::ReserveResult::kReserved);
   std::vector<FileSegmentPtr> segs{seg};
 
   std::atomic<bool> readerDone{false};

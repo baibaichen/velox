@@ -134,12 +134,29 @@ class FileSegment {
       ::facebook::velox::ReadFile& remote,
       const std::string& cacheRoot);
 
+  /// Outcome of reserve(). Disambiguates the three reasons reserve() can
+  /// fail to put the caller on the writer path, so callers do not
+  /// double-record the same segment via recordMiss().
+  enum class ReserveResult : uint8_t {
+    /// Caller won the kEmpty->kDownloading CAS and owns the writer fd.
+    /// Must follow up with write()+complete()+recordMiss() (or abandon()
+    /// on error).
+    kReserved = 0,
+    /// Caller won the CAS, then the warm-restart short-circuit found the
+    /// file already on disk and republished it as kDownloaded. Caller is
+    /// the publisher and must call recordMiss() exactly once.
+    kWarmRestartPublished = 1,
+    /// Caller lost the CAS: another writer is mid-download or already
+    /// completed. Caller must NOT call recordMiss() (the winner will);
+    /// instead wait for partial bytes and recordHit().
+    kLostRace = 2,
+  };
+
   /// Atomically transitions kEmpty -> kDownloading, opens the local cache
   /// file (O_CREAT|O_WRONLY, NO ftruncate), and records the calling thread
-  /// as the writer. Returns false if the segment was not kEmpty (another
-  /// writer already won or segment already kDownloaded).
+  /// as the writer. See ReserveResult for the three return paths.
   /// reservedBytes is the declared size; complete() will ftruncate to this.
-  bool reserve(uint64_t reservedBytes, const std::string& cacheRoot);
+  ReserveResult reserve(uint64_t reservedBytes, const std::string& cacheRoot);
 
   /// Appends `len` bytes at current downloadedSize_ via pwrite, advances
   /// downloadedSize_ release-store, notify_all on cv_. Must be called by

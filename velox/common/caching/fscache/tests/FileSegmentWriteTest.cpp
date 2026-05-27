@@ -39,7 +39,7 @@ TEST_F(FileSegmentWriteTest, reserveTransitionsEmptyToDownloading) {
   FsCacheKey key{PathKey::fromPath("/remote/x"), 0, 1024};
   FileSegment seg{key, "/remote/x"};
   ASSERT_EQ(seg.state(), FileSegment::State::kEmpty);
-  ASSERT_TRUE(seg.reserve(1024, cacheRoot_));
+  ASSERT_EQ(seg.reserve(1024, cacheRoot_), FileSegment::ReserveResult::kReserved);
   EXPECT_EQ(seg.state(), FileSegment::State::kDownloading);
   EXPECT_EQ(seg.getDownloader(), std::this_thread::get_id());
 }
@@ -47,7 +47,7 @@ TEST_F(FileSegmentWriteTest, reserveTransitionsEmptyToDownloading) {
 TEST_F(FileSegmentWriteTest, writeThenCompleteProducesFullFile) {
   FsCacheKey key{PathKey::fromPath("/remote/x"), 0, 8};
   FileSegment seg{key, "/remote/x"};
-  ASSERT_TRUE(seg.reserve(8, cacheRoot_));
+  ASSERT_EQ(seg.reserve(8, cacheRoot_), FileSegment::ReserveResult::kReserved);
   const char payload[] = "ABCDEFGH";
   seg.write(payload, 8);
   seg.complete();
@@ -60,7 +60,7 @@ TEST_F(FileSegmentWriteTest, writeThenCompleteProducesFullFile) {
 TEST_F(FileSegmentWriteTest, abandonLeavesPartialFileWithoutFtruncate) {
   FsCacheKey key{PathKey::fromPath("/remote/x"), 0, 1024};
   FileSegment seg{key, "/remote/x"};
-  ASSERT_TRUE(seg.reserve(1024, cacheRoot_));
+  ASSERT_EQ(seg.reserve(1024, cacheRoot_), FileSegment::ReserveResult::kReserved);
   std::string chunk(256, 'A');
   seg.write(chunk.data(), chunk.size());
   seg.abandon();
@@ -73,14 +73,14 @@ TEST_F(FileSegmentWriteTest, abandonLeavesPartialFileWithoutFtruncate) {
 TEST_F(FileSegmentWriteTest, reserveRejectsConcurrentWriter) {
   FsCacheKey key{PathKey::fromPath("/remote/x"), 0, 1024};
   FileSegment seg{key, "/remote/x"};
-  ASSERT_TRUE(seg.reserve(1024, cacheRoot_));
-  EXPECT_FALSE(seg.reserve(1024, cacheRoot_));
+  ASSERT_EQ(seg.reserve(1024, cacheRoot_), FileSegment::ReserveResult::kReserved);
+  EXPECT_EQ(seg.reserve(1024, cacheRoot_), FileSegment::ReserveResult::kLostRace);
 }
 
 TEST_F(FileSegmentWriteTest, writeBeyondReservedSizeThrows) {
   FsCacheKey key{PathKey::fromPath("/remote/x"), 0, 8};
   FileSegment seg{key, "/remote/x"};
-  ASSERT_TRUE(seg.reserve(8, cacheRoot_));
+  ASSERT_EQ(seg.reserve(8, cacheRoot_), FileSegment::ReserveResult::kReserved);
   std::string oversized(16, 'A');
   EXPECT_THROW(
       seg.write(oversized.data(), oversized.size()),

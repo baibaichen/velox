@@ -40,7 +40,7 @@ TEST(FsCachePartialRecoveryTest, abandonedPartialDeletedOnRestart) {
     cache.loadFromDisk();
     FsCacheKey key{PathKey::fromPath("/remote/abandoned"), 0, 1UL << 20};
     FileSegment seg{key, "/remote/abandoned"};
-    ASSERT_TRUE(seg.reserve(1UL << 20, cfg.cacheRoot));
+    ASSERT_EQ(seg.reserve(1UL << 20, cfg.cacheRoot), FileSegment::ReserveResult::kReserved);
     std::string chunk(256UL << 10, 'X');
     seg.write(chunk.data(), chunk.size());
     seg.abandon();
@@ -71,7 +71,7 @@ TEST(FsCachePartialRecoveryTest, completedSegmentSurvivesRestart) {
     cache.loadFromDisk();
     FsCacheKey key{PathKey::fromPath("/remote/full"), 0, 4'096};
     FileSegment seg{key, "/remote/full"};
-    ASSERT_TRUE(seg.reserve(4'096, cfg.cacheRoot));
+    ASSERT_EQ(seg.reserve(4'096, cfg.cacheRoot), FileSegment::ReserveResult::kReserved);
     std::string payload(4'096, 'Y');
     seg.write(payload.data(), payload.size());
     seg.complete();

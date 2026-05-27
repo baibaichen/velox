@@ -243,20 +243,22 @@ void FsCacheBufferedInput::load(LogType /*unused*/) {
         continue;
       }
       fsCache_->evict(seg->key().size);
-      if (!seg->reserve(seg->key().size, fsCache_->config().cacheRoot)) {
-        if (seg->state() == cache::fs::FileSegment::State::kDownloaded) {
-          // Warm-restart short-circuit inside reserve() found the file on
-          // disk and published it directly.
-          fsCache_->recordMiss(
-              seg.get(),
-              seg->key().size,
-              cache::fs::IsPrefetch::kPrefetch);
-        } else {
-          // Lost the reserve() race. The reader will sync via
-          // waitForDownloadedSize; just count this as a hit on the
-          // in-flight bytes.
-          fsCache_->recordHit(seg.get(), cache::fs::IsPrefetch::kPrefetch);
-        }
+      const auto reserveResult =
+          seg->reserve(seg->key().size, fsCache_->config().cacheRoot);
+      if (reserveResult == cache::fs::FileSegment::ReserveResult::kLostRace) {
+        // Another driver won the CAS and is mid-download (or already
+        // completed). The winner owns recordMiss; the reader will sync via
+        // waitForDownloadedSize, so we just count a hit here.
+        fsCache_->recordHit(seg.get(), cache::fs::IsPrefetch::kPrefetch);
+        continue;
+      }
+      if (reserveResult ==
+          cache::fs::FileSegment::ReserveResult::kWarmRestartPublished) {
+        // Won the CAS, then the warm-restart short-circuit inside reserve()
+        // found the file on disk and published it as kDownloaded. We are
+        // the publisher and owe a single recordMiss.
+        fsCache_->recordMiss(
+            seg.get(), seg->key().size, cache::fs::IsPrefetch::kPrefetch);
         continue;
       }
       // Move the per-segment work onto the download pool. The closure
