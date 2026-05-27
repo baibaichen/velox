@@ -125,8 +125,13 @@ BackendSnapshot snapshotBackend() {
   BackendSnapshot s;
   if (auto* fsCache = cache::fs::FsCache::getInstance()) {
     const auto fs = fsCache->stats();
-    s.hits = fs.hits;
-    s.lookups = fs.hits + fs.misses;
+    // Task 14 split FsCacheStats {hits, misses} into prefetch + demand POD
+    // counters. Sum both to preserve the CSV column semantic ("any cache hit,
+    // prefetch or demand") and total lookup count.
+    const uint64_t totalHits = fs.prefetchHits + fs.demandHits;
+    const uint64_t totalMisses = fs.prefetchMisses + fs.demandMisses;
+    s.hits = totalHits;
+    s.lookups = totalHits + totalMisses;
     // bytes_dl_mib: FsCache exposes bytesOnDisk (current footprint after
     // evictions), not cumulative bytes-written. Spec 3.2 acknowledges this
     // semantic divergence -- the merged report's header carries the caveat.
