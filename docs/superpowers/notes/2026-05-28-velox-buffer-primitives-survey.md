@@ -1,5 +1,12 @@
 # Velox 缓冲与小向量原语调研（FsCache phase-2 选型）
 
+> **已尝试被 revert（2026-05-28）。** 本 doc §4/§5 列出的两条候选
+> （`DataBuffer<char>` 替换 `unique_ptr<char[]>`、`folly::small_vector<,4>` +
+> HWM unique_ptr + LocalReadFile cache）已实验性套用，全部因 q17 +4–7%
+> 回归被 revert。回归详情见
+> `docs/superpowers/results/2026-05-28-fscache-q17-reprofile-post-memset.md` §6。
+> 本 doc 保留作为"候选评估"留底；§6 "下一步"不再适用。
+
 目标：为 FsCache 热路径两项优化挑选合适的原语。
 
 1. `FsCacheInputStream::loadCurrentSegmentBuffer` 每次 `std::make_unique_for_overwrite<char[]>(length)`，希望容量足够时复用既有分配。

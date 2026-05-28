@@ -23,8 +23,11 @@ Modify:
 
 - `velox/common/caching/fscache/FsCacheConfig.h` — add
   `EvictionPolicyKind { kLru, kSlru }` enum, `evictionPolicy` field default
-  `kSlru`, `slruProtectedRatio` field default `0.6` (matches CH
-  `FILECACHE_DEFAULT_SLRU_RATIO`, `FileCache_fwd.h:26`).
+  `kLru` (Task F decision B 否决了 default flip — HEAD has
+  `bool enableSlru{false}` in `FsCacheConfig.h`), `slruProtectedRatio` field
+  default `0.6` (matches CH `FILECACHE_DEFAULT_SLRU_RATIO`,
+  `FileCache_fwd.h:26`). The original "default `kSlru`" wording in this
+  plan was retired by §9 Task F outcome.
 - `velox/common/caching/fscache/FsCacheMetadata.h` /
   `FsCacheMetadata.cpp` — extend the existing `PolicyFactory`
   (`FsCacheMetadata.h:59`) callsite in `FsCache.cpp` to choose
@@ -404,6 +407,13 @@ match CH semantics (no hit counter, promote on first post-download hit,
 ---
 
 ## 7. Spec amendment (exact line changes)
+
+> **Task G amendment partially retracted by §9 Task F outcome (decision B):**
+> the default-on flip is **not adopted**. Keep spec §8.1 wording as opt-in
+> (default `enableSlru = false`) — HEAD `FsCacheConfig.h` confirms.
+> The promotion-semantics rewrite below (no hit counter, promote on first
+> post-download hit, 0.6 ratio) is still adopted; only the "default-on"
+> part of the amendment is withdrawn.
 
 In `docs/superpowers/specs/2026-05-26-fscache-ch-aligned-redesign.md`:
 
