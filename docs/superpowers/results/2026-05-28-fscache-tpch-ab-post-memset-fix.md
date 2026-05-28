@@ -1,7 +1,7 @@
 # FsCache TPC-H A/B Re-Sweep — post memset 修复后 vs CBI
 
 **Date:** 2026-05-28
-**HEAD:** `020f26ada` (branch `fscache-clickhouse-style`,
+**HEAD:** `6748e4a88` (branch `fscache-clickhouse-style`,
 commit `perf(fscache): eliminate redundant zero-fill on hot read path`)
 **Build:** `cmake-build-relwithdebinfo-gcc13` (GCC-13, RelWithDebInfo,
 binary mtime 2026-05-28 01:58)
@@ -81,7 +81,7 @@ Cache flags 与命令行（与 #179 sweep 一致，仅 `--fscache_root` 改名�
 
 ---
 
-## 2. 对照原 #179 sweep（commit `d5440b8be`，pre-memset-fix）
+## 2. 对照原 #179 sweep（commit `98b06e6c0`，pre-memset-fix）
 
 #179 sweep (`2026-05-27-fscache-tpch-ab-sweep.md` §1) 只报了 5 个 query。
 这 5 个在本次完整 22-query 重跑后的对比（同样 3-round 中位数）：
@@ -137,7 +137,7 @@ Cache flags 与命令行（与 #179 sweep 一致，仅 `--fscache_root` 改名�
 
 ## 4. spec §9.4 0.50× amendment 裁决
 
-**背景**：commit `1c64f9b1c` 把 perf gate 从微基准 0.95× 放宽到 0.50×，
+**背景**：commit `ea9998cdf` 把 perf gate 从微基准 0.95× 放宽到 0.50×，
 依据 ClickHouse-style metadata 开销在真实 workload 上不会被放大。
 `docs/superpowers/notes/2026-05-27-phase1-perf-gate-decision.md` 明确
 要求 real-workload p99 证据来支撑/推翻这一放宽。

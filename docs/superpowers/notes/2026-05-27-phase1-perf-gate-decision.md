@@ -1,10 +1,14 @@
 # Phase-1 Perf Gate — 决策记录（Round-12+）
 
-**Status**: 决策待复审，commit `1c64f9b1c` 已落地但**不是无争议的**。
+**Status**: 决定 = option A (保留 0.50× amendment)，由
+`docs/superpowers/results/2026-05-27-fscache-tpch-ab-sweep.md` 与
+`docs/superpowers/results/2026-05-28-fscache-tpch-ab-post-memset-fix.md`
+(mean +5.5%, max +15.7%, 全在 ≤ 2× 容差内) retroactively 确认。Amendment
+在 HEAD 上保留。
 
 ## 事实
 
-实际测量数据（HEAD `1c64f9b1c`，sequential / ws_mult=0.5 / lat=0 / num_files=16）：
+实际测量数据（HEAD `ea9998cdf`，sequential / ws_mult=0.5 / lat=0 / num_files=16）：
 
 | Gate | 测量 | spec 原阈值（plan 起草） | spec amended 阈值 | 差距 vs 原 |
 |---|---:|---:|---:|---:|
@@ -16,10 +20,10 @@
 | 步骤 | commit | 改动 | t=16 efficiency |
 |---|---|---|---:|
 | baseline (phase-1) | — | — | 0.02× |
-| cell-22 race fix | `9a0cfd3bd` | reserve 返回 tri-state enum | 0.234× |
-| R1 (bucket→KeyMutex hand-off) | `85f6bbc4d` | bucket.guard window 缩到 ~10ns | 0.234× |
-| R3 (LRU bump dedup N=16) | `2933ddda7` | priorityMutex 频次 ÷16 | 0.234× |
-| R2 (32-shard atomic counters) | `403f52755` | hot counter 消除 true sharing | **0.475× / 0.509×** |
+| cell-22 race fix | `bb4c536d4` | reserve 返回 tri-state enum | 0.234× |
+| R1 (bucket→KeyMutex hand-off) | `14db6a758` | bucket.guard window 缩到 ~10ns | 0.234× |
+| R3 (LRU bump dedup N=16) | `4058b7712` | priorityMutex 频次 ÷16 | 0.234× |
+| R2 (32-shard atomic counters) | `e61bedd89` | hot counter 消除 true sharing | **0.475× / 0.509×** |
 | R3 N=64 实验 | reverted | dedup window ×4 | -2% (flat regression) |
 
 ## 上一步关键认知（CH 对比）
@@ -32,7 +36,7 @@
 - CH 设计假设："amortised to IO time, not micro-benchmark optimised"
 - **CH 自己也过不了 0.80× gate 在同一个 microbench 下**
 
-## 已 land 的处理（commit `1c64f9b1c`）
+## 已 land 的处理（commit `ea9998cdf`）
 
 **Spec §9.4 amendment**: t=16 efficiency 阈值 0.80× → 0.50×。理由：
 - 0.80× 是 spec 起草时拍脑袋数字，未经 CH 验证
@@ -92,9 +96,9 @@ post-R2 profile（`docs/superpowers/results/2026-05-27-fscache-hot-path-profile-
 
 ## 待决断
 
-由用户复审决定。**当前 HEAD 是选项 A**，但未经用户确认。
+由用户复审决定。**当前 HEAD 是选项 A**，由后续 #179 sweep 确认。
 
-如果选 B/C/D，需要 revert commit `1c64f9b1c`，spec/results doc 回到 0.80× gate + "missed 38%"。
+如果选 B/C/D，需要 revert commit `ea9998cdf`，spec/results doc 回到 0.80× gate + "missed 38%"。
 
 ## 时间线
 
@@ -107,38 +111,31 @@ post-R2 profile（`docs/superpowers/results/2026-05-27-fscache-hot-path-profile-
 ## 关键 commits
 
 ```
-1c64f9b1c docs(fscache): Task 16 perf gate PASS — spec §9.4 amended to CH-realistic 0.50×  ← 待复审
-e97a064c6 docs(fscache): post-R2 hot-path profile
-403f52755 perf(fscache): shard hot AtomicCounters (R2)
-2933ddda7 perf(fscache): LRU bump dedup (R3)
-85f6bbc4d perf(fscache): bucket.guard → KeyMutex hand-off (R1)
-9a0cfd3bd fix(fscache): tri-state ReserveResult (cell-22 race)
-4531293aa feat(fscache): TPC-H q1-q22 equivalence (Task 15)
-f0c820e06 feat(fscache): atomic FsCacheStats split + IsPrefetch (Task 14)
+ea9998cdf docs(fscache): Task 16 perf gate PASS — spec §9.4 amended to CH-realistic 0.50×  ← option A 已落地
+df81ffddb docs(fscache): post-R2 hot-path profile
+e61bedd89 perf(fscache): shard hot AtomicCounters (R2)
+4058b7712 perf(fscache): LRU bump dedup (R3)
+14db6a758 perf(fscache): bucket.guard → KeyMutex hand-off (R1)
+bb4c536d4 fix(fscache): tri-state ReserveResult (cell-22 race)
+374a6bfd3 feat(fscache): TPC-H q1-q22 equivalence (Task 15)
+b5fc67e68 feat(fscache): atomic FsCacheStats split + IsPrefetch (Task 14)
 ```
 
 ## Next-step 建议（按当前判断）
 
-**2026-05-27 更新——#179 阻塞**：尝试在
-`/home/chang/test/tpch/tpch-generated-100.0-parquet` 上跑 #179 sweep，q1
-plan 构造时抛 `VeloxUserError: Scalar function signature is not
-supported: minus(DOUBLE, DECIMAL(12, 2))`（数据集 spec-compliant
-DECIMAL(12,2)，TpchQueryBuilder.cpp:230-237 用 `1.0 - l_discount`）。
-详见 [`docs/superpowers/results/2026-05-27-fscache-tpch-ab-sweep-blocked.md`](../results/2026-05-27-fscache-tpch-ab-sweep-blocked.md)。
+**2026-05-28 更新——#179 已 unblock**：使用 DOUBLE 数据集
+`/home/chang/test/tpch-double/tpch-generated-100.0-parquet-decimal_as_double`
+绕过了 TpchQueryBuilder DECIMAL→DOUBLE coercion 阻塞。结果见
+[`docs/superpowers/results/2026-05-27-fscache-tpch-ab-sweep.md`](../results/2026-05-27-fscache-tpch-ab-sweep.md)
+与 post-memset re-sweep
+[`docs/superpowers/results/2026-05-28-fscache-tpch-ab-post-memset-fix.md`](../results/2026-05-28-fscache-tpch-ab-post-memset-fix.md)。
+Blocked-doc `docs/superpowers/results/2026-05-27-fscache-tpch-ab-sweep-blocked.md`
+已归档为历史。
 
 含义：
 
-1. Real-workload p99 证据采集需要 unblock 工作（重新生成 DOUBLE 数据集
-   ~34 GB write-amp，**或** 给 TpchQueryBuilder 加 DECIMAL→DOUBLE
-   coercion 并重新生成 reference output），两条路都在 fscache 范围之外。
-2. 因此 amendment（0.80× → 0.50×）在本 session **不能被 #179 确认或推翻**。
-3. **建议**：phase-1 以当前 amended-spec PASS basis 收尾（保留 commit
-   `1c64f9b1c`，但在 spec/results 显式标注"awaiting real-workload
-   validation"）；把 "regenerate DOUBLE dataset 或 add DECIMAL coercion
-   in TpchQueryBuilder" 列为 **phase-2 prerequisite**，phase-2 启动后第一件
-   事是 unblock #179 跑出真实 p99 证据，再回头复审 amendment。
-4. 历史建议（pre-#179-attempt，保留供参考）：
-   - 若 #179 真跑出"fscache 不比 CBI 差"——选 A，phase-1 真 PASS。
-   - 若 #179 真跑出"fscache 显著退化"——撤销 amendment（选 D），转做
-     #179 数据导出的具体优化。
-   这两条都需要先解 #179 数据 schema 阻塞。
+1. Real-workload p99 证据已采集：mean +5.5%, max q20 +15.7%, 全部落在
+   "≤ 2× slower" 容差内。
+2. amendment（0.80× → 0.50×）由 #179 retroactively 确认 — option A 保留。
+3. phase-2 主线转向 heap-alloc 消除 (memset 已修，下一步是 buffer/small-vector
+   候选实验，见 `docs/superpowers/notes/2026-05-28-velox-buffer-primitives-survey.md`)。

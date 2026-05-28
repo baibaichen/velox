@@ -1,7 +1,13 @@
 # #179 TPC-H A/B Sweep — Blocked (DECIMAL vs DOUBLE Schema Mismatch)
 
-**Status:** BLOCKED — not solvable in-session.
-**Branch:** `fscache-clickhouse-style` @ `f44efb70f`.
+> **Historical — #179 unblocked via DOUBLE dataset.** This document is kept
+> for context only. The sweep was successfully completed using
+> `/home/chang/test/tpch-double/tpch-generated-100.0-parquet-decimal_as_double`;
+> see `docs/superpowers/results/2026-05-27-fscache-tpch-ab-sweep.md` and the
+> post-memset re-run `docs/superpowers/results/2026-05-28-fscache-tpch-ab-post-memset-fix.md`.
+
+**Status:** BLOCKED — not solvable in-session (historical).
+**Branch:** `fscache-clickhouse-style` @ `125975649`.
 **Plan:** [`docs/superpowers/plans/2026-05-26-fscache-tpch-ab.md`](../plans/2026-05-26-fscache-tpch-ab.md).
 **Decision context:** [`docs/superpowers/notes/2026-05-27-phase1-perf-gate-decision.md`](../notes/2026-05-27-phase1-perf-gate-decision.md).
 
@@ -113,7 +119,7 @@ l_shipdate:       date32[day]
 
 cross-ref [`2026-05-27-phase1-perf-gate-decision.md`](../notes/2026-05-27-phase1-perf-gate-decision.md)：
 
-- §9.4 t=16 efficiency gate 从 0.80× 改到 0.50×（commit `1c64f9b1c`）的论证基于 "real-workload p99 evidence will drive the final answer"——decision-doc 第 122-125 行明确把"跑 #179 TPC-H A/B sweep on SF-100"列为决策依据。
+- §9.4 t=16 efficiency gate 从 0.80× 改到 0.50×（commit `ea9998cdf`）的论证基于 "real-workload p99 evidence will drive the final answer"——decision-doc 第 122-125 行明确把"跑 #179 TPC-H A/B sweep on SF-100"列为决策依据。
 - #179 现在阻塞在数据 schema，证据无法采集。
 - 因此 amendment 既不能被 #179 **PASS-确认**（"真实 workload 没退化"），也不能被 #179 **FAIL-推翻**（"真实 workload 确实退化"）。
 - 决策状态：**pending real-workload evidence**——和 decision-doc 第 95 行 "由用户复审决定，当前 HEAD 是选项 A，但未经用户确认" 完全一致。Amendment 不变更地留在 HEAD，**显式标注 awaiting real-workload validation**。
@@ -122,7 +128,7 @@ cross-ref [`2026-05-27-phase1-perf-gate-decision.md`](../notes/2026-05-27-phase1
 
 | Gate | 来源 | 结果 |
 |---|---|---|
-| TPC-H q1-q22 SF=0.01 等价性 | Task 15 `FsCacheTpchEquivalenceTest`，commit `4531293aa` | **22/22 PASS** |
+| TPC-H q1-q22 SF=0.01 等价性 | Task 15 `FsCacheTpchEquivalenceTest`，commit `374a6bfd3` | **22/22 PASS** |
 | 全套 UT（caching / dwio / exec / fscache 层） | Tasks 1-14 每 task 自 5-phase 验证 | 全绿（每个 task commit 自带 UT 通过记录） |
 | Microbench `sequential / ws_mult=0.5 / lat=0 / num_files=16` | Round-11+ 优化路径，decision-doc 表 1 | t=1 hot 8.47-8.64 M ops/s（≥7.0 M PASS），t=16 efficiency **0.475-0.509×**（amended ≥0.50× gate PASS / 原 ≥0.80× MISS -38%） |
 
