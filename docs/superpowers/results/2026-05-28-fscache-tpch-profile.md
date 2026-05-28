@@ -1,7 +1,7 @@
 # FsCache vs CBI: TPC-H SF=100 perf profile — cold + hot
 
 - 日期: 2026-05-28
-- 分支: `fscache-clickhouse-style` @ `661ac1be2`
+- 分支: `fscache-clickhouse-style` @ `c000e8f6c`
 - 数据集: `/home/chang/test/tpch-double/tpch-generated-100.0-parquet-decimal_as_double`
 - 二进制: `cmake-build-relwithdebinfo-gcc13/velox/benchmarks/tpch/velox_tpch_benchmark`
 - 采样: `perf record -F 999 -g --call-graph fp`，`perf_event_paranoid=1`，`kptr_restrict=1` (内核符号未解析，仅显示十六进制地址)

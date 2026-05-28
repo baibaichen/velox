@@ -1,6 +1,6 @@
 # FsCache Hot-Path Profile (single-thread gate + t=4 contention)
 
-Date: 2026/05/27. HEAD: `61676e7b3` plus race-fix `9a0cfd3bd`.
+Date: 2026/05/27. HEAD: `(pre-rebase, no direct HEAD equivalent)` plus race-fix `bb4c536d4`. Pre-R1 profile commit on HEAD: `ae2f495a9`.
 Build: `cmake-build-relwithdebinfo-gcc13` (gcc-13 RelWithDebInfo, fp call-graph).
 Binary: `velox_fscache_benchmark`.
 Tool: `perf record -F 4000 -g --call-graph fp`.

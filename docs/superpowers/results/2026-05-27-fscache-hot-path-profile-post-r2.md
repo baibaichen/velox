@@ -1,8 +1,8 @@
 # FsCache hot-path profile — post R1+R2+R3
 
 - Date: 2026-05-27
-- HEAD: `fscache-clickhouse-style` (61676e7b3)
-- Includes: R1 (lockKeyMetadata hand-off, 85f6bbc4d), R2 (ShardedAtomic 32-slot, 403f52755), R3 (sequence-windowed LRU bump dedup, 2933ddda7)
+- HEAD: `fscache-clickhouse-style` (`(pre-rebase, no direct HEAD equivalent)`; profile commit `df81ffddb` on HEAD)
+- Includes: R1 (lockKeyMetadata hand-off, 14db6a758), R2 (ShardedAtomic 32-slot, e61bedd89), R3 (sequence-windowed LRU bump dedup, 4058b7712)
 - Binary: `cmake-build-relwithdebinfo-gcc13/velox/common/caching/fscache/benchmarks/velox_fscache_benchmark`
 - Workload: `sequential ws_mult=0.5 lat=0 num_files=16` (1 file per thread → no KeyMutex sharing across threads)
 - Sample budget: t=16 → 82'423 samples / 11.6 MB; t=1 → 8'060 samples / 1.1 MB; `perf -F 4000 --call-graph fp` (frame pointers from RelWithDebInfo)

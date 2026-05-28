@@ -1,6 +1,6 @@
 # Task D + Task E — retroactive 5-phase audit (2026-05-27)
 
-Tasks D (`085c575d6`) and E (`66026def3`) were landed without the
+Tasks D (`9f2c55f9c`) and E (`d8cecd11a`) were landed without the
 per-commit 5-phase rhythm (implement → spec review → simplify →
 post-simplify review → commit). This note captures the retroactive
 phases 2-4 and records the phase-5 verification numbers that should
@@ -8,7 +8,7 @@ have been in the original commits.
 
 ## Task D — `feat(fscache): add SLRU config fields`
 
-- **Phase 1 (implement)**: `085c575d6` — adds `enableSlru` (bool, default
+- **Phase 1 (implement)**: `9f2c55f9c` — adds `enableSlru` (bool, default
   false) and `slruProtectedRatio` (double, default 0.6) to
   `FsCacheConfig`. Header-only, no factory wiring yet.
 - **Phase 2 (spec review)**: clean.
@@ -26,7 +26,7 @@ have been in the original commits.
 
 ## Task E — `feat(fscache): wire SLRU into per-bucket policy factory`
 
-- **Phase 1 (implement)**: `66026def3` — passes a lambda
+- **Phase 1 (implement)**: `d8cecd11a` — passes a lambda
   `PolicyFactory` into `FsCacheMetadata`'s ctor that returns either
   `LruPolicy` (default) or `SlruPolicy(maxBytes/numBuckets,
   slruProtectedRatio)`. Adds smoke test
@@ -76,7 +76,7 @@ have been in the original commits.
   `SLRUFileCachePriority::tryIncreasePriority
   (SLRUFileCachePriority.cpp:586, move-to-protected at :705)`.
   Comment-only; no behavioural change. The original commit message
-  on `66026def3` retains the wrong citation in the historical record
+  on `d8cecd11a` retains the wrong citation in the historical record
   — not rewriting history.
 - **Phase 4 (post-simplify review)**: clean. The fixed citation is
   verified by direct inspection of the CH source: line 586 is the

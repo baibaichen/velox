@@ -1,6 +1,6 @@
 # fscache q17 重新剖析（memset 修复后 + 3 次内存分配实验被否决之后）
 
-> 日期: 2026-05-28  HEAD: `73c434dc0`  构建: `cmake-build-relwithdebinfo-gcc13`
+> 日期: 2026-05-28  HEAD: `13f0c2a26`  构建: `cmake-build-relwithdebinfo-gcc13`
 > 数据集: SF=100 parquet (`/home/chang/test/tpch-double/tpch-generated-100.0-parquet-decimal_as_double`)
 > 采样: `perf record -F 999 -g --call-graph fp`, 每后端 5 轮 × 22 个 query
 > CSV 输出: `/tmp/q17-fsc-hot-v2.csv`, `/tmp/q17-cbi-hot-v2.csv`

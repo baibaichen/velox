@@ -1,7 +1,7 @@
 # FsCache SLRU vs LRU — Task F perf re-run + default decision
 
 **Date:** 2026-05-27
-**HEAD baseline:** `ba637a61c` (post-Task-E audit fix) + the in-this-session
+**HEAD baseline:** `a59addbe2` (Task F commit; post-Task-E audit fix) + the in-this-session
 prep change adding `--enable_slru` / `--slru_protected_ratio` flags to
 `velox_fscache_benchmark` and `velox_tpch_benchmark` (`AbBenchmarkMain.cpp`).
 **Build:** `cmake-build-relwithdebinfo-gcc13` (GCC-13 RelWithDebInfo).

@@ -1,7 +1,7 @@
 # FsCache TPC-H A/B Sweep — 真实 workload p99 证据
 
 **Date:** 2026-05-27
-**HEAD:** d5440b8be (branch `fscache-clickhouse-style`)
+**HEAD:** 98b06e6c0 (branch `fscache-clickhouse-style`)
 **Build:** `cmake-build-relwithdebinfo-gcc13` (GCC-13, RelWithDebInfo)
 **Dataset:** `/home/chang/test/tpch-double/tpch-generated-100.0-parquet-decimal_as_double`
 (SF=100, parquet, money/quantity 列已预转 DOUBLE，绕开了
@@ -117,7 +117,7 @@ trajectory 不是主要瓶颈。
 
 ## 5. 结论：spec §9.4 0.50× amendment 是否站得住？
 
-**背景**：commit `1c64f9b1c` 把 perf gate 从微基准 0.95× 放宽到 0.50×，
+**背景**：commit `ea9998cdf` 把 perf gate 从微基准 0.95× 放宽到 0.50×，
 依据是 ClickHouse 等真实路径上 fscache 的 metadata 开销不会被微基准
 那种"零 IO 紧循环"放大。`docs/superpowers/notes/2026-05-27-phase1-perf-gate-decision.md`
 明确要求**真实 workload p99 证据**来验证这一放宽。

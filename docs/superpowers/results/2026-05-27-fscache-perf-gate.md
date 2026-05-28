@@ -1,7 +1,7 @@
 # FsCache Phase-1 Perf Gate — PASS on both amended §9.4 gates
 
 **Status**: Final. After 4 optimisation passes (cell-22 race fix
-`9a0cfd3bd` → R1 `85f6bbc4d` → R3 `2933ddda7` → R2 `403f52755`) the
+`bb4c536d4` → R1 `14db6a758` → R3 `4058b7712` → R2 `e61bedd89`) the
 phase-1 hit-path throughput landed at **t=1 8.47–8.64 M ops/s** and
 **t=16 efficiency 0.475–0.509×**. Spec §9.4 was amended in Round-11
 (2026-05-27) to a CH-realistic threshold of 0.50× after profile +
@@ -28,11 +28,11 @@ CH FileCache source comparison summarised below.
 
 | Variant                          | Commit       | t=1 M ops/s | t=16 M ops/s | eff_16 |
 |----------------------------------|--------------|------------:|-------------:|-------:|
-| Pre-fix (cell-22 race)           | `61676e7b3`  |        6.60 |         2.1* |  0.02× |
-| + cell-22 race fix               | `9a0cfd3bd`  |        6.60 |        24.72 |  0.234 |
-| + R1 (lockKeyMetadata hand-off)  | `85f6bbc4d`  |        6.64 |        27.78 |  0.262 |
-| + R3 (LRU bump dedup window N=16)| `2933ddda7`  |    **8.51** |        25.30 |  0.186 |
-| + R2 (ShardedAtomic 32-slot)     | `403f52755`  |    **8.47** |    **64.37** | **0.475** |
+| Pre-fix (cell-22 race)           | `(pre-rebase, no direct HEAD equivalent)` |        6.60 |         2.1* |  0.02× |
+| + cell-22 race fix               | `bb4c536d4`  |        6.60 |        24.72 |  0.234 |
+| + R1 (lockKeyMetadata hand-off)  | `14db6a758`  |        6.64 |        27.78 |  0.262 |
+| + R3 (LRU bump dedup window N=16)| `4058b7712`  |    **8.51** |        25.30 |  0.186 |
+| + R2 (ShardedAtomic 32-slot)     | `e61bedd89`  |    **8.47** |    **64.37** | **0.475** |
 | + R3-N=64 tuning attempt         | reverted     |        —    |          —   |    —   |
 
 \* t=16 pre-fix was crippled by the cell-22 race (0.02× efficiency).
@@ -97,7 +97,7 @@ ClickHouse so the project's CH-alignment promise is preserved.
 | Concurrent counter losslessness | `FsCacheStatsTest::concurrentIncrementsAreLossless`      | PASS        |
 | All fscache UTs                 | group0 54/54 + group1 68/68                              | PASS        |
 | dwio_common ctest               | 100%                                                     | PASS        |
-| 36-cell microbench (no crashes) | post R2 `403f52755`                                      | PASS 36/36  |
+| 36-cell microbench (no crashes) | post R2 `e61bedd89`                                      | PASS 36/36  |
 | `single_thread_m_ops ≥ 7.0`     | spec §9.4                                                | **PASS** 8.47–8.64 |
 | `efficiency_16t ≥ 0.50` (amended) | spec §9.4 Round-11 amendment                           | **PASS** 0.475–0.509 |
 
@@ -106,7 +106,7 @@ All correctness + performance gates PASS. Phase-1 acceptance complete.
 ## Methodology
 
 - Binary: `cmake-build-relwithdebinfo-gcc13/velox/common/caching/fscache/benchmarks/velox_fscache_benchmark`
-- HEAD: `61676e7b3` (Task 12 — R1/R2/R3 already landed in earlier commits referenced above).
+- HEAD: `(pre-rebase, no direct HEAD equivalent)` (Task 12 — R1/R2/R3 already landed in earlier commits referenced above).
 - Gate run command:
   ```
   ./velox_fscache_benchmark --out /tmp/r2-gate.md \
