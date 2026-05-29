@@ -78,6 +78,41 @@
    > 决策（如 `current_size`/`current_elements` 既是状态又被导出），即归**第 1 类（tier-1，
    > 照搬移植）**；**仅写给 metrics、算法从不读**的计数器才归第 3 类 no-op。
 
+### 2.3 基础类映射表（FileCache 目录之外的 CH 通用依赖，全表，环境已核查）
+
+按 §2.2 三档处理；"处置"列：**REUSE**=直接用 Velox/folly；**HAND**=手写小适配；
+**NO-OP**=先空实现 + `// TODO(metric)`；**SKIP**=不需要。
+
+| CH 基础类 / 头 | 用途 | Velox/folly 对应 | 处置 |
+|---|---|---|---|
+| `Common/logger_useful.h`（`LOG_*`） | 日志 | glog `LOG()`/`VLOG()`（仓内 `velox/common/caching/*.cpp` 已用） | REUSE |
+| `Common/Exception.h` / `ErrnoException.h` | 异常 | `VELOX_FAIL`/`VELOX_CHECK*`/`VELOX_USER_FAIL`（`common/base/Exceptions.h`） | REUSE |
+| `Common/ThreadPool.h` / `_fwd.h` | 线程池（即时任务） | `folly::CPUThreadPoolExecutor`/`IOThreadPoolExecutor` | REUSE |
+| （CH `BackgroundSchedulePool`） | 延迟/周期任务 | `folly::FunctionScheduler`（`folly/executors/FunctionScheduler.h`） | REUSE |
+| `Common/SharedMutex.h` | 读写锁 | `folly::SharedMutex`（`folly/SharedMutex.h`）或 `std::shared_mutex` | REUSE |
+| `Common/callOnce.h` | 一次性初始化 | `folly::call_once` / `std::call_once` | REUSE |
+| `Common/CurrentThread.h` / `Interpreters/Context.h` | TLS query context | **无 TLS 等价 → 显式上下文传递**（QueryLimit，step 15） | HAND |
+| `base/getThreadId.h` | 线程 id | `folly::getCurrentThreadID()` | REUSE |
+| `Common/CurrentMetrics.h` / ProfileEvents / `ElapsedTimeProfileEventIncrement.h` | 观测指标 | 收尾接 `RECORD_METRIC_VALUE`（`StatsReporter.h`） | NO-OP |
+| `Common/randomSeed.h` / `<random>` / `pcg_random.hpp` / `Core/UUID.h` | 随机/UUID | `folly::Random`（`folly/Random.h`） | REUSE |
+| `Common/FailPoint.h` | 故障注入 | `velox/common/testutil/TestValue.h` | REUSE |
+| `Common/assert_cast.h` | 下行转换断言 | `static_cast` + `VELOX_DCHECK`（手写小工具） | HAND |
+| `base/scope_guard.h`（`SCOPE_EXIT`） | RAII 退出 | `folly::makeGuard` / `SCOPE_EXIT`（`folly/ScopeGuard.h`） | REUSE |
+| `base/EnumReflection.h`（`magic_enum`） | 枚举↔串 | **本仓无反射 → 手写 switch/映射** | HAND |
+| `base/hex.h`（`getHexUIntLowercase`/`unhexUInt`） | 十六进制 | 手写（`FileCacheKey` 已实现） | HAND |
+| `boost/noncopyable.hpp` | 禁拷贝 | `= delete` 拷贝构造/赋值 | HAND |
+| `Core/Types.h`（`UInt128`） | 128 位整型 | `__uint128_t` | REUSE |
+| `Core/SettingsEnums.h` | settings 枚举 | 手写枚举 | HAND |
+| `IO/ReadBufferFromFileBase.h` / `ReadBufferFromFile.h` | 文件读 | `velox::ReadFile` / `LocalReadFile`（`common/file/File.h`） | REUSE |
+| `IO/WriteBufferFromFile.h` 等 | 文件写 | `velox::LocalWriteFile` | REUSE |
+| `IO/ReadSettings.h` / WriteSettings | 读写参数 | 手写最小结构 | HAND |
+| `IO/Operators.h` / `WriteBufferFromString.h` / `ReadHelpers.h` | 串格式化 | `fmt` / `folly` 串工具 | REUSE |
+| `fmt/format.h` / `fmt/ranges.h` | 格式化 | `fmt`（仓内可用） | REUSE |
+| `Poco/Util/AbstractConfiguration.h` / `NamedCollection` / `ServerSettings` | 配置解析 | —（FileCacheSettings 解析裁剪） | SKIP |
+| `Storages/ColumnsDescription.h` / `DataTypeString.h` / `MutableColumnsAndConstraints.h` | system 表自省 | — | SKIP |
+| `Disks/IO/CachedOnDiskWriteBufferFromFile.h` | CH 写缓存路径 | —（见 §8 非目标） | SKIP |
+| `<memory>`/`<mutex>`/`<list>`/`<unordered_map>`/`<atomic>`/`<shared_mutex>`/… | std 容器/同步 | 照搬 std | REUSE |
+
 ## 3. CH FileCache 类依赖分析
 
 分层（自底向上）：
@@ -129,7 +164,7 @@ CH 用**前向声明 + `FileCache_fwd_internal.h` + `weak_ptr<KeyMetadata>`** �
 | 4 | FileSegmentInfo / KeyType | FileSegmentInfo.h, FileSegmentKeyType.{h,cpp} | L0 | REWRITE（枚举→string 手写，Velox 无 enum 反射） |
 | 5 | OriginInfo / CacheUsage | FileCacheOriginInfo.h, CacheUsage.h | L0 | REWRITE |
 | 6 | Guards | Guards.h | L0 | REWRITE（纯 std 锁包装，平凡） |
-| 7 | FileCacheSettings | FileCacheSettings.{h,cpp} | L0 | REWRITE（仅 settings 结构）+ 解析方法 SKIP。**默认：先最小移植，step 18 需要再扩** |
+| 7 | FileCacheSettings | FileCacheSettings.{h,cpp} | L0 | 数据 struct + `Setting<T>`（默认值对齐 CH）+ `validate()` 忠实移植；解析/自省 **不实现**（`// TODO(config)`，见 §5.1） |
 | 8 | IFileCachePriority | IFileCachePriority.{h,cpp} | L1 | REWRITE |
 | 9 | FileSegment + Holder | FileSegment.{h,cpp} | L2 | REWRITE（I/O→`ReadFile`/`Local{Read,Write}File`） |
 | 10 | Metadata 全家 | Metadata.{h,cpp} | L3 | REWRITE（后台线程→folly executor+scheduler，见 §4.1） |
@@ -169,8 +204,7 @@ CH 用**前向声明 + `FileCache_fwd_internal.h` + `weak_ptr<KeyMetadata>`** �
 
 ## 5. 需裁剪 / 适配的 CH 专有依赖（遇到时处理）
 
-- `FileCacheSettings` 的 CH 配置解析（`Poco::Util::AbstractConfiguration`、
-  `ServerSettings`）→ 精简为普通 settings 结构 + 默认值。**默认：先最小移植，step 18 需要再扩。**
+- `FileCacheSettings` → 见 §5.1 专项方案。
 - `FileCacheFactory` 的 ClickHouse 全局注册表 → **默认不移植**；Velox 侧改为直接/注入式持有
   缓存实例，确有"按名/路径多缓存注册"需求再加。
 - `FileCacheOriginInfo` 的 `user_id` 等 CH 概念 → 用 Velox 等价物或精简。
@@ -180,6 +214,58 @@ CH 用**前向声明 + `FileCache_fwd_internal.h` + `weak_ptr<KeyMetadata>`** �
   在任意调用点读 `CurrentThread::getQueryContext()` 的 TLS 行为。此为已知的非平凡 API 改动，
   标记为"step 15 决策点"。
 - ProfileEvents / 指标 → 见 §2.2 第 3 档（移植先 no-op + TODO，收尾接 StatsReporter）。
+
+### 5.1 FileCacheSettings 迁移方案（unit #7，定稿）
+
+CH 现状拆 4 块及处置：
+
+1. **数据（28 具名设置 + 默认值）** → 全保留。FileCache 算法读了其中 ~25 个，几乎都相关。
+   **默认值逐一对齐 CH 缺省配置**：每个 `Setting<T>` 成员初始化器的默认值 = CH
+   `LIST_OF_FILE_CACHE_SETTINGS`（`FileCacheSettings.cpp:35-64`）里该字段的字面量 / 默认常量，
+   不得自拟。默认常量（`FILECACHE_DEFAULT_*`、`FILECACHE_BYPASS_THRESHOLD`）与 `FileCachePolicy`
+   枚举来自 `FileCache_fwd.h`（unit #2，1:1 移植），故 #7 依赖 #2。例如
+   `max_elements=FILECACHE_DEFAULT_MAX_ELEMENTS(10000000)`、
+   `max_file_segment_size=FILECACHE_DEFAULT_MAX_FILE_SEGMENT_SIZE(32Mi)`、
+   `boundary_alignment=FILECACHE_DEFAULT_FILE_SEGMENT_ALIGNMENT(4Mi)`、
+   `cache_policy=SLRU`、`slru_size_ratio=0.6`、`background_download_threads=5`、
+   `cache_on_write_operations=false`、`bypass_cache_threshold=256Mi`、
+   `path=""`、`max_size=0` 等，全部照搬。
+2. **机制（`BaseSettings` 宏 / pimpl `FileCacheSettingsImpl` / 下标算子 / `.changed`）** →
+   换成**普通 struct**，每字段用轻量包装 `Setting<T>` 复刻 `{value, changed}`：
+
+   ```cpp
+   template <typename T>
+   struct Setting {
+     T value{};
+     bool changed{false};
+     Setting() = default;
+     Setting(T v) : value(std::move(v)) {}        // 成员初始化器给默认值，changed=false
+     Setting& operator=(T v) { value = std::move(v); changed = true; return *this; }
+     operator const T&() const { return value; } // 隐式取值
+   };
+   struct FileCacheSettings {
+     Setting<std::string> path;
+     Setting<uint64_t>    max_size{0};
+     // …共 28 个字段，默认值逐一对齐 LIST_OF_FILE_CACHE_SETTINGS …
+     void validate();
+   };
+   ```
+   **读取迁移规则**：CH `settings[FileCacheSetting::x].value/.changed` → `settings.x.value/.changed`
+   （仅把 `[枚举]` 改 `.字段`；`.value`/`.changed`/隐式转换语义不变），最大限度不动 reader 代码。
+   默认值经成员初始化器 → `changed=false`；显式赋值经 `operator=` → `changed=true`，忠实复刻。
+3. **解析（`loadFromConfig`/Poco、`loadFromCollection`/NamedCollection）** → **不实现**。
+   Velox 侧由 step 18 集成时从 Velox 配置/`HiveConfig` **程序化构造**（直接给字段赋值）。
+4. **自省（`getColumnsDescription`/`dumpToSystemSettingsColumns`/`ColumnsDescription`）** → **不实现**
+   （CH system 表专用）。
+
+**`validate()` 保留并忠实移植**（算法相关 fail-fast）：`path` 必填且须为绝对路径、`max_size`
+与 `max_size_ratio_to_total_space` 互斥且至少一个、`max_size!=0`、`overcommit_eviction_evict_step!=0`、
+`boundary_alignment ≤ max_file_segment_size`、ratio 分支用 `statvfs`+`std::filesystem` 由占比算出
+`max_size`（保留该计算，日志改 glog `LOG(INFO)`，异常改 `VELOX_USER_FAIL`/`VELOX_CHECK`）。
+`.changed` 判断由上面的 `Setting<T>` 提供。对照 `FileCacheSettings.cpp:224-272`。
+> **TODO(config)**：长期看配置校验宜迁到 Velox 自身配置方案；现阶段先忠实移植 validate() 保证语义。
+> 即 unit #7 落地范围 = 28 字段数据持有（默认值对齐 CH）+ `Setting<T>` 包装 + `validate()` 忠实移植；
+> 解析/自省/系统表相关方法**均不实现**，以 `// TODO(config)` 指回 CH 来源，后续接 Velox 配置方案。
 
 ## 6. getOrSet 核心算法（已精读，移植锚点）
 
