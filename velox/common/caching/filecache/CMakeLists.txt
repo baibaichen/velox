@@ -27,6 +27,7 @@ velox_add_library(
   FileSegment.cpp
   Metadata.cpp
   FileCache.cpp
+  FileCacheDownloadExecutor.cpp
   HEADERS
   FileCacheKey.h
   FileCache_fwd.h
@@ -48,6 +49,7 @@ velox_add_library(
   SplitFileCachePriority.h
   QueryLimit.h
   FileCache.h
+  FileCacheDownloadExecutor.h
 )
 velox_link_libraries(
   velox_ch_file_cache
