@@ -17,7 +17,10 @@ add_executable(
   FileCacheKeyTest.cpp
   FileCacheUtilsTest.cpp
   FileSegmentKeyTypeTest.cpp
-  FileCacheSettingsTest.cpp)
+  FileCacheSettingsTest.cpp
+  FileCacheOriginInfoTest.cpp
+  FileSegmentInfoTest.cpp
+  GuardsTest.cpp)
 add_test(velox_ch_file_cache_test velox_ch_file_cache_test)
 target_link_libraries(
   velox_ch_file_cache_test

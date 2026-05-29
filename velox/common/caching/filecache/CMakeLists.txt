@@ -25,6 +25,9 @@ velox_add_library(
   FileCacheUtils.h
   FileSegmentKeyType.h
   FileCacheSettings.h
+  FileCacheOriginInfo.h
+  FileSegmentInfo.h
+  Guards.h
 )
 velox_link_libraries(
   velox_ch_file_cache
