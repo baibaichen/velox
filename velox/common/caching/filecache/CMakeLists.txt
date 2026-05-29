@@ -12,51 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# ClickHouse FileCache port (namespace facebook::velox::ch).
 velox_add_library(
-  velox_caching
-  AsyncDataCache.cpp
-  CacheTTLController.cpp
-  FileHandle.cpp
-  FileIds.cpp
-  ScanTracker.cpp
-  SsdCache.cpp
-  SsdFile.cpp
-  SsdFileTracker.cpp
-  StringIdMap.cpp
+  velox_ch_file_cache
+  FileCacheKey.cpp
   HEADERS
-  AsyncDataCache.h
-  CacheTTLController.h
-  FileGroupStats.h
-  FileHandle.h
-  FileIds.h
-  FileProperties.h
-  ScanTracker.h
-  SsdCache.h
-  SsdFile.h
-  SsdFileTracker.h
-  StringIdMap.h
+  FileCacheKey.h
 )
 velox_link_libraries(
-  velox_caching
+  velox_ch_file_cache
   PUBLIC
     velox_common_base
-    velox_common_config
     velox_exception
-    velox_file
-    velox_memory
-    velox_process
-    velox_time
     Folly::folly
     fmt::fmt
-  PRIVATE velox_time
 )
-
-add_subdirectory(filecache)
 
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)
 endif()
-
-velox_add_library(velox_simple_lru_cache INTERFACE HEADERS SimpleLRUCache.h)
-
-velox_add_library(velox_cached_factory INTERFACE HEADERS CachedFactory.h)
