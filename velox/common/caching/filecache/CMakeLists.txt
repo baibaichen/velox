@@ -18,6 +18,15 @@ velox_add_library(
   FileCacheKey.cpp
   FileSegmentKeyType.cpp
   FileCacheSettings.cpp
+  IFileCachePriority.cpp
+  QueryLimit.cpp
+  EvictionCandidates.cpp
+  SplitFileCachePriority.cpp
+  LRUFileCachePriority.cpp
+  SLRUFileCachePriority.cpp
+  FileSegment.cpp
+  Metadata.cpp
+  FileCache.cpp
   HEADERS
   FileCacheKey.h
   FileCache_fwd.h
@@ -25,6 +34,7 @@ velox_add_library(
   FileCacheUtils.h
   FileSegmentKeyType.h
   FileCacheSettings.h
+  FilesystemCacheSettings.h
   FileCacheOriginInfo.h
   FileSegmentInfo.h
   Guards.h
@@ -44,6 +54,8 @@ velox_link_libraries(
   PUBLIC
     velox_common_base
     velox_exception
+    velox_file
+    velox_process
     Folly::folly
     fmt::fmt
 )
