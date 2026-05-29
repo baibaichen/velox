@@ -28,6 +28,16 @@ velox_add_library(
   FileCacheOriginInfo.h
   FileSegmentInfo.h
   Guards.h
+  IFileCachePriority.h
+  FileSegment.h
+  Metadata.h
+  EvictionCandidates.h
+  CacheUsage.h
+  LRUFileCachePriority.h
+  SLRUFileCachePriority.h
+  SplitFileCachePriority.h
+  QueryLimit.h
+  FileCache.h
 )
 velox_link_libraries(
   velox_ch_file_cache

@@ -20,7 +20,8 @@ add_executable(
   FileCacheSettingsTest.cpp
   FileCacheOriginInfoTest.cpp
   FileSegmentInfoTest.cpp
-  GuardsTest.cpp)
+  GuardsTest.cpp
+  HeaderSmokeTest.cpp)
 add_test(velox_ch_file_cache_test velox_ch_file_cache_test)
 target_link_libraries(
   velox_ch_file_cache_test
