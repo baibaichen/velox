@@ -16,8 +16,15 @@
 velox_add_library(
   velox_ch_file_cache
   FileCacheKey.cpp
+  FileSegmentKeyType.cpp
+  FileCacheSettings.cpp
   HEADERS
   FileCacheKey.h
+  FileCache_fwd.h
+  FileCache_fwd_internal.h
+  FileCacheUtils.h
+  FileSegmentKeyType.h
+  FileCacheSettings.h
 )
 velox_link_libraries(
   velox_ch_file_cache

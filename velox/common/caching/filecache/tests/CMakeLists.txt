@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_executable(velox_ch_file_cache_test FileCacheKeyTest.cpp)
+add_executable(
+  velox_ch_file_cache_test
+  FileCacheKeyTest.cpp
+  FileCacheUtilsTest.cpp
+  FileSegmentKeyTypeTest.cpp
+  FileCacheSettingsTest.cpp)
 add_test(velox_ch_file_cache_test velox_ch_file_cache_test)
 target_link_libraries(
   velox_ch_file_cache_test
