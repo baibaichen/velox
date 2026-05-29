@@ -130,7 +130,7 @@ CH 用**前向声明 + `FileCache_fwd_internal.h` + `weak_ptr<KeyMetadata>`** �
 - `FileCacheFactory` 的 ClickHouse 全局注册表 → 视 Velox 需要决定是否移植/简化。
 - `FileCacheOriginInfo` 的 `user_id` 等 CH 概念 → 用 Velox 等价物或精简。
 - `QueryLimit` 依赖的 CH `QueryContext`/`CurrentThread` → Velox 侧以显式上下文传递替代。
-- ProfileEvents / 指标 → 用 Velox 指标或暂略。
+- ProfileEvents / 指标 → 见 §2.2 第 3 档（移植先 no-op + TODO，收尾接 StatsReporter）。
 
 ## 6. getOrSet 核心算法（已精读，移植锚点）
 
