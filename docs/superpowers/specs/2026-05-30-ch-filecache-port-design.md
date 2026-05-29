@@ -28,7 +28,14 @@
   通用符号 `FileCache`/`Metadata`/`FileSegment` 冲突）。**决策**：明知 `ch` 把 CH 出处
   带进公共 API，仍刻意保留，以便逐行对照 CH 源码、明确标注移植来源；后续若要作为长期
   生产后端再评估改名为 `filecache`（此为已知可逆决定，不阻塞移植）。
-- **类名**: 保留 CH 原名，便于逐行对照 CH 源码。
+- **类名**: 保留 CH 原名（已是 PascalCase：`FileCache`/`FileSegment`/`Metadata`），便于逐行对照 CH 源码。
+- **命名规范（遵循 `.claude/CLAUDE.md:145-147`，高于"贴近 CH"目标）**：
+  - **方法/函数**：camelCase。CH 多数方法已是 camelCase（`getOrSet`/`lockKeyMetadata`），原样保留。
+  - **成员变量**：camelCase（私有/受保护带尾下划线 `camelCase_`）。CH 的 snake_case 成员
+    （`max_size`/`current_size`/`downloaded_size`）**必须改成** camelCase（`maxSize`/`currentSize`/`downloadedSize`）。
+    这是与 CH 唯一刻意偏离的命名点——CLAUDE.md 明文优先；逐行对照时按"snake→camel"机械映射即可。
+  - **命名空间/构建目标**：snake_case（`facebook::velox::ch`、`velox_ch_file_cache`）。
+  - **宏**：UPPER_SNAKE_CASE。
 - **执行方式**: 一个类（一个文件）一个迁移单位，按依赖**自底向上**（从无依赖的
   叶子开始）。每个单位：忠实移植 → **每个单位都要带 UT（可写则必写）**；纯/叶子类
   (L0–L1) 必须有单测；状态机/Metadata (L2–L3) 必须至少有针对 mock 依赖的状态转换测试；
@@ -89,9 +96,9 @@
 | `Common/Exception.h` / `ErrnoException.h` | 异常 | `VELOX_FAIL`/`VELOX_CHECK*`/`VELOX_USER_FAIL`（`common/base/Exceptions.h`） | REUSE |
 | `Common/ThreadPool.h` / `_fwd.h` | 线程池（即时任务） | `folly::CPUThreadPoolExecutor`/`IOThreadPoolExecutor` | REUSE |
 | （CH `BackgroundSchedulePool`） | 延迟/周期任务 | `folly::FunctionScheduler`（`folly/executors/FunctionScheduler.h`） | REUSE |
-| `Common/SharedMutex.h` | 读写锁 | `folly::SharedMutex`（`folly/SharedMutex.h`）或 `std::shared_mutex` | REUSE |
+| `Common/SharedMutex.h` | 读写锁 | **`std::shared_mutex`**（同目录 `velox/common/caching/SsdFile.{h,cpp}` 既有惯例；本目录无 `folly::SharedMutex` 使用） | REUSE |
 | `Common/callOnce.h` | 一次性初始化 | `folly::call_once` / `std::call_once` | REUSE |
-| `Common/CurrentThread.h` / `Interpreters/Context.h` | TLS query context | **无 TLS 等价 → 显式上下文传递**（QueryLimit，step 15） | HAND |
+| `Common/CurrentThread.h` / `Interpreters/Context.h` | TLS query context | **沿用 Velox 非 TLS 设计取向，强制显式上下文传递**（QueryLimit，step 15）。注：Velox 有 `folly::ThreadLocal`（`velox/common/process/ThreadLocalRegistry.h`），但本移植刻意不用 TLS，改为显式下穿 `QueryLimitContext*`。 | HAND |
 | `base/getThreadId.h` | 线程 id | `folly::getCurrentThreadID()` | REUSE |
 | `Common/CurrentMetrics.h` / ProfileEvents / `ElapsedTimeProfileEventIncrement.h` | 观测指标 | 收尾接 `RECORD_METRIC_VALUE`（`StatsReporter.h`） | NO-OP |
 | `Common/randomSeed.h` / `<random>` / `pcg_random.hpp` / `Core/UUID.h` | 随机/UUID | `folly::Random`（`folly/Random.h`） | REUSE |
@@ -154,11 +161,11 @@ CH 用**前向声明 + `FileCache_fwd_internal.h` + `weak_ptr<KeyMetadata>`** �
 ## 4. 迁移顺序
 
 分类列：**REWRITE**=无 Velox 等价、忠实移植；**REUSE**=已有 Velox/folly 等价直接用；
-**SKIP**=不移植（裁剪或内联复现）。逐类明细见 §4.1。
+**PORTED**=本目录已移植完成的代码（非 Velox/folly 等价物）；**SKIP**=不移植（裁剪或内联复现）。逐类明细见 §4.1。
 
 | # | 单位 | CH 源 | 层 | 分类 |
 |---|------|-------|----|----|
-| 1 | FileCacheKey | FileCacheKey.{h,cpp} | L0 | **REUSE/已写**（worktree 已存在 `ch::FileCacheKey`） |
+| 1 | FileCacheKey | FileCacheKey.{h,cpp} | L0 | **PORTED**（worktree 已写 `ch::FileCacheKey`，未提交，待 review） |
 | 2 | fwd 头（破循环用） | FileCache_fwd*.h | L0 | SKIP-as-unit（无独立类型，按需建 fwd 头破 include 环） |
 | 3 | FileCacheUtils | FileCacheUtils.h | L0 | REWRITE（`roundUp`→`bits::roundUp`；`roundDown` 手写） |
 | 4 | FileSegmentInfo / KeyType | FileSegmentInfo.h, FileSegmentKeyType.{h,cpp} | L0 | REWRITE（枚举→string 手写，Velox 无 enum 反射） |
@@ -168,7 +175,7 @@ CH 用**前向声明 + `FileCache_fwd_internal.h` + `weak_ptr<KeyMetadata>`** �
 | 8 | IFileCachePriority | IFileCachePriority.{h,cpp} | L1 | REWRITE |
 | 9 | FileSegment + Holder | FileSegment.{h,cpp} | L2 | REWRITE（I/O→`ReadFile`/`Local{Read,Write}File`） |
 | 10 | Metadata 全家 | Metadata.{h,cpp} | L3 | REWRITE（后台线程→folly executor+scheduler，见 §4.1） |
-| 11 | EvictionCandidates | EvictionCandidates.{h,cpp} | L4 | REWRITE（`absl::flat_hash_map` 保留，环境可用） |
+| 11 | EvictionCandidates | EvictionCandidates.{h,cpp} | L4 | REWRITE（`absl::flat_hash_map` → `folly::F14FastMap`，见 §4.1） |
 | 12 | LRUFileCachePriority | LRUFileCachePriority.{h,cpp} | L4 | REWRITE（保留 `std::list`+迭代器） |
 | 13 | SLRUFileCachePriority | SLRUFileCachePriority.{h,cpp} | L4 | REWRITE |
 | 14 | (可选) SplitFileCachePriority | SplitFileCachePriority.{h,cpp} | L4 | REWRITE |
@@ -193,8 +200,11 @@ CH 用**前向声明 + `FileCache_fwd_internal.h` + `weak_ptr<KeyMetadata>`** �
   download 重试）用 `folly::FunctionScheduler`（`folly/executors/FunctionScheduler.h`）。
   *已核查*：本仓未发现可用的 `velox::ThreadPool`（`velox/common/concurrency/ThreadPool.h` 不存在），
   故统一走 folly。
-- **`absl::flat_hash_map`**（EvictionCandidates/EvictionInfo）→ **保留 absl**：环境已装
-  `/usr/local/include/absl/container/flat_hash_map.h`，最忠实；不强行换 std/F14。
+- **`absl::flat_hash_map`**（EvictionCandidates/EvictionInfo）→ **改用 `folly::F14FastMap`**
+  （`folly/container/F14Map.h`）。*已核查*：`absl` 不是 Velox 主库的直接依赖（仅作 Spark query
+  runner / s2geometry / protobuf / re2 的间接依赖被解析），在本目录引 `absl/` 会给主库新增直接
+  依赖（PR 阻塞点）；而 `folly::F14FastMap` 在主库已用 167 处。F14 同为开放寻址快表，语义最接近
+  absl::flat_hash_map（注意：迭代器在 rehash 时失效，与 absl 一致，移植时无需改动调用逻辑）。
 - **枚举→字符串**（FileSegmentKeyType 用 `magic_enum`）→ **手写** switch/映射：本仓 `common/base`
   无 enum 反射工具。
 - **`roundUpToMultiple`** → `bits::roundUp`（`velox/common/base/BitUtil.h:127`）；
@@ -245,23 +255,26 @@ CH 现状拆 4 块及处置：
    };
    struct FileCacheSettings {
      Setting<std::string> path;
-     Setting<uint64_t>    max_size{0};
-     // …共 28 个字段，默认值逐一对齐 LIST_OF_FILE_CACHE_SETTINGS …
+     Setting<uint64_t>    maxSize{0};
+     // …共 28 个字段，camelCase（CLAUDE.md），默认值逐一对齐 LIST_OF_FILE_CACHE_SETTINGS …
      void validate();
    };
    ```
-   **读取迁移规则**：CH `settings[FileCacheSetting::x].value/.changed` → `settings.x.value/.changed`
-   （仅把 `[枚举]` 改 `.字段`；`.value`/`.changed`/隐式转换语义不变），最大限度不动 reader 代码。
+   **字段命名**：CH `LIST_OF_FILE_CACHE_SETTINGS` 是 snake_case（`max_size`/`max_file_segment_size`
+   /`max_size_ratio_to_total_space`），本移植按 §2 命名规范统一改 camelCase
+   （`maxSize`/`maxFileSegmentSize`/`maxSizeRatioToTotalSpace`），与 CH 唯一刻意偏离点，机械映射。
+   **读取迁移规则**：CH `settings[FileCacheSetting::max_size].value/.changed` → `settings.maxSize.value/.changed`
+   （`[枚举]`→`.camelCase字段`；`.value`/`.changed`/隐式转换语义不变）。
    默认值经成员初始化器 → `changed=false`；显式赋值经 `operator=` → `changed=true`，忠实复刻。
 3. **解析（`loadFromConfig`/Poco、`loadFromCollection`/NamedCollection）** → **不实现**。
    Velox 侧由 step 18 集成时从 Velox 配置/`HiveConfig` **程序化构造**（直接给字段赋值）。
 4. **自省（`getColumnsDescription`/`dumpToSystemSettingsColumns`/`ColumnsDescription`）** → **不实现**
    （CH system 表专用）。
 
-**`validate()` 保留并忠实移植**（算法相关 fail-fast）：`path` 必填且须为绝对路径、`max_size`
-与 `max_size_ratio_to_total_space` 互斥且至少一个、`max_size!=0`、`overcommit_eviction_evict_step!=0`、
-`boundary_alignment ≤ max_file_segment_size`、ratio 分支用 `statvfs`+`std::filesystem` 由占比算出
-`max_size`（保留该计算，日志改 glog `LOG(INFO)`，异常改 `VELOX_USER_FAIL`/`VELOX_CHECK`）。
+**`validate()` 保留并忠实移植**（算法相关 fail-fast）：`path` 必填且须为绝对路径、`maxSize`
+与 `maxSizeRatioToTotalSpace` 互斥且至少一个、`maxSize!=0`、`overcommitEvictionEvictStep!=0`、
+`boundaryAlignment ≤ maxFileSegmentSize`、ratio 分支用 `statvfs`+`std::filesystem` 由占比算出
+`maxSize`（保留该计算，日志改 glog `LOG(INFO)`，异常改 `VELOX_USER_FAIL`/`VELOX_CHECK`）。
 `.changed` 判断由上面的 `Setting<T>` 提供。对照 `FileCacheSettings.cpp:224-272`。
 > **TODO(config)**：长期看配置校验宜迁到 Velox 自身配置方案；现阶段先忠实移植 validate() 保证语义。
 > 即 unit #7 落地范围 = 28 字段数据持有（默认值对齐 CH）+ `Setting<T>` 包装 + `validate()` 忠实移植；
