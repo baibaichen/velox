@@ -37,6 +37,7 @@ velox_add_library(
   DirectBufferedInput.cpp
   DirectDecoder.cpp
   DirectInputStream.cpp
+  FileCacheInputStream.cpp
   MetricsLog.cpp
   ExecutorBarrier.cpp
   FileSink.cpp
@@ -89,6 +90,7 @@ velox_add_library(
   DirectInputStream.h
   ErrorTolerance.h
   ExecutorBarrier.h
+  FileCacheInputStream.h
   FileMetadata.h
   FileSink.h
   FilterNode.h
@@ -144,6 +146,7 @@ velox_link_libraries(
   velox_dwio_common
   velox_buffer
   velox_caching
+  velox_ch_file_cache
   velox_common_io
   velox_common_compression
   velox_common_config
