@@ -29,7 +29,6 @@
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/caching/filecache/FileCache.h"
-#include "velox/common/caching/filecache/FileCacheDownloadExecutor.h"
 #include "velox/common/caching/filecache/FileCacheKey.h"
 #include "velox/common/caching/filecache/FileCacheSettings.h"
 #include "velox/common/caching/filecache/FileSegment.h"
@@ -109,28 +108,25 @@ class FileCacheBufferedInputTest : public testing::Test {
     return (std::filesystem::path(root_->getPath()) / name).string();
   }
 
-  // Builds an input that reads filePath through the given cache/executor. The
-  // cache and executor are owned by the caller so tests can vary their
-  // settings/parallelism and share a single cache across multiple inputs.
+  // Builds an input that reads filePath through the given cache. The cache is
+  // owned by the caller so tests can vary its settings and share a single cache
+  // across multiple inputs.
   FileCacheBufferedInput makeInput(
       FileCache& cache,
-      FileCacheDownloadExecutor& executor,
       const std::string& filePath,
       const FileCacheKey& key) const {
     return FileCacheBufferedInput(
         std::make_shared<LocalReadFile>(filePath),
         *pool_,
         &cache,
-        &executor,
         key,
         FileCache::getCommonOrigin());
   }
 
   FileCacheBufferedInput makeInput(
       FileCache& cache,
-      FileCacheDownloadExecutor& executor,
       const std::string& filePath) const {
-    return makeInput(cache, executor, filePath, FileCacheKey::fromPath(filePath));
+    return makeInput(cache, filePath, FileCacheKey::fromPath(filePath));
   }
 
   std::shared_ptr<TempDirectoryPath> root_;
@@ -144,8 +140,7 @@ TEST_F(FileCacheBufferedInputTest, enqueueAndLoadReadsExpectedBytes) {
 
   FileCache cache("e2e_smoke", settings(path("cache")));
   cache.initialize();
-  FileCacheDownloadExecutor executor(2);
-  auto input = makeInput(cache, executor, remotePath);
+  auto input = makeInput(cache, remotePath);
 
   auto stream = input.enqueue({100, 2048});
   input.load(LogType::FILE);
@@ -160,8 +155,7 @@ TEST_F(FileCacheBufferedInputTest, multipleRegionsInOneInput) {
 
   FileCache cache("multi_region", settings(path("cache")));
   cache.initialize();
-  FileCacheDownloadExecutor executor(4);
-  auto input = makeInput(cache, executor, remotePath);
+  auto input = makeInput(cache, remotePath);
 
   struct RegionExpect {
     uint64_t offset;
@@ -195,8 +189,7 @@ TEST_F(FileCacheBufferedInputTest, regionSpanningMultipleSegments) {
       "spanning",
       settings(path("cache"), 64ULL << 20, 64ULL << 10, 64ULL << 10));
   cache.initialize();
-  FileCacheDownloadExecutor executor(4);
-  auto input = makeInput(cache, executor, remotePath);
+  auto input = makeInput(cache, remotePath);
 
   auto stream = input.enqueue({0, 256 << 10});
   input.load(LogType::FILE);
@@ -214,11 +207,10 @@ TEST_F(FileCacheBufferedInputTest, secondInputServesFromCache) {
 
   FileCache cache("cache_hit", settings(path("cache")));
   cache.initialize();
-  FileCacheDownloadExecutor executor(2);
   const auto key = FileCacheKey::fromPath(remotePath);
 
   {
-    auto input = makeInput(cache, executor, remotePath, key);
+    auto input = makeInput(cache, remotePath, key);
     auto stream = input.enqueue({0, content.size()});
     input.load(LogType::FILE);
     EXPECT_EQ(drain(*stream, content.size()), content);
@@ -227,7 +219,7 @@ TEST_F(FileCacheBufferedInputTest, secondInputServesFromCache) {
   // Second input shares the same cache + key but points at a file with
   // different bytes. A correct cache hit returns the original content.
   {
-    auto input = makeInput(cache, executor, wrongPath, key);
+    auto input = makeInput(cache, wrongPath, key);
     auto stream = input.enqueue({0, content.size()});
     input.load(LogType::FILE);
     EXPECT_EQ(drain(*stream, content.size()), content);
@@ -241,8 +233,7 @@ TEST_F(FileCacheBufferedInputTest, skipThenReadAfterLoad) {
 
   FileCache cache("skip", settings(path("cache")));
   cache.initialize();
-  FileCacheDownloadExecutor executor(2);
-  auto input = makeInput(cache, executor, remotePath);
+  auto input = makeInput(cache, remotePath);
 
   auto stream = input.enqueue({1000, 4096});
   input.load(LogType::FILE);
@@ -256,8 +247,7 @@ TEST_F(FileCacheBufferedInputTest, isBufferedAlwaysFalse) {
   writeFile(remotePath, makeContent(1024));
   FileCache cache("is_buffered", settings(path("cache")));
   cache.initialize();
-  FileCacheDownloadExecutor executor(1);
-  auto input = makeInput(cache, executor, remotePath);
+  auto input = makeInput(cache, remotePath);
 
   EXPECT_FALSE(input.isBuffered(0, 1024));
   EXPECT_TRUE(input.hasCache());
@@ -268,8 +258,7 @@ TEST_F(FileCacheBufferedInputTest, unsupportedCacheRegionApisThrow) {
   writeFile(remotePath, makeContent(1024));
   FileCache cache("unsupported", settings(path("cache")));
   cache.initialize();
-  FileCacheDownloadExecutor executor(1);
-  auto input = makeInput(cache, executor, remotePath);
+  auto input = makeInput(cache, remotePath);
 
   VELOX_ASSERT_THROW(input.cacheRegion(0, 16, std::string_view{}), "");
   VELOX_ASSERT_THROW(input.findCachedRegion(0), "");
@@ -285,8 +274,7 @@ TEST_F(FileCacheBufferedInputTest, reserveFailureSurfacesErrorNotHang) {
   // rather than spin forever (regression guard for the EMPTY-reset livelock).
   FileCache cache("reserve_fail", settings(path("cache"), 4096, 4096, 4096));
   cache.initialize();
-  FileCacheDownloadExecutor executor(2);
-  auto input = makeInput(cache, executor, remotePath);
+  auto input = makeInput(cache, remotePath);
 
   auto stream = input.enqueue({0, 64 << 10});
   input.load(LogType::FILE);
@@ -305,8 +293,7 @@ TEST_F(FileCacheBufferedInputTest, prefixOnlyDownloadStopsAtRequestedEnd) {
   const auto key = FileCacheKey::fromPath(remotePath);
 
   {
-    FileCacheDownloadExecutor executor(2);
-    auto input = makeInput(cache, executor, remotePath, key);
+    auto input = makeInput(cache, remotePath, key);
     // Request only a small prefix of the much larger segment.
     auto stream = input.enqueue({0, 4096});
     input.load(LogType::FILE);
@@ -330,13 +317,11 @@ TEST_F(FileCacheBufferedInputTest, coalescedRegionsDownloadToFurthestEnd) {
   const auto key = FileCacheKey::fromPath(remotePath);
 
   {
-    // Several regions of the SAME segment with different ends, loaded
-    // concurrently. FileCacheInputStream only waits for the pre-download task
-    // and never drives the download itself, so the prefix download must coalesce
-    // to the furthest requested end -- otherwise the deepest reader is starved
-    // when its own download task loses the downloader race.
-    FileCacheDownloadExecutor executor(4);
-    auto input = makeInput(cache, executor, remotePath, key);
+    // Several regions of the SAME segment with different ends in one load().
+    // FileCacheInputStream only waits for the download and never drives it
+    // itself, so the prefix download must coalesce to the furthest requested
+    // end -- otherwise the deepest reader is starved.
+    auto input = makeInput(cache, remotePath, key);
     struct Region {
       uint64_t offset;
       uint64_t length;
@@ -372,8 +357,7 @@ TEST_F(FileCacheBufferedInputTest, crossLoadResumeDownloadsRemainingGap) {
   const auto key = FileCacheKey::fromPath(remotePath);
 
   {
-    FileCacheDownloadExecutor executor(2);
-    auto input = makeInput(cache, executor, remotePath, key);
+    auto input = makeInput(cache, remotePath, key);
     // First load() downloads only a shallow prefix of the segment.
     auto shallow = input.enqueue({0, 4096});
     input.load(LogType::FILE);
@@ -399,7 +383,6 @@ TEST_F(FileCacheBufferedInputTest, crossLoadResumeDownloadsRemainingGap) {
 FileCacheBufferedInput makeInputWithStats(
     memory::MemoryPool& pool,
     FileCache& cache,
-    FileCacheDownloadExecutor& executor,
     const std::string& filePath,
     const FileCacheKey& key,
     std::shared_ptr<io::IoStatistics> ioStats) {
@@ -407,7 +390,6 @@ FileCacheBufferedInput makeInputWithStats(
       std::make_shared<LocalReadFile>(filePath),
       pool,
       &cache,
-      &executor,
       key,
       FileCache::getCommonOrigin(),
       CreateFileSegmentSettings{},
@@ -425,11 +407,10 @@ TEST_F(FileCacheBufferedInputTest, metricsColdReadRecordsMissAndDownload) {
   auto ioStats = std::make_shared<io::IoStatistics>();
 
   {
-    // Scope the executor + input so their destructors join all download tasks,
-    // making the async miss/download counters deterministic before readback.
-    FileCacheDownloadExecutor executor(2);
+    // load() downloads synchronously, so the miss/download counters are
+    // already final once it returns and drain() observes the bytes.
     auto input =
-        makeInputWithStats(*pool_, cache, executor, remotePath, key, ioStats);
+        makeInputWithStats(*pool_, cache, remotePath, key, ioStats);
     auto stream = input.enqueue({0, content.size()});
     input.load(LogType::FILE);
     EXPECT_EQ(drain(*stream, content.size()), content);
@@ -458,8 +439,7 @@ TEST_F(FileCacheBufferedInputTest, metricsWarmReadRecordsHit) {
 
   // Cold pass populates the cache.
   {
-    FileCacheDownloadExecutor executor(2);
-    auto input = makeInput(cache, executor, remotePath, key);
+    auto input = makeInput(cache, remotePath, key);
     auto stream = input.enqueue({0, content.size()});
     input.load(LogType::FILE);
     EXPECT_EQ(drain(*stream, content.size()), content);
@@ -471,9 +451,8 @@ TEST_F(FileCacheBufferedInputTest, metricsWarmReadRecordsHit) {
   // serves bytes from the local cache file (Layer A ssdRead), downloading none.
   auto ioStats = std::make_shared<io::IoStatistics>();
   {
-    FileCacheDownloadExecutor executor(2);
     auto input =
-        makeInputWithStats(*pool_, cache, executor, remotePath, key, ioStats);
+        makeInputWithStats(*pool_, cache, remotePath, key, ioStats);
     auto stream = input.enqueue({0, content.size()});
     input.load(LogType::FILE);
     EXPECT_EQ(drain(*stream, content.size()), content);
@@ -507,8 +486,9 @@ TEST_F(FileCacheBufferedInputTest, singletonInstallAndClear) {
   EXPECT_EQ(FileCache::getInstance(), nullptr);
 }
 
-// initialize() eagerly builds the owned download executor from the configured
-// thread count, and createBufferedInput-style consumers can read it back.
+// initialize() eagerly builds the owned background download executor from the
+// configured thread count; a basic read through the cache still works. The
+// background executor is what later wires segment tail-fill.
 TEST_F(FileCacheBufferedInputTest, ownedDownloadExecutorReadback) {
   const auto remotePath = path("remote.bin");
   const auto content = makeContent(64 << 10);
@@ -523,7 +503,6 @@ TEST_F(FileCacheBufferedInputTest, ownedDownloadExecutorReadback) {
       std::make_shared<LocalReadFile>(remotePath),
       *pool_,
       &cache,
-      cache.downloadExecutor(),
       key,
       FileCache::getCommonOrigin());
   auto stream = input.enqueue({0, content.size()});

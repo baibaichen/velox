@@ -69,16 +69,16 @@ void FileCacheInputStream::loadCurrentSegmentBuffer() {
     if (state == FileSegment::State::EMPTY ||
         state == FileSegment::State::PARTIALLY_DOWNLOADED) {
       // The segment still has a downloader pending or a resumable gap:
-      //  - EMPTY: the async download task submitted by load() has not yet
-      //    claimed the downloader (EMPTY -> DOWNLOADING).
+      //  - EMPTY: a concurrent load() (this reader's or another thread's) has
+      //    not yet claimed the downloader (EMPTY -> DOWNLOADING).
       //  - PARTIALLY_DOWNLOADED: a prior, shorter-prefix download released the
-      //    segment in a resumable state; a later load() submits a resume task
-      //    that continues it (FileSegmentInfo.h: "download can be continued by
-      //    other owners").
+      //    segment in a resumable state; a later load() resumes it
+      //    (FileSegmentInfo.h: "download can be continued by other owners").
       // wait() returns immediately while the downloader is unset, so back off to
-      // avoid busy-spinning, bounded so a task that never starts surfaces an
-      // error instead of spinning forever. A genuinely abandoned download lands
-      // in a terminal NO_CONTINUATION/DETACHED state handled below.
+      // avoid busy-spinning, bounded so a download that never progresses
+      // surfaces an error instead of spinning forever. A genuinely abandoned
+      // download lands in a terminal NO_CONTINUATION/DETACHED state handled
+      // below.
       VELOX_CHECK(
           std::chrono::steady_clock::now() < resumeDeadline,
           "FileCacheInputStream: download did not progress; segment still "

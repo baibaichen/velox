@@ -17,7 +17,6 @@
 #pragma once
 
 #include "velox/common/caching/filecache/FileCache.h"
-#include "velox/common/caching/filecache/FileCacheDownloadExecutor.h"
 #include "velox/common/caching/filecache/FileSegment.h"
 #include "velox/common/io/IoStatistics.h"
 #include "velox/dwio/common/BufferedInput.h"
@@ -33,8 +32,10 @@ namespace facebook::velox::ch {
 class FileCacheBufferedInput final
     : public facebook::velox::dwio::common::BufferedInput {
  public:
-  /// fileCache, executor, and readFile must outlive this BufferedInput and all
-  /// download tasks submitted by load(); ownership stays with the caller.
+  /// fileCache and readFile must outlive this BufferedInput; ownership stays
+  /// with the caller. load() downloads cache misses synchronously on the calling
+  /// thread (ClickHouse-faithful: no dedicated foreground download pool), so
+  /// callers that want overlap submit load() to their own IO executor.
   /// ioStats (optional) receives per-query operator-level IO counters mirroring
   /// CachedBufferedInput: ssdRead() for cache hits, read()/prefetch() for source
   /// downloads. nullptr disables Layer A recording (e.g. in the benchmark, which
@@ -43,7 +44,6 @@ class FileCacheBufferedInput final
       std::shared_ptr<ReadFile> readFile,
       memory::MemoryPool& pool,
       FileCache* fileCache,
-      FileCacheDownloadExecutor* executor,
       FileCacheKey key,
       FileCache::OriginInfo origin = FileCache::getInternalOrigin(),
       CreateFileSegmentSettings createSettings = {},
@@ -91,7 +91,6 @@ class FileCacheBufferedInput final
 
  private:
   FileCache* fileCache_;
-  FileCacheDownloadExecutor* executor_;
   FileCacheKey key_;
   FileCache::OriginInfo origin_;
   CreateFileSegmentSettings createSettings_;
