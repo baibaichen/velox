@@ -459,6 +459,12 @@ size_t FileSegment::downloadFromReader(
 {
     // Per-write chunk cap. Bounds the scratch buffer and keeps each reserve()
     // small so a tight cache can satisfy it incrementally.
+    // TODO(io): this fixed 1 MiB step is the streaming download granularity that
+    // CH exposes as max_read_buffer_size (the benchmark's --fcbi_read_buffer_mb
+    // knob). Making it configurable means threading a chunk size through this
+    // shared static (called by both the foreground glue and the background pool)
+    // plus a FileCacheSettings field; deferred to avoid changing production
+    // cache behavior, so the knob currently validates == 1 MiB.
     constexpr size_t kDownloadChunk = 1ULL << 20;
 
     if (num_bytes == 0)
