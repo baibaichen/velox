@@ -57,6 +57,7 @@ while (segment->getDownloadedSize() < segment->range().size()) {  // 直到整�
 - 源端下载统一走 `ByteInputStream` 流式协议（兼容 S3/HTTP 远端），消除直接 `pread` 特判。
 - 实现 NYI 的 `downloadImpl`；`RemoteFileReaderPtr` retype；胶水层 wire `setRemoteFileReader`。
 - 保留 Velox 既有的 unit 级异步 I/O 重叠（`ParallelUnitLoader`）。
+- 砍掉 glue 前台 `FileCacheDownloadExecutor`，前缀同步下载（CH 忠实，见 §3.1）。
 
 **非目标**
 - 不引入 cbi 式的 `coalesceIo` 跨 region 合并（见 §7，忠实 CH 即无此机制）。
@@ -65,11 +66,34 @@ while (segment->getDownloadedSize() < segment->range().size()) {  // 直到整�
 
 ## 3. 决策：Option 1（CH 忠实，已确认）
 
-经 Option 1 vs Option 2 对抗式 PK，确认 **Option 1**：前台下载请求前缀 + 背景补尾，保留现有
-executor-pool + reader-waits 线程模型，保留 `ParallelUnitLoader` 的异步重叠。
-（PK 关键证据：`ParallelUnitLoader::load`，`ParallelUnitLoader.cpp:138-157`，把 `unit->load()`
+经 Option 1 vs Option 2 对抗式 PK，确认 **Option 1**：前台下载请求前缀 + 背景补尾，保留
+`ParallelUnitLoader` 的 unit 级异步重叠。
+（PK 关键证据：`ParallelUnitLoader::load`，`ParallelUnitLoader.cpp:138-159`，把 `unit->load()`
 经 AsyncSource 提交到 ioExecutor，先于 decode 执行——异步重叠真实存在；Option 2 把下载移进
 `Next()` 会回退该重叠，故否决。）
+
+### 3.1 线程模型（已确认 Option A：砍前台执行器，前缀同步下载）
+
+CH 的前缀下载是**同步在 read/query 线程上**（consumer-driven `next()`），唯一的异步池是**背景
+补尾池**（CH `DownloadQueue`）。据此采用 **Option A**：
+
+- **前缀下载 = 同步**，直接在 `FileCacheBufferedInput::load()` 调用线程上完成；**不**再经
+  `FileCacheDownloadExecutor` 前台池。
+- **unit 间 overlap 不丢**：生产路径下 `BufferedInput::load()` 由 `ParallelUnitLoader` 提交到
+  `ioExecutor` 执行（`ParallelUnitLoader.cpp:147-152`），`load()` 同步阻塞也只阻塞 IO 线程，
+  解码线程照常处理上一个 unit。砍前台池仅失去"**单个 unit 内多段并行下载**"——这正是 cbi
+  风格、CH 没有的增强，砍掉更忠实。
+- **背景补尾池**复用 `FileCache` 自带的 `downloadExecutor_`（`FileCache.cpp:486-487`，大小
+  = `backgroundDownloadThreads_`，源自 `settings.backgroundDownloadThreads`，line 279）。
+- **删除** glue ctor 的 `FileCacheDownloadExecutor* executor` 参数与非空断言
+  （现 `FileCacheBufferedInput.cpp:157,172`）。
+- **删除** benchmark flag `--fcbi_download_threads`；**新增** `--fcbi_background_download_threads`
+  （默认 5 = CH `FILECACHE_DEFAULT_BACKGROUND_DOWNLOAD_THREADS`，`FileCache_fwd.h:27`），映射到
+  已存在的 `settings.backgroundDownloadThreads`。
+
+> **关于 `FileCacheDownloadExecutor` 的两个实例（澄清）**：该类有两处使用——(a) 生产
+> `FileCache::downloadExecutor_`（背景池，`FileCache.cpp:487`）；(b) benchmark harness 注入给
+> glue 的前台池（`--fcbi_download_threads`）。Option A 只删除 (b)；(a) 保留作为背景补尾池。
 
 ## 4. 前缀语义（"前台下请求前缀"是什么）
 
@@ -96,14 +120,17 @@ segment **顺序从前往后填充**，`downloadedSize` 单调递增、中间**�
 
 ## 5. 下载粒度与配置旋钮
 
-### 5.1 两个正交旋钮
+### 5.1 配置旋钮
 | 旋钮 | 默认 | 含义 | CH 对应 |
 |---|---|---|---|
 | `--fcbi_segment_mb` | 4MB | **缓存/对齐单位**（一个 cache 段大小、背景补尾目标） | `FILE_SEGMENT_ALIGNMENT` / bgMaxSize |
 | `--fcbi_read_buffer_mb` | 1MB | **源下载的流式 step**（`FileInputStream` bufferSize） | `max_read_buffer_size` / `DBMS_DEFAULT_BUFFER_SIZE` |
+| `--fcbi_background_download_threads` | 5 | **背景补尾池**线程数（映射 `settings.backgroundDownloadThreads`） | `BACKGROUND_DOWNLOAD_THREADS` |
 
-二者正交：段大小决定缓存条目与背景补尾目标；read buffer 决定每次从源流式取多少。
-`--fcbi_read_buffer_mb` ≥ 段大小时 → 每段一次取完（"一次读完"）。
+> **移除** `--fcbi_download_threads`（Option A 砍掉前台执行器，见 §3.1）。
+
+`--fcbi_segment_mb` 与 `--fcbi_read_buffer_mb` 正交：段大小决定缓存条目与背景补尾目标；read
+buffer 决定每次从源流式取多少。`--fcbi_read_buffer_mb` ≥ 段大小时 → 每段一次取完（"一次读完"）。
 
 > **关于默认值**：`FileInputStream` 的 ctor 把 `bufferSize` 作为**必填参数**（`FileInputStream.h:30-32`，
 > 无隐藏默认），胶水层每次都显式传入 `--fcbi_read_buffer_mb`，因此该旋钮**总是生效**，不会被
@@ -122,8 +149,8 @@ segment **顺序从前往后填充**，`downloadedSize` 单调递增、中间**�
 | **范围翻译** | `BufferedInput::enqueue(region)` 记录待读区间；`load()` 对每个 region 调
 `getOrSet(key, region.offset, region.length, …)`，得到对齐到 4MB 的 `FileSegmentsHolder`。前台
 按 §4 只下 `[segStart, rangeEnd)` 前缀。 |
-| **prefetch 交互** | enqueue→load 仍走 executor 异步提交（保留 `ParallelUnitLoader` 重叠）；
-不实现 cbi 式 quantum 滑窗预取（§7）。 |
+| **prefetch 交互** | enqueue→load：`load()` 同步下前缀（Option A，§3.1），unit 间 overlap 由
+`ParallelUnitLoader` 把 `load()` 跑在 IO 线程提供；不实现 cbi 式 quantum 滑窗预取（§7）。 |
 | **SeekableInputStream 语义** | `FileCacheInputStream` 在 holder 的多段之上提供连续可 seek 流；
 `loadCurrentSegmentBuffer`（`FileCacheInputStream.cpp:40-96`）按 `segmentOffset+length` 的交集
 等待并读取，已是 partial-aware。 |
@@ -143,6 +170,9 @@ segment **顺序从前往后填充**，`downloadedSize` 单调递增、中间**�
 - **retype**：`FileSegment::RemoteFileReaderPtr`（`FileSegment.h:57`）从
   `shared_ptr<ReadBufferFromFileBase>` 改为 `shared_ptr<ByteInputStream>`（父 spec §2.1 已定）。
   确认安全：`setRemoteFileReader`（`FileSegment.h:271`）当前零调用点。
+- **glue ctor 简化（Option A）**：删除 `FileCacheBufferedInput` ctor 的
+  `FileCacheDownloadExecutor* executor` 参数及其非空断言（现 `FileCacheBufferedInput.cpp:157,172`）。
+  前缀下载不再经前台池（见 §3.1）；背景补尾由 `FileCache::downloadExecutor_` 承载。
 - **wire**：胶水层在 miss 时构造 `FileInputStream(over 源 ReadFile, bufferSize=--fcbi_read_buffer_mb)`
   并 `segment->setRemoteFileReader(...)`，供前台前缀下载与背景补尾共用同一流式 reader。
 - **实现 downloadImpl**：`CacheMetadata::downloadImpl`（`Metadata.cpp:887-918`，现 `VELOX_NYI`）
@@ -154,26 +184,31 @@ segment **顺序从前往后填充**，`downloadedSize` 单调递增、中间**�
   `getDownloadedSize()` 反映。实现时务必区分：源读进度看 `tellp/remainingSize`，缓存写进度看
   `getDownloadedSize`，两者不要互相代入（二者通常一致，但失败重试/部分写时会分叉）。
 
-### 6.4 前台下载循环（改造后）
-前台只把光标推进到 `rangeEnd`（前缀），每步 ≤ `--fcbi_read_buffer_mb`，经 `ByteInputStream`：
+### 6.4 前台下载循环（改造后，Option A：同步）
+`load()` 在**调用线程上同步**完成前缀下载（无 `executor_->submit`）：只把光标推进到 `rangeEnd`
+（前缀），每步 ≤ `--fcbi_read_buffer_mb`，经 `ByteInputStream`：
 
 ```
+# 在 FileCacheBufferedInput::load() 调用线程上同步执行
 cursor = segStart
 while (downloadedSize < (rangeEnd - segStart)):
     view = remoteFileReader->nextView(min(read_buffer, rangeEnd - cursor))
     reserve(view.size); segment->write(view.data(), view.size(), cursor)
     cursor += view.size()
-completePart(allow_background_download = true)   # 触发段尾背景补到 4MB
+completePart(allow_background_download = true)   # 触发段尾背景补到 4MB（背景池）
 ```
 
+unit 间 overlap 由 `ParallelUnitLoader` 在生产路径提供（§3.1），故同步 `load()` 不挡解码线程。
+
 `complete(..., allow_background_download=true)`（`FileSegment.cpp:759-830`）+
-`getSizeForBackgroundDownloadUnlocked`（704-732，配置下补满 4MB）负责段尾。
+`getSizeForBackgroundDownloadUnlocked`（704-732，配置下补满 4MB）由
+`FileCache::downloadExecutor_` 背景池负责段尾。
 
 **`reserve` 失败语义（前缀循环新增路径，需明确）**：前缀循环里 `reserve(view.size)` 失败
 （cache 满 / 无法腾出空间）时，沿用现有 miss 任务的终止语义——`setDownloadFailed` +
 `completePartAndResetDownloader`（`FileCacheBufferedInput.cpp:267-273`），使等待的 reader 观察到
 **放弃**而非空转；该 region 的本次读由上层走 DETACHED bypass 整段 `pread`（§6.1 表"cache-miss
-回退"行）兜底。**不**在前缀循环里抛异常穿透到 executor。（CH 在此处会改走远端读尾，属后续增强，
+回退"行）兜底。**不**在前缀循环里抛异常穿透到调用线程。（CH 在此处会改走远端读尾，属后续增强，
 见现有 TODO(bypass-on-reserve-failure)。）
 
 ## 7. 已知架构差异（忠实 CH 的代价，非 bug）
@@ -200,7 +235,13 @@ completePart(allow_background_download = true)   # 触发段尾背景补到 4MB
   正确性的硬前提（§9 风险 1），必须直接用 UT 验证，**不能**只靠 benchmark 间接观察。
 - **流式协议**：用 mock `ByteInputStream` 验证 `downloadImpl` 的 `nextView/atEnd/write` 序列对位
   CH 语义。
-- **异步重叠回归**：确认改造后 `load()` 仍经 executor 异步提交，`ParallelUnitLoader` 重叠不退化。
+- **同步 load() + unit 级 overlap（Option A）**：UT/断言确认 `load()` 在调用线程上**同步**完成前缀
+  下载（无前台 executor 提交）；并在生产路径下 `ParallelUnitLoader` 把 `load()` 跑在 IO 线程，
+  unit 间 overlap 不退化。
+- **benchmark 公平性（Option A 必处理）**：harness 直接调 `load()`、**不走** `ParallelUnitLoader`，
+  故 fcbi 同步 load() 与 cbi 异步 load() 不可直接比。处理：给 fcbi 的 `runBatch` 把 `load()` 包一层
+  IO executor 异步（等价 ParallelUnitLoader 的 unit 级 overlap），或统一以 end-to-end wall time
+  度量。报告中注明该处理。
 - **端到端**：`velox_bufferedinput_wrapper_benchmark` 跑 fcbi vs cbi，核对前缀语义下的字节数与
   hit-rate，与 §7 架构差异一致。
 - 构建：`cmake --build cmake-build-relwithdebinfo-gcc13 --target velox_bufferedinput_wrapper_benchmark -j$(nproc)`。
@@ -221,6 +262,11 @@ completePart(allow_background_download = true)   # 触发段尾背景补到 4MB
 3. **3a** ReadFile 所有权适配器（shared_ptr<ReadFile> → FileInputStream 所需 unique_ptr 语义的
    小包装，独立可测）。
 4. **3b** 胶水层 `setRemoteFileReader`（用 3a 的适配器包源 ReadFile）+ 前台前缀循环改造
-   （替换整段 while，含 reserve 失败语义）+ UT。
-5. 背景补尾接通（`complete(allow_background_download=true)`）+ UT（含 holder-drop 补尾 UT）。
-6. 配置旋钮 `--fcbi_read_buffer_mb` 接入 + benchmark 报告标注 §7 架构差异。
+   （**同步**替换整段 while，含 reserve 失败语义）+ UT。
+5. **Option A 砍前台执行器**：删 `FileCacheBufferedInput` ctor 的 `executor` 参数 + 断言，
+   `load()` 改同步直跑（依赖 3b）；删 benchmark flag `--fcbi_download_threads`；benchmark harness
+   给 fcbi `runBatch` 包一层 IO executor 异步（公平性）+ UT/断言。
+6. 背景补尾接通（`complete(allow_background_download=true)`，用 `FileCache::downloadExecutor_`）+
+   UT（含 holder-drop 补尾 UT）。
+7. 配置旋钮 `--fcbi_read_buffer_mb` 接入 + 新增 `--fcbi_background_download_threads`（映射
+   `settings.backgroundDownloadThreads`）+ benchmark 报告标注 §7 架构差异。
