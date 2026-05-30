@@ -46,6 +46,7 @@ namespace facebook::velox::ch {
 class BackgroundSchedulePoolTaskHolder; // TODO(threading): CH background scheduler holder.
 class StatusFile; // TODO(status-file): CH StatusFile marker.
 class ThreadFromGlobalPool; // TODO(threading): CH global thread pool thread.
+class FileCacheDownloadExecutor;
 
 struct ReadSettings;
 struct FilesystemCacheSettings;
@@ -311,6 +312,20 @@ public:
 
     const std::string & getName() const { return name; }
 
+    /// Process-global singleton accessors. Mirror velox AsyncDataCache /
+    /// velox2 FsCache: a benchmark or embedder installs the active FileCache via
+    /// setInstance(), and consumers (e.g. createBufferedInput) consult
+    /// getInstance() to route reads through the cache. Not owned here; the
+    /// caller owns the FileCache lifetime and must setInstance(nullptr) before
+    /// destroying it.
+    static FileCache * getInstance();
+    static void setInstance(FileCache * instance);
+
+    /// Returns the lazily/eagerly owned background download executor, or nullptr
+    /// when backgroundDownloadThreads == 0. Built once during initialize(); the
+    /// returned pointer is stable for the FileCache lifetime.
+    FileCacheDownloadExecutor * downloadExecutor() const { return downloadExecutor_.get(); }
+
 private:
     using KeyAndOffset = FileCacheKeyAndOffset;
 
@@ -346,6 +361,15 @@ private:
     const bool skipCacheOnDiskFailure_;
 
     std::string name;
+
+    /// Worker count for the background download executor (captured at
+    /// construction; the full settings object is not retained).
+    const size_t backgroundDownloadThreads_;
+    /// Owned background download executor, built once in initialize().
+    std::unique_ptr<FileCacheDownloadExecutor> downloadExecutor_;
+
+    /// Backing storage for the process-global singleton pointer.
+    static FileCache * & instanceRef();
 
     std::exception_ptr initException;
     std::atomic<bool> isInitialized_ = false;

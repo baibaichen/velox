@@ -388,5 +388,45 @@ TEST_F(FileCacheBufferedInputTest, metricsWarmReadRecordsHit) {
   EXPECT_EQ(ioStats->prefetch().sum(), 0u);
 }
 
+// The process-global singleton is null until installed, returns the installed
+// pointer, and clears back to null -- this is how createBufferedInput discovers
+// whether to route reads through the ch::FileCache backend.
+TEST_F(FileCacheBufferedInputTest, singletonInstallAndClear) {
+  EXPECT_EQ(FileCache::getInstance(), nullptr);
+
+  FileCache cache("singleton", settings(path("cache")));
+  cache.initialize();
+
+  FileCache::setInstance(&cache);
+  EXPECT_EQ(FileCache::getInstance(), &cache);
+
+  FileCache::setInstance(nullptr);
+  EXPECT_EQ(FileCache::getInstance(), nullptr);
+}
+
+// initialize() eagerly builds the owned download executor from the configured
+// thread count, and createBufferedInput-style consumers can read it back.
+TEST_F(FileCacheBufferedInputTest, ownedDownloadExecutorReadback) {
+  const auto remotePath = path("remote.bin");
+  const auto content = makeContent(64 << 10);
+  writeFile(remotePath, content);
+
+  FileCache cache("owned_executor", settings(path("cache")));
+  cache.initialize();
+  ASSERT_NE(cache.downloadExecutor(), nullptr);
+
+  const auto key = FileCacheKey::fromPath(remotePath);
+  auto input = FileCacheBufferedInput(
+      std::make_shared<LocalReadFile>(remotePath),
+      *pool_,
+      &cache,
+      cache.downloadExecutor(),
+      key,
+      FileCache::getCommonOrigin());
+  auto stream = input.enqueue({0, content.size()});
+  input.load(LogType::FILE);
+  EXPECT_EQ(drain(*stream, content.size()), content);
+}
+
 } // namespace
 } // namespace facebook::velox::ch

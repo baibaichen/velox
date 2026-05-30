@@ -18,6 +18,7 @@ velox_add_test_headers(velox_tpch_benchmark_lib TpchBenchmark.h)
 target_link_libraries(
   velox_tpch_benchmark_lib
   velox_query_benchmark
+  velox_benchmark_ab
   velox_aggregates
   velox_exec
   velox_exec_test_lib

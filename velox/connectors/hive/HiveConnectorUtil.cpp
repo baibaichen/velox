@@ -24,6 +24,8 @@
 #include "velox/connectors/hive/FileTableHandle.h"
 #include "velox/dwio/common/CachedBufferedInput.h"
 #include "velox/dwio/common/DirectBufferedInput.h"
+#include "velox/common/caching/filecache/FileCacheKey.h"
+#include "velox/dwio/common/FileCacheBufferedInput.h"
 #include "velox/expression/Expr.h"
 #include "velox/expression/ExprConstants.h"
 #include "velox/expression/ExprToSubfieldFilter.h"
@@ -658,6 +660,23 @@ std::unique_ptr<dwio::common::BufferedInput> createBufferedInput(
     std::shared_ptr<IoStats> ioStats,
     folly::Executor* executor,
     const folly::F14FastMap<std::string, std::string>& fileReadOps) {
+  // Route reads through the ClickHouse-style FileCache backend when one is
+  // installed process-wide (mirrors velox2 FsCache / the A/B benchmark harness).
+  // Mutually exclusive with the AsyncDataCache (CBI) backend.
+  if (auto* fileCache = ch::FileCache::getInstance()) {
+    VELOX_CHECK_NULL(
+        connectorQueryCtx->cache(),
+        "ch::FileCache and AsyncDataCache cannot both be installed");
+    return std::make_unique<ch::FileCacheBufferedInput>(
+        fileHandle.file,
+        readerOpts.memoryPool(),
+        fileCache,
+        fileCache->downloadExecutor(),
+        ch::FileCacheKey::fromPath(fileHandle.file->getName()),
+        ch::FileCache::getCommonOrigin(),
+        ch::CreateFileSegmentSettings{},
+        std::move(ioStatistics));
+  }
   if (connectorQueryCtx->cache()) {
     return std::make_unique<dwio::common::CachedBufferedInput>(
         fileHandle.file,
