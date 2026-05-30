@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include <functional>
+
 #include "velox/benchmarks/QueryBenchmarkBase.h"
 
 DECLARE_string(input_source);
@@ -41,6 +43,18 @@ class AbBenchmarkBase : public facebook::velox::QueryBenchmarkBase {
   /// re-reading the CSV.
   int32_t runAb();
 
+  /// Sets a callback invoked at the top of each round (after the first) when
+  /// --cold_each_round is set, to return the active cache backend to a cold
+  /// state. dispatchAbMain wires this per backend: fscache reinstalls its
+  /// singleton; cbi clears its AsyncDataCache.
+  void setColdResetFn(std::function<void()> fn) {
+    coldResetFn_ = std::move(fn);
+  }
+
+  /// Clears the CBI AsyncDataCache (cache_) if present. Used by the
+  /// --cold_each_round reset path for the cbi backend; no-op otherwise.
+  void clearCbiCache();
+
  protected:
   /// Total number of queries in this suite (TPC-H: 22).
   virtual int32_t numQueries() const = 0;
@@ -50,6 +64,9 @@ class AbBenchmarkBase : public facebook::velox::QueryBenchmarkBase {
   virtual facebook::velox::exec::test::TpchPlan buildPlan(int32_t queryId) = 0;
 
   std::unordered_map<std::string, std::string> queryConfigs_;
+
+ private:
+  std::function<void()> coldResetFn_;
 };
 
 } // namespace facebook::velox::benchmarks

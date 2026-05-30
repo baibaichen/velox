@@ -54,6 +54,21 @@ DEFINE_string(
     "CSV output path for the A/B sweep. "
     "Required when --input_source is set.");
 
+DEFINE_int32(
+    query_id,
+    0,
+    "If 0 (default) the A/B sweep runs every query in the suite. If positive, "
+    "the sweep is restricted to that single 1-based query id (useful for "
+    "isolating one query's cold-run behavior). Must be in [1, numQueries()].");
+
+DEFINE_bool(
+    cold_each_round,
+    false,
+    "If true, re-wipe the active cache backend at the top of every round so "
+    "each round is an independent cold sample. Default false: only round 1 is "
+    "cold and rounds 2+ are warm. Lets a single process collect multiple cold "
+    "wall_ms samples without per-process restart overhead.");
+
 // num_repeats is owned by QueryBenchmarkBase.cpp but not declared in its
 // header. runAb() asserts it is 1 to keep the outer --rounds loop honest.
 DECLARE_int32(num_repeats);
@@ -172,6 +187,12 @@ void populateBackendDelta(
 
 } // namespace
 
+void AbBenchmarkBase::clearCbiCache() {
+  if (cache_ != nullptr) {
+    cache_->clear();
+  }
+}
+
 int32_t AbBenchmarkBase::runAb() {
   // Outer rounds use --rounds; inner repetition pinned to 1 because
   // QueryBenchmarkBase::run loops --num_repeats times internally and that
@@ -183,12 +204,31 @@ int32_t AbBenchmarkBase::runAb() {
   VELOX_USER_CHECK(
       !FLAGS_out.empty(), "--out is required with --input_source");
 
+  // Build the list of query ids to run. --query_id=0 (default) sweeps every
+  // query in the suite; a positive value restricts the sweep to that single
+  // query so its cold-run behavior can be isolated.
+  const int32_t numQueriesTotal = numQueries();
+  std::vector<int32_t> queryIds;
+  if (FLAGS_query_id == 0) {
+    queryIds.reserve(numQueriesTotal);
+    for (int32_t q = 1; q <= numQueriesTotal; ++q) {
+      queryIds.push_back(q);
+    }
+  } else {
+    VELOX_USER_CHECK(
+        FLAGS_query_id >= 1 && FLAGS_query_id <= numQueriesTotal,
+        "--query_id={} is out of range [1, {}]",
+        FLAGS_query_id,
+        numQueriesTotal);
+    queryIds.push_back(FLAGS_query_id);
+  }
+
+  // Plan construction is hoisted out of the round loop so warm rounds do not
   // Plan construction is hoisted out of the round loop so warm rounds do not
   // re-pay the JSON parse + deserialization cost.
-  const int32_t numQueriesTotal = numQueries();
   std::vector<exec::test::TpchPlan> plans;
-  plans.reserve(numQueriesTotal);
-  for (int32_t q = 1; q <= numQueriesTotal; ++q) {
+  plans.reserve(queryIds.size());
+  for (int32_t q : queryIds) {
     plans.push_back(buildPlan(q));
   }
 
@@ -199,7 +239,14 @@ int32_t AbBenchmarkBase::runAb() {
 
   int32_t failed = 0;
   for (int32_t round = 1; round <= FLAGS_rounds; ++round) {
-    for (int32_t q = 1; q <= numQueriesTotal; ++q) {
+    // Round 1 is already cold (caches wiped at process startup). For rounds
+    // 2+, --cold_each_round returns the active backend to a cold state so each
+    // round is an independent cold sample.
+    if (FLAGS_cold_each_round && round > 1 && coldResetFn_) {
+      coldResetFn_();
+    }
+    for (size_t i = 0; i < queryIds.size(); ++i) {
+      const int32_t q = queryIds[i];
       // On the failure path below, the unfilled numeric fields stay at their
       // brace-default zeros and the error column carries the marker -- the
       // documented "all zeros + error message" row shape.
@@ -210,7 +257,7 @@ int32_t AbBenchmarkBase::runAb() {
       const auto wallStart = std::chrono::steady_clock::now();
       // wall_ms covers exactly one execution because the VELOX_USER_CHECK_EQ
       // on FLAGS_num_repeats above forbids the internal loop in run().
-      auto [cursor, results] = run(plans[q - 1], queryConfigs_);
+      auto [cursor, results] = run(plans[i], queryConfigs_);
       const auto wallEnd = std::chrono::steady_clock::now();
       row.wallMs =
           std::chrono::duration<double, std::milli>(wallEnd - wallStart)
