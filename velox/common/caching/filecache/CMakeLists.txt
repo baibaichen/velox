@@ -65,3 +65,6 @@ velox_link_libraries(
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)
 endif()
+if(VELOX_ENABLE_BENCHMARKS_BASIC)
+  add_subdirectory(benchmarks)
+endif()
