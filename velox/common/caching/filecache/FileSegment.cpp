@@ -15,6 +15,7 @@
  */
 #include "velox/common/caching/filecache/FileSegment.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <sstream>
 #include <utility>
@@ -447,6 +448,72 @@ void FileSegment::write(char * from, size_t size, size_t offset_in_file)
     }
 
     VELOX_DCHECK(getCurrentWriteOffset() == offset_in_file + size);
+}
+
+size_t FileSegment::downloadFromReader(
+    FileSegment& segment,
+    velox::ByteInputStream& reader,
+    size_t num_bytes,
+    std::vector<char>& scratch,
+    size_t lock_wait_timeout_milliseconds)
+{
+    // Per-write chunk cap. Bounds the scratch buffer and keeps each reserve()
+    // small so a tight cache can satisfy it incrementally.
+    constexpr size_t kDownloadChunk = 1ULL << 20;
+
+    if (num_bytes == 0)
+        return 0;
+
+    // Align the reader's read cursor to where the segment expects to be
+    // written next. ByteInputStream cannot seek backward, so a reader that is
+    // already past the write offset is a programming error rather than a
+    // recoverable state.
+    size_t offset = segment.getCurrentWriteOffset();
+    const auto reader_pos = static_cast<size_t>(reader.tellp());
+    if (reader_pos < offset)
+        reader.seekp(static_cast<std::streampos>(offset));
+    else if (reader_pos > offset)
+        VELOX_FAIL(
+            "Remote reader position {} is ahead of segment write offset {}",
+            reader_pos,
+            offset);
+
+    size_t written = 0;
+    while (num_bytes > 0 && !reader.atEnd())
+    {
+        const size_t to_read =
+            std::min({num_bytes, reader.remainingSize(), kDownloadChunk});
+        if (to_read == 0)
+            break;
+
+        std::string failure_reason;
+        if (!segment.reserve(to_read, lock_wait_timeout_milliseconds, failure_reason))
+        {
+            // reserve() has already moved the segment to
+            // PARTIALLY_DOWNLOADED_NO_CONTINUATION. Report what was written so
+            // far; do not consume from the reader.
+            LOG(INFO) << fmt::format(
+                "Stopping download of {} at {} bytes: failed to reserve {} bytes: {}",
+                segment.getInfoForLog(),
+                written,
+                to_read,
+                failure_reason);
+            break;
+        }
+
+        if (scratch.size() < to_read)
+            scratch.resize(to_read);
+        reader.readBytes(
+            reinterpret_cast<uint8_t*>(scratch.data()),
+            static_cast<int32_t>(to_read));
+        segment.write(scratch.data(), to_read, offset);
+
+        offset += to_read;
+        num_bytes -= to_read;
+        written += to_read;
+    }
+
+    return written;
 }
 
 FileSegment::State FileSegment::wait(size_t offset)

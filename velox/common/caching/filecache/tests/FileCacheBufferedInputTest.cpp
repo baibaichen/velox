@@ -32,7 +32,9 @@
 #include "velox/common/caching/filecache/FileCacheDownloadExecutor.h"
 #include "velox/common/caching/filecache/FileCacheKey.h"
 #include "velox/common/caching/filecache/FileCacheSettings.h"
+#include "velox/common/caching/filecache/FileSegment.h"
 #include "velox/common/file/File.h"
+#include "velox/common/memory/ByteStream.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
 #include "velox/dwio/common/MetricsLog.h"
@@ -426,6 +428,207 @@ TEST_F(FileCacheBufferedInputTest, ownedDownloadExecutorReadback) {
   auto stream = input.enqueue({0, content.size()});
   input.load(LogType::FILE);
   EXPECT_EQ(drain(*stream, content.size()), content);
+}
+
+// ===========================================================================
+// FileSegment::downloadFromReader — streaming download protocol (commit 2).
+// Drives the helper directly with an in-memory BufferInputStream as the
+// "remote" source so the nextView/reserve/write sequence is unit-tested
+// without the async background queue.
+// ===========================================================================
+
+namespace {
+std::string readFileFully(const std::string& filePath) {
+  std::ifstream in(filePath, std::ios::binary);
+  return std::string(
+      (std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+// Acquires the single segment covering [0, size) and makes this thread its
+// downloader so reserve()/write() are permitted.
+FileSegment& acquireDownloader(
+    FileCache& cache,
+    FileSegmentsHolderPtr& holder,
+    const FileCacheKey& key,
+    size_t size) {
+  holder = cache.getOrSet(
+      key,
+      /*offset=*/0,
+      size,
+      /*file_size=*/size,
+      CreateFileSegmentSettings{},
+      /*file_segments_limit=*/0,
+      FileCache::getCommonOrigin());
+  EXPECT_EQ(holder->size(), 1u);
+  auto& segment = holder->front();
+  EXPECT_EQ(segment.getOrSetDownloader(), FileSegment::getCallerId());
+  return segment;
+}
+} // namespace
+
+TEST_F(FileCacheBufferedInputTest, downloadFromReaderFillsWholeSegment) {
+  const size_t fileSize = 256 * 1024;
+  std::string content = makeContent(fileSize);
+
+  FileCache cache("download_whole", settings(path("cache")));
+  cache.initialize();
+  const auto key = FileCacheKey::fromPath("remote.bin");
+  FileSegmentsHolderPtr holder;
+  auto& segment = acquireDownloader(cache, holder, key, fileSize);
+
+  BufferInputStream reader({ByteRange{
+      reinterpret_cast<uint8_t*>(content.data()),
+      static_cast<int64_t>(content.size()),
+      0}});
+  std::vector<char> scratch;
+  const size_t written =
+      FileSegment::downloadFromReader(segment, reader, fileSize, scratch, 10000);
+
+  EXPECT_EQ(written, fileSize);
+  EXPECT_EQ(segment.getDownloadedSize(), fileSize);
+  segment.completePartAndResetDownloader();
+  EXPECT_EQ(segment.state(), FileSegment::State::DOWNLOADED);
+  EXPECT_EQ(readFileFully(segment.getPath()), content);
+}
+
+TEST_F(FileCacheBufferedInputTest, downloadFromReaderResumesPartialDownload) {
+  const size_t fileSize = 256 * 1024;
+  const size_t half = fileSize / 2;
+  std::string content = makeContent(fileSize);
+
+  FileCache cache("download_resume", settings(path("cache")));
+  cache.initialize();
+  const auto key = FileCacheKey::fromPath("remote.bin");
+  FileSegmentsHolderPtr holder;
+  auto& segment = acquireDownloader(cache, holder, key, fileSize);
+
+  BufferInputStream reader({ByteRange{
+      reinterpret_cast<uint8_t*>(content.data()),
+      static_cast<int64_t>(content.size()),
+      0}});
+  std::vector<char> scratch;
+
+  EXPECT_EQ(
+      FileSegment::downloadFromReader(segment, reader, half, scratch, 10000),
+      half);
+  EXPECT_EQ(segment.getDownloadedSize(), half);
+  // Still the downloader with more bytes to write: the segment stays
+  // DOWNLOADING until the downloader is released.
+  EXPECT_EQ(segment.state(), FileSegment::State::DOWNLOADING);
+
+  // Continue from the current write offset; the reader cursor is already at
+  // 'half', so no seek is needed.
+  EXPECT_EQ(
+      FileSegment::downloadFromReader(
+          segment, reader, fileSize - half, scratch, 10000),
+      fileSize - half);
+  EXPECT_EQ(segment.getDownloadedSize(), fileSize);
+  segment.completePartAndResetDownloader();
+  EXPECT_EQ(segment.state(), FileSegment::State::DOWNLOADED);
+  EXPECT_EQ(readFileFully(segment.getPath()), content);
+}
+
+TEST_F(FileCacheBufferedInputTest, downloadFromReaderHandlesMultiRangeReader) {
+  const size_t fileSize = 200 * 1024;
+  std::string content = makeContent(fileSize);
+
+  FileCache cache("download_multirange", settings(path("cache")));
+  cache.initialize();
+  const auto key = FileCacheKey::fromPath("remote.bin");
+  FileSegmentsHolderPtr holder;
+  auto& segment = acquireDownloader(cache, holder, key, fileSize);
+
+  // Split the source into uneven ranges so readBytes() crosses range
+  // boundaries within a single write chunk.
+  std::vector<ByteRange> ranges;
+  const std::vector<size_t> sizes{37 * 1024, 1, 100 * 1024, fileSize - 137 * 1024 - 1};
+  size_t off = 0;
+  for (auto sz : sizes) {
+    ranges.push_back(ByteRange{
+        reinterpret_cast<uint8_t*>(content.data()) + off,
+        static_cast<int64_t>(sz),
+        0});
+    off += sz;
+  }
+  ASSERT_EQ(off, fileSize);
+
+  BufferInputStream reader(std::move(ranges));
+  std::vector<char> scratch;
+  EXPECT_EQ(
+      FileSegment::downloadFromReader(segment, reader, fileSize, scratch, 10000),
+      fileSize);
+  segment.completePartAndResetDownloader();
+  EXPECT_EQ(segment.state(), FileSegment::State::DOWNLOADED);
+  EXPECT_EQ(readFileFully(segment.getPath()), content);
+}
+
+TEST_F(FileCacheBufferedInputTest, downloadFromReaderStopsAtReaderEof) {
+  const size_t fileSize = 256 * 1024;
+  const size_t available = 100 * 1024;
+  std::string content = makeContent(fileSize);
+
+  FileCache cache("download_eof", settings(path("cache")));
+  cache.initialize();
+  const auto key = FileCacheKey::fromPath("remote.bin");
+  FileSegmentsHolderPtr holder;
+  auto& segment = acquireDownloader(cache, holder, key, fileSize);
+
+  // Reader exposes fewer bytes than requested: the helper must stop at EOF
+  // and report only what it wrote, leaving the segment partially downloaded.
+  BufferInputStream reader({ByteRange{
+      reinterpret_cast<uint8_t*>(content.data()),
+      static_cast<int64_t>(available),
+      0}});
+  std::vector<char> scratch;
+  EXPECT_EQ(
+      FileSegment::downloadFromReader(segment, reader, fileSize, scratch, 10000),
+      available);
+  EXPECT_EQ(segment.getDownloadedSize(), available);
+
+  // Releasing the downloader with only part of the range written leaves the
+  // segment resumable (PARTIALLY_DOWNLOADED), not failed.
+  segment.completePartAndResetDownloader();
+  EXPECT_EQ(segment.state(), FileSegment::State::PARTIALLY_DOWNLOADED);
+  EXPECT_EQ(segment.getDownloadedSize(), available);
+}
+
+TEST_F(FileCacheBufferedInputTest, downloadFromReaderSeeksAbsoluteFileOffset) {
+  // A segment whose range starts at a non-zero file offset: the reader must be
+  // seeked to the absolute offset, so it writes the correct slice of the file.
+  const size_t segSize = 64 * 1024;
+  const size_t fileSize = 4 * segSize;
+  const size_t segOffset = 2 * segSize;
+  std::string content = makeContent(fileSize);
+
+  FileCache cache("download_absolute", settings(path("cache")));
+  cache.initialize();
+  const auto key = FileCacheKey::fromPath("remote.bin");
+  auto holder = cache.getOrSet(
+      key,
+      segOffset,
+      segSize,
+      fileSize,
+      CreateFileSegmentSettings{},
+      /*file_segments_limit=*/0,
+      FileCache::getCommonOrigin(),
+      /*boundary_alignment=*/segSize);
+  ASSERT_EQ(holder->size(), 1u);
+  auto& segment = holder->front();
+  ASSERT_EQ(segment.range().left, segOffset);
+  ASSERT_EQ(segment.getOrSetDownloader(), FileSegment::getCallerId());
+
+  // Reader spans the whole file in absolute coordinates.
+  BufferInputStream reader({ByteRange{
+      reinterpret_cast<uint8_t*>(content.data()),
+      static_cast<int64_t>(content.size()),
+      0}});
+  std::vector<char> scratch;
+  EXPECT_EQ(
+      FileSegment::downloadFromReader(segment, reader, segSize, scratch, 10000),
+      segSize);
+  segment.completePartAndResetDownloader();
+  EXPECT_EQ(segment.state(), FileSegment::State::DOWNLOADED);
+  EXPECT_EQ(readFileFully(segment.getPath()), content.substr(segOffset, segSize));
 }
 
 } // namespace
