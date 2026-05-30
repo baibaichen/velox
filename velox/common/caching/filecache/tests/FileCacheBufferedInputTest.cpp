@@ -34,12 +34,11 @@
 #include "velox/common/caching/filecache/FileCacheSettings.h"
 #include "velox/common/caching/filecache/FileSegment.h"
 #include "velox/common/file/File.h"
-#include "velox/common/file/FileInputStream.h"
 #include "velox/common/memory/ByteStream.h"
 #include "velox/common/memory/Memory.h"
-#include "velox/dwio/common/SharedReadFile.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
 #include "velox/dwio/common/MetricsLog.h"
+#include "velox/dwio/common/ReadFileByteInputStream.h"
 
 namespace facebook::velox::ch {
 namespace {
@@ -634,43 +633,63 @@ TEST_F(FileCacheBufferedInputTest, downloadFromReaderSeeksAbsoluteFileOffset) {
 }
 
 // ===========================================================================
-// SharedReadFile — shared-ownership ReadFile adapter (commit 3a). Lets a
-// shared_ptr<ReadFile> be moved into a unique_ptr-owning consumer (e.g.
-// FileInputStream) while keeping the underlying file alive for as long as the
-// adapter lives (so a segment's reader can outlive the BufferedInput).
+// ReadFileByteInputStream — positioned, random-access ByteInputStream over a
+// shared ReadFile. seekp uses absolute file offsets and never reads the skipped
+// bytes; readBytes is a single positioned pread. It keeps the underlying file
+// alive so a segment's reader can outlive the BufferedInput that created it.
 // ===========================================================================
 
-TEST_F(FileCacheBufferedInputTest, sharedReadFileForwardsAndKeepsSourceAlive) {
-  using facebook::velox::common::FileInputStream;
-
+TEST_F(FileCacheBufferedInputTest, readFileByteInputStreamPositionedReads) {
   const std::string content = makeContent(64 * 1024);
   auto source = std::make_shared<InMemoryReadFile>(content);
-  // Track destruction of the underlying file through a side shared_ptr.
   std::weak_ptr<InMemoryReadFile> weak = source;
 
-  auto adapter = std::make_unique<SharedReadFile>(source);
-  EXPECT_EQ(adapter->size(), content.size());
-  EXPECT_EQ(adapter->getName(), source->getName());
-  EXPECT_EQ(adapter->shouldCoalesce(), source->shouldCoalesce());
-  std::string buf(128, '\0');
-  EXPECT_EQ(adapter->pread(100, 128, buf.data()), content.substr(100, 128));
+  ReadFileByteInputStream stream(source);
+  EXPECT_EQ(stream.size(), content.size());
+  EXPECT_EQ(stream.remainingSize(), content.size());
+  EXPECT_FALSE(stream.atEnd());
+  EXPECT_EQ(static_cast<int64_t>(stream.tellp()), 0);
 
-  // Drop the caller's reference: the adapter must keep the source alive.
+  // Sequential read advances the cursor.
+  std::vector<char> out(256);
+  stream.readBytes(reinterpret_cast<uint8_t*>(out.data()), 256);
+  EXPECT_EQ(std::string(out.data(), 256), content.substr(0, 256));
+  EXPECT_EQ(static_cast<int64_t>(stream.tellp()), 256);
+  EXPECT_EQ(stream.remainingSize(), content.size() - 256);
+
+  // Absolute forward seek to a far offset reads only the requested bytes.
+  stream.seekp(40000);
+  EXPECT_EQ(static_cast<int64_t>(stream.tellp()), 40000);
+  stream.readBytes(reinterpret_cast<uint8_t*>(out.data()), 512);
+  EXPECT_EQ(std::string(out.data(), 512), content.substr(40000, 512));
+
+  // Backward seek is supported (unlike FileInputStream).
+  stream.seekp(0);
+  EXPECT_EQ(static_cast<int64_t>(stream.tellp()), 0);
+  EXPECT_EQ(stream.readByte(), static_cast<uint8_t>(content[0]));
+
+  // skip advances the absolute cursor.
+  stream.seekp(0);
+  stream.skip(100);
+  EXPECT_EQ(static_cast<int64_t>(stream.tellp()), 100);
+
+  // Reaching the end.
+  stream.seekp(content.size());
+  EXPECT_TRUE(stream.atEnd());
+  EXPECT_EQ(stream.remainingSize(), 0u);
+
+  // Out-of-range operations throw rather than silently over-read.
+  EXPECT_ANY_THROW(stream.seekp(content.size() + 1));
+  stream.seekp(content.size() - 4);
+  EXPECT_ANY_THROW(
+      stream.readBytes(reinterpret_cast<uint8_t*>(out.data()), 8));
+
+  // The stream keeps the underlying file alive after the caller drops it.
   source.reset();
   EXPECT_FALSE(weak.expired());
-  EXPECT_EQ(adapter->pread(0, 64, buf.data()), content.substr(0, 64));
-
-  // The adapter can drive a FileInputStream (unique_ptr-owned reader), and
-  // destroying the FileInputStream (and thus the adapter) releases the source.
-  {
-    FileInputStream stream(std::move(adapter), 4096, pool_.get());
-    stream.seekp(200);
-    std::vector<char> out(512);
-    stream.readBytes(reinterpret_cast<uint8_t*>(out.data()), 512);
-    EXPECT_EQ(std::string(out.data(), 512), content.substr(200, 512));
-    EXPECT_FALSE(weak.expired());
-  }
-  EXPECT_TRUE(weak.expired());
+  stream.seekp(10);
+  stream.readBytes(reinterpret_cast<uint8_t*>(out.data()), 16);
+  EXPECT_EQ(std::string(out.data(), 16), content.substr(10, 16));
 }
 
 } // namespace
