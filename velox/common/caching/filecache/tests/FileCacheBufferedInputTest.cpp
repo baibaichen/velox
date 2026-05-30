@@ -34,8 +34,10 @@
 #include "velox/common/caching/filecache/FileCacheSettings.h"
 #include "velox/common/caching/filecache/FileSegment.h"
 #include "velox/common/file/File.h"
+#include "velox/common/file/FileInputStream.h"
 #include "velox/common/memory/ByteStream.h"
 #include "velox/common/memory/Memory.h"
+#include "velox/dwio/common/SharedReadFile.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
 #include "velox/dwio/common/MetricsLog.h"
 
@@ -629,6 +631,46 @@ TEST_F(FileCacheBufferedInputTest, downloadFromReaderSeeksAbsoluteFileOffset) {
   segment.completePartAndResetDownloader();
   EXPECT_EQ(segment.state(), FileSegment::State::DOWNLOADED);
   EXPECT_EQ(readFileFully(segment.getPath()), content.substr(segOffset, segSize));
+}
+
+// ===========================================================================
+// SharedReadFile — shared-ownership ReadFile adapter (commit 3a). Lets a
+// shared_ptr<ReadFile> be moved into a unique_ptr-owning consumer (e.g.
+// FileInputStream) while keeping the underlying file alive for as long as the
+// adapter lives (so a segment's reader can outlive the BufferedInput).
+// ===========================================================================
+
+TEST_F(FileCacheBufferedInputTest, sharedReadFileForwardsAndKeepsSourceAlive) {
+  using facebook::velox::common::FileInputStream;
+
+  const std::string content = makeContent(64 * 1024);
+  auto source = std::make_shared<InMemoryReadFile>(content);
+  // Track destruction of the underlying file through a side shared_ptr.
+  std::weak_ptr<InMemoryReadFile> weak = source;
+
+  auto adapter = std::make_unique<SharedReadFile>(source);
+  EXPECT_EQ(adapter->size(), content.size());
+  EXPECT_EQ(adapter->getName(), source->getName());
+  EXPECT_EQ(adapter->shouldCoalesce(), source->shouldCoalesce());
+  std::string buf(128, '\0');
+  EXPECT_EQ(adapter->pread(100, 128, buf.data()), content.substr(100, 128));
+
+  // Drop the caller's reference: the adapter must keep the source alive.
+  source.reset();
+  EXPECT_FALSE(weak.expired());
+  EXPECT_EQ(adapter->pread(0, 64, buf.data()), content.substr(0, 64));
+
+  // The adapter can drive a FileInputStream (unique_ptr-owned reader), and
+  // destroying the FileInputStream (and thus the adapter) releases the source.
+  {
+    FileInputStream stream(std::move(adapter), 4096, pool_.get());
+    stream.seekp(200);
+    std::vector<char> out(512);
+    stream.readBytes(reinterpret_cast<uint8_t*>(out.data()), 512);
+    EXPECT_EQ(std::string(out.data(), 512), content.substr(200, 512));
+    EXPECT_FALSE(weak.expired());
+  }
+  EXPECT_TRUE(weak.expired());
 }
 
 } // namespace
