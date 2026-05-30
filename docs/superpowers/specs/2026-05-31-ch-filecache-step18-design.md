@@ -124,7 +124,7 @@ segment **顺序从前往后填充**，`downloadedSize` 单调递增、中间**�
 | 旋钮 | 默认 | 含义 | CH 对应 |
 |---|---|---|---|
 | `--fcbi_segment_mb` | 4MB | **缓存/对齐单位**（一个 cache 段大小、背景补尾目标） | `FILE_SEGMENT_ALIGNMENT` / bgMaxSize |
-| `--fcbi_read_buffer_mb` | 1MB | **源下载的流式 step**（`FileInputStream` bufferSize） | `max_read_buffer_size` / `DBMS_DEFAULT_BUFFER_SIZE` |
+| `--fcbi_read_buffer_mb` | 1MB | **源下载的流式 step**（`FileSegment::downloadFromReader` 的 `kDownloadChunk`） | `max_read_buffer_size` / `DBMS_DEFAULT_BUFFER_SIZE` |
 | `--fcbi_background_download_threads` | 5 | **背景补尾池**线程数（映射 `settings.backgroundDownloadThreads`） | `BACKGROUND_DOWNLOAD_THREADS` |
 
 > **移除** `--fcbi_download_threads`（Option A 砍掉前台执行器，见 §3.1）。
@@ -132,9 +132,13 @@ segment **顺序从前往后填充**，`downloadedSize` 单调递增、中间**�
 `--fcbi_segment_mb` 与 `--fcbi_read_buffer_mb` 正交：段大小决定缓存条目与背景补尾目标；read
 buffer 决定每次从源流式取多少。`--fcbi_read_buffer_mb` ≥ 段大小时 → 每段一次取完（"一次读完"）。
 
-> **关于默认值**：`FileInputStream` 的 ctor 把 `bufferSize` 作为**必填参数**（`FileInputStream.h:30-32`，
-> 无隐藏默认），胶水层每次都显式传入 `--fcbi_read_buffer_mb`，因此该旋钮**总是生效**，不会被
-> Velox 内部默认值架空。
+> **关于默认值与当前实现**：设计阶段曾设想 step 由 `FileInputStream` 的 `bufferSize`（必填参数，
+> `FileInputStream.h:30-32`）承载。实现最终改用 `ReadFileByteInputStream`（无 bufferSize 参数，每次
+> `readBytes` 直接 `pread`），流式 step 落在共享静态 `FileSegment::downloadFromReader` 内的常量
+> `kDownloadChunk = 1MB`（前台胶水与背景池**共用**该原语）。因此 `--fcbi_read_buffer_mb` 目前**固定为
+> 1MB**：benchmark 校验非 1MB 即报错（不静默忽略），把它做成真正可配需要给该共享原语加 chunk 参数 +
+> `FileCacheSettings` 字段，会改动生产缓存行为，故按最小改动原则推迟（见 `FileSegment.cpp` kDownloadChunk
+> 处 TODO）。
 
 ### 5.2 与 cbi loadQuantum 的对位（仅供对比理解，非实现耦合）
 - cbi `loadQuantum`（默认 8MB，`Options.h:65`）≈ fcbi `--fcbi_segment_mb`（缓存条目/加载单位）。

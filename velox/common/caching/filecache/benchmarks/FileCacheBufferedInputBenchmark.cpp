@@ -58,6 +58,26 @@ DEFINE_string(ws_mult_list, "0.5,2.0", "Working-set/cache-size CSV.");
 DEFINE_string(remote_latency_us_list, "0,200", "Remote latency CSV in us.");
 DEFINE_uint64(seed_base, 42, "Base RNG seed.");
 DEFINE_string(out, "", "Markdown output path; empty writes stdout.");
+DEFINE_uint64(
+    fcbi_segment_mb,
+    4,
+    "Cache/alignment segment size in MiB (CH FILE_SEGMENT_ALIGNMENT). Also the "
+    "background tail-fill target and this benchmark's per-op read size.");
+DEFINE_uint64(
+    fcbi_read_buffer_mb,
+    1,
+    "Streaming download step in MiB (CH max_read_buffer_size). Currently FIXED "
+    "at 1 MiB: it is the kDownloadChunk constant inside the shared "
+    "FileSegment::downloadFromReader primitive, not yet a setting, so any other "
+    "value is rejected rather than silently ignored.");
+DEFINE_uint64(
+    fcbi_background_download_threads,
+    5,
+    "Background tail-fill pool size (FileCacheSettings.backgroundDownloadThreads"
+    "); 0 disables background download. Note: this benchmark issues "
+    "segment-aligned full-segment reads, so the foreground prefix covers the "
+    "whole segment and background tail-fill is not exercised here; the flag "
+    "still sizes the pool.");
 
 namespace {
 
@@ -74,8 +94,13 @@ using facebook::velox::dwio::common::SeekableInputStream;
 namespace memory = facebook::velox::memory;
 
 constexpr const char* kRemotePath = "/tmp/velox_ch_filecache_bench_remote.bin";
-constexpr uint64_t kSegmentBytes = 1ULL << 20;
 constexpr uint64_t kMaxCacheBytes = 512ULL * (1ULL << 20);
+
+// Cache segment size, also used as this benchmark's per-op read size. Derived
+// from --fcbi_segment_mb so the cache/alignment unit is configurable.
+uint64_t segmentBytes() {
+  return FLAGS_fcbi_segment_mb << 20;
+}
 
 class SleepyReadFile : public ReadFile {
  public:
@@ -152,8 +177,11 @@ FileCacheSettings makeSettings(const std::string& path) {
   FileCacheSettings settings;
   settings.path = path;
   settings.maxSize = kMaxCacheBytes;
-  settings.maxFileSegmentSize = kSegmentBytes;
-  settings.boundaryAlignment = kSegmentBytes;
+  settings.maxFileSegmentSize = segmentBytes();
+  settings.boundaryAlignment = segmentBytes();
+  // Let the background pool fill the whole segment, not just the 4 MiB default.
+  settings.backgroundDownloadMaxFileSegmentSize = segmentBytes();
+  settings.backgroundDownloadThreads = FLAGS_fcbi_background_download_threads;
   settings.validate();
   return settings;
 }
@@ -306,7 +334,7 @@ void parallelRun(
       auto* lat = recordLatency ? &(*perThreadLatencies)[t] : nullptr;
       auto& stats = (*perThreadStats)[t];
       for (uint64_t i = 0; i < opsPerThread; ++i) {
-        const uint64_t offset = (keyOffset + gen.next()) * kSegmentBytes;
+        const uint64_t offset = (keyOffset + gen.next()) * segmentBytes();
         const auto beforeBytes = readFile->bytesRead();
         const auto start = std::chrono::steady_clock::now();
         auto input = FileCacheBufferedInput(
@@ -315,9 +343,9 @@ void parallelRun(
             &driver.cache(),
             FileCacheKey::fromPath(kRemotePath),
             FileCache::getCommonOrigin());
-        auto stream = input.enqueue({offset, kSegmentBytes});
+        auto stream = input.enqueue({offset, segmentBytes()});
         input.load(LogType::FILE);
-        (void)drain(*stream, kSegmentBytes);
+        (void)drain(*stream, segmentBytes());
         const auto end = std::chrono::steady_clock::now();
         const auto afterBytes = readFile->bytesRead();
         // hit == this reader issued no remote IO for the op. Under concurrency
@@ -352,16 +380,16 @@ CellResult runCell(
     int cellIdx) {
   const uint64_t wsKeys = static_cast<uint64_t>(
       key.wsMult * static_cast<double>(kMaxCacheBytes) /
-      static_cast<double>(kSegmentBytes));
+      static_cast<double>(segmentBytes()));
   VELOX_USER_CHECK_GT(wsKeys, 0, "ws_mult too small");
-  // The working set addresses offsets up to wsKeys*kSegmentBytes; keep it within
+  // The working set addresses offsets up to wsKeys*segmentBytes(); keep it within
   // the remote blob so reads never run past EOF (which would abort in pread).
   VELOX_USER_CHECK_LE(
-      wsKeys * kSegmentBytes,
+      wsKeys * segmentBytes(),
       FLAGS_remote_file_size_gb * (1ULL << 30),
       "Working set ({} MiB) exceeds remote_file_size_gb; raise --remote_file_size_gb "
       "or lower --ws_mult_list",
-      (wsKeys * kSegmentBytes) >> 20);
+      (wsKeys * segmentBytes()) >> 20);
   VELOX_USER_CHECK_EQ(ops % key.threads, 0, "ops must divide by threads");
   VELOX_USER_CHECK_EQ(
       warmupOps % key.threads, 0, "warmup_ops must divide by threads");
@@ -436,6 +464,28 @@ CellResult runCell(
 }
 
 void printMarkdownTable(std::ostream& os, const std::vector<CellResult>& rows) {
+  // Config + architecture preamble (HTML comment so it does not disturb the
+  // markdown table). Records the active knobs and the deliberate architectural
+  // differences from CachedBufferedInput (design spec §7) so a reader does not
+  // misread the numbers as a like-for-like comparison.
+  os << "<!--\n"
+     << "FileCacheBufferedInput (ClickHouse-faithful) benchmark\n"
+     << "  fcbi_segment_mb=" << FLAGS_fcbi_segment_mb
+     << " (cache/alignment unit + per-op read size)\n"
+     << "  fcbi_read_buffer_mb=" << FLAGS_fcbi_read_buffer_mb
+     << " (download step; currently fixed at 1 MiB)\n"
+     << "  fcbi_background_download_threads="
+     << FLAGS_fcbi_background_download_threads << " (tail-fill pool)\n"
+     << "Architecture notes (spec §7):\n"
+     << "  - load() downloads the requested prefix synchronously on the caller's\n"
+     << "    IO thread; the segment tail is filled by the background pool after\n"
+     << "    the holder is released. There is NO foreground download executor.\n"
+     << "  - No coalesceIo and no quantum sliding-window prefetch (unlike\n"
+     << "    CachedBufferedInput); these are faithful-to-CH omissions, not bugs.\n"
+     << "  - This workload reads segment-aligned full segments, so the foreground\n"
+     << "    prefix covers the whole segment and background tail-fill is not\n"
+     << "    exercised here.\n"
+     << "-->\n";
   os << "| workload   | threads | ws_mult | lat_us |     ops/s |  hit% |"
      << " dl_MB | used_MB | seg_count | p50_us | p95_us | p99_us | wallSec |\n"
      << "|------------|--------:|--------:|-------:|----------:|------:|"
@@ -483,6 +533,17 @@ int main(int argc, char** argv) {
   VELOX_USER_CHECK(!threadsList.empty(), "--threads_list is empty");
   VELOX_USER_CHECK(!wsMultList.empty(), "--ws_mult_list is empty");
   VELOX_USER_CHECK(!latencyList.empty(), "--remote_latency_us_list is empty");
+  VELOX_USER_CHECK_GT(FLAGS_fcbi_segment_mb, 0, "--fcbi_segment_mb must be > 0");
+  // The streaming download step is the fixed 1 MiB kDownloadChunk inside the
+  // shared FileSegment::downloadFromReader primitive (used by both the
+  // foreground glue and the background pool). It is not yet a setting, so reject
+  // any other --fcbi_read_buffer_mb rather than silently ignoring it.
+  VELOX_USER_CHECK_EQ(
+      FLAGS_fcbi_read_buffer_mb,
+      1,
+      "--fcbi_read_buffer_mb is currently fixed at 1 MiB "
+      "(FileSegment::downloadFromReader kDownloadChunk); other values are not "
+      "yet plumbed through that shared download primitive.");
   for (auto t : threadsList) {
     VELOX_USER_CHECK_GT(t, 0, "threads must be > 0");
     VELOX_USER_CHECK_EQ(FLAGS_ops % t, 0, "ops must divide by threads");
