@@ -19,6 +19,7 @@
 #include "velox/common/caching/filecache/FileCache.h"
 #include "velox/common/caching/filecache/FileCacheDownloadExecutor.h"
 #include "velox/common/caching/filecache/FileSegment.h"
+#include "velox/common/io/IoStatistics.h"
 #include "velox/dwio/common/BufferedInput.h"
 
 #include <list>
@@ -34,6 +35,10 @@ class FileCacheBufferedInput final
  public:
   /// fileCache, executor, and readFile must outlive this BufferedInput and all
   /// download tasks submitted by load(); ownership stays with the caller.
+  /// ioStats (optional) receives per-query operator-level IO counters mirroring
+  /// CachedBufferedInput: ssdRead() for cache hits, read()/prefetch() for source
+  /// downloads. nullptr disables Layer A recording (e.g. in the benchmark, which
+  /// reads backend aggregates via FileCache::stats() instead).
   FileCacheBufferedInput(
       std::shared_ptr<ReadFile> readFile,
       memory::MemoryPool& pool,
@@ -41,7 +46,8 @@ class FileCacheBufferedInput final
       FileCacheDownloadExecutor* executor,
       FileCacheKey key,
       FileCache::OriginInfo origin = FileCache::getInternalOrigin(),
-      CreateFileSegmentSettings createSettings = {});
+      CreateFileSegmentSettings createSettings = {},
+      std::shared_ptr<facebook::velox::io::IoStatistics> ioStats = nullptr);
 
   std::unique_ptr<facebook::velox::dwio::common::SeekableInputStream> enqueue(
       facebook::velox::common::Region region,
@@ -89,6 +95,7 @@ class FileCacheBufferedInput final
   FileCacheKey key_;
   FileCache::OriginInfo origin_;
   CreateFileSegmentSettings createSettings_;
+  std::shared_ptr<facebook::velox::io::IoStatistics> ioStats_;
   uint64_t fileSize_;
   std::list<EnqueuedRegion> enqueuedRegions_;
 };

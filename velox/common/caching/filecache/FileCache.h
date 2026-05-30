@@ -109,6 +109,26 @@ struct FileCacheReserveStat
     }
 };
 
+/// Backend (cache-wide) aggregate counters, surfaced by FileCache::stats().
+/// Mirrors the velox readback idiom of AsyncDataCache::refreshStats(): a plain
+/// POD snapshot of monotonic atomics, so callers read fields directly without
+/// .load(). Cross-field consistency is not guaranteed under concurrent writers.
+/// CH's hit/miss live in the read consumer (CachedOnDiskReadBufferFromFile), so
+/// hits/misses here are populated by the consumer (FileCacheBufferedInput).
+struct FileCacheStats
+{
+    /// Count of cache-hit segments (already DOWNLOADED at read time).
+    uint64_t hits = 0;
+    /// Count of cache-miss segments actually downloaded from source.
+    uint64_t misses = 0;
+    /// Cumulative bytes written into the cache by downloads.
+    uint64_t downloadedBytes = 0;
+    /// Current on-disk footprint (== getUsedCacheSize()), shrinks on eviction.
+    uint64_t bytesOnDisk = 0;
+    /// Count of file segments successfully evicted.
+    uint64_t evictions = 0;
+};
+
 /// Local cache for remote filesystem files, represented as a set of non-overlapping non-empty file segments.
 /// Different caching algorithms are implemented using IFileCachePriority.
 class FileCache : private boost::noncopyable
@@ -225,6 +245,24 @@ public:
 
     size_t getFileSegmentsNum() const;
 
+    /// Backend aggregate readback (Layer B). Composes a FileCacheStats snapshot
+    /// from the monotonic atomic counters; bytesOnDisk reuses getUsedCacheSize().
+    FileCacheStats stats() const;
+
+    /// Record a cache hit (one already-DOWNLOADED segment served at read time).
+    /// Called by the read consumer (FileCacheBufferedInput) -- CH-faithful
+    /// placement of hit/miss accounting in the consumer rather than the engine.
+    void recordHit() { hits_.fetch_add(1, std::memory_order_relaxed); }
+
+    /// Record a cache miss (one segment downloaded from source by the consumer).
+    void recordMiss() { misses_.fetch_add(1, std::memory_order_relaxed); }
+
+    /// Record bytes written into the cache by a download.
+    void recordDownloadedBytes(uint64_t bytes)
+    {
+        downloadedBytes_.fetch_add(bytes, std::memory_order_relaxed);
+    }
+
     size_t getMaxFileSegmentSize() const { return maxFileSegmentSize; }
 
     size_t getBackgroundDownloadMaxFileSegmentSize() const { return backgroundDownloadMaxFileSegmentSize.load(); }
@@ -275,6 +313,14 @@ public:
 
 private:
     using KeyAndOffset = FileCacheKeyAndOffset;
+
+    /// Layer B backend aggregate counters (see FileCacheStats / stats()).
+    /// Monotonic; read back as a snapshot. hits_/misses_ are written by the read
+    /// consumer; evictions_ is bumped after eviction; downloadedBytes_ on writes.
+    std::atomic<uint64_t> hits_{0};
+    std::atomic<uint64_t> misses_{0};
+    std::atomic<uint64_t> downloadedBytes_{0};
+    std::atomic<uint64_t> evictions_{0};
 
     std::atomic<size_t> maxFileSegmentSize;
     const size_t bypassCacheThreshold;
