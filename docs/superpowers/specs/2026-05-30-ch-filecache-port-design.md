@@ -51,7 +51,7 @@
 | `chassert(x)` | `VELOX_DCHECK(x)` | **debug/sanitizer-only，release no-op 且不求值**（`velox/common/base/Exceptions.h:455-470`：`NDEBUG` 下 `VELOX_CHECK(true)`，否则 `VELOX_CHECK(expr)`）。**不是** `VELOX_CHECK`。 |
 | `throw Exception(LOGICAL_ERROR,…)` | `VELOX_FAIL` / `VELOX_CHECK` | always-on 的逻辑错误。 |
 | `LOG_*` / `Poco::Logger` | `LOG`/`VLOG`（`velox/common/base/...`） | |
-| `ReadBufferFromFileBase`（远端读） | `velox::ReadFile`（`velox/common/file/File.h`） | 缓存后端数据源。 |
+| `ReadBufferFromFileBase`（远端读 / `FileSegment::remoteFileReader`） | `ByteInputStream`（抽象，`velox/common/memory/ByteStream.h:163`，`facebook::velox`）；具体用 `FileInputStream`（`velox/common/file/FileInputStream.h:28`，`facebook::velox::common`，包一个 `ReadFile` + bufferSize≈`max_read_buffer_size`） | **缓存后端数据源（流式读）**。CH 的 `ReadBufferFromFileBase` 是带内部缓冲的**流式** ReadBuffer，`downloadImpl`（`Metadata.cpp:861-935`）按 `set/seek/eof/available/position` + `file_segment.write(buf->position(),…)` 协议消费它——这套语义对应 Velox 的 `ByteInputStream::nextView/seekp/atEnd/remainingSize`，**不是**随机访问的 `velox::ReadFile`（pread 无 next/eof/position 游标）。`FileSegment::RemoteFileReaderPtr` 应从前向声明的 `ReadBufferFromFileBase` stub 改为 `std::shared_ptr<ByteInputStream>`；胶水层在 miss 时 `setRemoteFileReader(FileInputStream over 源 ReadFile)`。（`velox::ReadFile` 仍用于 bypass 回退的整段 pread，见 §6.1。） |
 | `WriteBufferFromFile`（本地段写） | `velox::LocalWriteFile` | 本地段文件写。 |
 | `ReadBufferFromFile`（本地段读） | `velox::LocalReadFile` | 本地段文件读。 |
 | `UInt128`（`KeyHash`） | `__uint128_t` | 128 位 key。固定用 `__uint128_t`（现有 `FileCacheKey.h:30` 即此选择），不用 `velox::int128_t`。 |
@@ -110,7 +110,8 @@
 | `boost/noncopyable.hpp` | 禁拷贝 | `= delete` 拷贝构造/赋值 | HAND |
 | `Core/Types.h`（`UInt128`） | 128 位整型 | `__uint128_t` | REUSE |
 | `Core/SettingsEnums.h` | settings 枚举 | 手写枚举 | HAND |
-| `IO/ReadBufferFromFileBase.h` / `ReadBufferFromFile.h` | 文件读 | `velox::ReadFile` / `LocalReadFile`（`common/file/File.h`） | REUSE |
+| `IO/ReadBufferFromFileBase.h`（远端流式读 / `remoteFileReader`） | 流式 ReadBuffer | `ByteInputStream` / `FileInputStream`（`common/memory/ByteStream.h`、`common/file/FileInputStream.h`） | REUSE（见 §2.1：流式 `set/seek/eof/available/position` → `nextView/seekp/atEnd`） |
+| `IO/ReadBufferFromFile.h`（本地段读） | 本地缓存段文件读 | `velox::LocalReadFile`（`common/file/File.h`） | REUSE |
 | `IO/WriteBufferFromFile.h` 等 | 文件写 | `velox::LocalWriteFile` | REUSE |
 | `IO/ReadSettings.h` / WriteSettings | 读写参数 | 手写最小结构 | HAND |
 | `IO/Operators.h` / `WriteBufferFromString.h` / `ReadHelpers.h` | 串格式化 | `fmt` / `folly` 串工具 | REUSE |
@@ -173,7 +174,7 @@ CH 用**前向声明 + `FileCache_fwd_internal.h` + `weak_ptr<KeyMetadata>`** �
 | 6 | Guards | Guards.h | L0 | REWRITE（纯 std 锁包装，平凡） |
 | 7 | FileCacheSettings | FileCacheSettings.{h,cpp} | L0 | 数据 struct + `Setting<T>`（默认值对齐 CH）+ `validate()` 忠实移植；解析/自省 **不实现**（`// TODO(config)`，见 §5.1） |
 | 8 | IFileCachePriority | IFileCachePriority.{h,cpp} | L1 | REWRITE |
-| 9 | FileSegment + Holder | FileSegment.{h,cpp} | L2 | REWRITE（I/O→`ReadFile`/`Local{Read,Write}File`） |
+| 9 | FileSegment + Holder | FileSegment.{h,cpp} | L2 | REWRITE（本地段 I/O→`Local{Read,Write}File`；`remoteFileReader` 槽位类型→`std::shared_ptr<ByteInputStream>`，见 §2.1） |
 | 10 | Metadata 全家 | Metadata.{h,cpp} | L3 | REWRITE（后台线程→folly executor+scheduler，见 §4.1） |
 | 11 | EvictionCandidates | EvictionCandidates.{h,cpp} | L4 | REWRITE（`absl::flat_hash_map` → `folly::F14FastMap`，见 §4.1） |
 | 12 | LRUFileCachePriority | LRUFileCachePriority.{h,cpp} | L4 | REWRITE（保留 `std::list`+迭代器） |
