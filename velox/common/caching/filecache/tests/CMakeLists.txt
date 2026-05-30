@@ -21,12 +21,15 @@ add_executable(
   FileCacheOriginInfoTest.cpp
   FileSegmentInfoTest.cpp
   GuardsTest.cpp
-  HeaderSmokeTest.cpp)
+  HeaderSmokeTest.cpp
+  FileCacheBufferedInputTest.cpp)
 add_test(velox_ch_file_cache_test velox_ch_file_cache_test)
 target_link_libraries(
   velox_ch_file_cache_test
   PRIVATE
     velox_ch_file_cache
+    velox_dwio_common
+    velox_test_util
     Folly::folly
     GTest::gtest
     GTest::gtest_main
