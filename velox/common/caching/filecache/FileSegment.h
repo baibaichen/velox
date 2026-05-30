@@ -259,6 +259,31 @@ class FileSegment : private boost::noncopyable {
   /// Write data into reserved space.
   void write(char* from, size_t size, size_t offset_in_file);
 
+  /// Streams up to `num_bytes` from `reader` into `segment`, starting at the
+  /// segment's current write offset, and returns the number of bytes written.
+  ///
+  /// Reserves cache space *before* consuming each chunk from `reader`. This
+  /// ordering is required for correctness: `ByteInputStream` advances its read
+  /// cursor as bytes are consumed and cannot seek backward (e.g.
+  /// FileInputStream), so consuming before a failed reservation would lose
+  /// bytes irrecoverably. On reservation failure `reserve()` already moves the
+  /// segment to PARTIALLY_DOWNLOADED_NO_CONTINUATION; streaming then stops and
+  /// the partial result is returned. Streaming also stops at reader EOF, which
+  /// leaves the segment partially downloaded.
+  ///
+  /// Precondition: the caller is the segment's downloader and `num_bytes` does
+  /// not exceed the bytes remaining in the segment's range. `reader` operates
+  /// in absolute file coordinates: position 0 is the start of the file, so the
+  /// reader is seeked to the segment's absolute write offset
+  /// (`getCurrentWriteOffset()`), not a range-relative offset. `scratch` is a
+  /// caller-owned, reusable buffer (grown as needed) used to copy each chunk.
+  static size_t downloadFromReader(
+      FileSegment& segment,
+      velox::ByteInputStream& reader,
+      size_t num_bytes,
+      std::vector<char>& scratch,
+      size_t lock_wait_timeout_milliseconds);
+
   // Invariant: if state() != DOWNLOADING and remote file reader is present, the reader's
   // available() == 0, and getFileOffsetOfBufferEnd() == our getCurrentWriteOffset().
   //

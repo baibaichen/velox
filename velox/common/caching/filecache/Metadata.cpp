@@ -909,12 +909,17 @@ void CacheMetadata::downloadImpl(
     return;
   }
 
+  // 'memory' is a caller-owned scratch buffer reused across background
+  // downloads (it replaces CH's reusable read buffer). downloadFromReader
+  // reserves before consuming so a reservation failure cannot lose bytes.
   if (!memory) {
-    memory.emplace(std::min(size_t(1024 * 1024), size_to_download));
+    memory.emplace();
   }
-
-  VELOX_NYI(
-      "TODO(io): ReadBufferFromFileBase is still only forward-declared in the Velox port; mapping CH buf->set/available/position/seek/eof to Velox ReadFile/LocalWriteFile requires the remote-reader interface decision");
+  // TODO(io): plumb a configurable reserve-space lock-wait timeout (CH's
+  // reserve_space_lock_wait_timeout_milliseconds) instead of this constant.
+  constexpr size_t kReserveTimeoutMs = 10000;
+  FileSegment::downloadFromReader(
+      file_segment, *buf, size_to_download, *memory, kReserveTimeoutMs);
 }
 
 void CacheMetadata::startup() {
