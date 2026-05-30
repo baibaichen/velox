@@ -294,6 +294,106 @@ TEST_F(FileCacheBufferedInputTest, reserveFailureSurfacesErrorNotHang) {
   VELOX_ASSERT_THROW(drain(*stream, 64 << 10), "");
 }
 
+TEST_F(FileCacheBufferedInputTest, prefixOnlyDownloadStopsAtRequestedEnd) {
+  const auto remotePath = path("remote.bin");
+  // 256 KiB file fits in a single (32 MiB default) segment.
+  const auto content = makeContent(256 << 10);
+  writeFile(remotePath, content);
+
+  FileCache cache("prefix_only", settings(path("cache")));
+  cache.initialize();
+  const auto key = FileCacheKey::fromPath(remotePath);
+
+  {
+    FileCacheDownloadExecutor executor(2);
+    auto input = makeInput(cache, executor, remotePath, key);
+    // Request only a small prefix of the much larger segment.
+    auto stream = input.enqueue({0, 4096});
+    input.load(LogType::FILE);
+    EXPECT_EQ(drain(*stream, 4096), content.substr(0, 4096));
+  }
+
+  // The foreground download fetches only the requested prefix; the rest of the
+  // segment is left untouched. No remote reader is wired here, so holder
+  // destruction does not trigger a background tail-fill.
+  const auto stats = cache.stats();
+  EXPECT_EQ(stats.downloadedBytes, 4096u);
+}
+
+TEST_F(FileCacheBufferedInputTest, coalescedRegionsDownloadToFurthestEnd) {
+  const auto remotePath = path("remote.bin");
+  const auto content = makeContent(256 << 10);
+  writeFile(remotePath, content);
+
+  FileCache cache("coalesce", settings(path("cache")));
+  cache.initialize();
+  const auto key = FileCacheKey::fromPath(remotePath);
+
+  {
+    // Several regions of the SAME segment with different ends, loaded
+    // concurrently. FileCacheInputStream only waits for the pre-download task
+    // and never drives the download itself, so the prefix download must coalesce
+    // to the furthest requested end -- otherwise the deepest reader is starved
+    // when its own download task loses the downloader race.
+    FileCacheDownloadExecutor executor(4);
+    auto input = makeInput(cache, executor, remotePath, key);
+    struct Region {
+      uint64_t offset;
+      uint64_t length;
+      std::unique_ptr<SeekableInputStream> stream;
+    };
+    std::vector<Region> regions;
+    regions.push_back({0, 4096, nullptr});
+    regions.push_back({8192, 4096, nullptr});
+    regions.push_back({200000, 12345, nullptr}); // furthest end: 212345
+    for (auto& r : regions) {
+      r.stream = input.enqueue({r.offset, r.length});
+    }
+    input.load(LogType::FILE);
+    for (auto& r : regions) {
+      EXPECT_EQ(drain(*r.stream, r.length), content.substr(r.offset, r.length))
+          << "region offset=" << r.offset;
+    }
+  }
+
+  // Coalesced target is the furthest requested end (200000 + 12345); the segment
+  // tail beyond it is not fetched.
+  const auto stats = cache.stats();
+  EXPECT_EQ(stats.downloadedBytes, 212345u);
+}
+
+TEST_F(FileCacheBufferedInputTest, crossLoadResumeDownloadsRemainingGap) {
+  const auto remotePath = path("remote.bin");
+  const auto content = makeContent(256 << 10);
+  writeFile(remotePath, content);
+
+  FileCache cache("cross_load", settings(path("cache")));
+  cache.initialize();
+  const auto key = FileCacheKey::fromPath(remotePath);
+
+  {
+    FileCacheDownloadExecutor executor(2);
+    auto input = makeInput(cache, executor, remotePath, key);
+    // First load() downloads only a shallow prefix of the segment.
+    auto shallow = input.enqueue({0, 4096});
+    input.load(LogType::FILE);
+    EXPECT_EQ(drain(*shallow, 4096), content.substr(0, 4096));
+
+    // A second load() on the SAME input requests a deeper region of the SAME
+    // segment, which is now PARTIALLY_DOWNLOADED. The download must resume from
+    // the current write offset and cover the deeper end rather than restart or
+    // strand the reader.
+    auto deep = input.enqueue({200000, 12345});
+    input.load(LogType::FILE);
+    EXPECT_EQ(drain(*deep, 12345), content.substr(200000, 12345));
+  }
+
+  // Total bytes pulled from source = the deepest requested end (212345); the
+  // resume downloaded only the [4096, 212345) gap, not the whole prefix twice.
+  const auto stats = cache.stats();
+  EXPECT_EQ(stats.downloadedBytes, 212345u);
+}
+
 // Builds an input wired with an IoStatistics sink so the Layer A operator-level
 // counters (read/ssdRead/prefetch) can be asserted alongside Layer B.
 FileCacheBufferedInput makeInputWithStats(
