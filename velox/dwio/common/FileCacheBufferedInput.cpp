@@ -154,14 +154,15 @@ class DeferredStream final
 // `readFile`, guaranteeing the segment durably covers `targetEnd` before
 // returning (or that it has reached a terminal, non-resumable state).
 //
-// Several readers can share one segment while requesting different prefixes, and
-// FileCacheInputStream only waits for this pre-download task -- it never drives
-// the download itself. A task that loses the downloader race must therefore
-// still ensure its own `targetEnd` is satisfied: an in-flight task that captured
-// a shallower target could otherwise complete first and strand a deeper reader
-// (which the old whole-segment download never did). Hence the retry loop:
-// become the downloader and resume the gap, or wait for whoever holds it and
-// re-check, until `targetEnd` is met or the segment is abandoned.
+// Several readers across threads can share one segment while requesting
+// different prefixes, and FileCacheInputStream only waits for the download --
+// it never drives it itself. A caller that loses the downloader race to another
+// thread must therefore still ensure its own `targetEnd` is satisfied: a
+// concurrent download that captured a shallower target could otherwise complete
+// first and strand a deeper reader (which the old whole-segment download never
+// did). Hence the retry loop: become the downloader and resume the gap, or wait
+// for whoever holds it and re-check, until `targetEnd` is met or the segment is
+// abandoned.
 void downloadSegmentPrefix(
     const FileSegmentPtr& segment,
     const std::shared_ptr<ReadFile>& readFile,
@@ -261,22 +262,18 @@ FileCacheBufferedInput::FileCacheBufferedInput(
     std::shared_ptr<ReadFile> readFile,
     memory::MemoryPool& pool,
     FileCache* fileCache,
-    FileCacheDownloadExecutor* executor,
     FileCacheKey key,
     FileCache::OriginInfo origin,
     CreateFileSegmentSettings createSettings,
     std::shared_ptr<facebook::velox::io::IoStatistics> ioStats)
     : BufferedInput(std::move(readFile), pool),
       fileCache_{fileCache},
-      executor_{executor},
       key_{key},
       origin_{std::move(origin)},
       createSettings_{createSettings},
       ioStats_{std::move(ioStats)},
       fileSize_{input_->getLength()} {
   VELOX_CHECK_NOT_NULL(fileCache_, "FileCacheBufferedInput requires FileCache");
-  VELOX_CHECK_NOT_NULL(
-      executor_, "FileCacheBufferedInput requires FileCacheDownloadExecutor");
 }
 
 std::unique_ptr<facebook::velox::dwio::common::SeekableInputStream>
@@ -337,12 +334,11 @@ void FileCacheBufferedInput::load(
   //
   // Coalescing: a segment can be shared by several regions; the foreground
   // download must cover the furthest byte any of them needs, because
-  // FileCacheInputStream only waits for this pre-download task and fails if the
-  // segment reaches a terminal state with too few bytes -- it never drives the
-  // download itself. The target is the absolute end offset min(segmentEnd,
-  // regionEnd), maximized across the regions sharing the segment. Keep the
-  // FileSegmentPtr alongside the target so the async task owns it (the task may
-  // outlive the holder).
+  // FileCacheInputStream only waits for the download and fails if the segment
+  // reaches a terminal state with too few bytes -- it never drives the download
+  // itself. The target is the absolute end offset min(segmentEnd, regionEnd),
+  // maximized across the regions sharing the segment. Keep the FileSegmentPtr
+  // alongside the target so Pass 3 can hand it to downloadSegmentPrefix.
   struct SegmentDownload {
     FileSegmentPtr segment;
     uint64_t targetEnd{0};
@@ -376,19 +372,20 @@ void FileCacheBufferedInput::load(
     }
   }
 
-  // Pass 3: submit one coalesced prefix download per distinct miss segment.
-  // Submitting a single task per segment (rather than one per region) means no
-  // two tasks from this load() contend for the same segment's downloader.
+  // Pass 3: download each distinct miss segment up to its coalesced prefix.
+  // The download runs synchronously on the calling thread -- ClickHouse-faithful
+  // (no dedicated foreground download pool); callers overlap by submitting
+  // load() to their own IO executor. One call per segment (rather than per
+  // region) means no two of this load()'s downloads contend for the same
+  // segment's downloader.
   auto readFile = input_->getReadFile();
-  auto* cache = fileCache_;
-  auto ioStats = ioStats_;
   for (auto& entry : segmentDownloads) {
-    auto segment = entry.second.segment;
-    const uint64_t targetEnd = entry.second.targetEnd;
-    (void)executor_->submit(
-        [segment, readFile, cache, ioStats, targetEnd]() mutable {
-          downloadSegmentPrefix(segment, readFile, cache, ioStats, targetEnd);
-        });
+    downloadSegmentPrefix(
+        entry.second.segment,
+        readFile,
+        fileCache_,
+        ioStats_,
+        entry.second.targetEnd);
   }
 }
 
@@ -404,7 +401,6 @@ FileCacheBufferedInput::clone() const {
       input_->getReadFile(),
       *pool_,
       fileCache_,
-      executor_,
       key_,
       origin_,
       createSettings_,

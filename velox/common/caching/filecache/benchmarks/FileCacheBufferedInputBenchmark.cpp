@@ -38,7 +38,6 @@
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/caching/filecache/FileCache.h"
-#include "velox/common/caching/filecache/FileCacheDownloadExecutor.h"
 #include "velox/common/caching/filecache/FileCacheKey.h"
 #include "velox/common/caching/filecache/FileCacheSettings.h"
 #include "velox/common/caching/filecache/benchmarks/KeyGenerator.h"
@@ -66,7 +65,6 @@ using facebook::velox::LocalReadFile;
 using facebook::velox::ReadFile;
 using facebook::velox::ch::FileCache;
 using facebook::velox::ch::FileCacheBufferedInput;
-using facebook::velox::ch::FileCacheDownloadExecutor;
 using facebook::velox::ch::FileCacheKey;
 using facebook::velox::ch::FileCacheSettings;
 using facebook::velox::ch::bench::KeyGenerator;
@@ -251,10 +249,9 @@ size_t drain(SeekableInputStream& stream, size_t expected) {
 
 class BufferedInputDriver {
  public:
-  BufferedInputDriver(uint64_t workingSetKeys, uint64_t threads, int cellIdx)
+  BufferedInputDriver(uint64_t workingSetKeys, int cellIdx)
       : cacheRoot_(benchTmpRoot() + "/" + std::to_string(cellIdx)),
-        workingSetKeys_(workingSetKeys),
-        executor_(threads) {
+        workingSetKeys_(workingSetKeys) {
     std::filesystem::create_directories(cacheRoot_);
     cache_ = std::make_unique<FileCache>("filecache_buffered_bench", makeSettings(cacheRoot_));
     cache_->initialize();
@@ -268,14 +265,12 @@ class BufferedInputDriver {
   }
 
   FileCache& cache() { return *cache_; }
-  FileCacheDownloadExecutor& executor() { return executor_; }
   memory::MemoryPool& pool() { return *pool_; }
   uint64_t workingSetKeys() const { return workingSetKeys_; }
 
  private:
   const std::string cacheRoot_;
   const uint64_t workingSetKeys_;
-  FileCacheDownloadExecutor executor_;
   std::shared_ptr<memory::MemoryPool> pool_;
   std::unique_ptr<FileCache> cache_;
 };
@@ -310,31 +305,18 @@ void parallelRun(
       auto readFile = std::make_shared<SleepyReadFile>(kRemotePath, latencyUs);
       auto* lat = recordLatency ? &(*perThreadLatencies)[t] : nullptr;
       auto& stats = (*perThreadStats)[t];
-      // Depth-1 keep-alive ring. The reader returns as soon as the segment has
-      // enough durable bytes, which can be a few microseconds before the async
-      // download task finishes its (benign, internally-caught) finalization
-      // tail. Destroying the input that instant lets the holder teardown race
-      // that tail and emit a harmless "Cannot lock key" ERROR log. Retiring an
-      // input only on the *next* iteration lets its task tail finish first,
-      // greatly reducing the noise without pinning segments against eviction
-      // (at most one extra region stays pinned per thread). This is a timing
-      // heuristic, not a barrier: the final op per thread (and rare back-to-back
-      // pure hits) can still race teardown, so an occasional benign log may
-      // remain.
-      std::unique_ptr<FileCacheBufferedInput> previous;
       for (uint64_t i = 0; i < opsPerThread; ++i) {
         const uint64_t offset = (keyOffset + gen.next()) * kSegmentBytes;
         const auto beforeBytes = readFile->bytesRead();
         const auto start = std::chrono::steady_clock::now();
-        auto input = std::make_unique<FileCacheBufferedInput>(
+        auto input = FileCacheBufferedInput(
             readFile,
             driver.pool(),
             &driver.cache(),
-            &driver.executor(),
             FileCacheKey::fromPath(kRemotePath),
             FileCache::getCommonOrigin());
-        auto stream = input->enqueue({offset, kSegmentBytes});
-        input->load(LogType::FILE);
+        auto stream = input.enqueue({offset, kSegmentBytes});
+        input.load(LogType::FILE);
         (void)drain(*stream, kSegmentBytes);
         const auto end = std::chrono::steady_clock::now();
         const auto afterBytes = readFile->bytesRead();
@@ -353,11 +335,7 @@ void parallelRun(
               std::chrono::duration_cast<std::chrono::nanoseconds>(end - start)
                   .count());
         }
-        // Retire the prior op's input (its download tail is now complete) and
-        // hold the current one until the next iteration.
-        previous = std::move(input);
       }
-      previous.reset();
       stats.bytesDl = readFile->bytesRead();
     });
   }
@@ -391,7 +369,7 @@ CellResult runCell(
     VELOX_USER_CHECK_GT(wsKeys / key.threads, 0, "Sequential slice is 0");
   }
 
-  BufferedInputDriver driver(wsKeys, key.threads, cellIdx);
+  BufferedInputDriver driver(wsKeys, cellIdx);
 
   std::vector<std::vector<uint64_t>> dummyLat;
   std::vector<RunStats> dummyStats;

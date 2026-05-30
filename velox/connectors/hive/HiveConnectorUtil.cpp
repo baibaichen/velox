@@ -671,7 +671,6 @@ std::unique_ptr<dwio::common::BufferedInput> createBufferedInput(
         fileHandle.file,
         readerOpts.memoryPool(),
         fileCache,
-        fileCache->downloadExecutor(),
         ch::FileCacheKey::fromPath(fileHandle.file->getName()),
         ch::FileCache::getCommonOrigin(),
         ch::CreateFileSegmentSettings{},
