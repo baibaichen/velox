@@ -18,6 +18,7 @@
 #include <iostream>
 #include "velox/common/base/SuccinctPrinter.h"
 #include "velox/common/file/FileSystems.h"
+#include "velox/common/memory/MmapAllocator.h"
 #include "velox/connectors/ConnectorRegistry.h"
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/dwio/dwrf/RegisterDwrfReader.h"
@@ -66,6 +67,18 @@ DEFINE_int32(
     facebook::velox::cache::AsyncDataCache::kDefaultNumShards,
     "Number of shards for the in-process AsyncDataCache. Must be a power of "
     "two. Only used when --cache_gb is non-0.");
+DEFINE_int32(
+    cache_mem_gb,
+    0,
+    "If > 0, the in-process AsyncDataCache uses a dedicated MmapAllocator "
+    "hard-capped at this many GB, separate from query memory (--cache_gb). "
+    "This mirrors how Gluten/Presto separate cache memory from query memory: "
+    "allocator-backed cache data cannot exceed this size, while query "
+    "execution gets the full --cache_gb budget on its own allocator. Note the "
+    "two budgets are additive: total process RSS can approach --cache_gb + "
+    "--cache_mem_gb, and query memory pressure no longer evicts the cache. If "
+    "0, the cache shares the query allocator (legacy behavior, where the cache "
+    "can grow to fill --cache_gb).");
 DEFINE_int32(num_repeats, 1, "Number of times to run each query");
 DEFINE_int32(num_io_threads, 8, "Threads for speculative IO");
 DEFINE_string(
@@ -197,10 +210,26 @@ void QueryBenchmarkBase::initialize() {
 
     cache::AsyncDataCache::Options cacheOptions;
     cacheOptions.numShards = FLAGS_cache_num_shards;
+
+    // Select the allocator backing the in-process cache. When --cache_mem_gb
+    // is set, the cache gets its own MmapAllocator hard-capped at that size,
+    // fully separate from query memory (the MemoryManager allocator sized by
+    // --cache_gb). This mirrors Gluten's VeloxBackend::initCache(), which
+    // builds a dedicated MmapAllocator for AsyncDataCache so the cache can
+    // never grow into query memory. When --cache_mem_gb is 0 the cache shares
+    // the query allocator (legacy behavior).
+    memory::MemoryAllocator* cacheAllocator;
+    if (FLAGS_cache_mem_gb > 0) {
+      memory::MemoryAllocator::Options allocatorOptions;
+      allocatorOptions.capacity =
+          static_cast<size_t>(FLAGS_cache_mem_gb) * (1LL << 30);
+      allocator_ = std::make_shared<memory::MmapAllocator>(allocatorOptions);
+      cacheAllocator = allocator_.get();
+    } else {
+      cacheAllocator = memory::memoryManager()->allocator();
+    }
     cache_ = cache::AsyncDataCache::create(
-        memory::memoryManager()->allocator(),
-        std::move(ssdCache),
-        cacheOptions);
+        cacheAllocator, std::move(ssdCache), cacheOptions);
     cache::AsyncDataCache::setInstance(cache_.get());
   } else {
     memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
@@ -257,6 +286,7 @@ QueryBenchmarkBase::listSplits(
 void QueryBenchmarkBase::shutdown() {
   if (cache_) {
     cache_->shutdown();
+    cache::AsyncDataCache::setInstance(nullptr);
   }
 }
 
