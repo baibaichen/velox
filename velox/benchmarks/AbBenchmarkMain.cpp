@@ -115,6 +115,19 @@ int32_t dispatchAbMain(
   }
 
   ab.initialize();
+
+  // Wire the per-backend cold-reset used by --cold_each_round. filecache tears
+  // down and reinstalls its singleton (re-wiping disk + metadata via the same
+  // installFileCache() path used at startup); cbi clears its AsyncDataCache.
+  if (FLAGS_input_source == "filecache") {
+    ab.setColdResetFn([&ownedFileCache]() {
+      ch::FileCache::setInstance(nullptr);
+      ownedFileCache = installFileCache();
+    });
+  } else {
+    ab.setColdResetFn([&ab]() { ab.clearCbiCache(); });
+  }
+
   const int32_t failed = ab.runAb();
   ab.shutdown();
 
