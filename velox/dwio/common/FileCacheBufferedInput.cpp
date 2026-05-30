@@ -236,6 +236,10 @@ void FileCacheBufferedInput::load(
             if (!segment->reserve(
                     toRead, kReserveTimeoutMs, failureReason, nullptr)) {
               // TODO(bypass-on-reserve-failure): CH reads the tail remotely.
+              // Until that exists, fail into a terminal state (rather than
+              // resetting to EMPTY with 0 bytes) so a waiting reader observes
+              // abandonment instead of spinning on a segment no task re-drives.
+              segment->setDownloadFailed();
               segment->completePartAndResetDownloader();
               return;
             }

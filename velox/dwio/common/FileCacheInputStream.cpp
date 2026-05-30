@@ -21,6 +21,8 @@
 #include "velox/common/file/File.h"
 
 #include <algorithm>
+#include <chrono>
+#include <thread>
 
 namespace facebook::velox::ch {
 
@@ -49,14 +51,31 @@ void FileCacheInputStream::loadCurrentSegmentBuffer() {
   const uint64_t segmentOffset = rangeStart - segStart;
 
   // Wait until the writer has persisted the last byte this read needs. Treat
-  // DOWNLOADING as a retryable wait timeout; fail only once the segment reaches
-  // a terminal state without enough durable bytes.
+  // DOWNLOADING as a retryable wait, and EMPTY as the brief window before the
+  // async download task submitted by load() has claimed the downloader
+  // (EMPTY -> DOWNLOADING). wait() returns immediately while the segment is
+  // EMPTY, so back off to avoid busy-spinning, but bound the wait so a task
+  // that never starts surfaces an error instead of spinning forever. Abandoned
+  // downloads land in a terminal non-EMPTY state, so EMPTY here only ever means
+  // "not started yet". Fail once the segment reaches a terminal state without
+  // enough durable bytes.
   const uint64_t needed = segmentOffset + length;
+  const auto emptyDeadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(60);
   while (segment->getDownloadedSize() < needed) {
     const auto state = segment->wait(segStart + needed - 1);
     const auto downloadedSize = segment->getDownloadedSize();
     if (downloadedSize >= needed) {
       break;
+    }
+    if (state == FileSegment::State::EMPTY) {
+      VELOX_CHECK(
+          std::chrono::steady_clock::now() < emptyDeadline,
+          "FileCacheInputStream: async download task did not start; segment "
+          "still EMPTY after timeout (needed: {})",
+          needed);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      continue;
     }
     if (state != FileSegment::State::DOWNLOADING) {
       VELOX_FAIL(
