@@ -27,6 +27,7 @@
 #include "velox/common/caching/filecache/FileCache.h"
 #include "velox/common/caching/filecache/FileCacheUtils.h"
 #include "velox/common/file/File.h"
+#include "velox/common/memory/ByteStream.h"
 #include "velox/common/process/ProcessBase.h"
 
 namespace fs = std::filesystem;
@@ -39,19 +40,6 @@ time_t timeInSeconds(std::chrono::system_clock::time_point tp) {
 
 template <typename T>
 void unused(const T&) {}
-
-class ReadBufferFromFileBase {
- public:
-  explicit ReadBufferFromFileBase(std::shared_ptr<velox::ReadFile> file)
-      : file_(std::move(file)) {}
-
-  const std::shared_ptr<velox::ReadFile>& file() const {
-    return file_;
-  }
-
- private:
-  std::shared_ptr<velox::ReadFile> file_;
-};
 
 class WriteBufferFromFile {
  public:
