@@ -54,6 +54,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <map>
 #include <memory>
 #include <random>
 #include <string>
@@ -127,6 +128,12 @@ DEFINE_int32(measure_passes, 3, "Measure passes per cell; median is reported.");
 DEFINE_string(ssd_path, "/tmp/velox_wrapper_bench_ssd", "SsdCache root for cbi.");
 DEFINE_string(filecache_root, "/tmp/velox_wrapper_bench_fc", "ch::FileCache root for fcbi.");
 DEFINE_string(out, "", "Markdown output path; empty writes stdout.");
+DEFINE_string(data_dir, "",
+    "If set, read the real *.parquet files in this directory (e.g. a TPC-H "
+    "lineitem dir) instead of the synthetic blob. Each file gets its own cache "
+    "key, so files distribute across SSD shards like the e2e workload. The "
+    "working set is the union of the files, capped to target_ws_gb (0 = all). "
+    "Reads are opaque byte ranges, mirroring the Parquet reader's IO layer.");
 
 namespace facebook::velox {
 namespace {
@@ -174,6 +181,126 @@ void ensureRemoteFile() {
   }
   VELOX_CHECK(out.good(), "Failed to write remote blob");
 }
+
+// One readable file in the working set.
+struct SourceFile {
+  std::string path;
+  uint64_t size;
+};
+
+// The shared set of files read by both wrappers, built once. data_dir mode
+// scans the directory's *.parquet files (sorted for a deterministic sequential
+// order); otherwise it is the single synthetic blob.
+const std::vector<SourceFile>& dataFiles() {
+  static const std::vector<SourceFile> files = [] {
+    std::vector<SourceFile> v;
+    namespace fs = std::filesystem;
+    if (!FLAGS_data_dir.empty()) {
+      for (const auto& e : fs::directory_iterator(FLAGS_data_dir)) {
+        if (!e.is_regular_file()) {
+          continue;
+        }
+        const auto name = e.path().filename().string();
+        if (!name.empty() && name.front() == '.') {
+          continue; // skip dotfiles such as .*.crc
+        }
+        if (e.path().extension() != ".parquet") {
+          continue;
+        }
+        v.push_back({e.path().string(), static_cast<uint64_t>(e.file_size())});
+      }
+      std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) {
+        return a.path < b.path;
+      });
+      VELOX_USER_CHECK(
+          !v.empty(), "No .parquet files found in --data_dir {}", FLAGS_data_dir);
+    } else {
+      v.push_back({kRemotePath, remoteBytes()});
+    }
+    return v;
+  }();
+  return files;
+}
+
+uint64_t rawTotalBytes() {
+  uint64_t total = 0;
+  for (const auto& f : dataFiles()) {
+    total += f.size;
+  }
+  return total;
+}
+
+// Working-set size in bytes, independent of read size. Synthetic mode honors
+// target_ws_gb directly; data_dir mode caps the union of files to target_ws_gb
+// (0 = all of it).
+uint64_t effectiveTargetBytes() {
+  if (FLAGS_data_dir.empty()) {
+    return gbToBytes(FLAGS_target_ws_gb);
+  }
+  const uint64_t raw = rawTotalBytes();
+  const uint64_t cap =
+      FLAGS_target_ws_gb > 0.0 ? gbToBytes(FLAGS_target_ws_gb) : raw;
+  return std::min(cap, raw);
+}
+
+// Maps a flat block-key space onto the (possibly multi-file) working set. Each
+// file contributes floor(size / readSize) fixed-size blocks (tail remainder
+// dropped so no read straddles a file). A flat key in [0, totalKeys) resolves
+// to the file holding it and the byte offset within that file.
+class DataLayout {
+ public:
+  DataLayout(
+      const std::vector<SourceFile>& files,
+      uint64_t readSize,
+      uint64_t maxBytes)
+      : readSize_(readSize) {
+    const uint64_t maxBlocks = maxBytes / readSize;
+    prefix_.push_back(0);
+    uint64_t acc = 0;
+    for (const auto& f : files) {
+      if (maxBytes > 0 && acc >= maxBlocks) {
+        break;
+      }
+      uint64_t blocks = f.size / readSize;
+      if (maxBytes > 0) {
+        blocks = std::min(blocks, maxBlocks - acc);
+      }
+      if (blocks == 0) {
+        continue;
+      }
+      acc += blocks;
+      prefix_.push_back(acc);
+    }
+    total_ = acc;
+    VELOX_USER_CHECK_GT(
+        total_,
+        0,
+        "No readable blocks: read size {} exceeds the file sizes",
+        readSize);
+  }
+
+  uint64_t totalKeys() const {
+    return total_;
+  }
+
+  struct Loc {
+    uint32_t fileIdx;
+    uint64_t offset;
+  };
+
+  Loc resolve(uint64_t key) const {
+    const auto it = std::upper_bound(prefix_.begin(), prefix_.end(), key);
+    const auto idx = static_cast<uint32_t>(
+        std::distance(prefix_.begin(), it) - 1);
+    return Loc{idx, (key - prefix_[idx]) * readSize_};
+  }
+
+ private:
+  const uint64_t readSize_;
+  uint64_t total_{0};
+  // prefix_[i] = cumulative blocks before file i; prefix_.back() == total_.
+  std::vector<uint64_t> prefix_;
+};
 
 // Tier-aware byte counters for one measured sweep.
 struct TierBytes {
@@ -271,7 +398,11 @@ class CbiHarness {
     tracker_ = std::make_shared<cache::ScanTracker>(
         "wrapperBenchTracker", nullptr, 256UL << 10);
     pool_ = memory::memoryManager()->addLeafPool("cbiWrapperBench");
-    readFile_ = std::make_shared<LocalReadFile>(kRemotePath);
+    auto& ids = fileIds();
+    for (const auto& f : dataFiles()) {
+      files_.push_back(std::make_shared<LocalReadFile>(f.path));
+      fileIds_.emplace_back(ids, f.path);
+    }
   }
 
   ~CbiHarness() {
@@ -290,7 +421,11 @@ class CbiHarness {
   // constructing a fresh CachedBufferedInput per `batch` regions. Returns wall
   // time, requested bytes and tier-byte deltas measured via a fresh
   // IoStatistics plus SsdCache backend bytesRead.
-  PassResult sweep(WorkloadDriver& driver, uint64_t ops, uint64_t readSize) {
+  PassResult sweep(
+      WorkloadDriver& driver,
+      uint64_t ops,
+      uint64_t readSize,
+      const DataLayout& layout) {
     const auto ioStats = std::make_shared<io::IoStatistics>();
     const auto ssdBefore = ssdCache_->stats();
     PassResult r;
@@ -299,7 +434,7 @@ class CbiHarness {
     uint64_t done = 0;
     while (done < ops) {
       const uint64_t n = std::min<uint64_t>(FLAGS_batch, ops - done);
-      runBatch(driver, n, readSize, ioStats);
+      runBatch(driver, n, readSize, layout, ioStats);
       done += n;
     }
     const auto t1 = std::chrono::steady_clock::now();
@@ -348,35 +483,48 @@ class CbiHarness {
       WorkloadDriver& driver,
       uint64_t n,
       uint64_t readSize,
+      const DataLayout& layout,
       const std::shared_ptr<io::IoStatistics>& ioStats) {
     auto& ids = fileIds();
-    StringIdLease fileId{ids, std::string{kRemotePath}};
     StringIdLease groupId{ids, "wrapperBenchGroup"};
-    io::ReaderOptions readerOptions{pool_.get()};
-    readerOptions.setDataIoStats(ioStats);
-    readerOptions.setLoadQuantum(
-        static_cast<int32_t>(FLAGS_read_quantum_mb * (1 << 20)));
-
-    dwio::common::CachedBufferedInput input(
-        readFile_,
-        MetricsLog::voidLog(),
-        std::move(fileId),
-        cache_.get(),
-        tracker_,
-        std::move(groupId),
-        ioStats,
-        nullptr,
-        loadExecutor_.get(),
-        readerOptions);
-
-    std::vector<std::unique_ptr<SeekableInputStream>> streams;
-    streams.reserve(n);
+    // Resolve the batch's keys to (file, offset) and group by file: each
+    // CachedBufferedInput is tied to one file, so a batch spanning several files
+    // builds one input per file.
+    std::map<uint32_t, std::vector<uint64_t>> byFile;
     for (uint64_t i = 0; i < n; ++i) {
-      streams.push_back(input.enqueue(driver.nextRegion(), nullptr));
+      const auto region = driver.nextRegion();
+      const auto loc = layout.resolve(region.offset / readSize);
+      byFile[loc.fileIdx].push_back(loc.offset);
     }
-    input.load(LogType::TEST);
-    for (auto& stream : streams) {
-      (void)drain(*stream, readSize);
+
+    for (const auto& [fileIdx, offsets] : byFile) {
+      io::ReaderOptions readerOptions{pool_.get()};
+      readerOptions.setDataIoStats(ioStats);
+      readerOptions.setLoadQuantum(
+          static_cast<int32_t>(FLAGS_read_quantum_mb * (1 << 20)));
+
+      dwio::common::CachedBufferedInput input(
+          files_[fileIdx],
+          MetricsLog::voidLog(),
+          fileIds_[fileIdx],
+          cache_.get(),
+          tracker_,
+          groupId,
+          ioStats,
+          nullptr,
+          loadExecutor_.get(),
+          readerOptions);
+
+      std::vector<std::unique_ptr<SeekableInputStream>> streams;
+      streams.reserve(offsets.size());
+      for (const auto offset : offsets) {
+        streams.push_back(
+            input.enqueue(velox::common::Region{offset, readSize}, nullptr));
+      }
+      input.load(LogType::TEST);
+      for (auto& stream : streams) {
+        (void)drain(*stream, readSize);
+      }
     }
   }
 
@@ -387,7 +535,8 @@ class CbiHarness {
   cache::SsdCache* ssdCache_{nullptr};
   std::shared_ptr<cache::ScanTracker> tracker_;
   std::shared_ptr<memory::MemoryPool> pool_;
-  std::shared_ptr<ReadFile> readFile_;
+  std::vector<std::shared_ptr<ReadFile>> files_;
+  std::vector<StringIdLease> fileIds_;
 };
 
 // ---- fcbi: FileCacheBufferedInput + ch::FileCache(disk) ----
@@ -409,7 +558,10 @@ class FcbiHarness {
     executor_ = std::make_unique<ch::FileCacheDownloadExecutor>(
         FLAGS_ssd_num_shards);
     pool_ = memory::memoryManager()->addLeafPool("fcbiWrapperBench");
-    readFile_ = std::make_shared<LocalReadFile>(kRemotePath);
+    for (const auto& f : dataFiles()) {
+      files_.push_back(std::make_shared<LocalReadFile>(f.path));
+      keys_.push_back(ch::FileCacheKey::fromPath(f.path));
+    }
   }
 
   ~FcbiHarness() {
@@ -418,7 +570,11 @@ class FcbiHarness {
     std::filesystem::remove_all(FLAGS_filecache_root, ec);
   }
 
-  PassResult sweep(WorkloadDriver& driver, uint64_t ops, uint64_t readSize) {
+  PassResult sweep(
+      WorkloadDriver& driver,
+      uint64_t ops,
+      uint64_t readSize,
+      const DataLayout& layout) {
     const auto ioStats = std::make_shared<io::IoStatistics>();
     PassResult r;
     r.requestedBytes = ops * readSize;
@@ -426,7 +582,7 @@ class FcbiHarness {
     uint64_t done = 0;
     while (done < ops) {
       const uint64_t n = std::min<uint64_t>(FLAGS_batch, ops - done);
-      runBatch(driver, n, readSize, ioStats);
+      runBatch(driver, n, readSize, layout, ioStats);
       done += n;
     }
     const auto t1 = std::chrono::steady_clock::now();
@@ -449,34 +605,46 @@ class FcbiHarness {
       WorkloadDriver& driver,
       uint64_t n,
       uint64_t readSize,
+      const DataLayout& layout,
       const std::shared_ptr<io::IoStatistics>& ioStats) {
-    // FileCacheBufferedInput::enqueue accumulates regions, so use a fresh
-    // instance per batch.
-    ch::FileCacheBufferedInput input(
-        readFile_,
-        *pool_,
-        cache_.get(),
-        executor_.get(),
-        ch::FileCacheKey::fromPath(kRemotePath),
-        ch::FileCache::getCommonOrigin(),
-        ch::CreateFileSegmentSettings{},
-        ioStats);
-
-    std::vector<std::unique_ptr<SeekableInputStream>> streams;
-    streams.reserve(n);
+    // Resolve and group by file; FileCacheBufferedInput is tied to one key, and
+    // enqueue accumulates regions, so build a fresh instance per file per batch.
+    std::map<uint32_t, std::vector<uint64_t>> byFile;
     for (uint64_t i = 0; i < n; ++i) {
-      streams.push_back(input.enqueue(driver.nextRegion(), nullptr));
+      const auto region = driver.nextRegion();
+      const auto loc = layout.resolve(region.offset / readSize);
+      byFile[loc.fileIdx].push_back(loc.offset);
     }
-    input.load(LogType::TEST);
-    for (auto& stream : streams) {
-      (void)drain(*stream, readSize);
+
+    for (const auto& [fileIdx, offsets] : byFile) {
+      ch::FileCacheBufferedInput input(
+          files_[fileIdx],
+          *pool_,
+          cache_.get(),
+          executor_.get(),
+          keys_[fileIdx],
+          ch::FileCache::getCommonOrigin(),
+          ch::CreateFileSegmentSettings{},
+          ioStats);
+
+      std::vector<std::unique_ptr<SeekableInputStream>> streams;
+      streams.reserve(offsets.size());
+      for (const auto offset : offsets) {
+        streams.push_back(
+            input.enqueue(velox::common::Region{offset, readSize}, nullptr));
+      }
+      input.load(LogType::TEST);
+      for (auto& stream : streams) {
+        (void)drain(*stream, readSize);
+      }
     }
   }
 
   std::unique_ptr<ch::FileCache> cache_;
   std::unique_ptr<ch::FileCacheDownloadExecutor> executor_;
   std::shared_ptr<memory::MemoryPool> pool_;
-  std::shared_ptr<ReadFile> readFile_;
+  std::vector<std::shared_ptr<ReadFile>> files_;
+  std::vector<ch::FileCacheKey> keys_;
 };
 
 struct CellSpec {
@@ -519,9 +687,10 @@ PassResult medianByWall(std::vector<PassResult> runs) {
 // one wrapper, returns the median measure pass.
 template <typename Harness>
 PassResult runWrapper(Harness& h, const CellSpec& spec) {
-  const uint64_t targetBytes = gbToBytes(FLAGS_target_ws_gb);
+  const uint64_t targetBytes = effectiveTargetBytes();
   const uint64_t scrubBytes = gbToBytes(FLAGS_scrub_gb);
-  const uint64_t targetKeys = targetBytes / spec.readSize;
+  const DataLayout layout{dataFiles(), spec.readSize, targetBytes};
+  const uint64_t targetKeys = layout.totalKeys();
   const uint64_t scrubKeys = scrubBytes / spec.readSize;
   VELOX_USER_CHECK_GT(targetKeys, 0, "target_ws_gb too small for read size");
 
@@ -539,7 +708,7 @@ PassResult runWrapper(Harness& h, const CellSpec& spec) {
     WorkloadDriver warm{
         ch::bench::Workload::kSequential, n, spec.readSize,
         /*seed=*/1, /*baseOffset=*/warmed * spec.readSize};
-    (void)h.sweep(warm, n, spec.readSize);
+    (void)h.sweep(warm, n, spec.readSize, layout);
     h.flush();
     warmed += n;
   }
@@ -555,13 +724,13 @@ PassResult runWrapper(Harness& h, const CellSpec& spec) {
       WorkloadDriver scrub{
           ch::bench::Workload::kSequential, scrubKeys, spec.readSize,
           /*seed=*/7, /*baseOffset=*/targetBytes};
-      (void)h.sweep(scrub, scrubKeys, spec.readSize);
+      (void)h.sweep(scrub, scrubKeys, spec.readSize, layout);
     }
     WorkloadDriver measure{
         spec.workload, targetKeys, spec.readSize,
         /*seed=*/static_cast<uint64_t>(1 + p),
         /*baseOffset=*/0};
-    passes.push_back(h.sweep(measure, targetKeys, spec.readSize));
+    passes.push_back(h.sweep(measure, targetKeys, spec.readSize, layout));
   }
   return medianByWall(std::move(passes));
 }
@@ -625,19 +794,34 @@ int main(int argc, char** argv) {
   filesystems::registerLocalFileSystem();
   memory::MemoryManager::initialize(memory::MemoryManager::Options{});
 
+  // Validate that the working set exceeds RAM (so measure passes hit the
+  // SSD/disk tier) and fits in both caches. In data_dir mode the working set is
+  // the union of the real files capped by target_ws_gb, so validate in bytes.
+  const uint64_t targetBytes = effectiveTargetBytes();
+  const uint64_t scrubBytes = gbToBytes(FLAGS_scrub_gb);
   VELOX_USER_CHECK_GT(
-      FLAGS_target_ws_gb, FLAGS_ram_cache_gb,
-      "target_ws_gb must exceed ram_cache_gb so measure passes read from the "
-      "SSD/disk cache rather than RAM");
+      targetBytes, gbToBytes(FLAGS_ram_cache_gb),
+      "working set ({} bytes) must exceed ram_cache_gb so measure passes read "
+      "from the SSD/disk cache rather than RAM", targetBytes);
   VELOX_USER_CHECK_LE(
-      FLAGS_target_ws_gb + FLAGS_scrub_gb, FLAGS_ssd_cache_gb,
-      "target_ws_gb + scrub_gb must fit in ssd_cache_gb");
+      targetBytes + scrubBytes, gbToBytes(FLAGS_ssd_cache_gb),
+      "working set + scrub_gb must fit in ssd_cache_gb");
   VELOX_USER_CHECK_LE(
-      FLAGS_target_ws_gb + FLAGS_scrub_gb, FLAGS_filecache_disk_gb,
-      "target_ws_gb + scrub_gb must fit in filecache_disk_gb");
+      targetBytes + scrubBytes, gbToBytes(FLAGS_filecache_disk_gb),
+      "working set + scrub_gb must fit in filecache_disk_gb");
+  VELOX_USER_CHECK(
+      FLAGS_data_dir.empty() || FLAGS_scrub_gb == 0.0,
+      "--scrub_gb is not supported with --data_dir (the scrub range has no "
+      "backing file)");
 
   signal(SIGINT, onSigint);
-  ensureRemoteFile();
+  if (FLAGS_data_dir.empty()) {
+    ensureRemoteFile();
+  } else {
+    LOG(INFO) << "Reading " << dataFiles().size() << " real file(s) from "
+              << FLAGS_data_dir << " (" << (rawTotalBytes() >> 30)
+              << " GiB raw, working set " << (targetBytes >> 30) << " GiB)";
+  }
 
   const auto workloads = parseCsv<ch::bench::Workload>(
       FLAGS_workloads, parseWorkload);
