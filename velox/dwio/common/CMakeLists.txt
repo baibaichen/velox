@@ -23,6 +23,10 @@ elseif(${VELOX_BUILD_TEST_UTILS})
   add_subdirectory(tests/utils)
 endif()
 
+if(VELOX_ENABLE_BENCHMARKS_BASIC)
+  add_subdirectory(benchmarks)
+endif()
+
 velox_add_library(
   velox_dwio_common
   BitConcatenation.cpp
