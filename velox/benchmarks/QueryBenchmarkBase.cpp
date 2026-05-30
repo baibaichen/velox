@@ -61,6 +61,11 @@ DEFINE_int32(
     0,
     "GB of process memory for cache and query.. if "
     "non-0, uses mmap to allocator and in-process data cache.");
+DEFINE_int32(
+    cache_num_shards,
+    facebook::velox::cache::AsyncDataCache::kDefaultNumShards,
+    "Number of shards for the in-process AsyncDataCache. Must be a power of "
+    "two. Only used when --cache_gb is non-0.");
 DEFINE_int32(num_repeats, 1, "Number of times to run each query");
 DEFINE_int32(num_io_threads, 8, "Threads for speculative IO");
 DEFINE_string(
@@ -190,8 +195,12 @@ void QueryBenchmarkBase::initialize() {
       ssdCache = std::make_unique<cache::SsdCache>(config);
     }
 
+    cache::AsyncDataCache::Options cacheOptions;
+    cacheOptions.numShards = FLAGS_cache_num_shards;
     cache_ = cache::AsyncDataCache::create(
-        memory::memoryManager()->allocator(), std::move(ssdCache));
+        memory::memoryManager()->allocator(),
+        std::move(ssdCache),
+        cacheOptions);
     cache::AsyncDataCache::setInstance(cache_.get());
   } else {
     memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
