@@ -157,13 +157,15 @@ FileCacheBufferedInput::FileCacheBufferedInput(
     FileCacheDownloadExecutor* executor,
     FileCacheKey key,
     FileCache::OriginInfo origin,
-    CreateFileSegmentSettings createSettings)
+    CreateFileSegmentSettings createSettings,
+    std::shared_ptr<facebook::velox::io::IoStatistics> ioStats)
     : BufferedInput(std::move(readFile), pool),
       fileCache_{fileCache},
       executor_{executor},
       key_{key},
       origin_{std::move(origin)},
       createSettings_{createSettings},
+      ioStats_{std::move(ioStats)},
       fileSize_{input_->getLength()} {
   VELOX_CHECK_NOT_NULL(fileCache_, "FileCacheBufferedInput requires FileCache");
   VELOX_CHECK_NOT_NULL(
@@ -208,20 +210,47 @@ void FileCacheBufferedInput::load(
           enqueued.region.offset,
           enqueued.region.length,
           enqueued.bypassBuffer.data());
+      // Bypass is intentionally non-cacheable, so it is excluded from the
+      // cache hit/miss ratio; only surface its source bytes (Layer A).
+      if (ioStats_ != nullptr) {
+        ioStats_->read().increment(enqueued.region.length);
+      }
       continue;
     }
 
     for (const auto& segment : *enqueued.holder) {
       if (segment->state() == FileSegment::State::DOWNLOADED) {
+        // Cache hit: bytes are already on disk and will be served from the
+        // local cache file. Record one hit (Layer B) plus the overlapping
+        // bytes served from cache (Layer A, ssdRead -- FileCache is disk-backed).
+        fileCache_->recordHit();
+        if (ioStats_ != nullptr) {
+          const uint64_t segStart = segment->range().left;
+          const uint64_t segEnd = segStart + segment->range().size();
+          const uint64_t regStart = enqueued.region.offset;
+          const uint64_t regEnd = regStart + enqueued.region.length;
+          const uint64_t lo = std::max(segStart, regStart);
+          const uint64_t hi = std::min(segEnd, regEnd);
+          if (hi > lo) {
+            ioStats_->ssdRead().increment(hi - lo);
+          }
+        }
         continue;
       }
 
       auto readFile = input_->getReadFile();
-      (void)executor_->submit([segment, readFile]() mutable {
+      auto* cache = fileCache_;
+      auto ioStats = ioStats_;
+      (void)executor_->submit([segment, readFile, cache, ioStats]() mutable {
         const auto downloaderId = segment->getOrSetDownloader();
         if (downloaderId != FileSegment::getCallerId()) {
+          // Lost the race: another task downloads this segment. Coalesced -- do
+          // not count it as a fresh miss (avoids over-counting concurrent
+          // waiters) nor a hit.
           return;
         }
+        // Won the downloader: this is a true cache miss serviced from source.
+        cache->recordMiss();
 
         try {
           constexpr uint64_t kChunk = 1u << 20;
@@ -248,6 +277,14 @@ void FileCacheBufferedInput::load(
             }
             readFile->pread(cursor, toRead, buffer.data());
             segment->write(buffer.data(), toRead, cursor);
+            // Bytes fetched from source and written into the cache (Layer B
+            // cumulative + Layer A: read() = source bytes, prefetch() = bytes
+            // pulled ahead into the cache, mirroring CachedBufferedInput).
+            cache->recordDownloadedBytes(toRead);
+            if (ioStats != nullptr) {
+              ioStats->read().increment(toRead);
+              ioStats->prefetch().increment(toRead);
+            }
           }
           segment->completePartAndResetDownloader();
         } catch (...) {
@@ -274,7 +311,8 @@ FileCacheBufferedInput::clone() const {
       executor_,
       key_,
       origin_,
-      createSettings_);
+      createSettings_,
+      ioStats_);
 }
 
 void FileCacheBufferedInput::cacheRegion(

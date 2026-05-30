@@ -355,6 +355,7 @@ void EvictionCandidates::evict() {
 
         // TODO(metric): CH increments FilesystemCacheEvictedFileSegments here.
         // TODO(metric): CH increments FilesystemCacheEvictedBytes by segment->range().size() here.
+        ++numEvicted;
 
         if (iterator) {
           queueEntriesToInvalidate.push_back(iterator);

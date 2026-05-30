@@ -170,6 +170,12 @@ public:
 
     FailedCandidates getFailedCandidates() const { return failedCandidates; }
 
+    /// Count of file segments successfully evicted by evict() (Layer B metric;
+    /// incremented at the CH FilesystemCacheEvictedFileSegments site). Monotonic
+    /// for the lifetime of this single-use object; FileCache aggregates it into
+    /// its cache-wide evictions_ counter after evict() returns.
+    size_t getNumEvicted() const { return numEvicted; }
+
     /// Get the original queue type of a candidate saved during removeQueueEntries.
     /// Returns None if not found (e.g., if removeQueueEntries was not called).
     FileCacheQueueEntryType getOriginalQueueType(const FileSegmentMetadata * candidate) const
@@ -182,6 +188,7 @@ private:
     absl::flat_hash_map<FileCacheKey, KeyCandidates, std::hash<FileCacheKey>> candidates;
     size_t candidatesSize = 0;
     size_t candidatesBytes = 0;
+    size_t numEvicted = 0;
     FailedCandidates failedCandidates;
 
     /// Saved original queue type per candidate, populated in removeQueueEntries.

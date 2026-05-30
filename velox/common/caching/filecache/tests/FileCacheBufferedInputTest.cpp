@@ -291,5 +291,102 @@ TEST_F(FileCacheBufferedInputTest, reserveFailureSurfacesErrorNotHang) {
   VELOX_ASSERT_THROW(drain(*stream, 64 << 10), "");
 }
 
+// Builds an input wired with an IoStatistics sink so the Layer A operator-level
+// counters (read/ssdRead/prefetch) can be asserted alongside Layer B.
+FileCacheBufferedInput makeInputWithStats(
+    memory::MemoryPool& pool,
+    FileCache& cache,
+    FileCacheDownloadExecutor& executor,
+    const std::string& filePath,
+    const FileCacheKey& key,
+    std::shared_ptr<io::IoStatistics> ioStats) {
+  return FileCacheBufferedInput(
+      std::make_shared<LocalReadFile>(filePath),
+      pool,
+      &cache,
+      &executor,
+      key,
+      FileCache::getCommonOrigin(),
+      CreateFileSegmentSettings{},
+      std::move(ioStats));
+}
+
+TEST_F(FileCacheBufferedInputTest, metricsColdReadRecordsMissAndDownload) {
+  const auto remotePath = path("remote.bin");
+  const auto content = makeContent(256 << 10);
+  writeFile(remotePath, content);
+
+  FileCache cache("metrics_cold", settings(path("cache")));
+  cache.initialize();
+  const auto key = FileCacheKey::fromPath(remotePath);
+  auto ioStats = std::make_shared<io::IoStatistics>();
+
+  {
+    // Scope the executor + input so their destructors join all download tasks,
+    // making the async miss/download counters deterministic before readback.
+    FileCacheDownloadExecutor executor(2);
+    auto input =
+        makeInputWithStats(*pool_, cache, executor, remotePath, key, ioStats);
+    auto stream = input.enqueue({0, content.size()});
+    input.load(LogType::FILE);
+    EXPECT_EQ(drain(*stream, content.size()), content);
+  }
+
+  const auto stats = cache.stats();
+  // Cold read: at least one segment downloaded from source, none served warm.
+  EXPECT_GT(stats.misses, 0u);
+  EXPECT_EQ(stats.hits, 0u);
+  EXPECT_EQ(stats.downloadedBytes, content.size());
+
+  // Layer A: source + prefetch bytes track the downloaded payload; no ssd hit.
+  EXPECT_EQ(ioStats->read().sum(), content.size());
+  EXPECT_EQ(ioStats->prefetch().sum(), content.size());
+  EXPECT_EQ(ioStats->ssdRead().sum(), 0u);
+}
+
+TEST_F(FileCacheBufferedInputTest, metricsWarmReadRecordsHit) {
+  const auto remotePath = path("remote.bin");
+  const auto content = makeContent(256 << 10);
+  writeFile(remotePath, content);
+
+  FileCache cache("metrics_warm", settings(path("cache")));
+  cache.initialize();
+  const auto key = FileCacheKey::fromPath(remotePath);
+
+  // Cold pass populates the cache.
+  {
+    FileCacheDownloadExecutor executor(2);
+    auto input = makeInput(cache, executor, remotePath, key);
+    auto stream = input.enqueue({0, content.size()});
+    input.load(LogType::FILE);
+    EXPECT_EQ(drain(*stream, content.size()), content);
+  }
+
+  const auto afterCold = cache.stats();
+
+  // Warm pass: every segment is already DOWNLOADED, so it counts as a hit and
+  // serves bytes from the local cache file (Layer A ssdRead), downloading none.
+  auto ioStats = std::make_shared<io::IoStatistics>();
+  {
+    FileCacheDownloadExecutor executor(2);
+    auto input =
+        makeInputWithStats(*pool_, cache, executor, remotePath, key, ioStats);
+    auto stream = input.enqueue({0, content.size()});
+    input.load(LogType::FILE);
+    EXPECT_EQ(drain(*stream, content.size()), content);
+  }
+
+  const auto afterWarm = cache.stats();
+  EXPECT_GT(afterWarm.hits, afterCold.hits);
+  EXPECT_EQ(afterWarm.misses, afterCold.misses);
+  EXPECT_EQ(afterWarm.downloadedBytes, afterCold.downloadedBytes);
+
+  // Warm read is served entirely from cache: ssdRead covers the region, and no
+  // source read/prefetch happens on this input.
+  EXPECT_EQ(ioStats->ssdRead().sum(), content.size());
+  EXPECT_EQ(ioStats->read().sum(), 0u);
+  EXPECT_EQ(ioStats->prefetch().sum(), 0u);
+}
+
 } // namespace
 } // namespace facebook::velox::ch

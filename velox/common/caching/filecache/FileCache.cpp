@@ -1431,9 +1431,13 @@ bool FileCache::doEviction(
         try
         {
             eviction_candidates.evict();
+            evictions_.fetch_add(
+                eviction_candidates.getNumEvicted(), std::memory_order_relaxed);
         }
         catch (...)
         {
+            evictions_.fetch_add(
+                eviction_candidates.getNumEvicted(), std::memory_order_relaxed);
             on_failed_evict();
             throw;
         }
@@ -1543,6 +1547,8 @@ void FileCache::freeSpaceRatioKeepingThreadFunc()
     {
         desired_size_status = IFileCachePriority::CollectStatus::SUCCESS;
         eviction_candidates.evict();
+        evictions_.fetch_add(
+            eviction_candidates.getNumEvicted(), std::memory_order_relaxed);
     }
 
     /// Take lock again to finalize eviction,
@@ -2185,6 +2191,17 @@ size_t FileCache::getUsedCacheSize() const
     return mainPriority->getSizeApprox();
 }
 
+FileCacheStats FileCache::stats() const
+{
+    FileCacheStats result;
+    result.hits = hits_.load(std::memory_order_relaxed);
+    result.misses = misses_.load(std::memory_order_relaxed);
+    result.downloadedBytes = downloadedBytes_.load(std::memory_order_relaxed);
+    result.evictions = evictions_.load(std::memory_order_relaxed);
+    result.bytesOnDisk = getUsedCacheSize();
+    return result;
+}
+
 size_t FileCache::getMaxCacheSize() const
 {
     return mainPriority->getSizeLimitApprox();
@@ -2515,6 +2532,8 @@ bool FileCache::doDynamicResizeImpl(
 
     /// Do actual eviction from filesystem.
     eviction_candidates.evict();
+    evictions_.fetch_add(
+        eviction_candidates.getNumEvicted(), std::memory_order_relaxed);
 
     VELOX_DCHECK(!eviction_candidates.requiresAfterEvictWrite());
     IFileCachePriority::removeEntries(invalidated_entries, cacheGuard.writeLock());
