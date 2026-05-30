@@ -32,9 +32,12 @@
 #include "velox/common/caching/filecache/FileSegmentInfo.h"
 #include "velox/common/caching/filecache/FileCache_fwd_internal.h"
 
+namespace facebook::velox {
+class ByteInputStream;
+}
+
 namespace facebook::velox::ch {
 
-class ReadBufferFromFileBase; // TODO(filecache-io): Port ClickHouse IO ReadBufferFromFileBase.
 class WriteBufferFromFile; // TODO(filecache-io): Port ClickHouse IO WriteBufferFromFile.
 struct FileCacheReserveStat;
 
@@ -54,7 +57,7 @@ class FileSegment : private boost::noncopyable {
 
  public:
   using Key = FileCacheKey;
-  using RemoteFileReaderPtr = std::shared_ptr<ReadBufferFromFileBase>;
+  using RemoteFileReaderPtr = std::shared_ptr<velox::ByteInputStream>;
   using LocalCacheWriterPtr = std::shared_ptr<WriteBufferFromFile>;
   using Downloader = std::string;
   using DownloaderId = std::string;
