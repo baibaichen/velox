@@ -15,6 +15,7 @@
  */
 
 #include "velox/benchmarks/QueryBenchmarkBase.h"
+#include <gflags/gflags.h>
 #include <iostream>
 #include "velox/common/base/SuccinctPrinter.h"
 #include "velox/common/file/FileSystems.h"
@@ -44,6 +45,12 @@ bool validateDataFormat(const char* flagname, const std::string& value) {
   return false;
 }
 } // namespace
+
+// Defined in velox/flag_definitions/flags.cpp. The global default is true
+// (O_DIRECT for SSD cache IO), which can return corrupt bytes from the SSD
+// cache on some filesystems. This benchmark defaults it to false (buffered IO)
+// to match Gluten's production setup (VeloxBackend uses ssd-odirect=false).
+DECLARE_bool(velox_ssd_odirect);
 
 DEFINE_string(data_format, "parquet", "Data format: parquet or dwrf.");
 
@@ -186,6 +193,10 @@ void QueryBenchmarkBase::printResults(
 }
 
 void QueryBenchmarkBase::initialize() {
+  // Register the local file system before constructing the SsdCache below: the
+  // SsdCache constructor resolves its on-disk path via getFileSystem(), which
+  // fails if no file system is registered yet.
+  filesystems::registerLocalFileSystem();
   if (FLAGS_cache_gb) {
     memory::MemoryManager::Options options;
     int64_t memoryBytes = FLAGS_cache_gb * (1LL << 30);
@@ -196,6 +207,13 @@ void QueryBenchmarkBase::initialize() {
     memory::MemoryManager::testingSetInstance(options);
     std::unique_ptr<cache::SsdCache> ssdCache;
     if (FLAGS_ssd_cache_gb) {
+      // Default the SSD cache to buffered IO (matching Gluten), unless the
+      // user explicitly set --velox_ssd_odirect on the command line. O_DIRECT
+      // (the velox global default) can return corrupt bytes from the SSD cache
+      // on some filesystems.
+      if (gflags::GetCommandLineFlagInfoOrDie("velox_ssd_odirect").is_default) {
+        FLAGS_velox_ssd_odirect = false;
+      }
       constexpr int32_t kNumSsdShards = 16;
       cacheExecutor_ =
           std::make_unique<folly::IOThreadPoolExecutor>(kNumSsdShards);
@@ -237,7 +255,6 @@ void QueryBenchmarkBase::initialize() {
   functions::prestosql::registerAllScalarFunctions();
   aggregate::prestosql::registerAllAggregateFunctions();
   parse::registerTypeResolver();
-  filesystems::registerLocalFileSystem();
 
   ioExecutor_ =
       std::make_unique<folly::IOThreadPoolExecutor>(FLAGS_num_io_threads);
