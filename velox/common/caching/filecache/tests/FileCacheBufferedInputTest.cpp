@@ -17,11 +17,14 @@
 #include "velox/dwio/common/FileCacheBufferedInput.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -90,7 +93,8 @@ class FileCacheBufferedInputTest : public testing::Test {
       const std::string& cacheDir,
       uint64_t maxSize = 64ULL << 20,
       uint64_t maxFileSegmentSize = 0,
-      uint64_t boundaryAlignment = 0) const {
+      uint64_t boundaryAlignment = 0,
+      std::optional<uint64_t> backgroundDownloadThreads = std::nullopt) const {
     FileCacheSettings settings;
     settings.path = cacheDir;
     settings.maxSize = maxSize;
@@ -99,6 +103,9 @@ class FileCacheBufferedInputTest : public testing::Test {
     }
     if (boundaryAlignment != 0) {
       settings.boundaryAlignment = boundaryAlignment;
+    }
+    if (backgroundDownloadThreads.has_value()) {
+      settings.backgroundDownloadThreads = backgroundDownloadThreads.value();
     }
     settings.validate();
     return settings;
@@ -288,7 +295,11 @@ TEST_F(FileCacheBufferedInputTest, prefixOnlyDownloadStopsAtRequestedEnd) {
   const auto content = makeContent(256 << 10);
   writeFile(remotePath, content);
 
-  FileCache cache("prefix_only", settings(path("cache")));
+  // Background download disabled so this test isolates the foreground prefix
+  // behavior: the segment tail is never fetched (no background tail-fill).
+  FileCache cache(
+      "prefix_only",
+      settings(path("cache"), 64ULL << 20, 0, 0, /*backgroundDownloadThreads=*/0));
   cache.initialize();
   const auto key = FileCacheKey::fromPath(remotePath);
 
@@ -301,8 +312,8 @@ TEST_F(FileCacheBufferedInputTest, prefixOnlyDownloadStopsAtRequestedEnd) {
   }
 
   // The foreground download fetches only the requested prefix; the rest of the
-  // segment is left untouched. No remote reader is wired here, so holder
-  // destruction does not trigger a background tail-fill.
+  // segment is left untouched. Background download is disabled, so holder
+  // destruction does not trigger a tail-fill.
   const auto stats = cache.stats();
   EXPECT_EQ(stats.downloadedBytes, 4096u);
 }
@@ -312,7 +323,11 @@ TEST_F(FileCacheBufferedInputTest, coalescedRegionsDownloadToFurthestEnd) {
   const auto content = makeContent(256 << 10);
   writeFile(remotePath, content);
 
-  FileCache cache("coalesce", settings(path("cache")));
+  // Background download disabled so the only fetch is the foreground coalesced
+  // prefix; the segment tail beyond the furthest requested end stays unfetched.
+  FileCache cache(
+      "coalesce",
+      settings(path("cache"), 64ULL << 20, 0, 0, /*backgroundDownloadThreads=*/0));
   cache.initialize();
   const auto key = FileCacheKey::fromPath(remotePath);
 
@@ -352,7 +367,12 @@ TEST_F(FileCacheBufferedInputTest, crossLoadResumeDownloadsRemainingGap) {
   const auto content = makeContent(256 << 10);
   writeFile(remotePath, content);
 
-  FileCache cache("cross_load", settings(path("cache")));
+  // Background download disabled so the resume path is driven solely by the two
+  // foreground load()s, deterministically, with no background tail-fill racing
+  // between them.
+  FileCache cache(
+      "cross_load",
+      settings(path("cache"), 64ULL << 20, 0, 0, /*backgroundDownloadThreads=*/0));
   cache.initialize();
   const auto key = FileCacheKey::fromPath(remotePath);
 
@@ -604,6 +624,67 @@ TEST_F(FileCacheBufferedInputTest, downloadFromReaderResumesPartialDownload) {
       fileSize - half);
   EXPECT_EQ(segment.getDownloadedSize(), fileSize);
   segment.completePartAndResetDownloader();
+  EXPECT_EQ(segment.state(), FileSegment::State::DOWNLOADED);
+  EXPECT_EQ(readFileFully(segment.getPath()), content);
+}
+
+// After load() downloads only the requested prefix and the holder is released,
+// the FileCache background pool fills the rest of the segment to the background
+// target size using the reader the glue wired via setRemoteFileReader. This is
+// ClickHouse's "foreground prefix + background tail-fill" model.
+TEST_F(FileCacheBufferedInputTest, backgroundFillCompletesSegmentTailAfterHolderRelease) {
+  const size_t segmentSize = 64 * 1024;
+  const auto remotePath = path("remote.bin");
+  const auto content = makeContent(segmentSize);
+  writeFile(remotePath, content);
+
+  // One 64KiB segment (alignment must not exceed the segment size). Background
+  // download is enabled; its target (default 4MiB) caps at the segment size, so
+  // releasing the holder should fill the segment to the full 64KiB.
+  FileCache cache(
+      "bg_fill",
+      settings(
+          path("cache"),
+          /*maxSize=*/64ULL << 20,
+          /*maxFileSegmentSize=*/segmentSize,
+          /*boundaryAlignment=*/segmentSize,
+          /*backgroundDownloadThreads=*/2));
+  cache.initialize();
+  const auto key = FileCacheKey::fromPath(remotePath);
+
+  {
+    auto input = makeInput(cache, remotePath, key);
+    auto stream = input.enqueue({0, 4096});
+    input.load(LogType::FILE);
+    EXPECT_EQ(drain(*stream, 4096), content.substr(0, 4096));
+    // While the holder is alive no background fill runs: the foreground fetched
+    // only the requested prefix.
+    EXPECT_EQ(cache.stats().downloadedBytes, 4096u);
+  }
+
+  // Holder released -> complete(allow_background_download=true) enqueues the
+  // segment; the background pool fills the tail. Observe via a non-downloader
+  // inspection holder. downloadedSize reaches the full size while the worker is
+  // still DOWNLOADING; wait for the DOWNLOADED transition (which also resets the
+  // reader) before asserting.
+  auto holder = cache.getOrSet(
+      key,
+      /*offset=*/0,
+      segmentSize,
+      /*file_size=*/segmentSize,
+      CreateFileSegmentSettings{},
+      /*file_segments_limit=*/0,
+      FileCache::getCommonOrigin());
+  ASSERT_EQ(holder->size(), 1u);
+  auto& segment = holder->front();
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while ((segment.getDownloadedSize() < segmentSize ||
+          segment.state() != FileSegment::State::DOWNLOADED) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  EXPECT_EQ(segment.getDownloadedSize(), segmentSize);
   EXPECT_EQ(segment.state(), FileSegment::State::DOWNLOADED);
   EXPECT_EQ(readFileFully(segment.getPath()), content);
 }

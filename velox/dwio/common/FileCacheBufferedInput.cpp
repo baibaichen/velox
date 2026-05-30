@@ -216,7 +216,19 @@ void downloadSegmentPrefix(
       // failure it stops after moving the segment to a terminal state.
       const uint64_t writeOffset = segment->getCurrentWriteOffset();
       if (targetEnd > writeOffset) {
-        auto reader = std::make_shared<ReadFileByteInputStream>(readFile);
+        // Install a positioned reader on the segment (only the first downloader
+        // does; a later resume reuses it). The same reader serves this
+        // foreground prefix download and, after the holder is released, the
+        // background tail-fill that completes the segment to its background
+        // target size. It holds a shared_ptr to the source file, so it safely
+        // outlives this BufferedInput; downloader ownership serializes its use
+        // between the foreground and the background pool. Reaching a terminal or
+        // fully-downloaded state resets it inside FileSegment.
+        auto reader = segment->getRemoteFileReader();
+        if (reader == nullptr) {
+          reader = std::make_shared<ReadFileByteInputStream>(readFile);
+          segment->setRemoteFileReader(reader);
+        }
         std::vector<char> scratch;
         const size_t written = FileSegment::downloadFromReader(
             *segment, *reader, targetEnd - writeOffset, scratch,
