@@ -15,10 +15,10 @@
  */
 #pragma once
 
-#include "velox/benchmarks/QueryBenchmarkBase.h"
+#include "velox/benchmarks/AbBenchmarkBase.h"
 #include "velox/exec/tests/utils/TpchQueryBuilder.h"
 
-class TpchBenchmark : public facebook::velox::QueryBenchmarkBase {
+class TpchBenchmark : public facebook::velox::benchmarks::AbBenchmarkBase {
  public:
   void initialize() override;
 
@@ -31,8 +31,13 @@ class TpchBenchmark : public facebook::velox::QueryBenchmarkBase {
     run(planContext, queryConfigs_);
   }
 
- protected:
-  std::unordered_map<std::string, std::string> queryConfigs_;
+  int32_t numQueries() const override {
+    return 22;
+  }
+
+  facebook::velox::exec::test::TpchPlan buildPlan(int32_t queryId) override {
+    return queryBuilder_->getQueryPlan(queryId);
+  }
 
  private:
   void initQueryBuilder();

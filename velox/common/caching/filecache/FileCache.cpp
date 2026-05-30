@@ -43,6 +43,7 @@
 #include "velox/common/caching/filecache/EvictionCandidates.h"
 #include "velox/common/caching/filecache/FileCacheSettings.h"
 #include "velox/common/caching/filecache/FileCacheUtils.h"
+#include "velox/common/caching/filecache/FileCacheDownloadExecutor.h"
 #include "velox/common/caching/filecache/FileSegmentInfo.h"
 #include "velox/common/caching/filecache/IFileCachePriority.h"
 #include "velox/common/caching/filecache/LRUFileCachePriority.h"
@@ -275,6 +276,7 @@ FileCache::FileCache(const std::string & cache_name, const FileCacheSettings & s
     , splitCacheRatio(settings.splitCacheRatio.value)
     , skipCacheOnDiskFailure_(settings.skipCacheOnDiskFailure.value)
     , name(cache_name)
+    , backgroundDownloadThreads_(settings.backgroundDownloadThreads.value)
     , metadata(settings.path.value,
                settings.backgroundDownloadQueueSizeLimit.value,
                settings.backgroundDownloadThreads.value,
@@ -480,6 +482,9 @@ void FileCache::initialize()
         {
             initializeImpl(need_to_load_metadata);
         }
+
+        if (backgroundDownloadThreads_ > 0)
+            downloadExecutor_ = std::make_unique<FileCacheDownloadExecutor>(backgroundDownloadThreads_);
     });
 }
 
@@ -2108,8 +2113,27 @@ void FileCache::loadMetadataForKey(const fs::path & key_directory, const OriginI
 
 FileCache::~FileCache()
 {
+    // Join all in-flight download tasks (they capture FileCache/segment state)
+    // before any cache members are torn down.
+    downloadExecutor_.reset();
     deactivateBackgroundOperations();
     assertCacheCorrectness();
+}
+
+FileCache * & FileCache::instanceRef()
+{
+    static FileCache * instance = nullptr;
+    return instance;
+}
+
+FileCache * FileCache::getInstance()
+{
+    return instanceRef();
+}
+
+void FileCache::setInstance(FileCache * instance)
+{
+    instanceRef() = instance;
 }
 
 void FileCache::deactivateBackgroundOperations()
