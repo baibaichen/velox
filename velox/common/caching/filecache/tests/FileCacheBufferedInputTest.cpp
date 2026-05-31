@@ -852,5 +852,28 @@ TEST_F(FileCacheBufferedInputTest, readFileByteInputStreamPositionedReads) {
   EXPECT_EQ(std::string(out.data(), 16), content.substr(10, 16));
 }
 
+// Regression for the boundary-alignment divide-by-zero: ClickHouse treats a
+// zero boundary_alignment as a valid value (its roundUpToMultiple guards
+// `multiple == 0`). getOrSet() must not divide by zero when alignment is 0.
+// Before the fix it used bits::roundUp(x, 0) and crashed with SIGFPE.
+TEST_F(FileCacheBufferedInputTest, zeroBoundaryAlignmentDoesNotDivideByZero) {
+  const auto remotePath = path("remote.bin");
+  const auto content = makeContent(1 << 20);
+  writeFile(remotePath, content);
+
+  auto s = settings(path("cache"));
+  s.boundaryAlignment = 0;
+  s.validate();
+
+  FileCache cache("zero_alignment", s);
+  cache.initialize();
+  auto input = makeInput(cache, remotePath);
+
+  auto stream = input.enqueue({100, 2048});
+  input.load(LogType::FILE);
+
+  EXPECT_EQ(drain(*stream, 2048), content.substr(100, 2048));
+}
+
 } // namespace
 } // namespace facebook::velox::ch
