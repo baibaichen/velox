@@ -111,8 +111,11 @@ DEFINE_string(read_sizes_kib, "1024,8192", "Read-size CSV in KiB.");
 DEFINE_uint64(batch, 64, "Regions enqueued per BufferedInput before load().");
 DEFINE_int32(measure_passes, 3, "Measure passes per cell; median is reported.");
 DEFINE_string(wrappers, "both",
-    "Which wrappers to run: 'cbi', 'fcbi', or 'both'. Running a single wrapper "
-    "is useful for profiling (the sampler then sees only that read path).");
+    "Which wrappers to run: 'cbi', 'fcbi', 'dbi', 'both' (cbi+fcbi) or 'all' "
+    "(cbi+fcbi+dbi). 'dbi' is DirectBufferedInput with no cache layer (reads "
+    "served by the OS page cache when hot), the SP1 direct-read baseline. "
+    "Running a single wrapper is useful for profiling (the sampler then sees "
+    "only that read path).");
 DEFINE_string(ssd_path, "/tmp/velox_wrapper_bench_ssd", "SsdCache root for cbi.");
 DEFINE_string(filecache_root, "/tmp/velox_wrapper_bench_fc", "ch::FileCache root for fcbi.");
 DEFINE_string(out, "", "Markdown output path; empty writes stdout.");
@@ -135,6 +138,7 @@ namespace {
 
 using dwio::common::bench::CbiHarness;
 using dwio::common::bench::DataLayout;
+using dwio::common::bench::DbiHarness;
 using dwio::common::bench::FcbiHarness;
 using dwio::common::bench::HarnessConfig;
 using dwio::common::bench::PassResult;
@@ -220,8 +224,10 @@ struct CellRow {
   CellSpec spec;
   bool hasCbi{false};
   bool hasFcbi{false};
+  bool hasDbi{false};
   WrapperRow cbi;
   WrapperRow fcbi;
+  WrapperRow dbi;
 };
 
 double wallMs(const PassResult& r) {
@@ -322,15 +328,23 @@ void writeTable(std::ostream& os, const std::vector<CellRow>& rows) {
     os << " |\n";
   };
   for (const auto& row : rows) {
+    const double cbiMs = wallMs(row.cbi.result);
+    const bool deltaBase = row.hasCbi && cbiMs != 0.0;
+    // cbi is the delta baseline (0% against itself); fcbi/dbi are reported
+    // relative to cbi when that baseline is available.
+    auto lineVsCbi = [&](const WrapperRow& w) {
+      const double delta =
+          deltaBase ? 100.0 * (wallMs(w.result) - cbiMs) / cbiMs : 0.0;
+      line(row.spec, w, delta, deltaBase);
+    };
     if (row.hasCbi) {
       line(row.spec, row.cbi, 0.0, false);
     }
     if (row.hasFcbi) {
-      const double cbiMs = wallMs(row.cbi.result);
-      const bool hasDelta = row.hasCbi && cbiMs != 0.0;
-      const double delta =
-          hasDelta ? 100.0 * (wallMs(row.fcbi.result) - cbiMs) / cbiMs : 0.0;
-      line(row.spec, row.fcbi, delta, hasDelta);
+      lineVsCbi(row.fcbi);
+    }
+    if (row.hasDbi) {
+      lineVsCbi(row.dbi);
     }
   }
 }
@@ -483,21 +497,38 @@ int main(int argc, char** argv) {
   harnessConfig.cleanupOnDestroy = true;
   gHarnessConfig = &harnessConfig;
 
-  // Validate that the working set exceeds RAM (so measure passes hit the
-  // SSD/disk tier) and fits in both caches. In data_dir mode the working set is
-  // the union of the real files capped by target_ws_gb, so validate in bytes.
+  const bool runAll = FLAGS_wrappers == "all";
+  const bool runCbi = runAll || FLAGS_wrappers == "both" || FLAGS_wrappers == "cbi";
+  const bool runFcbi =
+      runAll || FLAGS_wrappers == "both" || FLAGS_wrappers == "fcbi";
+  const bool runDbi = runAll || FLAGS_wrappers == "dbi";
+  VELOX_USER_CHECK(
+      runCbi || runFcbi || runDbi,
+      "--wrappers must be 'cbi', 'fcbi', 'dbi', 'both' or 'all' (got '{}')",
+      FLAGS_wrappers);
+
+  // Validate the working set fits the tiers of the wrappers that will run. Each
+  // check is gated on its wrapper: dbi (no cache layer) only needs a non-empty
+  // working set, so a dbi-only run is not constrained by the cbi/fcbi sizes. In
+  // data_dir mode the working set is the union of the real files capped by
+  // target_ws_gb, so validate in bytes.
   const uint64_t targetBytes = effectiveTargetBytes();
   const uint64_t scrubBytes = gbToBytes(FLAGS_scrub_gb);
-  VELOX_USER_CHECK_GT(
-      targetBytes, gbToBytes(FLAGS_ram_cache_gb),
-      "working set ({} bytes) must exceed ram_cache_gb so measure passes read "
-      "from the SSD/disk cache rather than RAM", targetBytes);
-  VELOX_USER_CHECK_LE(
-      targetBytes + scrubBytes, gbToBytes(FLAGS_ssd_cache_gb),
-      "working set + scrub_gb must fit in ssd_cache_gb");
-  VELOX_USER_CHECK_LE(
-      targetBytes + scrubBytes, gbToBytes(FLAGS_filecache_disk_gb),
-      "working set + scrub_gb must fit in filecache_disk_gb");
+  VELOX_USER_CHECK_GT(targetBytes, 0, "working set is empty");
+  if (runCbi) {
+    VELOX_USER_CHECK_GT(
+        targetBytes, gbToBytes(FLAGS_ram_cache_gb),
+        "working set ({} bytes) must exceed ram_cache_gb so measure passes read "
+        "from the SSD cache rather than RAM", targetBytes);
+    VELOX_USER_CHECK_LE(
+        targetBytes + scrubBytes, gbToBytes(FLAGS_ssd_cache_gb),
+        "working set + scrub_gb must fit in ssd_cache_gb");
+  }
+  if (runFcbi) {
+    VELOX_USER_CHECK_LE(
+        targetBytes + scrubBytes, gbToBytes(FLAGS_filecache_disk_gb),
+        "working set + scrub_gb must fit in filecache_disk_gb");
+  }
   VELOX_USER_CHECK(
       FLAGS_data_dir.empty() || FLAGS_scrub_gb == 0.0,
       "--scrub_gb is not supported with --data_dir (the scrub range has no "
@@ -529,12 +560,6 @@ int main(int argc, char** argv) {
     }
   }
 
-  const bool runCbi = FLAGS_wrappers == "both" || FLAGS_wrappers == "cbi";
-  const bool runFcbi = FLAGS_wrappers == "both" || FLAGS_wrappers == "fcbi";
-  VELOX_USER_CHECK(
-      runCbi || runFcbi,
-      "--wrappers must be 'cbi', 'fcbi', or 'both' (got '{}')", FLAGS_wrappers);
-
   std::vector<CellRow> rows;
   rows.reserve(cells.size());
   for (const auto& spec : cells) {
@@ -551,18 +576,36 @@ int main(int argc, char** argv) {
       row.fcbi = WrapperRow{"fcbi", runWrapper(fcbi, spec)};
       row.hasFcbi = true;
     }
+    if (runDbi) {
+      DbiHarness dbi{*gHarnessConfig, dataFiles()};
+      row.dbi = WrapperRow{"dbi", runWrapper(dbi, spec)};
+      row.hasDbi = true;
+    }
     const auto& cbiRes = row.cbi.result;
     const auto& fcbiRes = row.fcbi.result;
-    LOG(INFO) << "  "
-              << (runCbi ? "cbi wall=" + std::to_string(wallMs(cbiRes)) +
-                      "ms ssd_MB=" + std::to_string(cbiRes.tiers.ssdBytes >> 20) +
-                      " src_MB=" + std::to_string(cbiRes.tiers.sourceBytes >> 20)
-                         : std::string{})
-              << (runCbi && runFcbi ? " | " : "")
-              << (runFcbi ? "fcbi wall=" + std::to_string(wallMs(fcbiRes)) +
-                      "ms ssd_MB=" + std::to_string(fcbiRes.tiers.ssdBytes >> 20) +
-                      " src_MB=" + std::to_string(fcbiRes.tiers.sourceBytes >> 20)
-                          : std::string{});
+    // One " | "-joined segment per wrapper that ran. dbi has no ssd tier, so it
+    // only reports wall and source bytes.
+    std::vector<std::string> logParts;
+    if (runCbi) {
+      logParts.push_back(
+          "cbi wall=" + std::to_string(wallMs(cbiRes)) +
+          "ms ssd_MB=" + std::to_string(cbiRes.tiers.ssdBytes >> 20) +
+          " src_MB=" + std::to_string(cbiRes.tiers.sourceBytes >> 20));
+    }
+    if (runFcbi) {
+      logParts.push_back(
+          "fcbi wall=" + std::to_string(wallMs(fcbiRes)) +
+          "ms ssd_MB=" + std::to_string(fcbiRes.tiers.ssdBytes >> 20) +
+          " src_MB=" + std::to_string(fcbiRes.tiers.sourceBytes >> 20));
+    }
+    if (runDbi) {
+      logParts.push_back(
+          "dbi wall=" + std::to_string(wallMs(row.dbi.result)) +
+          "ms src_MB=" + std::to_string(row.dbi.result.tiers.sourceBytes >> 20));
+    }
+    LOG(INFO) << "  " << folly::join(" | ", logParts);
+    // dbi has no cache layer, so its source bytes are expected; only cbi/fcbi
+    // source bytes signal a non-resident target.
     if ((runCbi && cbiRes.tiers.sourceBytes > 0) ||
         (runFcbi && fcbiRes.tiers.sourceBytes > 0)) {
       LOG(WARNING) << "  non-zero source bytes: target not fully cache-resident;"

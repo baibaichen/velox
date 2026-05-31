@@ -285,4 +285,37 @@ class FcbiHarness {
   std::vector<ch::FileCacheKey> keys_;
 };
 
+// dbi: DirectBufferedInput, no local cache. Reads go straight to the file and
+// are served by the OS page cache when hot, so this is the "no cache layer"
+// baseline. All read bytes are counted as source bytes (there is no cache
+// tier to attribute them to).
+class DbiHarness {
+ public:
+  DbiHarness(const HarnessConfig& config, const std::vector<SourceFile>& files);
+
+  PassResult sweep(
+      WorkloadDriver& driver,
+      uint64_t ops,
+      uint64_t readSize,
+      const DataLayout& layout);
+
+  void readBatch(
+      const std::map<uint32_t, std::vector<uint64_t>>& byFile,
+      uint64_t readSize,
+      const std::shared_ptr<io::IoStatistics>& ioStats,
+      const StreamConsumer& consume);
+
+  // Warm reads already populate the OS page cache; nothing to flush.
+  void flush() {}
+
+  void logWarmState() const {}
+
+ private:
+  const HarnessConfig config_;
+  std::shared_ptr<cache::ScanTracker> tracker_;
+  std::shared_ptr<memory::MemoryPool> pool_;
+  std::vector<std::shared_ptr<ReadFile>> files_;
+  std::vector<StringIdLease> fileIds_;
+};
+
 } // namespace facebook::velox::dwio::common::bench

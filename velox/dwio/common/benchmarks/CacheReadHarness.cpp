@@ -33,6 +33,7 @@
 #include "velox/common/memory/Memory.h"
 #include "velox/common/memory/MmapAllocator.h"
 #include "velox/dwio/common/CachedBufferedInput.h"
+#include "velox/dwio/common/DirectBufferedInput.h"
 #include "velox/dwio/common/FileCacheBufferedInput.h"
 #include "velox/dwio/common/MetricsLog.h"
 
@@ -422,6 +423,92 @@ void FcbiHarness::readBatch(
         ch::FileCache::getCommonOrigin(),
         ch::CreateFileSegmentSettings{},
         ioStats);
+
+    std::vector<std::unique_ptr<SeekableInputStream>> streams;
+    streams.reserve(offsets.size());
+    for (const auto offset : offsets) {
+      streams.push_back(
+          input.enqueue(velox::common::Region{offset, readSize}, nullptr));
+    }
+    input.load(LogType::TEST);
+    for (size_t i = 0; i < streams.size(); ++i) {
+      consume(*streams[i], readSize, fileIdx, offsets[i]);
+    }
+  }
+}
+
+// ---- DbiHarness ----
+
+DbiHarness::DbiHarness(
+    const HarnessConfig& config,
+    const std::vector<SourceFile>& files)
+    : config_(config) {
+  tracker_ = std::make_shared<cache::ScanTracker>(
+      "wrapperBenchTrackerDbi", nullptr, 256UL << 10);
+  pool_ = memory::memoryManager()->addLeafPool("dbiWrapperBench");
+  auto& ids = fileIds();
+  for (const auto& f : files) {
+    files_.push_back(std::make_shared<LocalReadFile>(f.path));
+    fileIds_.emplace_back(ids, f.path);
+  }
+}
+
+PassResult DbiHarness::sweep(
+    WorkloadDriver& driver,
+    uint64_t ops,
+    uint64_t readSize,
+    const DataLayout& layout) {
+  const auto ioStats = std::make_shared<io::IoStatistics>();
+  PassResult r;
+  r.requestedBytes = ops * readSize;
+  const auto t0 = std::chrono::steady_clock::now();
+  uint64_t done = 0;
+  while (done < ops) {
+    const uint64_t n = std::min<uint64_t>(config_.batch, ops - done);
+    std::map<uint32_t, std::vector<uint64_t>> byFile;
+    for (uint64_t i = 0; i < n; ++i) {
+      const auto region = driver.nextRegion();
+      const auto loc = layout.resolve(region.offset / readSize);
+      byFile[loc.fileIdx].push_back(loc.offset);
+    }
+    readBatch(byFile, readSize, ioStats, drainConsumer);
+    done += n;
+  }
+  const auto t1 = std::chrono::steady_clock::now();
+  r.wallNs =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+  // DirectBufferedInput has no cache tier: every read is a source read (served
+  // by the OS page cache when hot, but still attributed to the file).
+  r.tiers.ramBytes = 0;
+  r.tiers.ssdBytes = 0;
+  r.tiers.sourceBytes = ioStats->read().sum();
+  return r;
+}
+
+void DbiHarness::readBatch(
+    const std::map<uint32_t, std::vector<uint64_t>>& byFile,
+    uint64_t readSize,
+    const std::shared_ptr<io::IoStatistics>& ioStats,
+    const StreamConsumer& consume) {
+  auto& ids = fileIds();
+  StringIdLease groupId{ids, "wrapperBenchGroup"};
+  for (const auto& [fileIdx, offsets] : byFile) {
+    io::ReaderOptions readerOptions{pool_.get()};
+    readerOptions.setDataIoStats(ioStats);
+    if (config_.cbiReadQuantumBytes > 0) {
+      readerOptions.setLoadQuantum(config_.cbiReadQuantumBytes);
+    }
+
+    dwio::common::DirectBufferedInput input(
+        files_[fileIdx],
+        MetricsLog::voidLog(),
+        fileIds_[fileIdx],
+        tracker_,
+        groupId,
+        ioStats,
+        /*ioStats=*/nullptr,
+        /*executor=*/nullptr,
+        readerOptions);
 
     std::vector<std::unique_ptr<SeekableInputStream>> streams;
     streams.reserve(offsets.size());
