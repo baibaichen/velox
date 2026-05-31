@@ -64,18 +64,30 @@ void writeFile(const std::string& path, const std::string& content) {
   ASSERT_TRUE(out.good()) << path;
 }
 
-std::string drain(SeekableInputStream& s, size_t size) {
+// Reads up to `size` bytes from `s`, appending the length of every Next() chunk
+// to `chunkSizes` so tests can assert the run-based chunking behaviour of
+// FileCacheInputStream.
+std::string drainRecordingChunks(
+    SeekableInputStream& s,
+    size_t size,
+    std::vector<int32_t>& chunkSizes) {
   std::string buf(size, '\0');
   size_t copied = 0;
   const void* data;
   int32_t len;
   while (copied < size && s.Next(&data, &len)) {
-    size_t toCopy = std::min<size_t>(len, size - copied);
+    chunkSizes.push_back(len);
+    const size_t toCopy = std::min<size_t>(len, size - copied);
     std::memcpy(buf.data() + copied, data, toCopy);
     copied += toCopy;
   }
   buf.resize(copied);
   return buf;
+}
+
+std::string drain(SeekableInputStream& s, size_t size) {
+  std::vector<int32_t> ignoredChunkSizes;
+  return drainRecordingChunks(s, size, ignoredChunkSizes);
 }
 
 class FileCacheBufferedInputTest : public testing::Test {
@@ -202,6 +214,95 @@ TEST_F(FileCacheBufferedInputTest, regionSpanningMultipleSegments) {
   input.load(LogType::FILE);
 
   EXPECT_EQ(drain(*stream, 256 << 10), content);
+}
+
+// 64KiB segments, 256KiB region: the region spans >=4 cache segments and the
+// run-based stream returns multiple Next() chunks that must reassemble exactly.
+TEST_F(FileCacheBufferedInputTest, multiSegmentRegionRoundTripsInChunks) {
+  const auto remotePath = path("remote.bin");
+  const auto content = makeContent(256 << 10);
+  writeFile(remotePath, content);
+
+  FileCache cache(
+      "multi_chunk",
+      settings(path("cache"), 64ULL << 20, 64ULL << 10, 64ULL << 10));
+  cache.initialize();
+  auto input = makeInput(cache, remotePath);
+
+  auto stream = input.enqueue({0, 256 << 10});
+  input.load(LogType::FILE);
+
+  std::vector<int32_t> chunks;
+  const auto got = drainRecordingChunks(*stream, 256 << 10, chunks);
+  EXPECT_EQ(got, content);
+  EXPECT_GT(chunks.size(), 1u);
+}
+
+// SkipInt64 that crosses several whole segments, then read the remainder.
+TEST_F(FileCacheBufferedInputTest, skipSpanningSegmentsThenRead) {
+  const auto remotePath = path("remote.bin");
+  const auto content = makeContent(256 << 10);
+  writeFile(remotePath, content);
+
+  FileCache cache(
+      "skip_span",
+      settings(path("cache"), 64ULL << 20, 64ULL << 10, 64ULL << 10));
+  cache.initialize();
+  auto input = makeInput(cache, remotePath);
+
+  auto stream = input.enqueue({0, 256 << 10});
+  input.load(LogType::FILE);
+
+  ASSERT_TRUE(stream->SkipInt64(200 << 10)); // skips ~3 segments
+  EXPECT_EQ(
+      drain(*stream, (256 << 10) - (200 << 10)),
+      content.substr(200 << 10, (256 << 10) - (200 << 10)));
+}
+
+// BackUp the entire first chunk and re-read the whole region.
+TEST_F(FileCacheBufferedInputTest, backUpFirstChunkRoundTrips) {
+  const auto remotePath = path("remote.bin");
+  const auto content = makeContent(256 << 10);
+  writeFile(remotePath, content);
+
+  FileCache cache(
+      "backup",
+      settings(path("cache"), 64ULL << 20, 64ULL << 10, 64ULL << 10));
+  cache.initialize();
+  auto input = makeInput(cache, remotePath);
+
+  auto stream = input.enqueue({0, 256 << 10});
+  input.load(LogType::FILE);
+
+  const void* data;
+  int32_t len;
+  ASSERT_TRUE(stream->Next(&data, &len));
+  ASSERT_GT(len, 0);
+  stream->BackUp(len);
+  EXPECT_EQ(drain(*stream, 256 << 10), content);
+}
+
+// seekToPosition into the middle of a later segment, then read to the end.
+TEST_F(FileCacheBufferedInputTest, seekToPositionAcrossSegments) {
+  const auto remotePath = path("remote.bin");
+  const auto content = makeContent(256 << 10);
+  writeFile(remotePath, content);
+
+  FileCache cache(
+      "seek_span",
+      settings(path("cache"), 64ULL << 20, 64ULL << 10, 64ULL << 10));
+  cache.initialize();
+  auto input = makeInput(cache, remotePath);
+
+  auto stream = input.enqueue({0, 256 << 10});
+  input.load(LogType::FILE);
+
+  std::vector<uint64_t> positions{150 << 10};
+  dwio::common::PositionProvider pp(positions);
+  stream->seekToPosition(pp);
+  EXPECT_EQ(
+      drain(*stream, (256 << 10) - (150 << 10)),
+      content.substr(150 << 10, (256 << 10) - (150 << 10)));
 }
 
 TEST_F(FileCacheBufferedInputTest, secondInputServesFromCache) {

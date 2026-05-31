@@ -33,8 +33,10 @@ constexpr size_t kReserveTimeoutMs{10000};
 class DeferredStream final
     : public facebook::velox::dwio::common::SeekableInputStream {
  public:
-  explicit DeferredStream(FileCacheBufferedInput::EnqueuedRegion* slot)
-      : slot_{slot} {}
+  explicit DeferredStream(
+      FileCacheBufferedInput::EnqueuedRegion* slot,
+      memory::MemoryPool* pool)
+      : slot_{slot}, pool_{pool} {}
 
   bool Next(const void** data, int32_t* size) override {
     ensureWithData();
@@ -137,7 +139,8 @@ class DeferredStream final
       segments.push_back(segment);
     }
     inner_ = std::make_unique<FileCacheInputStream>(
-        std::move(segments), slot_->region.offset, slot_->region.length);
+        std::move(segments), slot_->region.offset, slot_->region.length,
+        *pool_);
     if (bytesConsumed_ > 0) {
       const bool ok = inner_->SkipInt64(static_cast<int64_t>(bytesConsumed_));
       VELOX_CHECK(ok, "Replaying pre-load skip past region end");
@@ -145,6 +148,7 @@ class DeferredStream final
   }
 
   FileCacheBufferedInput::EnqueuedRegion* const slot_;
+  memory::MemoryPool* const pool_;
   std::unique_ptr<FileCacheInputStream> inner_;
   uint64_t bytesConsumed_{0};
   bool bypassActive_{false};
@@ -293,7 +297,7 @@ FileCacheBufferedInput::enqueue(
     facebook::velox::common::Region region,
     const facebook::velox::dwio::common::StreamIdentifier* /*sid*/) {
   enqueuedRegions_.push_back(EnqueuedRegion{region, nullptr, false, {}});
-  return std::make_unique<DeferredStream>(&enqueuedRegions_.back());
+  return std::make_unique<DeferredStream>(&enqueuedRegions_.back(), pool_);
 }
 
 void FileCacheBufferedInput::load(

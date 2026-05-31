@@ -17,10 +17,13 @@
 #pragma once
 
 #include "velox/common/caching/filecache/FileCache_fwd_internal.h"
+#include "velox/common/memory/Allocation.h"
+#include "velox/common/memory/Memory.h"
 #include "velox/dwio/common/SeekableInputStream.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -33,7 +36,8 @@ class FileCacheInputStream final
   FileCacheInputStream(
       std::vector<FileSegmentPtr> segments,
       uint64_t regionOffset,
-      uint64_t regionLength);
+      uint64_t regionLength,
+      memory::MemoryPool& pool);
 
   bool Next(const void** data, int32_t* size) override;
   void BackUp(int32_t count) override;
@@ -45,17 +49,43 @@ class FileCacheInputStream final
   size_t positionSize() const override;
 
  private:
-  void loadCurrentSegmentBuffer();
+  // Loads the segment slice at `index` into reused storage (segData_/tinyData_),
+  // waiting for the download to cover the slice first.
+  void loadSegment(size_t index);
+
+  // Ensures the byte at regionCursor_ is resident and sets the run_/runSize_/
+  // offsetInRun_ view onto it, loading the owning segment if needed.
+  void loadPosition();
+
+  // Index of the segment slice covering absolute region offset `cursor`
+  // (cursor must be < regionLength_).
+  size_t segmentIndexFor(uint64_t cursor) const;
 
   const std::vector<FileSegmentPtr> segments_;
   const uint64_t regionOffset_;
   const uint64_t regionLength_;
+  memory::MemoryPool& pool_;
 
-  size_t index_{0};
-  uint64_t byteCount_{0};
-  std::unique_ptr<char[]> buffer_;
-  size_t bufferSize_{0};
-  size_t cursor_{0};
+  // Prefix sums of per-segment slice lengths within the region; size
+  // segments_.size()+1, front()==0, back()==regionLength_.
+  std::vector<uint64_t> sliceStartInRegion_;
+  // Offset of each segment's slice within its on-disk segment file.
+  std::vector<uint64_t> sliceOffsetInSegment_;
+
+  // Reused destination for the currently loaded segment slice. segData_ holds
+  // slices >= kTinySize; tinyData_ holds smaller ones.
+  memory::Allocation segData_;
+  std::string tinyData_;
+  size_t loadedIndex_{std::numeric_limits<size_t>::max()};
+  uint64_t loadedSliceLen_{0};
+
+  // Absolute consumed position within the region: [0, regionLength_].
+  uint64_t regionCursor_{0};
+
+  // Run view of the loaded slice for the current position.
+  uint8_t* run_{nullptr};
+  uint32_t runSize_{0};
+  uint64_t offsetInRun_{0};
 };
 
 } // namespace facebook::velox::ch
