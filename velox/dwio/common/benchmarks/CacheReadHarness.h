@@ -190,6 +190,10 @@ struct HarnessConfig {
   uint64_t batch{64};
   bool clearCacheOnStart{true};
   bool cleanupOnDestroy{true};
+  // measure-only (--phase=measure): the harness must self-check at construction
+  // that the persisted cache actually reloaded, and throw rather than silently
+  // running cold against an empty/missing cache dir.
+  bool requireResidentCache{false};
 };
 
 // Reads and discards `readSize` bytes from `stream`; returns the count copied.

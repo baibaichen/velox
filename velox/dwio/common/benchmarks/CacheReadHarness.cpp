@@ -230,6 +230,17 @@ CbiHarness::CbiHarness(
     files_.push_back(std::make_shared<LocalReadFile>(f.path));
     fileIds_.emplace_back(ids, f.path);
   }
+  if (config_.requireResidentCache) {
+    // measure phase: the SsdCache must have reloaded a checkpoint. An empty
+    // cache means the dir was missing/cold or the checkpoint failed to load;
+    // fail loud instead of silently re-reading from source.
+    VELOX_CHECK_GT(
+        ssdCache_->stats().entriesCached,
+        0,
+        "--phase=measure: SSD cache at {} is empty (no checkpoint reloaded); "
+        "run --phase=prime first",
+        config_.ssdPath);
+  }
 }
 
 CbiHarness::~CbiHarness() {
@@ -366,6 +377,18 @@ FcbiHarness::FcbiHarness(
   for (const auto& f : files) {
     files_.push_back(std::make_shared<LocalReadFile>(f.path));
     keys_.push_back(ch::FileCacheKey::fromPath(f.path));
+  }
+  if (config_.requireResidentCache) {
+    // measure phase: FileCache::initialize() must have reloaded segment
+    // metadata. No bytes on disk means the dir was missing/cold; fail loud.
+    // Valid because the harness loads metadata synchronously (the default,
+    // loadMetadataAsynchronously=false); an async load would need awaiting here.
+    VELOX_CHECK_GT(
+        cache_->stats().bytesOnDisk,
+        0,
+        "--phase=measure: FileCache at {} is empty (no metadata reloaded); "
+        "run --phase=prime first",
+        config_.filecacheRoot);
   }
 }
 

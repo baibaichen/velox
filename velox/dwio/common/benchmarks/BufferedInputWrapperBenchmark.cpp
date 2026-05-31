@@ -128,6 +128,12 @@ DEFINE_bool(reuse_cache, false,
 DEFINE_double(ssd_checkpoint_mb, 0.0,
     "cbi SsdCache checkpoint interval (MiB); 0 disables checkpointing. With "
     "--reuse_cache a 0 value defaults to 256 MiB so the cache is durable.");
+DEFINE_string(phase, "full",
+    "Run phase for the two-phase persistent workflow (implies --reuse_cache for "
+    "prime/measure): 'full' warms then measures in one process (default); "
+    "'prime' only warms the caches and persists them, writing no results table; "
+    "'measure' reloads the persisted caches and runs only the measure passes, "
+    "failing loud if a cache did not reload (no silent cold fallback).");
 DEFINE_string(out, "", "Markdown output path; empty writes stdout.");
 #ifndef WRAPPER_BENCH_REPORT_DIR
 #define WRAPPER_BENCH_REPORT_DIR "."
@@ -159,6 +165,30 @@ using dwio::common::bench::WorkingSetConfig;
 using dwio::common::bench::WorkloadDriver;
 
 constexpr const char* kRemotePath = "/tmp/velox_wrapper_bench_remote.bin";
+
+// Two-phase persistent-cache workflow (see --phase). kFull warms then measures
+// in one process; kPrime only warms+persists; kMeasure reloads and only
+// measures. Prime/measure imply persisting the on-disk caches.
+enum class Phase { kFull, kPrime, kMeasure };
+
+Phase parsePhase(const std::string& s) {
+  if (s == "full") {
+    return Phase::kFull;
+  }
+  if (s == "prime") {
+    return Phase::kPrime;
+  }
+  if (s == "measure") {
+    return Phase::kMeasure;
+  }
+  VELOX_USER_FAIL("--phase must be 'full', 'prime' or 'measure' (got '{}')", s);
+}
+
+// Prime and measure both persist the on-disk caches (no wipe), as does an
+// explicit --reuse_cache.
+bool persistCache(Phase phase) {
+  return FLAGS_reuse_cache || phase != Phase::kFull;
+}
 
 uint64_t gbToBytes(double gb) {
   return static_cast<uint64_t>(gb * static_cast<double>(1ULL << 30));
@@ -262,9 +292,11 @@ PassResult medianByWall(std::vector<PassResult> runs) {
 }
 
 // Runs chunked-warm (with RAM->SSD flush) + optional RAM-scrub + measure for
-// one wrapper, returns the median measure pass.
+// one wrapper, returns the median measure pass. The phase selects which halves
+// run: kFull does both, kPrime only warms (returns an empty PassResult), and
+// kMeasure skips warming and only measures the reloaded cache.
 template <typename Harness>
-PassResult runWrapper(Harness& h, const CellSpec& spec) {
+PassResult runWrapper(Harness& h, const CellSpec& spec, Phase phase) {
   const uint64_t targetBytes = effectiveTargetBytes();
   const uint64_t scrubBytes = gbToBytes(FLAGS_scrub_gb);
   const DataLayout layout{dataFiles(), spec.readSize, targetBytes};
@@ -272,34 +304,42 @@ PassResult runWrapper(Harness& h, const CellSpec& spec) {
   const uint64_t scrubKeys = scrubBytes / spec.readSize;
   VELOX_USER_CHECK_GT(targetKeys, 0, "target_ws_gb too small for read size");
 
-  // Warm in RAM-sized chunks, flushing RAM->SSD after each chunk so a target
-  // larger than the RAM tier still becomes fully cache-resident: AsyncDataCache
-  // drops RAM-evicted entries that have not yet been written to SSD, so the
-  // whole target must be persisted before later chunks evict it from RAM.
-  const double chunkGb =
-      FLAGS_warm_chunk_gb > 0.0 ? FLAGS_warm_chunk_gb : FLAGS_ram_cache_gb / 2.0;
-  const uint64_t chunkKeys =
-      std::max<uint64_t>(1, gbToBytes(chunkGb) / spec.readSize);
-  uint64_t warmed = 0;
-  TierBytes warmTiers;
-  while (warmed < targetKeys) {
-    const uint64_t n = std::min<uint64_t>(chunkKeys, targetKeys - warmed);
-    WorkloadDriver warm{
-        ch::bench::Workload::kSequential, n, spec.readSize,
-        /*seed=*/1, /*baseOffset=*/warmed * spec.readSize};
-    const auto warmPass = h.sweep(warm, n, spec.readSize, layout);
-    warmTiers.ramBytes += warmPass.tiers.ramBytes;
-    warmTiers.ssdBytes += warmPass.tiers.ssdBytes;
-    warmTiers.sourceBytes += warmPass.tiers.sourceBytes;
-    h.flush();
-    warmed += n;
+  if (phase != Phase::kMeasure) {
+    // Warm in RAM-sized chunks, flushing RAM->SSD after each chunk so a target
+    // larger than the RAM tier still becomes fully cache-resident: AsyncDataCache
+    // drops RAM-evicted entries that have not yet been written to SSD, so the
+    // whole target must be persisted before later chunks evict it from RAM.
+    const double chunkGb = FLAGS_warm_chunk_gb > 0.0
+        ? FLAGS_warm_chunk_gb
+        : FLAGS_ram_cache_gb / 2.0;
+    const uint64_t chunkKeys =
+        std::max<uint64_t>(1, gbToBytes(chunkGb) / spec.readSize);
+    uint64_t warmed = 0;
+    TierBytes warmTiers;
+    while (warmed < targetKeys) {
+      const uint64_t n = std::min<uint64_t>(chunkKeys, targetKeys - warmed);
+      WorkloadDriver warm{
+          ch::bench::Workload::kSequential, n, spec.readSize,
+          /*seed=*/1, /*baseOffset=*/warmed * spec.readSize};
+      const auto warmPass = h.sweep(warm, n, spec.readSize, layout);
+      warmTiers.ramBytes += warmPass.tiers.ramBytes;
+      warmTiers.ssdBytes += warmPass.tiers.ssdBytes;
+      warmTiers.sourceBytes += warmPass.tiers.sourceBytes;
+      h.flush();
+      warmed += n;
+    }
+    // Warm source bytes reveal cache reuse: on a --reuse_cache hot re-run the
+    // warm sweep should serve from the persisted cache (warm src_MB ~ 0); a
+    // non-zero value means the cache was cold or shape-incompatible and got
+    // re-downloaded.
+    LOG(INFO) << "  warm src_MB=" << (warmTiers.sourceBytes >> 20)
+              << " ssd_MB=" << (warmTiers.ssdBytes >> 20);
+    h.logWarmState();
   }
-  // Warm source bytes reveal cache reuse: on a --reuse_cache hot re-run the warm
-  // sweep should serve from the persisted cache (warm src_MB ~ 0); a non-zero
-  // value means the cache was cold or shape-incompatible and got re-downloaded.
-  LOG(INFO) << "  warm src_MB=" << (warmTiers.sourceBytes >> 20)
-            << " ssd_MB=" << (warmTiers.ssdBytes >> 20);
-  h.logWarmState();
+
+  if (phase == Phase::kPrime) {
+    return PassResult{};
+  }
 
   std::vector<PassResult> passes;
   passes.reserve(FLAGS_measure_passes);
@@ -412,6 +452,7 @@ void writeConfig(std::ostream& os) {
   os << "| scrub_gb | " << FLAGS_scrub_gb << " |\n";
   os << "| warm_chunk_gb (effective) | " << warmChunkGb << " |\n";
   os << "| measure_passes | " << FLAGS_measure_passes << " |\n";
+  os << "| phase | " << FLAGS_phase << " |\n";
   os << "| reuse_cache | " << (FLAGS_reuse_cache ? "true" : "false") << " |\n";
   os << "| workloads | " << FLAGS_workloads << " |\n";
   os << "| read_sizes_kib | " << FLAGS_read_sizes_kib << " |\n";
@@ -455,8 +496,10 @@ void writeReport(const std::vector<CellRow>& rows) {
 }
 
 void cleanup() {
-  // --reuse_cache deliberately persists the caches across runs; skip every wipe.
-  if (FLAGS_reuse_cache) {
+  // --reuse_cache and the prime/measure phases deliberately persist the caches
+  // across runs; skip every wipe. Checked via raw FLAGS so this is safe even if
+  // SIGINT fires before --phase was validated in main().
+  if (FLAGS_reuse_cache || FLAGS_phase != "full") {
     return;
   }
   std::error_code ec;
@@ -505,6 +548,8 @@ int main(int argc, char** argv) {
   gWorkingSet = &workingSet;
 
   HarnessConfig harnessConfig;
+  const Phase phase = parsePhase(FLAGS_phase);
+  const bool persist = persistCache(phase);
   harnessConfig.ssdPath = FLAGS_ssd_path;
   harnessConfig.ssdCacheBytes = gbToBytes(FLAGS_ssd_cache_gb);
   harnessConfig.ssdNumShards = FLAGS_ssd_num_shards;
@@ -518,19 +563,18 @@ int main(int argc, char** argv) {
   harnessConfig.fcbiSegmentBytes =
       static_cast<uint64_t>(FLAGS_fcbi_segment_mb * (1 << 20));
   harnessConfig.batch = FLAGS_batch;
-  harnessConfig.clearCacheOnStart = true;
-  harnessConfig.cleanupOnDestroy = true;
-  if (FLAGS_reuse_cache) {
-    // Keep the on-disk caches: don't wipe on start (reload them) or on destroy,
-    // and give cbi a non-zero checkpoint interval so its SSD state is durable.
-    harnessConfig.clearCacheOnStart = false;
-    harnessConfig.cleanupOnDestroy = false;
-  }
-  // With --reuse_cache a 0 interval defaults to 256 MiB so the cache is durable;
+  // Persisting runs (--reuse_cache or --phase=prime|measure) keep the on-disk
+  // caches: don't wipe on start (reload them) or on destroy, and give cbi a
+  // non-zero checkpoint interval so its SSD state is durable.
+  harnessConfig.clearCacheOnStart = !persist;
+  harnessConfig.cleanupOnDestroy = !persist;
+  // --phase=measure must fail loud if a cache did not reload (no cold fallback).
+  harnessConfig.requireResidentCache = phase == Phase::kMeasure;
+  // While persisting, a 0 interval defaults to 256 MiB so the cache is durable;
   // otherwise the flag value (if any) drives checkpointing while still wiping.
-  const double checkpointMb = (FLAGS_reuse_cache && FLAGS_ssd_checkpoint_mb <= 0.0)
-      ? 256.0
-      : FLAGS_ssd_checkpoint_mb;
+  const double checkpointMb =
+      (persist && FLAGS_ssd_checkpoint_mb <= 0.0) ? 256.0
+                                                  : FLAGS_ssd_checkpoint_mb;
   if (checkpointMb > 0.0) {
     harnessConfig.ssdCheckpointIntervalBytes =
         static_cast<uint64_t>(checkpointMb * (1 << 20));
@@ -608,18 +652,24 @@ int main(int argc, char** argv) {
     CellRow row{spec};
     if (runCbi) {
       CbiHarness cbi{*gHarnessConfig, dataFiles()};
-      row.cbi = WrapperRow{"cbi", runWrapper(cbi, spec)};
+      row.cbi = WrapperRow{"cbi", runWrapper(cbi, spec, phase)};
       row.hasCbi = true;
     }
     if (runFcbi) {
       FcbiHarness fcbi{*gHarnessConfig, dataFiles()};
-      row.fcbi = WrapperRow{"fcbi", runWrapper(fcbi, spec)};
+      row.fcbi = WrapperRow{"fcbi", runWrapper(fcbi, spec, phase)};
       row.hasFcbi = true;
     }
     if (runDbi) {
       DbiHarness dbi{*gHarnessConfig, dataFiles()};
-      row.dbi = WrapperRow{"dbi", runWrapper(dbi, spec)};
+      row.dbi = WrapperRow{"dbi", runWrapper(dbi, spec, phase)};
       row.hasDbi = true;
+    }
+    if (phase == Phase::kPrime) {
+      // Prime only warms+persists the caches (see the per-wrapper "warm src_MB"
+      // log); there are no measure results to report.
+      LOG(INFO) << "  primed (no measure pass)";
+      continue;
     }
     const auto& cbiRes = row.cbi.result;
     const auto& fcbiRes = row.fcbi.result;
@@ -652,6 +702,13 @@ int main(int argc, char** argv) {
                    << " increase ssd/disk size or lower target_ws_gb";
     }
     rows.push_back(std::move(row));
+  }
+
+  if (phase == Phase::kPrime) {
+    LOG(INFO) << "Primed " << cells.size() << " cell(s); caches persisted at "
+              << FLAGS_ssd_path << " and " << FLAGS_filecache_root
+              << ". Re-run with --phase=measure to read them hot.";
+    return 0;
   }
 
   if (FLAGS_out.empty()) {
