@@ -326,6 +326,10 @@ void CbiHarness::flush() {
     cache_->saveToSsd(/*saveAll=*/true);
     ssdCache_->waitForWriteToFinish();
   }
+  // Durable checkpoints for --reuse_cache are written once at destruction by
+  // SsdCache::shutdown() (force-checkpoints every shard when checkpointing is
+  // enabled), so flush() only persists RAM->SSD per warm chunk here. A no-op
+  // when checkpointing is off (the default).
 }
 
 void CbiHarness::logWarmState() const {

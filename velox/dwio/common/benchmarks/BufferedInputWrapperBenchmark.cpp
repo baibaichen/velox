@@ -118,6 +118,16 @@ DEFINE_string(wrappers, "both",
     "only that read path).");
 DEFINE_string(ssd_path, "/tmp/velox_wrapper_bench_ssd", "SsdCache root for cbi.");
 DEFINE_string(filecache_root, "/tmp/velox_wrapper_bench_fc", "ch::FileCache root for fcbi.");
+DEFINE_bool(reuse_cache, false,
+    "Persist the on-disk caches across process restarts instead of wiping them "
+    "on start/exit: cbi writes a durable SsdCache checkpoint, fcbi reloads its "
+    "metadata, so a later process can re-run hot without re-downloading. The "
+    "reusing run MUST use cache-shape-compatible flags (same data/blob, "
+    "read sizes, ssd_num_shards and cache sizes); mismatches silently miss and "
+    "re-download. The warm-phase 'warm src_MB' log line is ~0 when reuse hit.");
+DEFINE_double(ssd_checkpoint_mb, 0.0,
+    "cbi SsdCache checkpoint interval (MiB); 0 disables checkpointing. With "
+    "--reuse_cache a 0 value defaults to 256 MiB so the cache is durable.");
 DEFINE_string(out, "", "Markdown output path; empty writes stdout.");
 #ifndef WRAPPER_BENCH_REPORT_DIR
 #define WRAPPER_BENCH_REPORT_DIR "."
@@ -143,6 +153,7 @@ using dwio::common::bench::FcbiHarness;
 using dwio::common::bench::HarnessConfig;
 using dwio::common::bench::PassResult;
 using dwio::common::bench::SourceFile;
+using dwio::common::bench::TierBytes;
 using dwio::common::bench::WorkingSet;
 using dwio::common::bench::WorkingSetConfig;
 using dwio::common::bench::WorkloadDriver;
@@ -270,15 +281,24 @@ PassResult runWrapper(Harness& h, const CellSpec& spec) {
   const uint64_t chunkKeys =
       std::max<uint64_t>(1, gbToBytes(chunkGb) / spec.readSize);
   uint64_t warmed = 0;
+  TierBytes warmTiers;
   while (warmed < targetKeys) {
     const uint64_t n = std::min<uint64_t>(chunkKeys, targetKeys - warmed);
     WorkloadDriver warm{
         ch::bench::Workload::kSequential, n, spec.readSize,
         /*seed=*/1, /*baseOffset=*/warmed * spec.readSize};
-    (void)h.sweep(warm, n, spec.readSize, layout);
+    const auto warmPass = h.sweep(warm, n, spec.readSize, layout);
+    warmTiers.ramBytes += warmPass.tiers.ramBytes;
+    warmTiers.ssdBytes += warmPass.tiers.ssdBytes;
+    warmTiers.sourceBytes += warmPass.tiers.sourceBytes;
     h.flush();
     warmed += n;
   }
+  // Warm source bytes reveal cache reuse: on a --reuse_cache hot re-run the warm
+  // sweep should serve from the persisted cache (warm src_MB ~ 0); a non-zero
+  // value means the cache was cold or shape-incompatible and got re-downloaded.
+  LOG(INFO) << "  warm src_MB=" << (warmTiers.sourceBytes >> 20)
+            << " ssd_MB=" << (warmTiers.ssdBytes >> 20);
   h.logWarmState();
 
   std::vector<PassResult> passes;
@@ -392,6 +412,7 @@ void writeConfig(std::ostream& os) {
   os << "| scrub_gb | " << FLAGS_scrub_gb << " |\n";
   os << "| warm_chunk_gb (effective) | " << warmChunkGb << " |\n";
   os << "| measure_passes | " << FLAGS_measure_passes << " |\n";
+  os << "| reuse_cache | " << (FLAGS_reuse_cache ? "true" : "false") << " |\n";
   os << "| workloads | " << FLAGS_workloads << " |\n";
   os << "| read_sizes_kib | " << FLAGS_read_sizes_kib << " |\n";
   os << "| batch | " << FLAGS_batch << " |\n\n";
@@ -434,6 +455,10 @@ void writeReport(const std::vector<CellRow>& rows) {
 }
 
 void cleanup() {
+  // --reuse_cache deliberately persists the caches across runs; skip every wipe.
+  if (FLAGS_reuse_cache) {
+    return;
+  }
   std::error_code ec;
   std::filesystem::remove_all(FLAGS_ssd_path, ec);
   std::filesystem::remove_all(FLAGS_filecache_root, ec);
@@ -495,6 +520,21 @@ int main(int argc, char** argv) {
   harnessConfig.batch = FLAGS_batch;
   harnessConfig.clearCacheOnStart = true;
   harnessConfig.cleanupOnDestroy = true;
+  if (FLAGS_reuse_cache) {
+    // Keep the on-disk caches: don't wipe on start (reload them) or on destroy,
+    // and give cbi a non-zero checkpoint interval so its SSD state is durable.
+    harnessConfig.clearCacheOnStart = false;
+    harnessConfig.cleanupOnDestroy = false;
+  }
+  // With --reuse_cache a 0 interval defaults to 256 MiB so the cache is durable;
+  // otherwise the flag value (if any) drives checkpointing while still wiping.
+  const double checkpointMb = (FLAGS_reuse_cache && FLAGS_ssd_checkpoint_mb <= 0.0)
+      ? 256.0
+      : FLAGS_ssd_checkpoint_mb;
+  if (checkpointMb > 0.0) {
+    harnessConfig.ssdCheckpointIntervalBytes =
+        static_cast<uint64_t>(checkpointMb * (1 << 20));
+  }
   gHarnessConfig = &harnessConfig;
 
   const bool runAll = FLAGS_wrappers == "all";
