@@ -252,10 +252,21 @@ class CbiHarness {
   // Forces RAM-resident, ssd-savable entries out to SSD and blocks until done.
   void flush();
 
+  // Tears down and rebuilds the RAM+SSD cache stack so the next sweep starts
+  // cold (empty local cache). Used by --cold_each_pass to measure the
+  // cache-populate path on every measure pass. The source files, scan tracker
+  // and memory pool are preserved; only the cache tiers are rebuilt.
+  void clearCache();
+
   // Logs SSD residency after warming so a failed warm is visible.
   void logWarmState() const;
 
  private:
+  // Builds the RAM+SSD cache stack (wipes ssdPath, then constructs the
+  // executors, SsdCache, allocator and AsyncDataCache). Shared by the
+  // constructor and clearCache().
+  void buildCache();
+
   const HarnessConfig config_;
   std::unique_ptr<folly::IOThreadPoolExecutor> ssdExecutor_;
   std::unique_ptr<folly::IOThreadPoolExecutor> loadExecutor_;
@@ -289,9 +300,18 @@ class FcbiHarness {
   // ch::FileCache writes synchronously during load; no RAM->disk flush needed.
   void flush() {}
 
+  // Tears down and rebuilds the ch::FileCache so the next sweep starts cold
+  // (empty on-disk segment cache). Used by --cold_each_pass. The source files,
+  // segment keys and memory pool are preserved.
+  void clearCache();
+
   void logWarmState() const {}
 
  private:
+  // Builds the ch::FileCache (wipes filecacheRoot, then constructs and
+  // initializes the cache). Shared by the constructor and clearCache().
+  void buildCache();
+
   const HarnessConfig config_;
   std::unique_ptr<ch::FileCache> cache_;
   std::shared_ptr<memory::MemoryPool> pool_;
@@ -321,6 +341,10 @@ class DbiHarness {
 
   // Warm reads already populate the OS page cache; nothing to flush.
   void flush() {}
+
+  // dbi has no local cache tier, so a cold reset is a no-op (kept for a uniform
+  // harness interface; --cold_each_pass only targets cbi/fcbi).
+  void clearCache() {}
 
   void logWarmState() const {}
 

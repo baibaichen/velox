@@ -125,6 +125,12 @@ DEFINE_double(allocator_capacity_gb, 64.0,
     "Must exceed the peak concurrent allocation footprint; reserved as address "
     "space (no upfront physical commit).");
 DEFINE_int32(measure_passes, 3, "Measure passes per cell; median is reported.");
+DEFINE_bool(cold_each_pass, false,
+    "Clear the local cache tier before every measure pass so each pass measures "
+    "the cold cache-populate path (cbi: wipe RAM+SSD; fcbi: wipe on-disk "
+    "segments) instead of warm cache hits. The source files stay warm in the OS "
+    "page cache, so this isolates the download+write+serve cost. No-op for dbi "
+    "(no cache layer). Use to compare cbi vs fcbi cold behavior.");
 DEFINE_string(wrappers, "both",
     "Which wrappers to run: 'cbi', 'fcbi', 'dbi', 'both' (cbi+fcbi) or 'all' "
     "(cbi+fcbi+dbi). 'dbi' is DirectBufferedInput with no cache layer (reads "
@@ -385,6 +391,12 @@ PassResult runWrapper(Harness& h, const CellSpec& spec, Phase phase) {
   std::vector<PassResult> passes;
   passes.reserve(FLAGS_measure_passes);
   for (int p = 0; p < FLAGS_measure_passes; ++p) {
+    // Cold mode: wipe the local cache tier so this pass re-downloads from the
+    // (page-cache-warm) source and repopulates the cache from scratch, turning
+    // every measure pass into the cold cache-populate path. No-op for dbi.
+    if (FLAGS_cold_each_pass) {
+      h.clearCache();
+    }
     // Optional: scrub the RAM tier with a disjoint range so measured reads come
     // from SSD rather than RAM. Disabled by default (see --scrub_gb) because the
     // scrub data is itself cacheable and can evict the target.
@@ -494,6 +506,8 @@ void writeConfig(std::ostream& os) {
   os << "| scrub_gb | " << FLAGS_scrub_gb << " |\n";
   os << "| warm_chunk_gb (effective) | " << warmChunkGb << " |\n";
   os << "| measure_passes | " << FLAGS_measure_passes << " |\n";
+  os << "| cold_each_pass | " << (FLAGS_cold_each_pass ? "true" : "false")
+     << " |\n";
   os << "| phase | " << FLAGS_phase << " |\n";
   os << "| reuse_cache | " << (FLAGS_reuse_cache ? "true" : "false") << " |\n";
   os << "| workloads | " << FLAGS_workloads << " |\n";

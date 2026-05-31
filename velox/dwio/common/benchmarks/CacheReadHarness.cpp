@@ -195,6 +195,29 @@ CbiHarness::CbiHarness(
     const HarnessConfig& config,
     const std::vector<SourceFile>& files)
     : config_(config) {
+  tracker_ = std::make_shared<cache::ScanTracker>(
+      "wrapperBenchTracker", nullptr, 256UL << 10);
+  pool_ = memory::memoryManager()->addLeafPool("cbiWrapperBench");
+  auto& ids = fileIds();
+  for (const auto& f : files) {
+    files_.push_back(std::make_shared<LocalReadFile>(f.path));
+    fileIds_.emplace_back(ids, f.path);
+  }
+  buildCache();
+  if (config_.requireResidentCache) {
+    // measure phase: the SsdCache must have reloaded a checkpoint. An empty
+    // cache means the dir was missing/cold or the checkpoint failed to load;
+    // fail loud instead of silently re-reading from source.
+    VELOX_CHECK_GT(
+        ssdCache_->stats().entriesCached,
+        0,
+        "--phase=hot: SSD cache at {} is empty (no checkpoint reloaded); "
+        "run --phase=cold first",
+        config_.ssdPath);
+  }
+}
+
+void CbiHarness::buildCache() {
   namespace fs = std::filesystem;
   if (config_.clearCacheOnStart) {
     fs::remove_all(config_.ssdPath);
@@ -222,25 +245,27 @@ CbiHarness::CbiHarness(
 
   loadExecutor_ = std::make_unique<folly::IOThreadPoolExecutor>(
       config_.loadThreads > 0 ? config_.loadThreads : config_.ssdNumShards);
-  tracker_ = std::make_shared<cache::ScanTracker>(
-      "wrapperBenchTracker", nullptr, 256UL << 10);
-  pool_ = memory::memoryManager()->addLeafPool("cbiWrapperBench");
-  auto& ids = fileIds();
-  for (const auto& f : files) {
-    files_.push_back(std::make_shared<LocalReadFile>(f.path));
-    fileIds_.emplace_back(ids, f.path);
+}
+
+void CbiHarness::clearCache() {
+  // Tear down the cache stack in the same order as the destructor, then rebuild
+  // it empty. buildCache() wipes ssdPath when clearCacheOnStart is set, so the
+  // next sweep re-downloads from source and repopulates RAM+SSD from scratch.
+  if (ssdCache_ != nullptr) {
+    const auto ssd = ssdCache_->stats();
+    LOG(INFO) << "[cbi-cold] wiping cache (pre-pass): ssd entriesCached="
+              << ssd.entriesCached << " bytesCached=" << (ssd.bytesCached >> 20)
+              << "MiB -> removing " << config_.ssdPath;
   }
-  if (config_.requireResidentCache) {
-    // measure phase: the SsdCache must have reloaded a checkpoint. An empty
-    // cache means the dir was missing/cold or the checkpoint failed to load;
-    // fail loud instead of silently re-reading from source.
-    VELOX_CHECK_GT(
-        ssdCache_->stats().entriesCached,
-        0,
-        "--phase=hot: SSD cache at {} is empty (no checkpoint reloaded); "
-        "run --phase=cold first",
-        config_.ssdPath);
+  loadExecutor_.reset();
+  if (cache_ != nullptr) {
+    cache_->shutdown();
+    cache_.reset();
   }
+  ssdCache_ = nullptr;
+  ssdExecutor_.reset();
+  allocator_.reset();
+  buildCache();
 }
 
 CbiHarness::~CbiHarness() {
@@ -360,6 +385,27 @@ FcbiHarness::FcbiHarness(
     const HarnessConfig& config,
     const std::vector<SourceFile>& files)
     : config_(config) {
+  pool_ = memory::memoryManager()->addLeafPool("fcbiWrapperBench");
+  for (const auto& f : files) {
+    files_.push_back(std::make_shared<LocalReadFile>(f.path));
+    keys_.push_back(ch::FileCacheKey::fromPath(f.path));
+  }
+  buildCache();
+  if (config_.requireResidentCache) {
+    // measure phase: FileCache::initialize() must have reloaded segment
+    // metadata. No bytes on disk means the dir was missing/cold; fail loud.
+    // Valid because the harness loads metadata synchronously (the default,
+    // loadMetadataAsynchronously=false); an async load would need awaiting here.
+    VELOX_CHECK_GT(
+        cache_->stats().bytesOnDisk,
+        0,
+        "--phase=hot: FileCache at {} is empty (no metadata reloaded); "
+        "run --phase=cold first",
+        config_.filecacheRoot);
+  }
+}
+
+void FcbiHarness::buildCache() {
   namespace fs = std::filesystem;
   if (config_.clearCacheOnStart) {
     fs::remove_all(config_.filecacheRoot);
@@ -373,23 +419,17 @@ FcbiHarness::FcbiHarness(
   settings.validate();
   cache_ = std::make_unique<ch::FileCache>("wrapperBenchFc", settings);
   cache_->initialize();
-  pool_ = memory::memoryManager()->addLeafPool("fcbiWrapperBench");
-  for (const auto& f : files) {
-    files_.push_back(std::make_shared<LocalReadFile>(f.path));
-    keys_.push_back(ch::FileCacheKey::fromPath(f.path));
-  }
-  if (config_.requireResidentCache) {
-    // measure phase: FileCache::initialize() must have reloaded segment
-    // metadata. No bytes on disk means the dir was missing/cold; fail loud.
-    // Valid because the harness loads metadata synchronously (the default,
-    // loadMetadataAsynchronously=false); an async load would need awaiting here.
-    VELOX_CHECK_GT(
-        cache_->stats().bytesOnDisk,
-        0,
-        "--phase=hot: FileCache at {} is empty (no metadata reloaded); "
-        "run --phase=cold first",
-        config_.filecacheRoot);
-  }
+}
+
+void FcbiHarness::clearCache() {
+  // Drop the live FileCache and rebuild it empty. buildCache() wipes
+  // filecacheRoot when clearCacheOnStart is set, so the next sweep re-downloads
+  // from source and rewrites the on-disk segments from scratch.
+  LOG(INFO) << "[fcbi-cold] wiping cache (pre-pass): bytesOnDisk="
+            << (cache_->stats().bytesOnDisk >> 20) << "MiB -> removing "
+            << config_.filecacheRoot;
+  cache_.reset();
+  buildCache();
 }
 
 FcbiHarness::~FcbiHarness() {
