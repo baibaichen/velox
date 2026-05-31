@@ -81,6 +81,11 @@ DEFINE_int32(ssd_num_shards, 1,
     "downloads cache misses synchronously on the calling thread (CH-faithful, "
     "no separate download pool).");
 DEFINE_double(filecache_disk_gb, 80.0, "ch::FileCache disk size (GiB) for fcbi.");
+DEFINE_int32(cbi_load_threads, 0,
+    "cbi read (load) IO thread pool size. 0 keeps the legacy behavior of using "
+    "ssd_num_shards. Set to 1 to force a serial cbi read path (e.g. for fair "
+    "single-threaded on-CPU profiling) while keeping the SSD cache sharded for "
+    "checkpoint reload.");
 DEFINE_double(cbi_read_quantum_mb, 8.0,
     "cbi load quantum (cache granularity), MiB.");
 DEFINE_double(fcbi_segment_mb, 4.0,
@@ -469,6 +474,7 @@ void writeConfig(std::ostream& os) {
   os << "| ram_num_shards | " << FLAGS_ram_num_shards << " |\n";
   os << "| ssd_cache_gb | " << FLAGS_ssd_cache_gb << " |\n";
   os << "| ssd_num_shards | " << FLAGS_ssd_num_shards << " |\n";
+  os << "| cbi_load_threads | " << FLAGS_cbi_load_threads << " |\n";
   os << "| cbi_read_quantum_mb | " << FLAGS_cbi_read_quantum_mb << " |\n";
   os << "| velox_ssd_odirect | " << (FLAGS_velox_ssd_odirect ? "true" : "false")
      << " |\n";
@@ -607,6 +613,7 @@ int main(int argc, char** argv) {
   harnessConfig.ssdNumShards = FLAGS_ssd_num_shards;
   harnessConfig.ramCacheBytes = gbToBytes(FLAGS_ram_cache_gb);
   harnessConfig.ramNumShards = FLAGS_ram_num_shards;
+  harnessConfig.loadThreads = FLAGS_cbi_load_threads;
   harnessConfig.cbiReadQuantumBytes =
       static_cast<int32_t>(FLAGS_cbi_read_quantum_mb * (1 << 20));
   harnessConfig.ssdCheckpointIntervalBytes = 0;

@@ -182,6 +182,10 @@ struct HarnessConfig {
   int32_t ssdNumShards{1};
   uint64_t ramCacheBytes{0};
   int32_t ramNumShards{4};
+  // cbi read (load) IO thread pool size. 0 means "use ssdNumShards" (legacy
+  // behavior). Set to 1 to force a serial read path while keeping the SSD
+  // cache sharded for checkpoint reload.
+  int32_t loadThreads{0};
   int32_t cbiReadQuantumBytes{0};
   // Non-zero makes the SsdCache durable across restarts (checkpoint). The
   // benchmark leaves it 0 (no checkpoint); two-phase/verify runs set it.

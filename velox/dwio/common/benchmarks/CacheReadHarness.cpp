@@ -220,8 +220,8 @@ CbiHarness::CbiHarness(
   cache_ = cache::AsyncDataCache::create(
       allocator_.get(), std::move(ssdCache), cacheOptions);
 
-  loadExecutor_ =
-      std::make_unique<folly::IOThreadPoolExecutor>(config_.ssdNumShards);
+  loadExecutor_ = std::make_unique<folly::IOThreadPoolExecutor>(
+      config_.loadThreads > 0 ? config_.loadThreads : config_.ssdNumShards);
   tracker_ = std::make_shared<cache::ScanTracker>(
       "wrapperBenchTracker", nullptr, 256UL << 10);
   pool_ = memory::memoryManager()->addLeafPool("cbiWrapperBench");
