@@ -18,6 +18,12 @@
 # default OFF build is unaffected.
 add_executable(velox_bufferedinput_wrapper_benchmark
                BufferedInputWrapperBenchmark.cpp)
+# Default directory for the per-run markdown report (--report_dir). Using the
+# source dir keeps reports next to the benchmark regardless of the run cwd,
+# without hardcoding an absolute path in the source.
+target_compile_definitions(
+  velox_bufferedinput_wrapper_benchmark
+  PRIVATE WRAPPER_BENCH_REPORT_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(
   velox_bufferedinput_wrapper_benchmark
   PRIVATE

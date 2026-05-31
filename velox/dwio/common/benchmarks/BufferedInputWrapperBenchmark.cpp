@@ -40,14 +40,15 @@
 // pass with non-zero source bytes is flagged: it means the target was not fully
 // cache-resident and the number does not reflect the cache read path.
 //
-// All sizes are gflags; defaults honor the e2e alignment (4 GiB RAM / 50 GiB
-// SSD / 50 GiB disk). For a fast smoke run pass small overrides, e.g.
+// All sizes are gflags; defaults honor the e2e alignment (4 GiB RAM / 80 GiB
+// SSD / 80 GiB disk). For a fast smoke run pass small overrides, e.g.
 //   --ram_cache_gb=1 --ssd_cache_gb=4 --filecache_disk_gb=4
 //   --target_ws_gb=1.5 --read_sizes_kib=1024 --workloads=sequential
 //   --measure_passes=1
 
 #include <algorithm>
 #include <chrono>
+#include <ctime>
 #include <csignal>
 #include <cstdint>
 #include <cstring>
@@ -73,7 +74,6 @@
 #include "velox/common/caching/ScanTracker.h"
 #include "velox/common/caching/SsdCache.h"
 #include "velox/common/caching/filecache/FileCache.h"
-#include "velox/common/caching/filecache/FileCacheDownloadExecutor.h"
 #include "velox/common/caching/filecache/FileCacheKey.h"
 #include "velox/common/caching/filecache/FileCacheSettings.h"
 #include "velox/common/file/File.h"
@@ -92,16 +92,22 @@
 DECLARE_bool(velox_ssd_odirect);
 
 DEFINE_double(ram_cache_gb, 4.0, "AsyncDataCache RAM size (GiB) for cbi.");
-DEFINE_double(ssd_cache_gb, 50.0, "SsdCache size (GiB) for cbi.");
+DEFINE_double(ssd_cache_gb, 80.0, "SsdCache size (GiB) for cbi.");
 DEFINE_int32(ram_num_shards, 4, "AsyncDataCache shard count for cbi.");
 DEFINE_int32(ssd_num_shards, 1,
-    "SsdCache shard count for cbi. SsdCache shards by file id, so a single "
-    "synthetic blob lands entirely in one shard with capacity ssd_cache_gb / "
-    "ssd_num_shards. Keep this at 1 so the whole blob can use the full SSD.");
-DEFINE_double(filecache_disk_gb, 50.0, "ch::FileCache disk size (GiB) for fcbi.");
-DEFINE_double(read_quantum_mb, 8.0,
-    "Load quantum (cbi) and segment size/alignment (fcbi), MiB. Aligns "
-    "cache granularity across the two backends.");
+    "SsdCache shard count for cbi (also sizes cbi's ssd/load IO thread pools). "
+    "SsdCache shards by file id, so a single synthetic blob lands entirely in "
+    "one shard with capacity ssd_cache_gb / ssd_num_shards. Keep this at 1 so "
+    "the whole blob can use the full SSD. This is a cbi-only knob; fcbi "
+    "downloads cache misses synchronously on the calling thread (CH-faithful, "
+    "no separate download pool).");
+DEFINE_double(filecache_disk_gb, 80.0, "ch::FileCache disk size (GiB) for fcbi.");
+DEFINE_double(cbi_read_quantum_mb, 8.0,
+    "cbi load quantum (cache granularity), MiB.");
+DEFINE_double(fcbi_segment_mb, 4.0,
+    "fcbi segment size and boundary alignment (ch::FileCache "
+    "maxFileSegmentSize / boundaryAlignment), MiB. Defaults to 4 MiB to match "
+    "ch::FileCache's native boundary alignment.");
 DEFINE_double(target_ws_gb, 32.0,
     "Measured target working set (GiB). Must exceed ram_cache_gb so the "
     "measure passes read from SSD/disk, and target_ws_gb + scrub_gb must fit "
@@ -125,9 +131,19 @@ DEFINE_string(workloads, "sequential,zipfian", "Workload CSV: sequential,zipfian
 DEFINE_string(read_sizes_kib, "1024,8192", "Read-size CSV in KiB.");
 DEFINE_uint64(batch, 64, "Regions enqueued per BufferedInput before load().");
 DEFINE_int32(measure_passes, 3, "Measure passes per cell; median is reported.");
+DEFINE_string(wrappers, "both",
+    "Which wrappers to run: 'cbi', 'fcbi', or 'both'. Running a single wrapper "
+    "is useful for profiling (the sampler then sees only that read path).");
 DEFINE_string(ssd_path, "/tmp/velox_wrapper_bench_ssd", "SsdCache root for cbi.");
 DEFINE_string(filecache_root, "/tmp/velox_wrapper_bench_fc", "ch::FileCache root for fcbi.");
 DEFINE_string(out, "", "Markdown output path; empty writes stdout.");
+#ifndef WRAPPER_BENCH_REPORT_DIR
+#define WRAPPER_BENCH_REPORT_DIR "."
+#endif
+DEFINE_string(report_dir, WRAPPER_BENCH_REPORT_DIR,
+    "Directory for the per-run markdown report (effective config + results). A "
+    "timestamped bench_run_<YYYYMMDD_HHMMSS>.md is written here on every run. "
+    "Defaults to the benchmark source dir; set empty to disable.");
 DEFINE_string(data_dir, "",
     "If set, read the real *.parquet files in this directory (e.g. a TPC-H "
     "lineitem dir) instead of the synthetic blob. Each file gets its own cache "
@@ -501,7 +517,7 @@ class CbiHarness {
       io::ReaderOptions readerOptions{pool_.get()};
       readerOptions.setDataIoStats(ioStats);
       readerOptions.setLoadQuantum(
-          static_cast<int32_t>(FLAGS_read_quantum_mb * (1 << 20)));
+          static_cast<int32_t>(FLAGS_cbi_read_quantum_mb * (1 << 20)));
 
       dwio::common::CachedBufferedInput input(
           files_[fileIdx],
@@ -546,7 +562,7 @@ class FcbiHarness {
     std::filesystem::remove_all(FLAGS_filecache_root);
     std::filesystem::create_directories(FLAGS_filecache_root);
     const uint64_t segBytes =
-        static_cast<uint64_t>(FLAGS_read_quantum_mb * (1 << 20));
+        static_cast<uint64_t>(FLAGS_fcbi_segment_mb * (1 << 20));
     ch::FileCacheSettings settings;
     settings.path = FLAGS_filecache_root;
     settings.maxSize = gbToBytes(FLAGS_filecache_disk_gb);
@@ -555,8 +571,6 @@ class FcbiHarness {
     settings.validate();
     cache_ = std::make_unique<ch::FileCache>("wrapperBenchFc", settings);
     cache_->initialize();
-    executor_ = std::make_unique<ch::FileCacheDownloadExecutor>(
-        FLAGS_ssd_num_shards);
     pool_ = memory::memoryManager()->addLeafPool("fcbiWrapperBench");
     for (const auto& f : dataFiles()) {
       files_.push_back(std::make_shared<LocalReadFile>(f.path));
@@ -591,6 +605,12 @@ class FcbiHarness {
     r.tiers.ramBytes = 0; // no RAM tier
     r.tiers.ssdBytes = ioStats->ssdRead().sum();
     r.tiers.sourceBytes = ioStats->read().sum();
+    {
+      const auto st = cache_->stats();
+      LOG(ERROR) << "[fcbi-stats] hits=" << st.hits << " misses=" << st.misses
+                 << " dlBytes=" << st.downloadedBytes
+                 << " onDisk=" << st.bytesOnDisk << " evict=" << st.evictions;
+    }
     return r;
   }
 
@@ -621,7 +641,6 @@ class FcbiHarness {
           files_[fileIdx],
           *pool_,
           cache_.get(),
-          executor_.get(),
           keys_[fileIdx],
           ch::FileCache::getCommonOrigin(),
           ch::CreateFileSegmentSettings{},
@@ -641,7 +660,6 @@ class FcbiHarness {
   }
 
   std::unique_ptr<ch::FileCache> cache_;
-  std::unique_ptr<ch::FileCacheDownloadExecutor> executor_;
   std::shared_ptr<memory::MemoryPool> pool_;
   std::vector<std::shared_ptr<ReadFile>> files_;
   std::vector<ch::FileCacheKey> keys_;
@@ -659,6 +677,8 @@ struct WrapperRow {
 
 struct CellRow {
   CellSpec spec;
+  bool hasCbi{false};
+  bool hasFcbi{false};
   WrapperRow cbi;
   WrapperRow fcbi;
 };
@@ -761,13 +781,101 @@ void writeTable(std::ostream& os, const std::vector<CellRow>& rows) {
     os << " |\n";
   };
   for (const auto& row : rows) {
-    line(row.spec, row.cbi, 0.0, false);
-    const double cbiMs = wallMs(row.cbi.result);
-    const double delta = cbiMs == 0.0
-        ? 0.0
-        : 100.0 * (wallMs(row.fcbi.result) - cbiMs) / cbiMs;
-    line(row.spec, row.fcbi, delta, true);
+    if (row.hasCbi) {
+      line(row.spec, row.cbi, 0.0, false);
+    }
+    if (row.hasFcbi) {
+      const double cbiMs = wallMs(row.cbi.result);
+      const bool hasDelta = row.hasCbi && cbiMs != 0.0;
+      const double delta =
+          hasDelta ? 100.0 * (wallMs(row.fcbi.result) - cbiMs) / cbiMs : 0.0;
+      line(row.spec, row.fcbi, delta, hasDelta);
+    }
   }
+}
+
+// Renders the effective per-run configuration (the actual FLAGS values used)
+// as a markdown section, so every report is self-documenting. Mirrors the
+// cbi/fcbi/experiment grouping in cbi_vs_fcbi_full_config.md.
+void writeConfig(std::ostream& os) {
+  const uint64_t targetBytes = effectiveTargetBytes();
+  const double warmChunkGb = FLAGS_warm_chunk_gb > 0.0
+      ? FLAGS_warm_chunk_gb
+      : FLAGS_ram_cache_gb / 2.0;
+  os << "## Effective configuration\n\n";
+  os << "Data source: "
+     << (FLAGS_data_dir.empty()
+             ? "synthetic blob"
+             : (FLAGS_data_dir + " (" + std::to_string(dataFiles().size()) +
+                " file(s), " + std::to_string(rawTotalBytes() >> 30) +
+                " GiB raw)"))
+     << "  \n";
+  os << "Working set: " << (targetBytes >> 20) << " MiB\n\n";
+
+  os << "### CBI (AsyncDataCache RAM + SsdCache)\n\n";
+  os << "| option | value |\n|---|---|\n";
+  os << "| ram_cache_gb | " << FLAGS_ram_cache_gb << " |\n";
+  os << "| ram_num_shards | " << FLAGS_ram_num_shards << " |\n";
+  os << "| ssd_cache_gb | " << FLAGS_ssd_cache_gb << " |\n";
+  os << "| ssd_num_shards | " << FLAGS_ssd_num_shards << " |\n";
+  os << "| cbi_read_quantum_mb | " << FLAGS_cbi_read_quantum_mb << " |\n";
+  os << "| velox_ssd_odirect | " << (FLAGS_velox_ssd_odirect ? "true" : "false")
+     << " |\n";
+  os << "| ssd_path | " << FLAGS_ssd_path << " |\n\n";
+
+  os << "### FCBI (ch::FileCache + OS page cache)\n\n";
+  os << "| option | value |\n|---|---|\n";
+  os << "| filecache_disk_gb | " << FLAGS_filecache_disk_gb << " |\n";
+  os << "| fcbi_segment_mb | " << FLAGS_fcbi_segment_mb << " |\n";
+  os << "| fcbi_download | synchronous (CH-faithful, serial foreground) |\n";
+  os << "| filecache_root | " << FLAGS_filecache_root << " |\n\n";
+
+  os << "### Experiment\n\n";
+  os << "| option | value |\n|---|---|\n";
+  os << "| wrappers | " << FLAGS_wrappers << " |\n";
+  os << "| target_ws_gb | " << FLAGS_target_ws_gb << " |\n";
+  os << "| scrub_gb | " << FLAGS_scrub_gb << " |\n";
+  os << "| warm_chunk_gb (effective) | " << warmChunkGb << " |\n";
+  os << "| measure_passes | " << FLAGS_measure_passes << " |\n";
+  os << "| workloads | " << FLAGS_workloads << " |\n";
+  os << "| read_sizes_kib | " << FLAGS_read_sizes_kib << " |\n";
+  os << "| batch | " << FLAGS_batch << " |\n\n";
+}
+
+// Local timestamp YYYYMMDD_HHMMSS for the report filename.
+std::string runTimestamp() {
+  const auto now = std::chrono::system_clock::to_time_t(
+      std::chrono::system_clock::now());
+  std::tm tm{};
+  localtime_r(&now, &tm);
+  char buf[32];
+  std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
+  return buf;
+}
+
+// Writes the per-run report (config + results) to
+// report_dir/bench_run_<timestamp>.md. No-op when --report_dir is empty.
+void writeReport(const std::vector<CellRow>& rows) {
+  if (FLAGS_report_dir.empty()) {
+    return;
+  }
+  std::error_code ec;
+  std::filesystem::create_directories(FLAGS_report_dir, ec);
+  const std::string ts = runTimestamp();
+  const std::filesystem::path path =
+      std::filesystem::path(FLAGS_report_dir) / ("bench_run_" + ts + ".md");
+  std::ofstream os{path};
+  if (!os.good()) {
+    LOG(WARNING) << "Failed to open report path: " << path.string();
+    return;
+  }
+  os << "# velox_bufferedinput_wrapper_benchmark run " << ts << "\n\n";
+  os << "See `cbi_vs_fcbi_full_config.md` for the meaning of each option and "
+     << "the cbi/fcbi fairness caveats.\n\n";
+  writeConfig(os);
+  os << "## Results\n\n";
+  writeTable(os, rows);
+  LOG(INFO) << "Wrote run report to " << path.string();
 }
 
 void cleanup() {
@@ -839,27 +947,46 @@ int main(int argc, char** argv) {
     }
   }
 
+  const bool runCbi = FLAGS_wrappers == "both" || FLAGS_wrappers == "cbi";
+  const bool runFcbi = FLAGS_wrappers == "both" || FLAGS_wrappers == "fcbi";
+  VELOX_USER_CHECK(
+      runCbi || runFcbi,
+      "--wrappers must be 'cbi', 'fcbi', or 'both' (got '{}')", FLAGS_wrappers);
+
   std::vector<CellRow> rows;
   rows.reserve(cells.size());
   for (const auto& spec : cells) {
     LOG(INFO) << "cell workload=" << workloadName(spec.workload)
               << " read=" << (spec.readSize >> 10) << "KiB";
-    CbiHarness cbi;
-    const auto cbiRes = runWrapper(cbi, spec);
-    FcbiHarness fcbi;
-    const auto fcbiRes = runWrapper(fcbi, spec);
-    rows.push_back(CellRow{
-        spec, WrapperRow{"cbi", cbiRes}, WrapperRow{"fcbi", fcbiRes}});
-    LOG(INFO) << "  cbi wall=" << wallMs(cbiRes) << "ms ssd_MB="
-              << (cbiRes.tiers.ssdBytes >> 20)
-              << " src_MB=" << (cbiRes.tiers.sourceBytes >> 20)
-              << " | fcbi wall=" << wallMs(fcbiRes) << "ms ssd_MB="
-              << (fcbiRes.tiers.ssdBytes >> 20)
-              << " src_MB=" << (fcbiRes.tiers.sourceBytes >> 20);
-    if (cbiRes.tiers.sourceBytes > 0 || fcbiRes.tiers.sourceBytes > 0) {
+    CellRow row{spec};
+    if (runCbi) {
+      CbiHarness cbi;
+      row.cbi = WrapperRow{"cbi", runWrapper(cbi, spec)};
+      row.hasCbi = true;
+    }
+    if (runFcbi) {
+      FcbiHarness fcbi;
+      row.fcbi = WrapperRow{"fcbi", runWrapper(fcbi, spec)};
+      row.hasFcbi = true;
+    }
+    const auto& cbiRes = row.cbi.result;
+    const auto& fcbiRes = row.fcbi.result;
+    LOG(INFO) << "  "
+              << (runCbi ? "cbi wall=" + std::to_string(wallMs(cbiRes)) +
+                      "ms ssd_MB=" + std::to_string(cbiRes.tiers.ssdBytes >> 20) +
+                      " src_MB=" + std::to_string(cbiRes.tiers.sourceBytes >> 20)
+                         : std::string{})
+              << (runCbi && runFcbi ? " | " : "")
+              << (runFcbi ? "fcbi wall=" + std::to_string(wallMs(fcbiRes)) +
+                      "ms ssd_MB=" + std::to_string(fcbiRes.tiers.ssdBytes >> 20) +
+                      " src_MB=" + std::to_string(fcbiRes.tiers.sourceBytes >> 20)
+                          : std::string{});
+    if ((runCbi && cbiRes.tiers.sourceBytes > 0) ||
+        (runFcbi && fcbiRes.tiers.sourceBytes > 0)) {
       LOG(WARNING) << "  non-zero source bytes: target not fully cache-resident;"
                    << " increase ssd/disk size or lower target_ws_gb";
     }
+    rows.push_back(std::move(row));
   }
 
   if (FLAGS_out.empty()) {
@@ -870,6 +997,8 @@ int main(int argc, char** argv) {
     writeTable(out, rows);
     LOG(INFO) << "Wrote " << rows.size() << " cells to " << FLAGS_out;
   }
+
+  writeReport(rows);
 
   cleanup();
   return 0;
