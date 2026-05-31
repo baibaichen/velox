@@ -109,6 +109,16 @@ DEFINE_bool(rebuild_remote_file, false, "Force rebuilding the remote blob.");
 DEFINE_string(workloads, "sequential,zipfian", "Workload CSV: sequential,zipfian,uniform.");
 DEFINE_string(read_sizes_kib, "1024,8192", "Read-size CSV in KiB.");
 DEFINE_uint64(batch, 64, "Regions enqueued per BufferedInput before load().");
+DEFINE_bool(use_mmap_allocator, false,
+    "Use Velox MmapAllocator (size-class arena with page reuse) instead of the "
+    "default MallocAllocator (std::malloc). Presto-native sets this true by "
+    "default; Gluten leaves it false. With MallocAllocator, large per-read "
+    "buffers are mmap'd/munmap'd by glibc and re-page-faulted on every read; "
+    "MmapAllocator reuses resident pages and avoids that overhead.");
+DEFINE_double(allocator_capacity_gb, 64.0,
+    "MmapAllocator arena capacity (GiB). Only used when --use_mmap_allocator. "
+    "Must exceed the peak concurrent allocation footprint; reserved as address "
+    "space (no upfront physical commit).");
 DEFINE_int32(measure_passes, 3, "Measure passes per cell; median is reported.");
 DEFINE_string(wrappers, "both",
     "Which wrappers to run: 'cbi', 'fcbi', 'dbi', 'both' (cbi+fcbi) or 'all' "
@@ -483,6 +493,11 @@ void writeConfig(std::ostream& os) {
   os << "| workloads | " << FLAGS_workloads << " |\n";
   os << "| read_sizes_kib | " << FLAGS_read_sizes_kib << " |\n";
   os << "| batch | " << FLAGS_batch << " |\n";
+  os << "| use_mmap_allocator | "
+     << (FLAGS_use_mmap_allocator ? "true" : "false") << " |\n";
+  if (FLAGS_use_mmap_allocator) {
+    os << "| allocator_capacity_gb | " << FLAGS_allocator_capacity_gb << " |\n";
+  }
   if (gMemAvailableKib > 0) {
     os << "| pre-measure MemAvailable GiB | " << (gMemAvailableKib >> 20)
        << " |\n";
@@ -554,7 +569,13 @@ int main(int argc, char** argv) {
 
   using namespace facebook::velox;
   filesystems::registerLocalFileSystem();
-  memory::MemoryManager::initialize(memory::MemoryManager::Options{});
+  memory::MemoryManager::Options memoryOptions;
+  memoryOptions.useMmapAllocator = FLAGS_use_mmap_allocator;
+  if (FLAGS_use_mmap_allocator) {
+    memoryOptions.allocatorCapacity =
+        static_cast<int64_t>(FLAGS_allocator_capacity_gb * (1LL << 30));
+  }
+  memory::MemoryManager::initialize(memoryOptions);
 
   // O_DIRECT default: the e2e A/B benchmark runs the SsdCache with O_DIRECT off
   // so cbi reads go through the OS page cache. Apply the same default here
