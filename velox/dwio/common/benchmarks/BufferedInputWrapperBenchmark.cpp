@@ -51,41 +51,20 @@
 #include <ctime>
 #include <csignal>
 #include <cstdint>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
-#include <map>
-#include <memory>
-#include <random>
 #include <string>
 #include <vector>
 
-#include <unistd.h>
-
 #include <folly/String.h>
-#include <folly/executors/IOThreadPoolExecutor.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include "velox/common/base/Exceptions.h"
-#include "velox/common/caching/AsyncDataCache.h"
-#include "velox/common/caching/FileIds.h"
-#include "velox/common/caching/ScanTracker.h"
-#include "velox/common/caching/SsdCache.h"
-#include "velox/common/caching/filecache/FileCache.h"
-#include "velox/common/caching/filecache/FileCacheKey.h"
-#include "velox/common/caching/filecache/FileCacheSettings.h"
-#include "velox/common/file/File.h"
 #include "velox/common/file/FileSystems.h"
-#include "velox/common/io/IoStatistics.h"
-#include "velox/common/io/Options.h"
-#include "velox/common/memory/MmapAllocator.h"
 #include "velox/common/memory/Memory.h"
-#include "velox/dwio/common/CachedBufferedInput.h"
-#include "velox/dwio/common/FileCacheBufferedInput.h"
-#include "velox/dwio/common/MetricsLog.h"
-#include "velox/dwio/common/SeekableInputStream.h"
+#include "velox/dwio/common/benchmarks/CacheReadHarness.h"
 #include "velox/dwio/common/benchmarks/WorkloadDriver.h"
 
 // Defined in velox/flag_definitions/flags.cpp; global default is O_DIRECT.
@@ -154,9 +133,14 @@ DEFINE_string(data_dir, "",
 namespace facebook::velox {
 namespace {
 
-using dwio::common::LogType;
-using dwio::common::MetricsLog;
-using dwio::common::SeekableInputStream;
+using dwio::common::bench::CbiHarness;
+using dwio::common::bench::DataLayout;
+using dwio::common::bench::FcbiHarness;
+using dwio::common::bench::HarnessConfig;
+using dwio::common::bench::PassResult;
+using dwio::common::bench::SourceFile;
+using dwio::common::bench::WorkingSet;
+using dwio::common::bench::WorkingSetConfig;
 using dwio::common::bench::WorkloadDriver;
 
 constexpr const char* kRemotePath = "/tmp/velox_wrapper_bench_remote.bin";
@@ -165,171 +149,23 @@ uint64_t gbToBytes(double gb) {
   return static_cast<uint64_t>(gb * static_cast<double>(1ULL << 30));
 }
 
-uint64_t remoteBytes() {
-  if (FLAGS_remote_gb > 0.0) {
-    return gbToBytes(FLAGS_remote_gb);
-  }
-  return gbToBytes(FLAGS_target_ws_gb + FLAGS_scrub_gb + 1.0);
-}
+// The working set and harness config are built once in main() and read through
+// these file-scope pointers by the report/run helpers (which still source the
+// rest of their values straight from FLAGS).
+const WorkingSet* gWorkingSet = nullptr;
+const HarnessConfig* gHarnessConfig = nullptr;
 
-// Lazily (re)builds the shared remote blob, pseudo-random with a fixed seed.
-void ensureRemoteFile() {
-  namespace fs = std::filesystem;
-  const uint64_t want = remoteBytes();
-  if (!FLAGS_rebuild_remote_file && fs::exists(kRemotePath) &&
-      fs::file_size(kRemotePath) == want) {
-    return;
-  }
-  LOG(INFO) << "Building remote blob " << kRemotePath << " (" << want
-            << " bytes)";
-  std::ofstream out{kRemotePath, std::ios::binary | std::ios::trunc};
-  constexpr size_t kChunk = 1 << 20;
-  std::vector<char> chunk(kChunk);
-  std::mt19937_64 rng{0xfeedfaceULL};
-  for (uint64_t written = 0; written < want; written += kChunk) {
-    for (size_t i = 0; i < kChunk; i += 8) {
-      const uint64_t v = rng();
-      std::memcpy(chunk.data() + i, &v, 8);
-    }
-    const size_t toWrite =
-        static_cast<size_t>(std::min<uint64_t>(kChunk, want - written));
-    out.write(chunk.data(), toWrite);
-  }
-  VELOX_CHECK(out.good(), "Failed to write remote blob");
-}
-
-// One readable file in the working set.
-struct SourceFile {
-  std::string path;
-  uint64_t size;
-};
-
-// The shared set of files read by both wrappers, built once. data_dir mode
-// scans the directory's *.parquet files (sorted for a deterministic sequential
-// order); otherwise it is the single synthetic blob.
 const std::vector<SourceFile>& dataFiles() {
-  static const std::vector<SourceFile> files = [] {
-    std::vector<SourceFile> v;
-    namespace fs = std::filesystem;
-    if (!FLAGS_data_dir.empty()) {
-      for (const auto& e : fs::directory_iterator(FLAGS_data_dir)) {
-        if (!e.is_regular_file()) {
-          continue;
-        }
-        const auto name = e.path().filename().string();
-        if (!name.empty() && name.front() == '.') {
-          continue; // skip dotfiles such as .*.crc
-        }
-        if (e.path().extension() != ".parquet") {
-          continue;
-        }
-        v.push_back({e.path().string(), static_cast<uint64_t>(e.file_size())});
-      }
-      std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) {
-        return a.path < b.path;
-      });
-      VELOX_USER_CHECK(
-          !v.empty(), "No .parquet files found in --data_dir {}", FLAGS_data_dir);
-    } else {
-      v.push_back({kRemotePath, remoteBytes()});
-    }
-    return v;
-  }();
-  return files;
+  return gWorkingSet->files();
 }
 
 uint64_t rawTotalBytes() {
-  uint64_t total = 0;
-  for (const auto& f : dataFiles()) {
-    total += f.size;
-  }
-  return total;
+  return gWorkingSet->rawTotalBytes();
 }
 
-// Working-set size in bytes, independent of read size. Synthetic mode honors
-// target_ws_gb directly; data_dir mode caps the union of files to target_ws_gb
-// (0 = all of it).
 uint64_t effectiveTargetBytes() {
-  if (FLAGS_data_dir.empty()) {
-    return gbToBytes(FLAGS_target_ws_gb);
-  }
-  const uint64_t raw = rawTotalBytes();
-  const uint64_t cap =
-      FLAGS_target_ws_gb > 0.0 ? gbToBytes(FLAGS_target_ws_gb) : raw;
-  return std::min(cap, raw);
+  return gWorkingSet->effectiveTargetBytes();
 }
-
-// Maps a flat block-key space onto the (possibly multi-file) working set. Each
-// file contributes floor(size / readSize) fixed-size blocks (tail remainder
-// dropped so no read straddles a file). A flat key in [0, totalKeys) resolves
-// to the file holding it and the byte offset within that file.
-class DataLayout {
- public:
-  DataLayout(
-      const std::vector<SourceFile>& files,
-      uint64_t readSize,
-      uint64_t maxBytes)
-      : readSize_(readSize) {
-    const uint64_t maxBlocks = maxBytes / readSize;
-    prefix_.push_back(0);
-    uint64_t acc = 0;
-    for (const auto& f : files) {
-      if (maxBytes > 0 && acc >= maxBlocks) {
-        break;
-      }
-      uint64_t blocks = f.size / readSize;
-      if (maxBytes > 0) {
-        blocks = std::min(blocks, maxBlocks - acc);
-      }
-      if (blocks == 0) {
-        continue;
-      }
-      acc += blocks;
-      prefix_.push_back(acc);
-    }
-    total_ = acc;
-    VELOX_USER_CHECK_GT(
-        total_,
-        0,
-        "No readable blocks: read size {} exceeds the file sizes",
-        readSize);
-  }
-
-  uint64_t totalKeys() const {
-    return total_;
-  }
-
-  struct Loc {
-    uint32_t fileIdx;
-    uint64_t offset;
-  };
-
-  Loc resolve(uint64_t key) const {
-    const auto it = std::upper_bound(prefix_.begin(), prefix_.end(), key);
-    const auto idx = static_cast<uint32_t>(
-        std::distance(prefix_.begin(), it) - 1);
-    return Loc{idx, (key - prefix_[idx]) * readSize_};
-  }
-
- private:
-  const uint64_t readSize_;
-  uint64_t total_{0};
-  // prefix_[i] = cumulative blocks before file i; prefix_.back() == total_.
-  std::vector<uint64_t> prefix_;
-};
-
-// Tier-aware byte counters for one measured sweep.
-struct TierBytes {
-  uint64_t ramBytes{0};
-  uint64_t ssdBytes{0}; // local cache (SSD for cbi / disk for fcbi)
-  uint64_t sourceBytes{0}; // remote/source reads -- should be ~0 when warm
-};
-
-struct PassResult {
-  uint64_t wallNs{0};
-  uint64_t requestedBytes{0};
-  TierBytes tiers;
-};
 
 const char* workloadName(ch::bench::Workload w) {
   switch (w) {
@@ -369,301 +205,6 @@ std::vector<T> parseCsv(const std::string& csv, T (*parse)(const std::string&)) 
   }
   return out;
 }
-
-uint64_t drain(SeekableInputStream& stream, uint64_t expected) {
-  uint64_t copied = 0;
-  const void* data = nullptr;
-  int32_t size = 0;
-  while (copied < expected && stream.Next(&data, &size)) {
-    copied += std::min<uint64_t>(static_cast<uint64_t>(size), expected - copied);
-  }
-  return copied;
-}
-
-// ---- cbi: CachedBufferedInput + AsyncDataCache(RAM) + SsdCache ----
-class CbiHarness {
- public:
-  CbiHarness() {
-    std::filesystem::remove_all(FLAGS_ssd_path);
-    std::filesystem::create_directories(FLAGS_ssd_path);
-    ssdExecutor_ = std::make_unique<folly::IOThreadPoolExecutor>(
-        FLAGS_ssd_num_shards);
-    if (gflags::GetCommandLineFlagInfoOrDie("velox_ssd_odirect").is_default) {
-      FLAGS_velox_ssd_odirect = false;
-    }
-    const cache::SsdCache::Config ssdConfig(
-        FLAGS_ssd_path + "/cache",
-        gbToBytes(FLAGS_ssd_cache_gb),
-        FLAGS_ssd_num_shards,
-        ssdExecutor_.get(),
-        /*checkpointIntervalBytes=*/0);
-    auto ssdCache = std::make_unique<cache::SsdCache>(ssdConfig);
-
-    memory::MemoryAllocator::Options allocOptions;
-    allocOptions.capacity = gbToBytes(FLAGS_ram_cache_gb);
-    allocator_ = std::make_shared<memory::MmapAllocator>(allocOptions);
-
-    cache::AsyncDataCache::Options cacheOptions;
-    cacheOptions.numShards = FLAGS_ram_num_shards;
-    ssdCache_ = ssdCache.get();
-    cache_ = cache::AsyncDataCache::create(
-        allocator_.get(), std::move(ssdCache), cacheOptions);
-
-    loadExecutor_ = std::make_unique<folly::IOThreadPoolExecutor>(
-        FLAGS_ssd_num_shards);
-    tracker_ = std::make_shared<cache::ScanTracker>(
-        "wrapperBenchTracker", nullptr, 256UL << 10);
-    pool_ = memory::memoryManager()->addLeafPool("cbiWrapperBench");
-    auto& ids = fileIds();
-    for (const auto& f : dataFiles()) {
-      files_.push_back(std::make_shared<LocalReadFile>(f.path));
-      fileIds_.emplace_back(ids, f.path);
-    }
-  }
-
-  ~CbiHarness() {
-    loadExecutor_.reset();
-    if (cache_ != nullptr) {
-      cache_->shutdown();
-      cache_.reset();
-    }
-    ssdExecutor_.reset();
-    allocator_.reset();
-    std::error_code ec;
-    std::filesystem::remove_all(FLAGS_ssd_path, ec);
-  }
-
-  // Runs one enqueue/load/drain sweep of `driver` for `ops` operations,
-  // constructing a fresh CachedBufferedInput per `batch` regions. Returns wall
-  // time, requested bytes and tier-byte deltas measured via a fresh
-  // IoStatistics plus SsdCache backend bytesRead.
-  PassResult sweep(
-      WorkloadDriver& driver,
-      uint64_t ops,
-      uint64_t readSize,
-      const DataLayout& layout) {
-    const auto ioStats = std::make_shared<io::IoStatistics>();
-    const auto ssdBefore = ssdCache_->stats();
-    PassResult r;
-    r.requestedBytes = ops * readSize;
-    const auto t0 = std::chrono::steady_clock::now();
-    uint64_t done = 0;
-    while (done < ops) {
-      const uint64_t n = std::min<uint64_t>(FLAGS_batch, ops - done);
-      runBatch(driver, n, readSize, layout, ioStats);
-      done += n;
-    }
-    const auto t1 = std::chrono::steady_clock::now();
-    r.wallNs =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-    r.tiers.ramBytes = ioStats->ramHit().sum();
-    r.tiers.ssdBytes = ioStats->ssdRead().sum();
-    r.tiers.sourceBytes = ioStats->read().sum();
-    // SsdCache backend confirmation: prefer its bytesRead when IoStatistics
-    // ssdRead is not populated by the load path.
-    const auto ssdDelta = ssdCache_->stats().bytesRead - ssdBefore.bytesRead;
-    if (r.tiers.ssdBytes == 0 && ssdDelta > 0) {
-      r.tiers.ssdBytes = ssdDelta;
-    }
-    return r;
-  }
-
-  // Forces RAM-resident, ssd-savable entries out to SSD and blocks until the
-  // writes complete. Must drive the SsdCache write state machine in the
-  // startWrite() -> saveToSsd() -> waitForWriteToFinish() order: saveToSsd()
-  // requires a write to be in progress and SsdCache::write() asserts every
-  // shard is in the writing state.
-  void flush() {
-    ssdCache_->waitForWriteToFinish();
-    if (ssdCache_->startWrite()) {
-      cache_->saveToSsd(/*saveAll=*/true);
-      ssdCache_->waitForWriteToFinish();
-    }
-  }
-
-  // Logs SSD residency after warming so a failed warm (drops, no-space,
-  // eviction) is visible before the measure passes run.
-  void logWarmState() const {
-    const auto s = ssdCache_->stats();
-    LOG(INFO) << "  cbi warm: ssd bytesCached=" << (s.bytesCached >> 20)
-              << "MiB entriesCached=" << s.entriesCached
-              << " bytesWritten=" << (s.bytesWritten >> 20)
-              << "MiB writeDropped=" << s.writeSsdDropped
-              << " writeErrors=" << s.writeSsdErrors
-              << " noSpace=" << s.writeSsdNoSpaceErrors
-              << " regionsEvicted=" << s.regionsEvicted;
-  }
-
- private:
-  void runBatch(
-      WorkloadDriver& driver,
-      uint64_t n,
-      uint64_t readSize,
-      const DataLayout& layout,
-      const std::shared_ptr<io::IoStatistics>& ioStats) {
-    auto& ids = fileIds();
-    StringIdLease groupId{ids, "wrapperBenchGroup"};
-    // Resolve the batch's keys to (file, offset) and group by file: each
-    // CachedBufferedInput is tied to one file, so a batch spanning several files
-    // builds one input per file.
-    std::map<uint32_t, std::vector<uint64_t>> byFile;
-    for (uint64_t i = 0; i < n; ++i) {
-      const auto region = driver.nextRegion();
-      const auto loc = layout.resolve(region.offset / readSize);
-      byFile[loc.fileIdx].push_back(loc.offset);
-    }
-
-    for (const auto& [fileIdx, offsets] : byFile) {
-      io::ReaderOptions readerOptions{pool_.get()};
-      readerOptions.setDataIoStats(ioStats);
-      readerOptions.setLoadQuantum(
-          static_cast<int32_t>(FLAGS_cbi_read_quantum_mb * (1 << 20)));
-
-      dwio::common::CachedBufferedInput input(
-          files_[fileIdx],
-          MetricsLog::voidLog(),
-          fileIds_[fileIdx],
-          cache_.get(),
-          tracker_,
-          groupId,
-          ioStats,
-          nullptr,
-          loadExecutor_.get(),
-          readerOptions);
-
-      std::vector<std::unique_ptr<SeekableInputStream>> streams;
-      streams.reserve(offsets.size());
-      for (const auto offset : offsets) {
-        streams.push_back(
-            input.enqueue(velox::common::Region{offset, readSize}, nullptr));
-      }
-      input.load(LogType::TEST);
-      for (auto& stream : streams) {
-        (void)drain(*stream, readSize);
-      }
-    }
-  }
-
-  std::unique_ptr<folly::IOThreadPoolExecutor> ssdExecutor_;
-  std::unique_ptr<folly::IOThreadPoolExecutor> loadExecutor_;
-  std::shared_ptr<memory::MmapAllocator> allocator_;
-  std::shared_ptr<cache::AsyncDataCache> cache_;
-  cache::SsdCache* ssdCache_{nullptr};
-  std::shared_ptr<cache::ScanTracker> tracker_;
-  std::shared_ptr<memory::MemoryPool> pool_;
-  std::vector<std::shared_ptr<ReadFile>> files_;
-  std::vector<StringIdLease> fileIds_;
-};
-
-// ---- fcbi: FileCacheBufferedInput + ch::FileCache(disk) ----
-class FcbiHarness {
- public:
-  FcbiHarness() {
-    std::filesystem::remove_all(FLAGS_filecache_root);
-    std::filesystem::create_directories(FLAGS_filecache_root);
-    const uint64_t segBytes =
-        static_cast<uint64_t>(FLAGS_fcbi_segment_mb * (1 << 20));
-    ch::FileCacheSettings settings;
-    settings.path = FLAGS_filecache_root;
-    settings.maxSize = gbToBytes(FLAGS_filecache_disk_gb);
-    settings.maxFileSegmentSize = segBytes;
-    settings.boundaryAlignment = segBytes;
-    settings.validate();
-    cache_ = std::make_unique<ch::FileCache>("wrapperBenchFc", settings);
-    cache_->initialize();
-    pool_ = memory::memoryManager()->addLeafPool("fcbiWrapperBench");
-    for (const auto& f : dataFiles()) {
-      files_.push_back(std::make_shared<LocalReadFile>(f.path));
-      keys_.push_back(ch::FileCacheKey::fromPath(f.path));
-    }
-  }
-
-  ~FcbiHarness() {
-    cache_.reset();
-    std::error_code ec;
-    std::filesystem::remove_all(FLAGS_filecache_root, ec);
-  }
-
-  PassResult sweep(
-      WorkloadDriver& driver,
-      uint64_t ops,
-      uint64_t readSize,
-      const DataLayout& layout) {
-    const auto ioStats = std::make_shared<io::IoStatistics>();
-    PassResult r;
-    r.requestedBytes = ops * readSize;
-    const auto t0 = std::chrono::steady_clock::now();
-    uint64_t done = 0;
-    while (done < ops) {
-      const uint64_t n = std::min<uint64_t>(FLAGS_batch, ops - done);
-      runBatch(driver, n, readSize, layout, ioStats);
-      done += n;
-    }
-    const auto t1 = std::chrono::steady_clock::now();
-    r.wallNs =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-    r.tiers.ramBytes = 0; // no RAM tier
-    r.tiers.ssdBytes = ioStats->ssdRead().sum();
-    r.tiers.sourceBytes = ioStats->read().sum();
-    {
-      const auto st = cache_->stats();
-      LOG(ERROR) << "[fcbi-stats] hits=" << st.hits << " misses=" << st.misses
-                 << " dlBytes=" << st.downloadedBytes
-                 << " onDisk=" << st.bytesOnDisk << " evict=" << st.evictions;
-    }
-    return r;
-  }
-
-  // ch::FileCache writes to disk synchronously during load, so warmed segments
-  // are already disk-resident; no RAM->disk flush step is needed.
-  void flush() {}
-
-  void logWarmState() const {}
-
- private:
-  void runBatch(
-      WorkloadDriver& driver,
-      uint64_t n,
-      uint64_t readSize,
-      const DataLayout& layout,
-      const std::shared_ptr<io::IoStatistics>& ioStats) {
-    // Resolve and group by file; FileCacheBufferedInput is tied to one key, and
-    // enqueue accumulates regions, so build a fresh instance per file per batch.
-    std::map<uint32_t, std::vector<uint64_t>> byFile;
-    for (uint64_t i = 0; i < n; ++i) {
-      const auto region = driver.nextRegion();
-      const auto loc = layout.resolve(region.offset / readSize);
-      byFile[loc.fileIdx].push_back(loc.offset);
-    }
-
-    for (const auto& [fileIdx, offsets] : byFile) {
-      ch::FileCacheBufferedInput input(
-          files_[fileIdx],
-          *pool_,
-          cache_.get(),
-          keys_[fileIdx],
-          ch::FileCache::getCommonOrigin(),
-          ch::CreateFileSegmentSettings{},
-          ioStats);
-
-      std::vector<std::unique_ptr<SeekableInputStream>> streams;
-      streams.reserve(offsets.size());
-      for (const auto offset : offsets) {
-        streams.push_back(
-            input.enqueue(velox::common::Region{offset, readSize}, nullptr));
-      }
-      input.load(LogType::TEST);
-      for (auto& stream : streams) {
-        (void)drain(*stream, readSize);
-      }
-    }
-  }
-
-  std::unique_ptr<ch::FileCache> cache_;
-  std::shared_ptr<memory::MemoryPool> pool_;
-  std::vector<std::shared_ptr<ReadFile>> files_;
-  std::vector<ch::FileCacheKey> keys_;
-};
 
 struct CellSpec {
   ch::bench::Workload workload;
@@ -902,6 +443,46 @@ int main(int argc, char** argv) {
   filesystems::registerLocalFileSystem();
   memory::MemoryManager::initialize(memory::MemoryManager::Options{});
 
+  // O_DIRECT default: the e2e A/B benchmark runs the SsdCache with O_DIRECT off
+  // so cbi reads go through the OS page cache. Apply the same default here
+  // unless the user set --velox_ssd_odirect explicitly. Must run before the
+  // harnesses construct their SsdCache.
+  if (gflags::GetCommandLineFlagInfoOrDie("velox_ssd_odirect").is_default) {
+    FLAGS_velox_ssd_odirect = false;
+  }
+
+  // Build the working set once (synthetic: a deterministic blob; data_dir: a
+  // sorted scan of the real *.parquet files) and the cache config the harnesses
+  // read. All sizes are converted from the gb/mb flags to bytes here.
+  WorkingSetConfig wsConfig;
+  wsConfig.dataDir = FLAGS_data_dir;
+  wsConfig.remotePath = kRemotePath;
+  wsConfig.targetBytes = gbToBytes(FLAGS_target_ws_gb);
+  wsConfig.scrubBytes = gbToBytes(FLAGS_scrub_gb);
+  wsConfig.remoteBytesOverride =
+      FLAGS_remote_gb > 0.0 ? gbToBytes(FLAGS_remote_gb) : 0;
+  wsConfig.rebuildRemote = FLAGS_rebuild_remote_file;
+  const WorkingSet workingSet = WorkingSet::create(wsConfig);
+  gWorkingSet = &workingSet;
+
+  HarnessConfig harnessConfig;
+  harnessConfig.ssdPath = FLAGS_ssd_path;
+  harnessConfig.ssdCacheBytes = gbToBytes(FLAGS_ssd_cache_gb);
+  harnessConfig.ssdNumShards = FLAGS_ssd_num_shards;
+  harnessConfig.ramCacheBytes = gbToBytes(FLAGS_ram_cache_gb);
+  harnessConfig.ramNumShards = FLAGS_ram_num_shards;
+  harnessConfig.cbiReadQuantumBytes =
+      static_cast<int32_t>(FLAGS_cbi_read_quantum_mb * (1 << 20));
+  harnessConfig.ssdCheckpointIntervalBytes = 0;
+  harnessConfig.filecacheRoot = FLAGS_filecache_root;
+  harnessConfig.filecacheDiskBytes = gbToBytes(FLAGS_filecache_disk_gb);
+  harnessConfig.fcbiSegmentBytes =
+      static_cast<uint64_t>(FLAGS_fcbi_segment_mb * (1 << 20));
+  harnessConfig.batch = FLAGS_batch;
+  harnessConfig.clearCacheOnStart = true;
+  harnessConfig.cleanupOnDestroy = true;
+  gHarnessConfig = &harnessConfig;
+
   // Validate that the working set exceeds RAM (so measure passes hit the
   // SSD/disk tier) and fits in both caches. In data_dir mode the working set is
   // the union of the real files capped by target_ws_gb, so validate in bytes.
@@ -923,9 +504,10 @@ int main(int argc, char** argv) {
       "backing file)");
 
   signal(SIGINT, onSigint);
-  if (FLAGS_data_dir.empty()) {
-    ensureRemoteFile();
-  } else {
+  // Build the synthetic blob (if any) only after the config passed validation,
+  // so a misconfigured run fails fast without a wasted multi-GiB write.
+  workingSet.materialize();
+  if (!FLAGS_data_dir.empty()) {
     LOG(INFO) << "Reading " << dataFiles().size() << " real file(s) from "
               << FLAGS_data_dir << " (" << (rawTotalBytes() >> 30)
               << " GiB raw, working set " << (targetBytes >> 30) << " GiB)";
@@ -960,12 +542,12 @@ int main(int argc, char** argv) {
               << " read=" << (spec.readSize >> 10) << "KiB";
     CellRow row{spec};
     if (runCbi) {
-      CbiHarness cbi;
+      CbiHarness cbi{*gHarnessConfig, dataFiles()};
       row.cbi = WrapperRow{"cbi", runWrapper(cbi, spec)};
       row.hasCbi = true;
     }
     if (runFcbi) {
-      FcbiHarness fcbi;
+      FcbiHarness fcbi{*gHarnessConfig, dataFiles()};
       row.fcbi = WrapperRow{"fcbi", runWrapper(fcbi, spec)};
       row.hasFcbi = true;
     }

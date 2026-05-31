@@ -12,6 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Shared cache-read harness: working-set resolution, flat-key DataLayout and the
+# per-wrapper read harnesses (cbi / fcbi). Reused by the wrapper microbench and
+# the standalone velox_cache_verify tool.
+add_library(velox_cache_read_harness CacheReadHarness.cpp)
+target_link_libraries(
+  velox_cache_read_harness
+  PUBLIC
+    velox_dwio_common
+    velox_ch_file_cache
+    velox_caching
+    velox_file
+    velox_memory
+    velox_exception
+    Folly::folly
+    gflags::gflags
+    glog::glog)
+
 # Wrapper microbench comparing CachedBufferedInput (AsyncDataCache + SsdCache)
 # vs FileCacheBufferedInput (ch::FileCache), with cache config aligned to the
 # e2e TPC-H A/B benchmark. Gated on VELOX_ENABLE_BENCHMARKS_BASIC so the
@@ -27,6 +44,7 @@ target_compile_definitions(
 target_link_libraries(
   velox_bufferedinput_wrapper_benchmark
   PRIVATE
+    velox_cache_read_harness
     velox_dwio_common
     velox_ch_file_cache
     velox_caching
@@ -36,3 +54,7 @@ target_link_libraries(
     Folly::folly
     gflags::gflags
     glog::glog)
+
+if(${VELOX_BUILD_TESTING})
+  add_subdirectory(tests)
+endif()
