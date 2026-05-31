@@ -38,7 +38,6 @@
 #include <tuple>
 #include <vector>
 
-#include "velox/common/base/BitUtil.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/caching/filecache/EvictionCandidates.h"
 #include "velox/common/caching/filecache/FileCacheSettings.h"
@@ -887,8 +886,8 @@ FileCache::getOrSet(
     const size_t alignment = boundary_alignment_.value_or(boundaryAlignment);
     const auto aligned_offset = roundDownToMultiple(initial_range.left, alignment);
     auto aligned_end_offset = (file_size
-        ? std::min(bits::roundUp(initial_range.right + 1, alignment), file_size)
-        : bits::roundUp(initial_range.right + 1, alignment)) - 1;
+        ? std::min(FileCacheUtils::roundUpToMultiple(initial_range.right + 1, alignment), file_size)
+        : FileCacheUtils::roundUpToMultiple(initial_range.right + 1, alignment)) - 1;
 
     VELOX_DCHECK(aligned_offset <= initial_range.left);
     VELOX_DCHECK(aligned_end_offset >= initial_range.right);

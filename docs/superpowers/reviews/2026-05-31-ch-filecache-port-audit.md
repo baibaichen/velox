@@ -37,7 +37,7 @@
 | ID | 主题 | 层 | GPT-5.5 | Claude-d | 独立 | 作者复核 | 最终 |
 |---|---|---|:--:|:--:|:--:|:--:|:--:|
 | F1 | 读路径缓存写/预留失败未降级为 bypass → 硬失败 | 集成 | H | H | H | 确认 | **HIGH** |
-| F2 | `boundaryAlignment==0` 时 `roundUp` 除零崩溃（丢 0 保护） | **核心** | – | – | H | **确认（真坑）** | **HIGH** |
+| F2 | `boundaryAlignment==0` 时 `roundUp` 除零崩溃（丢 0 保护） | **核心** | – | – | H | **确认（真坑）** | **HIGH** ✅ 已修复 |
 | F3 | `FileSegment::write` 部分写失败后缺 ENOSPC 处理/元数据修复 | **核心** | M | M | H | 确认 | **HIGH** |
 | F4 | per-query 缓存配额事实禁用（query context NYI） | 核心(NYI) | H | M | M | – | MEDIUM |
 | F5 | keep-free-space 后台任务 NYI，配置开启即抛 | 核心(NYI) | H | – | M | – | MEDIUM |
@@ -78,7 +78,13 @@
 - **差异/影响**：缓存盘满、配额超限或缓存盘 IO 错误时，CH 查询降级成功，Velox 查询**硬失败**。生产可用性实质回归。
 - **判定**：待人确认。集成读路径按 spec §7 有意改写，但「缓存失败→查询失败」是否可接受需拍板；若要对齐 CH 健壮性，需补 bypass 远端读降级。
 
-### F2 — `boundaryAlignment==0` 除零崩溃（HIGH，核心层，作者已逐行复核确认）
+### F2 — `boundaryAlignment==0` 除零崩溃（HIGH，核心层，作者已逐行复核确认）✅ 已修复
+
+> **已修复**：`FileCache.cpp:890-891` 的 `bits::roundUp` 改回带 0 保护的
+> `FileCacheUtils::roundUpToMultiple`（复用现有、已单测、忠于 CH 的工具函数），
+> 并移除随之未使用的 `#include "velox/common/base/BitUtil.h"`。
+> 新增回归测试 `FileCacheBufferedInputTest.zeroBoundaryAlignmentDoesNotDivideByZero`
+> 揭示该坑（改前 `SIGFPE`/exit 136，改后 74/74 通过）。
 
 - **CH**：两个对齐工具都防 0。
   - `src/Interpreters/FileCache/FileCacheUtils.h:9-20`（`roundUpToMultiple`/`roundDownToMultiple` 均 `if (!multiple) return num;`）
@@ -243,7 +249,7 @@
 按「核心层应忠实、集成层有意改写」原则区分：
 
 **应修的核心层 bug（核心层却偏离 → 最可疑）：**
-1. **F2 对齐除零** — 核心 `FileCache.cpp`，一行修复（`bits::roundUp` 改回带 0 保护的 `roundUpToMultiple`）。
+1. **F2 对齐除零** ✅ 已修复 — 核心 `FileCache.cpp`，一行修复（`bits::roundUp` 改回带 0 保护的 `roundUpToMultiple`），并补回归测试。
 2. **F3 write 失败 ENOSPC 处理** — 核心 `FileSegment.cpp`，补 `downloaded_size` 校正与空文件清理。
 
 **需拍板的集成层改写后果（spec §7 已声明读路径重写）：**

@@ -29,6 +29,7 @@
   .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; color:var(--vx); }
   .badge { color:#0e1117; font-weight:700; font-size:11px; padding:2px 8px; border-radius:20px; }
   .badge.sm { font-size:10px; padding:1px 7px; }
+  .badge.fixed { background:#3fb950; color:#0e1117; }
   .card { background:var(--panel); border:1px solid var(--line); border-radius:12px;
            padding:16px 18px; margin:16px 0; scroll-margin-top:16px; }
   .card:target { border-color:var(--vx); box-shadow:0 0 0 1px var(--vx); }
@@ -89,7 +90,7 @@
     <thead><tr><th>ID</th><th>主题</th><th>层</th><th class="ctr">GPT-5.5</th><th class="ctr">Claude-d</th><th class="ctr">独立</th><th class="ctr">最终</th></tr></thead>
     <tbody>
 <tr><td><a class="jump" href="#F1">F1</a></td><td>读路径无 bypass 降级 → 硬失败</td><td>集成</td><td class="ctr">H</td><td class="ctr">H</td><td class="ctr">H</td><td class="ctr"><span class="badge sm" style="background:#ff5c5c">HIGH</span></td></tr>
-<tr><td><a class="jump" href="#F2">F2</a></td><td>boundaryAlignment==0 除零崩溃</td><td>核心</td><td class="ctr">–</td><td class="ctr">–</td><td class="ctr">H</td><td class="ctr"><span class="badge sm" style="background:#ff5c5c">HIGH</span></td></tr>
+<tr><td><a class="jump" href="#F2">F2</a></td><td>boundaryAlignment==0 除零崩溃</td><td>核心</td><td class="ctr">–</td><td class="ctr">–</td><td class="ctr">H</td><td class="ctr"><span class="badge sm" style="background:#ff5c5c">HIGH</span> <span class="badge sm fixed">✅ 已修复</span></td></tr>
 <tr><td><a class="jump" href="#F3">F3</a></td><td>write 部分写失败缺 ENOSPC 处理</td><td>核心</td><td class="ctr">M</td><td class="ctr">M</td><td class="ctr">H</td><td class="ctr"><span class="badge sm" style="background:#ff5c5c">HIGH</span></td></tr>
 <tr><td><a class="jump" href="#F4">F4</a></td><td>per-query 配额事实禁用 (NYI)</td><td>核心</td><td class="ctr">H</td><td class="ctr">M</td><td class="ctr">M</td><td class="ctr"><span class="badge sm" style="background:#ffb454">MEDIUM</span></td></tr>
 <tr><td><a class="jump" href="#F5">F5</a></td><td>free-space scheduler NYI 配置即抛</td><td>核心</td><td class="ctr">H</td><td class="ctr">–</td><td class="ctr">M</td><td class="ctr"><span class="badge sm" style="background:#ffb454">MEDIUM</span></td></tr>
@@ -114,6 +115,7 @@
       <span class="fid">F1</span>
       <span class="title">读路径缓存写/预留失败未降级为 bypass → 硬失败</span>
       <span class="layer">集成层</span>
+      
     </div>
     <div class="votes">三方评级 — GPT-5.5: <b>H</b> · Claude-detailed: <b>H</b> · 独立: <b>H</b> &nbsp;|&nbsp; 三方一致 HIGH；作者复核确认</div>
     <div class="cols">
@@ -166,6 +168,7 @@ state.read_type = ReadType::REMOTE_FS_READ_BYPASS_CACHE;   <span class="c">// ke
       <span class="fid">F2</span>
       <span class="title">boundaryAlignment==0 时 roundUp 除零崩溃（丢 0 保护）</span>
       <span class="layer">核心层</span>
+      <span class="badge fixed">✅ 已修复</span>
     </div>
     <div class="votes">三方评级 — GPT-5.5: <b>–</b> · Claude-detailed: <b>–</b> · 独立: <b>H</b> &nbsp;|&nbsp; 另两方漏掉；作者逐行复核确认为真坑</div>
     <div class="cols">
@@ -197,7 +200,7 @@ state.read_type = ReadType::REMOTE_FS_READ_BYPASS_CACHE;   <span class="c">// ke
 }</code></pre>
       </div>
     </div>
-    <div class="impact"><b>影响：</b>settings 校验不禁止 alignment=0，而 CH 默认 per-read alignment 就是 0。配 boundaryAlignment=0 时 getOrSet 触发 SIGFPE。一行修复：改回带 0 保护的 roundUpToMultiple。</div>
+    <div class="impact"><b>影响：</b>settings 校验不禁止 alignment=0，而 CH 默认 per-read alignment 就是 0。配 boundaryAlignment=0 时 getOrSet 触发 SIGFPE。【已修复】改回带 0 保护的 FileCacheUtils::roundUpToMultiple（复用现有已单测工具），并补回归测试 zeroBoundaryAlignmentDoesNotDivideByZero（改前 SIGFPE，改后 74/74 通过）。</div>
   </div>
 
   <div class="card" id="F3">
@@ -206,6 +209,7 @@ state.read_type = ReadType::REMOTE_FS_READ_BYPASS_CACHE;   <span class="c">// ke
       <span class="fid">F3</span>
       <span class="title">FileSegment::write 部分写失败后缺 ENOSPC 处理 / 元数据修复</span>
       <span class="layer">核心层</span>
+      
     </div>
     <div class="votes">三方评级 — GPT-5.5: <b>M</b> · Claude-detailed: <b>M</b> · 独立: <b>H</b> &nbsp;|&nbsp; 三方一致（严重度 M~H）</div>
     <div class="cols">
@@ -252,6 +256,7 @@ state.read_type = ReadType::REMOTE_FS_READ_BYPASS_CACHE;   <span class="c">// ke
       <span class="fid">F4</span>
       <span class="title">per-query 缓存配额事实禁用（query context NYI）</span>
       <span class="layer">核心层 (NYI)</span>
+      
     </div>
     <div class="votes">三方评级 — GPT-5.5: <b>H</b> · Claude-detailed: <b>M</b> · 独立: <b>M</b> &nbsp;|&nbsp; 三方一致；默认行为与 CH 相同（CH 默认也禁用）</div>
     <div class="cols">
@@ -285,6 +290,7 @@ FileCacheQueryLimit::tryGetQueryContext(<span class="k">const</span> CacheStateG
       <span class="fid">F5</span>
       <span class="title">keep-free-space 后台任务 NYI，配置开启即抛</span>
       <span class="layer">核心层 (NYI)</span>
+      
     </div>
     <div class="votes">三方评级 — GPT-5.5: <b>H</b> · Claude-detailed: <b>–</b> · 独立: <b>M</b> &nbsp;|&nbsp; 默认 ratio=1 不触发；配置开启时显式抛错（非静默）</div>
     <div class="cols">
@@ -312,6 +318,7 @@ FileCacheQueryLimit::tryGetQueryContext(<span class="k">const</span> CacheStateG
       <span class="fid">F6</span>
       <span class="title">reserve 锁等待超时硬编码 10s（应可配，默认 1s）</span>
       <span class="layer">集成 / 下载</span>
+      
     </div>
     <div class="votes">三方评级 — GPT-5.5: <b>M</b> · Claude-detailed: <b>–</b> · 独立: <b>M</b> &nbsp;|&nbsp; 双方一致；仅时序，无数据损坏</div>
     <div class="cols">
@@ -337,6 +344,7 @@ FileCacheQueryLimit::tryGetQueryContext(<span class="k">const</span> CacheStateG
       <span class="fid">F7</span>
       <span class="title">FileCacheKey 哈希不同（SpookyHashV2 vs SipHash128）</span>
       <span class="layer">已文档化</span>
+      
     </div>
     <div class="votes">三方评级 — GPT-5.5: <b>M</b> · Claude-detailed: <b>L</b> · 独立: <b>(折叠)</b> &nbsp;|&nbsp; 代码注释已说明为有意替换；非 bug</div>
     <div class="cols">
@@ -364,6 +372,7 @@ FileCacheQueryLimit::tryGetQueryContext(<span class="k">const</span> CacheStateG
       <span class="fid">F8</span>
       <span class="title">getCallerId 丢 query_id / 线程名</span>
       <span class="layer">核心层（等价）</span>
+      
     </div>
     <div class="votes">三方评级 — GPT-5.5: <b>–</b> · Claude-detailed: <b>L</b> · 独立: <b>M</b> &nbsp;|&nbsp; 进程内 downloader 选举靠唯一 thread id 仍正确</div>
     <div class="cols">
@@ -474,7 +483,7 @@ FileCacheQueryLimit::tryGetQueryContext(<span class="k">const</span> CacheStateG
 
   <h2>优先级建议</h2>
   <ol class="prio">
-    <li><b>F2 对齐除零（核心层，一行修复）</b> —— round-up 改回带 0 保护的 <code>roundUpToMultiple</code>，消除崩溃面。</li>
+    <li><b>F2 对齐除零（核心层，一行修复）</b> <span class="badge fixed">✅ 已修复</span> —— round-up 改回带 0 保护的 <code>FileCacheUtils::roundUpToMultiple</code>，消除崩溃面，并补回归测试。</li>
     <li><b>F3 write 失败 ENOSPC 处理（核心层）</b> —— 补 <code>downloaded_size</code> 校正与空文件清理，对齐 CH。</li>
     <li><b>F1 无 bypass 降级（集成层，需拍板）</b> —— 「盘满 / IO 错 → 查询硬失败」是可用性回归；读路径按 spec §7 有意改写，是否补 bypass 远端读由产品决定。</li>
     <li><span class="note">已知 NYI（显式抛错非静默）：F4 query 配额、F5 free-space scheduler，默认不触发。等价适配 / 非功能：F7·F8·F12·F13·F14·F15。</span></li>
