@@ -108,9 +108,15 @@ int32_t dispatchAbMain(
   } else if (FLAGS_input_source == "cbi") {
     VELOX_USER_CHECK_GT(
         FLAGS_cache_gb, 0, "--input_source=cbi requires --cache_gb > 0");
+  } else if (FLAGS_input_source == "direct") {
+    // No application-level cache: with FLAGS_cache_gb == 0 the AsyncDataCache
+    // tier stays nullptr and no ch::FileCache singleton is installed, so
+    // createBufferedInput() falls back to DirectBufferedInput (pure Velox
+    // direct reads). Must be set before ab.initialize() builds the cache.
+    FLAGS_cache_gb = 0;
   } else {
     VELOX_USER_FAIL(
-        "Unknown --input_source: {} (expected cbi or filecache)",
+        "Unknown --input_source: {} (expected cbi, filecache, or direct)",
         FLAGS_input_source);
   }
 
@@ -118,7 +124,8 @@ int32_t dispatchAbMain(
 
   // Wire the per-backend cold-reset used by --cold_each_round. filecache tears
   // down and reinstalls its singleton (re-wiping disk + metadata via the same
-  // installFileCache() path used at startup); cbi clears its AsyncDataCache.
+  // installFileCache() path used at startup); the else branch covers cbi (clears
+  // its AsyncDataCache) and direct (clearCbiCache is a no-op as no cache exists).
   if (FLAGS_input_source == "filecache") {
     ab.setColdResetFn([&ownedFileCache]() {
       ch::FileCache::setInstance(nullptr);

@@ -26,9 +26,10 @@
 DEFINE_string(
     input_source,
     "",
-    "Cache backend for the A/B sweep. One of: cbi, filecache. Empty disables "
-    "the new A/B path and falls back to the legacy folly::runBenchmarks() "
-    "flow (see the suite's BenchmarkMain.cpp).");
+    "Cache backend for the A/B sweep. One of: cbi, filecache, direct. 'direct' "
+    "installs no application cache (pure Velox DirectBufferedInput reads). Empty "
+    "disables the new A/B path and falls back to the legacy "
+    "folly::runBenchmarks() flow (see the suite's BenchmarkMain.cpp).");
 
 DEFINE_int32(
     rounds,

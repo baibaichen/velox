@@ -46,7 +46,8 @@ class AbBenchmarkBase : public facebook::velox::QueryBenchmarkBase {
   /// Sets a callback invoked at the top of each round (after the first) when
   /// --cold_each_round is set, to return the active cache backend to a cold
   /// state. dispatchAbMain wires this per backend: fscache reinstalls its
-  /// singleton; cbi clears its AsyncDataCache.
+  /// singleton; cbi clears its AsyncDataCache; direct has no cache so the reset
+  /// is a no-op.
   void setColdResetFn(std::function<void()> fn) {
     coldResetFn_ = std::move(fn);
   }
