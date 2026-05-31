@@ -164,7 +164,8 @@ using dwio::common::bench::WorkingSet;
 using dwio::common::bench::WorkingSetConfig;
 using dwio::common::bench::WorkloadDriver;
 
-constexpr const char* kRemotePath = "/tmp/velox_wrapper_bench_remote.bin";
+constexpr const char* kRemotePath =
+    facebook::velox::dwio::common::bench::kSyntheticBlobPath;
 
 // Two-phase persistent-cache workflow (see --phase). kFull warms then measures
 // in one process; kPrime only warms+persists; kMeasure reloads and only

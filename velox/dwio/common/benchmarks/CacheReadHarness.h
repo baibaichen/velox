@@ -66,6 +66,12 @@ struct SourceFile {
   uint64_t size;
 };
 
+// Default synthetic-blob path. Shared by the wrapper microbench and the
+// velox_cache_verify tool so both resolve the exact same source bytes when run
+// in synthetic mode (no --data_dir).
+inline constexpr const char* kSyntheticBlobPath =
+    "/tmp/velox_wrapper_bench_remote.bin";
+
 // Tier-aware byte counters for one measured sweep. sourceBytes should be ~0
 // when the working set is fully cache-resident.
 struct TierBytes {

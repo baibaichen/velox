@@ -21,3 +21,13 @@ target_link_libraries(
     velox_exception
     GTest::gtest
     GTest::gtest_main)
+
+add_executable(velox_cache_verify_test CacheVerifyTest.cpp)
+add_test(velox_cache_verify_test velox_cache_verify_test)
+target_link_libraries(
+  velox_cache_verify_test
+  PRIVATE
+    velox_cache_read_harness
+    velox_exception
+    GTest::gtest
+    GTest::gtest_main)
