@@ -195,11 +195,36 @@ uint64_t gbToBytes(double gb) {
   return static_cast<uint64_t>(gb * static_cast<double>(1ULL << 30));
 }
 
+// MemAvailable from /proc/meminfo, in KiB (the field's "kB" is really KiB), or 0
+// if it can't be read. Captured before the measure passes as a "hot is really
+// hot" sanity signal: the working set has to fit in the OS page cache for a
+// measured read to actually be served warm (matters most for dbi and the
+// O_DIRECT-off cbi/fcbi tiers, which lean on the page cache).
+uint64_t readMemAvailableKib() {
+  const std::string kField = "MemAvailable:";
+  std::ifstream meminfo{"/proc/meminfo"};
+  std::string line;
+  while (std::getline(meminfo, line)) {
+    if (line.rfind(kField, 0) == 0) {
+      try {
+        return std::stoull(line.substr(kField.size()));
+      } catch (const std::exception&) {
+        return 0;
+      }
+    }
+  }
+  return 0;
+}
+
 // The working set and harness config are built once in main() and read through
 // these file-scope pointers by the report/run helpers (which still source the
 // rest of their values straight from FLAGS).
 const WorkingSet* gWorkingSet = nullptr;
 const HarnessConfig* gHarnessConfig = nullptr;
+// MemAvailable (KiB) snapshot taken just before the measure passes; 0 in prime
+// runs or when /proc/meminfo is unavailable. Read into the report by
+// writeConfig.
+uint64_t gMemAvailableKib = 0;
 
 const std::vector<SourceFile>& dataFiles() {
   return gWorkingSet->files();
@@ -457,7 +482,12 @@ void writeConfig(std::ostream& os) {
   os << "| reuse_cache | " << (FLAGS_reuse_cache ? "true" : "false") << " |\n";
   os << "| workloads | " << FLAGS_workloads << " |\n";
   os << "| read_sizes_kib | " << FLAGS_read_sizes_kib << " |\n";
-  os << "| batch | " << FLAGS_batch << " |\n\n";
+  os << "| batch | " << FLAGS_batch << " |\n";
+  if (gMemAvailableKib > 0) {
+    os << "| pre-measure MemAvailable GiB | " << (gMemAvailableKib >> 20)
+       << " |\n";
+  }
+  os << "\n";
 }
 
 // Local timestamp YYYYMMDD_HHMMSS for the report filename.
@@ -647,6 +677,17 @@ int main(int argc, char** argv) {
 
   std::vector<CellRow> rows;
   rows.reserve(cells.size());
+  // Snapshot MemAvailable before the measure passes (skip prime: it only warms).
+  // A measured "hot" read is only trustworthy if the target fits in the page
+  // cache, so record the headroom as a sanity signal in the log and report.
+  if (phase != Phase::kPrime) {
+    gMemAvailableKib = readMemAvailableKib();
+    if (gMemAvailableKib > 0) {
+      LOG(INFO) << "pre-measure MemAvailable=" << (gMemAvailableKib >> 20)
+                << " GiB (working set " << (targetBytes >> 20)
+                << " MiB; hot reads need it page-cache resident)";
+    }
+  }
   for (const auto& spec : cells) {
     LOG(INFO) << "cell workload=" << workloadName(spec.workload)
               << " read=" << (spec.readSize >> 10) << "KiB";
