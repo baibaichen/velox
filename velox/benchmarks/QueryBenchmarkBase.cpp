@@ -86,6 +86,16 @@ DEFINE_int32(
     "--cache_mem_gb, and query memory pressure no longer evicts the cache. If "
     "0, the cache shares the query allocator (legacy behavior, where the cache "
     "can grow to fill --cache_gb).");
+DEFINE_int32(
+    query_mem_gb,
+    0,
+    "GB of process memory for the query mmap allocator when --cache_gb is 0 "
+    "(e.g. the FileCache and Direct backends, which build no in-process "
+    "AsyncDataCache). If > 0, the MemoryManager uses an MmapAllocator capped at "
+    "this size so all backends share the same allocator behavior (the mmap "
+    "arena pre-reserves address space and recycles pages, avoiding the page "
+    "faults the default malloc allocator incurs). Ignored when --cache_gb is "
+    "non-0, where the allocator is sized by --cache_gb instead.");
 DEFINE_int32(num_repeats, 1, "Number of times to run each query");
 DEFINE_int32(num_io_threads, 8, "Threads for speculative IO");
 DEFINE_string(
@@ -197,14 +207,26 @@ void QueryBenchmarkBase::initialize() {
   // SsdCache constructor resolves its on-disk path via getFileSystem(), which
   // fails if no file system is registered yet.
   filesystems::registerLocalFileSystem();
-  if (FLAGS_cache_gb) {
+  // Decide the query memory budget backing the MmapAllocator-based
+  // MemoryManager. cbi sizes it from --cache_gb; the FileCache and Direct
+  // backends run with --cache_gb 0 but can opt into the same mmap query
+  // allocator via --query_mem_gb, so every backend shares one allocator
+  // behavior (the mmap arena recycles pages instead of faulting in fresh ones
+  // like the default malloc allocator).
+  const int64_t mmapCapacityGb =
+      FLAGS_cache_gb > 0 ? FLAGS_cache_gb : FLAGS_query_mem_gb;
+  if (mmapCapacityGb > 0) {
     memory::MemoryManager::Options options;
-    int64_t memoryBytes = FLAGS_cache_gb * (1LL << 30);
     options.useMmapAllocator = true;
-    options.allocatorCapacity = memoryBytes;
+    options.allocatorCapacity = mmapCapacityGb * (1LL << 30);
     options.useMmapArena = true;
     options.mmapArenaCapacityRatio = 1;
     memory::MemoryManager::testingSetInstance(options);
+  } else {
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
+  }
+
+  if (FLAGS_cache_gb) {
     std::unique_ptr<cache::SsdCache> ssdCache;
     if (FLAGS_ssd_cache_gb) {
       // Default the SSD cache to buffered IO (matching Gluten), unless the
@@ -249,8 +271,6 @@ void QueryBenchmarkBase::initialize() {
     cache_ = cache::AsyncDataCache::create(
         cacheAllocator, std::move(ssdCache), cacheOptions);
     cache::AsyncDataCache::setInstance(cache_.get());
-  } else {
-    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
   functions::prestosql::registerAllScalarFunctions();
   aggregate::prestosql::registerAllAggregateFunctions();
