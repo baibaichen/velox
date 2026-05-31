@@ -346,24 +346,26 @@ FileCacheQueryLimit::tryGetQueryContext(<span class="k">const</span> CacheStateG
       <span class="layer">已文档化</span>
       
     </div>
-    <div class="votes">三方评级 — GPT-5.5: <b>M</b> · Claude-detailed: <b>L</b> · 独立: <b>(折叠)</b> &nbsp;|&nbsp; 代码注释已说明为有意替换；非 bug</div>
+    <div class="votes">三方评级 — GPT-5.5: <b>M</b> · Claude-detailed: <b>L</b> · 独立: <b>(折叠)</b> &nbsp;|&nbsp; 有意替换；非 bug。影响更正 2026-05-31：跨重启可复用</div>
     <div class="cols">
       <div class="col">
-        <div class="col-label ch">ClickHouse — sipHash128</div>
+        <div class="col-label ch">ClickHouse — sipHash128（固定零 key）</div>
         <pre><code><span class="c">// FileCacheKey::fromPath(path): sipHash128(path.data(), path.size())</span></code></pre>
       </div>
       <div class="col">
-        <div class="col-label vx">Velox — SpookyHashV2（注释已说明）</div>
+        <div class="col-label vx">Velox — SpookyHashV2（固定种子 0,0，同为确定性哈希）</div>
         <pre><code>FileCacheKey FileCacheKey::fromPath(<span class="k">const</span> <span class="t">std</span>::string&amp; path) {
   <span class="t">uint64_t</span> h1 = <span class="n">0</span>, h2 = <span class="n">0</span>;
-  <span class="c">// TODO(hash-stability): CH uses sipHash128 here. We pin SpookyHashV2 ...</span>
-  <span class="c">// cache directory is NOT reusable across builds/restarts.</span>
+  <span class="c">// CH uses sipHash128; we pin SpookyHashV2 (fixed seed 0,0). Both are</span>
+  <span class="c">// deterministic -&gt; keys ARE stable across restarts of the same binary.</span>
+  <span class="c">// Only limitation: different algorithm than CH, so the cache directory</span>
+  <span class="c">// cannot be shared with a real ClickHouse instance.</span>
   <span class="t">folly</span>::hash::SpookyHashV2::Hash128(path.data(), path.size(), &amp;h1, &amp;h2);
   <span class="k">return</span> FileCacheKey((static_cast&lt;UInt128&gt;(h1) &lt;&lt; <span class="n">64</span>) | h2);
 }</code></pre>
       </div>
     </div>
-    <div class="impact"><b>影响：</b>同一路径 key 与 CH 不一致 → 缓存目录不可与 CH 互用。等价适配。</div>
+    <div class="impact"><b>影响：</b>更正：两者在固定 key/seed 下都是确定性哈希 → 同一路径同一二进制产出同一 key，跨进程重启稳定可复用（配合 initialize()→loadMetadata() 重扫目录）。唯一真实限制是算法不同 → 缓存目录无法与真实 ClickHouse 互通；进程内/跨重启复用不受影响。原代码注释「NOT reusable across restarts」措辞过宽，将修正。</div>
   </div>
 
   <div class="card" id="F8">

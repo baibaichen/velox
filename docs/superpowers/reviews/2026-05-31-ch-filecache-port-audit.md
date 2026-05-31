@@ -141,14 +141,24 @@
 - **影响**：锁竞争/缓存满时放弃时机与 CH 不等价，配置不可控。仅时序，无数据损坏。
 - **判定**：待人确认。
 
-### F7 — `FileCacheKey` 哈希不同（LOW，已文档化）
+### F7 — `FileCacheKey` 哈希不同（LOW，已文档化）（影响更正 2026-05-31）
 
-- **CH**：`fromPath()` 用 `sipHash128(path.data(), path.size())`。
+- **CH**：`fromPath()` 用 `sipHash128(path.data(), path.size())`（固定零 key）。
   - `src/Interpreters/FileCache/FileCacheKey.cpp:31-34`
-- **Velox**：`fromPath()` 用 `folly::hash::SpookyHashV2::Hash128`，代码注释已说明不同于 CH。
+- **Velox**：`fromPath()` 用 `folly::hash::SpookyHashV2::Hash128`（固定种子 `0,0`）。
   - `velox/common/caching/filecache/FileCacheKey.cpp:66-75`
-- **影响**：同一路径生成的 128-bit key 与 CH 不一致 → 缓存目录不可与 CH 互用。
-- **判定**：等价适配（已文档化）；若目标是「缓存目录与 CH 互通」才算 bug。
+- **确定性（关键更正）**：SipHash128 与 SpookyHashV2 在固定 key/seed 下**都是确定性哈希** ——
+  同一路径、同一二进制每次产出同一 128-bit key，**跨进程重启稳定可复用**。配合
+  `FileCache::initialize()`→`loadMetadata()` 重扫缓存目录（`FileCache.cpp:449,500`），
+  重启后即可复用已落盘段（前提：不 wipe 目录、文件路径不变）。
+  - ⚠️ `FileCacheKey.cpp` 原注释「cache directory is NOT reusable across builds/restarts」
+    **措辞过宽**：跨「重启」实际可复用；仅跨「folly 改了 SpookyHashV2 实现的构建」或
+    「与真实 ClickHouse 互通」才不可用。该注释将在 direct-read baseline 工作中修正。
+- **影响（更正后）**：唯一真实限制是**算法不同（SpookyHashV2 ≠ SipHash128）→ 缓存目录无法与
+  真实 ClickHouse 互通**；进程内 / 跨重启复用不受影响。抗 DoS / 加密强度对缓存身份无实际意义
+  （key 源自可信文件路径，非对手可控输入）。
+- **判定**：等价适配（已文档化）；仅当目标为「缓存目录与 CH 互通」时才需移植 SipHash128
+  （见 HANDOFF §4 siphash-port TODO）。
 
 ### F8 — `getCallerId` 丢 query_id（LOW，核心层等价）
 
