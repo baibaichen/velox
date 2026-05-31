@@ -32,6 +32,17 @@ TEST(FileCacheKeyTest, fromPathDeterministic) {
   EXPECT_FALSE(a == c);
 }
 
+// Golden vector locking the hash's stability across restarts AND builds.
+// fromPath() uses SpookyHashV2 with a fixed zero seed and no runtime salt, so a
+// given path always maps to the same 128-bit key in any process of any build.
+// If this value ever changes, the on-disk cache directory silently stops being
+// reusable across restarts -- so the change must be deliberate, not incidental.
+TEST(FileCacheKeyTest, fromPathStableAcrossBuilds) {
+  EXPECT_EQ(
+      FileCacheKey::fromPath("/velox/filecache/stability/probe").toString(),
+      "ee9020b538f79bed736ed6d8b5df8a48");
+}
+
 TEST(FileCacheKeyTest, toStringIs32LowercaseHex) {
   const auto key = FileCacheKey::fromPath("/some/path");
   const auto keyString = key.toString();

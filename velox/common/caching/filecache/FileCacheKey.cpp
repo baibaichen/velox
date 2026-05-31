@@ -66,10 +66,12 @@ FileCacheKey FileCacheKey::random() {
 FileCacheKey FileCacheKey::fromPath(const std::string& path) {
   uint64_t h1 = 0;
   uint64_t h2 = 0;
-  // TODO(hash-stability): CH uses sipHash128 here. We pin SpookyHashV2 (no folly
-  // SipHash available), so cache keys are process-local and the cache directory is
-  // NOT reusable across builds/restarts. See spec §2.1 (hash substitution). Port
-  // CH's SipHash128 if cross-run key identity is ever required.
+  // SpookyHashV2 with a fixed zero seed: keys are deterministic across process
+  // restarts AND across builds (no runtime salt, no version/date macros). The
+  // on-disk cache directory is therefore reusable after a restart as long as the
+  // file paths are unchanged. The only incompatibility is with real ClickHouse,
+  // which keys with sipHash128 (no folly SipHash available here). Port CH's
+  // SipHash128 only if cache-directory interop with real ClickHouse is required.
   folly::hash::SpookyHashV2::Hash128(path.data(), path.size(), &h1, &h2);
   return FileCacheKey((static_cast<UInt128>(h1) << 64) | h2);
 }
