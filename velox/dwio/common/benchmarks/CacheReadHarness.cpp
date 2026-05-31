@@ -237,8 +237,8 @@ CbiHarness::CbiHarness(
     VELOX_CHECK_GT(
         ssdCache_->stats().entriesCached,
         0,
-        "--phase=measure: SSD cache at {} is empty (no checkpoint reloaded); "
-        "run --phase=prime first",
+        "--phase=hot: SSD cache at {} is empty (no checkpoint reloaded); "
+        "run --phase=cold first",
         config_.ssdPath);
   }
 }
@@ -386,8 +386,8 @@ FcbiHarness::FcbiHarness(
     VELOX_CHECK_GT(
         cache_->stats().bytesOnDisk,
         0,
-        "--phase=measure: FileCache at {} is empty (no metadata reloaded); "
-        "run --phase=prime first",
+        "--phase=hot: FileCache at {} is empty (no metadata reloaded); "
+        "run --phase=cold first",
         config_.filecacheRoot);
   }
 }

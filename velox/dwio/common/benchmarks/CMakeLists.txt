@@ -57,7 +57,7 @@ target_link_libraries(
 
 # One-time cache-correctness gate: reloads a backend's persisted on-disk cache
 # and byte-compares the whole working set against the source files. Used after a
-# cold --phase=prime run to certify the persisted cache before hot re-runs.
+# --phase=cold run to certify the persisted cache before hot re-runs.
 add_executable(velox_cache_verify CacheVerifyMain.cpp)
 target_link_libraries(
   velox_cache_verify

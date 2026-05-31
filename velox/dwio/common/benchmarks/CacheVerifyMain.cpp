@@ -15,7 +15,7 @@
  */
 
 // One-time cache-correctness gate for the two-phase persistent workflow. After
-// a cold --phase=prime run of the wrapper microbench has populated and persisted
+// a --phase=cold run of the wrapper microbench has populated and persisted
 // a backend's on-disk cache, this tool reloads that exact cache and re-reads the
 // whole working set through the matching BufferedInput wrapper, byte-comparing
 // every segment against a fresh pread of the source file. It exits 0 iff every

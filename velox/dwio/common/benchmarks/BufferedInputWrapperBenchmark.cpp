@@ -130,9 +130,9 @@ DEFINE_double(ssd_checkpoint_mb, 0.0,
     "--reuse_cache a 0 value defaults to 256 MiB so the cache is durable.");
 DEFINE_string(phase, "full",
     "Run phase for the two-phase persistent workflow (implies --reuse_cache for "
-    "prime/measure): 'full' warms then measures in one process (default); "
-    "'prime' only warms the caches and persists them, writing no results table; "
-    "'measure' reloads the persisted caches and runs only the measure passes, "
+    "cold/hot): 'full' warms then measures in one process (default); "
+    "'cold' only warms the caches and persists them, writing no results table; "
+    "'hot' reloads the persisted caches and runs only the measure passes, "
     "failing loud if a cache did not reload (no silent cold fallback).");
 DEFINE_string(out, "", "Markdown output path; empty writes stdout.");
 #ifndef WRAPPER_BENCH_REPORT_DIR
@@ -168,24 +168,24 @@ constexpr const char* kRemotePath =
     facebook::velox::dwio::common::bench::kSyntheticBlobPath;
 
 // Two-phase persistent-cache workflow (see --phase). kFull warms then measures
-// in one process; kPrime only warms+persists; kMeasure reloads and only
-// measures. Prime/measure imply persisting the on-disk caches.
-enum class Phase { kFull, kPrime, kMeasure };
+// in one process; kCold only warms+persists; kHot reloads and only
+// measures. Cold/hot imply persisting the on-disk caches.
+enum class Phase { kFull, kCold, kHot };
 
 Phase parsePhase(const std::string& s) {
   if (s == "full") {
     return Phase::kFull;
   }
-  if (s == "prime") {
-    return Phase::kPrime;
+  if (s == "cold") {
+    return Phase::kCold;
   }
-  if (s == "measure") {
-    return Phase::kMeasure;
+  if (s == "hot") {
+    return Phase::kHot;
   }
-  VELOX_USER_FAIL("--phase must be 'full', 'prime' or 'measure' (got '{}')", s);
+  VELOX_USER_FAIL("--phase must be 'full', 'cold' or 'hot' (got '{}')", s);
 }
 
-// Prime and measure both persist the on-disk caches (no wipe), as does an
+// Cold and hot both persist the on-disk caches (no wipe), as does an
 // explicit --reuse_cache.
 bool persistCache(Phase phase) {
   return FLAGS_reuse_cache || phase != Phase::kFull;
@@ -319,8 +319,8 @@ PassResult medianByWall(std::vector<PassResult> runs) {
 
 // Runs chunked-warm (with RAM->SSD flush) + optional RAM-scrub + measure for
 // one wrapper, returns the median measure pass. The phase selects which halves
-// run: kFull does both, kPrime only warms (returns an empty PassResult), and
-// kMeasure skips warming and only measures the reloaded cache.
+// run: kFull does both, kCold only warms (returns an empty PassResult), and
+// kHot skips warming and only measures the reloaded cache.
 template <typename Harness>
 PassResult runWrapper(Harness& h, const CellSpec& spec, Phase phase) {
   const uint64_t targetBytes = effectiveTargetBytes();
@@ -330,7 +330,7 @@ PassResult runWrapper(Harness& h, const CellSpec& spec, Phase phase) {
   const uint64_t scrubKeys = scrubBytes / spec.readSize;
   VELOX_USER_CHECK_GT(targetKeys, 0, "target_ws_gb too small for read size");
 
-  if (phase != Phase::kMeasure) {
+  if (phase != Phase::kHot) {
     // Warm in RAM-sized chunks, flushing RAM->SSD after each chunk so a target
     // larger than the RAM tier still becomes fully cache-resident: AsyncDataCache
     // drops RAM-evicted entries that have not yet been written to SSD, so the
@@ -363,7 +363,7 @@ PassResult runWrapper(Harness& h, const CellSpec& spec, Phase phase) {
     h.logWarmState();
   }
 
-  if (phase == Phase::kPrime) {
+  if (phase == Phase::kCold) {
     return PassResult{};
   }
 
@@ -594,13 +594,13 @@ int main(int argc, char** argv) {
   harnessConfig.fcbiSegmentBytes =
       static_cast<uint64_t>(FLAGS_fcbi_segment_mb * (1 << 20));
   harnessConfig.batch = FLAGS_batch;
-  // Persisting runs (--reuse_cache or --phase=prime|measure) keep the on-disk
+  // Persisting runs (--reuse_cache or --phase=cold|hot) keep the on-disk
   // caches: don't wipe on start (reload them) or on destroy, and give cbi a
   // non-zero checkpoint interval so its SSD state is durable.
   harnessConfig.clearCacheOnStart = !persist;
   harnessConfig.cleanupOnDestroy = !persist;
-  // --phase=measure must fail loud if a cache did not reload (no cold fallback).
-  harnessConfig.requireResidentCache = phase == Phase::kMeasure;
+  // --phase=hot must fail loud if a cache did not reload (no cold fallback).
+  harnessConfig.requireResidentCache = phase == Phase::kHot;
   // While persisting, a 0 interval defaults to 256 MiB so the cache is durable;
   // otherwise the flag value (if any) drives checkpointing while still wiping.
   const double checkpointMb =
@@ -677,10 +677,10 @@ int main(int argc, char** argv) {
 
   std::vector<CellRow> rows;
   rows.reserve(cells.size());
-  // Snapshot MemAvailable before the measure passes (skip prime: it only warms).
+  // Snapshot MemAvailable before the measure passes (skip cold: it only warms).
   // A measured "hot" read is only trustworthy if the target fits in the page
   // cache, so record the headroom as a sanity signal in the log and report.
-  if (phase != Phase::kPrime) {
+  if (phase != Phase::kCold) {
     gMemAvailableKib = readMemAvailableKib();
     if (gMemAvailableKib > 0) {
       LOG(INFO) << "pre-measure MemAvailable=" << (gMemAvailableKib >> 20)
@@ -707,8 +707,8 @@ int main(int argc, char** argv) {
       row.dbi = WrapperRow{"dbi", runWrapper(dbi, spec, phase)};
       row.hasDbi = true;
     }
-    if (phase == Phase::kPrime) {
-      // Prime only warms+persists the caches (see the per-wrapper "warm src_MB"
+    if (phase == Phase::kCold) {
+      // Cold only warms+persists the caches (see the per-wrapper "warm src_MB"
       // log); there are no measure results to report.
       LOG(INFO) << "  primed (no measure pass)";
       continue;
@@ -746,10 +746,10 @@ int main(int argc, char** argv) {
     rows.push_back(std::move(row));
   }
 
-  if (phase == Phase::kPrime) {
+  if (phase == Phase::kCold) {
     LOG(INFO) << "Primed " << cells.size() << " cell(s); caches persisted at "
               << FLAGS_ssd_path << " and " << FLAGS_filecache_root
-              << ". Re-run with --phase=measure to read them hot.";
+              << ". Re-run with --phase=hot to read them hot.";
     return 0;
   }
 

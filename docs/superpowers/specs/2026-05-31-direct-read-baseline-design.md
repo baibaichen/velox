@@ -22,10 +22,10 @@ SP2 的设计**完全依赖** SP1 的测量结果，本文档不展开 SP2。
 **目标**
 - TPCH 基准支持第三种后端 `--input_source=direct`（纯 Velox 直读，无应用层缓存）。
 - micro 基准支持第三个 wrapper `dbi`（`DirectBufferedInput`）。
-- micro 基准支持**两阶段持久方法论**：prime 一个进程灌缓存并落盘持久、退出不删；measure 重启另一个
+- micro 基准支持**两阶段持久方法论**：cold 一个进程灌缓存并落盘持久、退出不删；hot 重启另一个
   进程，不 wipe、重载持久缓存、只跑 hot 测量轮。
-- **一次性正确性闸门**：独立二进制 `velox_cache_verify` —— prime（cold）之后跑一次，把整个工作集经
-  各 wrapper 从持久缓存读回、逐区间字节级对比源文件 + 段级 checksum，pass 才放行 measure；失败则
+- **一次性正确性闸门**：独立二进制 `velox_cache_verify` —— cold 之后跑一次，把整个工作集经
+  各 wrapper 从持久缓存读回、逐区间字节级对比源文件 + 段级 checksum，pass 才放行 hot；失败则
   非零退出、不进入 hot。校验逻辑抽成**共享组件**，bench 与 verify 工具同链接（保证通用）。
 - 产出三方 hot-read 基线报告（md ground-truth + html for humans，随 repo 走）。
 
@@ -67,15 +67,15 @@ SP2 的设计**完全依赖** SP1 的测量结果，本文档不展开 SP2。
     构造，使 SSD 层 durable，退出前 `checkpoint()` + 等待写完。**cbi 的 SSD 写必须
     `--velox_ssd_odirect=false`**（避免 checkpoint 001 的 O_DIRECT 损坏前科，TPCH 矩阵已带此项，
     micro 矩阵此处补齐）。
-- **新 flag `--phase=full|prime|measure`（默认 full）**：
+- **新 flag `--phase=full|cold|hot`（默认 full）**：
   - `full`：现状单进程（wipe → warm → measure）。
-  - `prime`：只灌缓存 + 持久 + 退出**不删**，不出测量数。
-  - `measure`：**不**灌缓存，重载持久缓存，只跑 hot 测量轮并出数。
+  - `cold`：只灌缓存 + 持久 + 退出**不删**，不出测量数。
+  - `hot`：**不**灌缓存，重载持久缓存，只跑 hot 测量轮并出数。
     **若缓存目录不存在或 metadata 重建失败 → 立即 loud fail（非零退出），严禁静默回落到 cold**，
-    否则 hot 数会被污染且不可察。由各 harness 在 measure 入口自检并 throw（具体判据放 plan：
+    否则 hot 数会被污染且不可察。由各 harness 在 hot 入口自检并 throw（具体判据放 plan：
     filecache 看 `initialize()` 抛异常 / `loadMetadata()` 后段表为空但目录非空；cbi 看 SsdCache
     checkpoint 文件缺失或 magic 校验失败）。
-- **并发约定**：prime/verify/measure 三步**约定单进程独占 cache 目录，不加锁**；若需防误并发，
+- **并发约定**：cold/verify/hot 三步**约定单进程独占 cache 目录，不加锁**；若需防误并发，
   plan 阶段可选加 lockfile（本 SP1 默认不加，文档显式声明独占即可）。
 - 持久化底层能力（已逐行核实，见 §5）：cbi 靠 SsdCache checkpoint；fcbi 靠
   `ch::FileCache::initialize()` → `loadMetadata()` 扫盘重建段；dbi 靠 OS page cache。
@@ -83,7 +83,7 @@ SP2 的设计**完全依赖** SP1 的测量结果，本文档不展开 SP2。
 ### C. 正确性校验：共享组件 + 独立二进制 `velox_cache_verify`
 
 理由：本 codebase 有缓存损坏前科（checkpoint 001 SSD O_DIRECT corruption）；`src_MB≈0` 只证明
-“没回源”，不证明“字节正确”。需在 prime（cold）之后、measure（hot）之前做**一次性**字节级校验，
+“没回源”，不证明“字节正确”。需在 cold 之后、hot 之前做**一次性**字节级校验，
 之后所有 hot run 复读同一份已验证缓存即可信，不必每趟都验（省时且不污染热读计时）。
 
 - **共享校验组件**（新文件，建议 `velox/dwio/common/benchmarks/CacheVerify.{h,cpp}` 或同级）：
@@ -104,17 +104,17 @@ SP2 的设计**完全依赖** SP1 的测量结果，本文档不展开 SP2。
 
 **micro（两阶段，同一 shell 顺序起两个进程）**
 ```
-# Phase 1: prime（灌缓存、落盘、不删）
-velox_bufferedinput_wrapper_benchmark --phase=prime --reuse_cache --wrappers=all \
+# Phase 1: cold（灌缓存、落盘、不删）
+velox_bufferedinput_wrapper_benchmark --phase=cold --reuse_cache --wrappers=all \
   --target_ws_gb=32 --workloads=sequential,zipfian --read_sizes_kib=1024,8192 --batch=64
 
 # Gate: 一次性正确性校验（cbi + filecache，逐区间字节对比源）。
-# 用 && 链：前一个 verify pass（退出 0）才跑后一个；任一非零即中止，绝不进 measure。
+# 用 && 链：前一个 verify pass（退出 0）才跑后一个；任一非零即中止，绝不进 hot。
 velox_cache_verify --backend=filecache --reuse_cache --target_ws_gb=32 ... \
   && velox_cache_verify --backend=cbi --reuse_cache --target_ws_gb=32 ...
 
-# Phase 2: measure（重启、不 wipe、重载、只测热）
-velox_bufferedinput_wrapper_benchmark --phase=measure --reuse_cache --wrappers=all \
+# Phase 2: hot（重启、不 wipe、重载、只测热）
+velox_bufferedinput_wrapper_benchmark --phase=hot --reuse_cache --wrappers=all \
   --target_ws_gb=32 --workloads=sequential,zipfian --read_sizes_kib=1024,8192 --batch=64 \
   --measure_passes=3 --out=<report.md>
 ```
