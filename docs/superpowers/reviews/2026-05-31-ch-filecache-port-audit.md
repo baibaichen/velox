@@ -51,8 +51,18 @@
 | F13 | write 打开 flags 丢 `O_APPEND`/`O_CLOEXEC`（功能仍正确） | 集成 | – | – | L | – | LOW |
 | F14 | 删文件后 `OpenedFileCache` fd 清理未移植（当前无 fd 缓存） | 核心 | – | M | – | – | LOW |
 | F15 | 可观测性 metrics/ProfileEvents/failpoint 成片 TODO | 全局 | L | L | L | – | LOW |
+| F16 | 刚下载的字节一律读回缓存文件，未复用内存 buffer（CH 复用 working_buffer） | 集成 | – | – | – | **后补确认** | **MEDIUM** ⚠ 原审计漏报 |
+| F17 | 无 `canStartFromCache` 流式前缀快路：非下载方读卡满整段 needed 而非边写边读 | 集成 | – | – | – | **数据流再审** | **MEDIUM** |
+| F18 | 供数前对整 slice 单次 pread（CH 按 buffer 块边读边给） | 集成 | – | – | – | **数据流再审** | LOW |
+| F19 | DETACHED bypass 在 load() 线程上 eager 把整 region 读进 RAM（CH 逐 buffer 流式） | 集成 | – | – | – | **数据流再审** | **MEDIUM** |
+| F20 | 新段首写不带 `O_TRUNC`（lseek SEEK_END 续写）；缺 CH 的截断防御 | 集成 | – | – | – | **数据流再审** | LOW |
+| F21 | `LocalWriteFile::append` 单次 `::write`，无 EINTR/部分写重试循环 | 集成 | – | – | – | **数据流再审** | LOW |
 
 ※ F7 虽两方提及，但代码已注释说明为有意替换，实质为「等价适配/已文档化」，非 bug。
+
+※ F16 为审计后补（2026-06-01，经冷写性能调查发现）：三个审计代理均未提及，详见 §3 F16 与 §6「为何漏报」。
+
+※ F17–F21 为 2026-06-01「数据流再审」新发现（因 F16 漏报触发，专查数据搬运路径，用「追字节：从哪来→到哪去→拷贝几次→同步/异步→与 CH 同路径逐跳对齐」方法学）。F20/F21 经作者复核代码后由 MEDIUM 下调为 LOW（详见 §3）。同批对 reserve/淘汰/SLRU 账目流做了第二遍逐跳核验，**确认账目完全守恒、忠实**，无新发现（正向印证原审计核心层「逐行忠实」结论）。
 
 **共识强度**：
 - 🔴 三方一致：F1、F3、F4、F15
@@ -227,6 +237,64 @@
 - **影响**：监控、容量诊断、队列积压排查、测试故障注入能力下降；**不影响核心算法账目**。
 - **判定**：功能缺失（非 bug）。
 
+### F16 — 刚下载的字节一律读回缓存文件，未复用内存 buffer（MEDIUM，集成层，审计后补）⚠ 原审计漏报
+
+- **CH**：下载路径从远端把字节读进 `state.buf`（working buffer），`writeCache(state.buf...)` 同步写盘后，**把同一个 `state.buf` 直接作为 `working_buffer` 返回给消费者**——刚下载的字节从内存供数，**不重新 pread 缓存文件**；只有后续命中（其他 reader、字节已在盘）才走 `cache_file_reader` 读文件。
+  - `src/Disks/IO/CachedOnDiskReadBufferFromFile.cpp:1287-1303`（`writeCache(state.buf->buffer().begin(), size, offset, ...)` 后复用 `state.buf`，注释明示 "Later reads for this file segment can reuse it"）
+  - `:1124,1151`（`state.buf->set(internal_buffer...)` / `working_buffer = Buffer(internal_buffer...)`，working_buffer 即源读 buffer）
+  - `writeCache → file_segment.write`（`:971`）同步，但供数字节取自内存 buffer，非回读
+- **Velox**：下载与供数完全解耦。`downloadFromReader` 把每 1MB chunk 读进局部 `scratch`、`write` 进缓存文件后**丢弃 scratch**；消费者侧 `FileCacheInputStream::loadSegment` **无论命中还是刚下载，一律**打开缓存文件 `preadv` 读回。
+  - `velox/common/caching/filecache/FileSegment.cpp:497-530`（`scratch` 局部变量，循环用完即弃）
+  - `velox/dwio/common/FileCacheInputStream.cpp:116-159`（先 `while(getDownloadedSize()<needed)` 等写落盘，再 `LocalReadFile(...).preadv(...)` 读回）
+- **差异/影响**：
+  1. **每字节多一次拷贝**：源→scratch→`::write`(page cache)→`preadv`→segData_，比 CH 多一趟 page-cache→用户态 memcpy（冷读 20GB 即多一遍全量拷贝）。
+  2. **下载方 reader 被耦合到写**：velox 消费者卡在 `getDownloadedSize()`（写落盘后才推进）→ 才能 pread；CH 下载方从 working_buffer 取字节，与回读无关。这是冷写关键路径上"写挡读"的结构性来源（详见 `docs`/session 冷写性能调查）。
+  3. 数据**不损坏**、语义正确——纯性能/架构偏差。
+- **判定**：待人确认。属集成读路径重写的衍生差异，但 spec **未将其列为已知偏差**（§7 只列 coalesceIo / loadQuantum）。修复方向 = serve-from-memory（回归 CH，Option 1）+ 可选异步写（超出 CH，Option 2）。
+
+### F17 — 无 `canStartFromCache` 流式前缀快路径（MEDIUM，集成层，数据流再审）
+
+- **CH**：非下载方 reader 命中正在下载/部分下载的段时，只要 `current_write_offset > current_offset` 即 `canStartFromCache` 为真，**立即从缓存文件读已写入的前缀**，不等整段下载完；若暂不可读则 `file_segment.wait(offset)` 在写偏移越过 `offset`（FileSegment chunk 粒度）即返回，边写边读流式推进。
+  - `src/Disks/IO/CachedOnDiskReadBufferFromFile.cpp:375-386`（`canStartFromCache`）、`:445-478`（DOWNLOADING/PARTIALLY_DOWNLOADED 走 `ReadType::CACHED`）、`:909-923`（追上写偏移后切远端）
+- **Velox**：`FileCacheInputStream::loadSegment` 卡在 `while(getDownloadedSize() < needed)`，`needed = segmentOffset + length` 是**本 stream 整个 slice 的末端**，落盘后才一次性读；`downloadSegmentPrefix` 输给下载方的 reader 同样 `wait(targetEnd-1)` 等满整段 coalesced 目标。**全港无 `canStartFromCache` 等价物**。
+  - `velox/dwio/common/FileCacheInputStream.cpp:113,116-142`（`needed=segmentOffset+length`；阻塞等满）、`velox/dwio/common/FileCacheBufferedInput.cpp:182-200`（`downloadSegmentPrefix` 等满）
+- **差异/影响**：场景（b）部分命中、（h）第二并发 reader。CH 第二 reader 在写偏移越过其位置的瞬间即开始消费盘上前缀，与下载流水线重叠；Velox 第二 reader 被完全串行化——阻塞到整段 needed 落盘后才 pread。首字节延迟、并发读吞吐回退；**数据不损坏**。与 F16 不同角度：F16 是*下载方*回读自己刚下的字节，F17 是*非下载方*丢了流式前缀快路。
+- **判定**：集成层下载/供数解耦的衍生差异，待人确认。
+
+### F18 — 供数前对整 slice 单次 pread（LOW，集成层，数据流再审）
+
+- **CH**：`nextImplStep` 把 `internal_buffer` 调成 `min(local_fs_buffer_size, remaining)`，读一个 buffer 即把 `working_buffer` 交给消费者，余量后续 `nextImplStep` 再流式给。
+  - `src/Disks/IO/CachedOnDiskReadBufferFromFile.cpp:1095-1110,1148-1151,1243`
+- **Velox**：`loadSegment` 对整个 slice（`length`）单次 `preadv` 后 `Next()` 才能给出第 0 字节；整 slice 在 stream 生命周期内常驻 `segData_`。
+  - `velox/dwio/common/FileCacheInputStream.cpp:152-159,192-207`
+- **差异/影响**：多 MB 段首字节延迟升至整 slice 读、峰值常驻内存为整 slice；消费者只读前缀后 seek 走也已读全。纯性能/内存。**与已接受的 loadQuantum 偏差部分重叠**（此处是已定读内的供数/读取粒度，非预取大小），故记 LOW 备查。
+- **判定**：集成层重写衍生，LOW。
+
+### F19 — DETACHED bypass 在 load() 线程上 eager 整 region 读进 RAM（MEDIUM，集成层，数据流再审）
+
+- **CH**：`REMOTE_FS_READ_BYPASS_CACHE` 经 `working_buffer` 逐 buffer 流式拉取，整 region 从不常驻内存。
+  - `src/Disks/IO/CachedOnDiskReadBufferFromFile.cpp:350-364,1243`
+- **Velox**：`FileCacheBufferedInput::load` 命中 bypass 时 `bypassBuffer.resize(region.length)` + 对**整 region 单次同步 `pread`，且在 load() 线程上、消费者拉取前**完成；之后 `DeferredStream::Next` 从这块全常驻 buffer 切片供数。
+  - `velox/dwio/common/FileCacheBufferedInput.cpp:330-343`、`:41-56`
+- **差异/影响**：场景（d）。峰值内存=每 stream 整个 bypass region（非一个 buffer），且即使消费者只读一部分也整段预取。属已知 F10/F11（region 级 bypass）经端到端追踪暴露的**内存足迹/无谓预取**新角度，非独立 bug。
+- **判定**：F10 region 级 bypass 设计的衍生后果，MEDIUM（内存足迹）。
+
+### F20 — 新段首写不带 `O_TRUNC`（LOW，集成层，数据流再审）
+
+- **CH**：首写（`downloaded_size==0`）以截断方式打开陈旧文件，保证从零开始（是对 F3 残留半成品文件的兜底防御）。
+- **Velox**：`WriteBufferFromFile` 用 `LocalWriteFile(path, false, false)` → `O_WRONLY|O_CREAT` + `lseek(SEEK_END)` 续写，计算出的 `flags` 被 `unused(flags)` 丢弃，**无 `O_TRUNC`**。
+  - `velox/common/caching/filecache/FileSegment.cpp:47-48`、`velox/common/file/File.cpp:345-383,395-406`
+- **差异/影响**：超出 F13（仅枚举 `O_APPEND`/`O_CLOEXEC`）的一条*正确性*防御。**复核后下调为 LOW**：正常运行下淘汰即 `fs::remove(path)`、且 `downloadedSize==0` 时断言文件不存在（`Metadata.cpp:1148-1153,1150-1151`），启动 `loadMetadata` 又以 `file_size()` 为准对账，故陈旧文件基本被前置清理；仅当 F3 半写失败残留、或崩溃后陈旧文件在对账前路径被复用时，`lseek SEEK_END` 续写会信任陈旧字节。条件性、概率低。
+- **判定**：纵深防御缺口，LOW，依赖 F3/崩溃场景。
+
+### F21 — `LocalWriteFile::append` 单次 `::write`、无 EINTR/部分写重试（LOW，集成层，数据流再审）
+
+- **CH**：`WriteBufferFromFileDescriptor::nextImpl` 用 `::write` 循环，重试 `EINTR`、累加短写。
+- **Velox**：`LocalWriteFile::append` 单次 `::write` + `VELOX_CHECK_EQ`，把可恢复瞬态（`EINTR`/部分写）变为永久段失败。
+  - `velox/common/file/File.cpp:395-406`
+- **差异/影响**：机制不同于 F3（F3 是抛后 ENOSPC 修复）。**复核后下调为 LOW**：Linux 上对普通文件的缓冲 `::write` 几乎不被信号中断（EINTR 主要见于管道/终端/套接字等慢设备），普通文件短写主要源于 ENOSPC——而 ENOSPC 属 F3 范畴。故实际触发概率低。
+- **判定**：忠实度偏差，LOW，与 F3 部分重叠。
+
 ---
 
 ## 4. 已核验为「一致」/ 剔除的假阳性
@@ -264,11 +332,25 @@
 
 **需拍板的集成层改写后果（spec §7 已声明读路径重写）：**
 3. **F1 无 bypass 降级** — 「盘满/IO 错 → 查询硬失败」是可用性回归，是否补 bypass 远端读由产品决定。其余 F9/F10/F11 同属读路径重写的衍生差异。
+4. **F16 刚下载字节读回文件（审计后补）** — serve-from-memory 偏离 CH，导致每字节多一趟 memcpy + 下载方读被耦合到写落盘。是冷写/冷读性能差距的结构性来源。修复 = 回归 CH 的 working_buffer 复用（Option 1），可叠加异步写（Option 2，超出 CH）。
+5. **F17 无流式前缀快路（数据流再审）** — 非下载方第二 reader 卡满整段 needed 才读。建议与 F16/Option 1 的 serve-from-memory 改造一并评估（同属"下载/供数解耦"代价）。
+6. **F19 bypass eager 整 region 入 RAM（数据流再审）** — 内存足迹随 region 线性增长，F10/F11 的衍生后果，是否改逐 buffer 流式由产品/内存预算决定。
+
+**低风险 / 纵深防御 / 性能微调（数据流再审，复核后 LOW）：** F18 整 slice 单次 pread（与 loadQuantum 重叠）、F20 新段首写缺 `O_TRUNC`（淘汰即 `fs::remove`+启动对账已前置兜底，仅 F3/崩溃残留时才咬）、F21 `append` 无 EINTR/部分写重试（普通文件缓冲写极少 EINTR，短写归 F3）。
 
 **已知 NYI（显式未移植，非静默）：** F4 query 配额、F5 free-space scheduler — 默认不触发，配置开启即显式抛错。
 
 **等价适配 / 非功能（非 bug）：** F7 哈希（已文档化）、F8 callerId、F12 user、F13 flags、F14 fd 清理、F15 可观测性。
 
+### 为何原审计漏报 F16 / F17–F21（流程教训）
+
+1. **偏差被 spec 设计进去 → 审计继承了 spec 的盲点**：spec §6.2 明写「cache-hit 读…保持现状（`FileCacheInputStream.cpp:91-94` 一律 pread）」，把"下载只写文件"与"消费者一律读回文件"当成两件独立的事，**从未建模 CH 的 `working_buffer` 复用**。审计以「实现 vs spec + 实现 vs CH 正确性」为基准，既然 spec 声明 pread 有意，这条就没进偏差清单。§7「已知差异」只列 coalesceIo / loadQuantum，未列 serve-from-memory。
+2. **审计为正确性/严重度视角**：F16 是「正确但更慢 + 多一次拷贝」，不丢数据、不死锁、不硬失败，落在 CRITICAL/HIGH 雷达之外。
+3. **`downloadFromReader` 只被当「写路径」核对**：§4 还把它认证为「逐行忠实」（reserve-先于-consume 不变量）。三方都未回答「消费者从哪拿刚下载的字节」，也就没和 CH `nextImplStep` 返回 `working_buffer` 做对照。
+4. **教训**：跨实现移植审计除「逐函数对照」外，应补一条「**端到端数据流对照**」——对每条读/写路径，追问「字节从哪来、到哪去、中间拷贝几次」，并与参照实现的同一路径逐跳对齐，而非只比单个函数。
+
 ### 未完全覆盖（建议如需 100% 置信再补一轮逐行核验）
 
-写路径 `CachedObjectStorage`/`CachedOnDiskWriteBufferFromFile`/`WriteBufferToFileSegment`、`FileCacheFactory`、`FileCacheSettings` 全量字段映射、`SLRUFileCachePriority` 升降级账目细节、`FileCache.cpp` 中 `getOrSet`/`set`/`doEviction`/动态 resize 的剩余约 2000 行 —— 三方报告均为「忠实/等价」，未发现 CRITICAL。
+2026-06-01 数据流再审已补齐：**写数据流**（FileSegment::write / WriteBufferFromFile / downloadFromReader，R1）与 **reserve/淘汰/SLRU 账目流**（R3）经第二遍逐跳核验——写路径除 F20/F21 外**无额外拷贝、忠实**，账目**完全守恒**。
+
+仍未逐行覆盖：`CachedObjectStorage` 写直通、`FileCacheFactory`、`FileCacheSettings` 全量字段映射、`FileCache.cpp` 中 `getOrSet`/`set`/动态 resize 的剩余约 2000 行 —— 三方报告均为「忠实/等价」，未发现 CRITICAL。

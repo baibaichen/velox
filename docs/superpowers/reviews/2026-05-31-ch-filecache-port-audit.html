@@ -70,7 +70,7 @@
 <body>
 <div class="wrap">
   <h1>ClickHouse FileCache → Velox 移植审计</h1>
-  <div class="sub">分支 <code>ch-filecache</code> · 2026-05-31 · 三方独立 review 交叉汇总 + 作者逐行复核</div>
+  <div class="sub">分支 <code>ch-filecache</code> · 2026-06-01 · 三方独立 review 交叉汇总 + 作者逐行复核</div>
 
   <div class="meta">
     <div>被审对象：<code>facebook::velox::ch</code> — 核心子系统 <code>velox/common/caching/filecache/</code>（应逐行忠实）+ 集成读/下载层 <code>velox/dwio/common/FileCache*</code>（按 spec §7 有意改写）</div>
@@ -104,6 +104,12 @@
 <tr><td><a class="jump" href="#F13">F13</a></td><td>write flags 丢 O_APPEND/O_CLOEXEC</td><td>集成</td><td class="ctr">–</td><td class="ctr">–</td><td class="ctr">L</td><td class="ctr"><span class="badge sm" style="background:#7fb4ff">LOW</span></td></tr>
 <tr><td><a class="jump" href="#F14">F14</a></td><td>OpenedFileCache fd 清理未移植</td><td>核心</td><td class="ctr">–</td><td class="ctr">M</td><td class="ctr">–</td><td class="ctr"><span class="badge sm" style="background:#7fb4ff">LOW</span></td></tr>
 <tr><td><a class="jump" href="#F15">F15</a></td><td>可观测性 metrics/failpoint TODO</td><td>全局</td><td class="ctr">L</td><td class="ctr">L</td><td class="ctr">L</td><td class="ctr"><span class="badge sm" style="background:#7fb4ff">LOW</span></td></tr>
+<tr><td><a class="jump" href="#F16">F16</a></td><td>刚下载字节读回文件未复用内存 (后补)</td><td>集成</td><td class="ctr">–</td><td class="ctr">–</td><td class="ctr">M</td><td class="ctr"><span class="badge sm" style="background:#ffb454">MEDIUM</span></td></tr>
+<tr><td><a class="jump" href="#F17">F17</a></td><td>无 canStartFromCache 流式前缀快路 (再审)</td><td>集成</td><td class="ctr">–</td><td class="ctr">–</td><td class="ctr">M</td><td class="ctr"><span class="badge sm" style="background:#ffb454">MEDIUM</span></td></tr>
+<tr><td><a class="jump" href="#F18">F18</a></td><td>供数前整 slice 单次 pread (再审)</td><td>集成</td><td class="ctr">–</td><td class="ctr">–</td><td class="ctr">L</td><td class="ctr"><span class="badge sm" style="background:#7fb4ff">LOW</span></td></tr>
+<tr><td><a class="jump" href="#F19">F19</a></td><td>bypass eager 整 region 入 RAM (再审)</td><td>集成</td><td class="ctr">–</td><td class="ctr">–</td><td class="ctr">M</td><td class="ctr"><span class="badge sm" style="background:#ffb454">MEDIUM</span></td></tr>
+<tr><td><a class="jump" href="#F20">F20</a></td><td>新段首写缺 O_TRUNC (再审)</td><td>集成</td><td class="ctr">–</td><td class="ctr">–</td><td class="ctr">L</td><td class="ctr"><span class="badge sm" style="background:#7fb4ff">LOW</span></td></tr>
+<tr><td><a class="jump" href="#F21">F21</a></td><td>append 无 EINTR/部分写重试 (再审)</td><td>集成</td><td class="ctr">–</td><td class="ctr">–</td><td class="ctr">L</td><td class="ctr"><span class="badge sm" style="background:#7fb4ff">LOW</span></td></tr>
     </tbody>
   </table>
 
@@ -394,6 +400,40 @@ FileCacheQueryLimit::tryGetQueryContext(<span class="k">const</span> CacheStateG
     <div class="impact"><b>影响：</b>主要影响 per-query 归因与诊断（与 F4 一致）。</div>
   </div>
 
+  <div class="card" id="F16">
+    <div class="card-head">
+      <span class="badge" style="background:#ffb454">MEDIUM</span>
+      <span class="fid">F16</span>
+      <span class="title">刚下载的字节一律读回缓存文件，未复用内存 buffer</span>
+      <span class="layer">集成层</span>
+      
+    </div>
+    <div class="votes">三方评级 — GPT-5.5: <b>–</b> · Claude-detailed: <b>–</b> · 独立: <b>M</b> &nbsp;|&nbsp; 原审计漏报；作者后补（2026-06-01）</div>
+    <div class="cols">
+      <div class="col">
+        <div class="col-label ch">ClickHouse — nextImplStep 复用 working_buffer，从内存供数</div>
+        <pre><code><span class="c">// CachedOnDiskReadBufferFromFile::nextImplStep — 刚下载的字节直接当 working_buffer 返回</span>
+size = readFromSourceAndWriteCache(state.buf);   <span class="c">// 读远端进 state.buf，writeCache 同步写盘</span>
+<span class="c">// 把同一个 state.buf 设为对外 working_buffer —— 不重新读缓存文件</span>
+working_buffer = Buffer(state.buf-&gt;buffer().begin(),
+                        state.buf-&gt;buffer().begin() + size);
+<span class="c">// 只有「字节已在盘 / 别的 reader 命中」才走 cache_file_reader 读文件</span></code></pre>
+      </div>
+      <div class="col">
+        <div class="col-label vx">Velox — downloadFromReader 丢弃 scratch，消费者一律 preadv 读回</div>
+        <pre><code><span class="c">// downloadFromReader：每 1MB chunk 读进局部 scratch，write 进缓存文件后丢弃</span>
+<span class="t">std</span>::vector&lt;<span class="t">char</span>&gt; scratch(chunk);                <span class="c">// 局部，循环用完即弃</span>
+reader-&gt;pread(off, n, scratch.data());
+segment.write(scratch.data(), n, ...);           <span class="c">// -&gt; ::write 进 page cache</span>
+
+<span class="c">// FileCacheInputStream::loadSegment：无论命中还是刚下载，一律读回缓存文件</span>
+<span class="k">while</span> (segment-&gt;getDownloadedSize() &lt; needed) { <span class="c">/* 等写落盘 */</span> }
+LocalReadFile(segment-&gt;path()).preadv(...);       <span class="c">// 多一趟 page-cache-&gt;用户态 memcpy</span></code></pre>
+      </div>
+    </div>
+    <div class="impact"><b>影响：</b>每字节多一趟 page-cache→用户态 memcpy；且消费者卡在 getDownloadedSize()（写落盘后才推进）→ 下载方读被耦合到写，是冷写/冷读性能差距的结构性来源。数据不损坏，纯性能/架构偏差。修复=回归 CH 的 working_buffer 复用（serve-from-memory）。</div>
+  </div>
+
   <h2>其余条目</h2>
 
   <div class="card slim" id="F9">
@@ -473,6 +513,61 @@ FileCacheQueryLimit::tryGetQueryContext(<span class="k">const</span> CacheStateG
     <div class="impact">CH 各处的 ProfileEvents / CurrentMetrics / fiu_do_on 在 Velox 均为 // TODO 占位。影响监控、容量诊断、故障注入，不影响核心算法账目。</div>
   </div>
 
+  <div class="card slim" id="F17">
+    <div class="card-head">
+      <span class="badge" style="background:#ffb454">MEDIUM</span>
+      <span class="fid">F17</span>
+      <span class="title">无 canStartFromCache 流式前缀快路：非下载方读卡满整段 needed</span>
+      <span class="layer">集成层</span>
+    </div>
+    <div class="votes">来源 — 数据流再审 2026-06-01</div>
+    <div class="impact">CH canStartFromCache（current_write_offset&gt;current_offset 即真）让非下载方边写边读盘上前缀、与下载流水线重叠；Velox loadSegment 卡在 getDownloadedSize()&lt;needed（needed=segmentOffset+length 整段），第二并发 reader 被完全串行化。首字节延迟/并发读吞吐回退，不损坏数据。与 F16 不同角度（F16=下载方回读自己，F17=非下载方丢流式前缀）。</div>
+  </div>
+
+  <div class="card slim" id="F18">
+    <div class="card-head">
+      <span class="badge" style="background:#7fb4ff">LOW</span>
+      <span class="fid">F18</span>
+      <span class="title">供数前对整 slice 单次 pread（CH 按 buffer 块流式给）</span>
+      <span class="layer">集成层</span>
+    </div>
+    <div class="votes">来源 — 数据流再审 2026-06-01</div>
+    <div class="impact">CH nextImplStep 每读一个 buffer（min(local_fs_buffer_size,remaining)）即交付 working_buffer，余量后续流式给；Velox loadSegment 对整 slice 单次 preadv 后才给第 0 字节，整 slice 常驻 segData_。多 MB 段首字节延迟+内存足迹上升。与已接受的 loadQuantum 偏差部分重叠。</div>
+  </div>
+
+  <div class="card slim" id="F19">
+    <div class="card-head">
+      <span class="badge" style="background:#ffb454">MEDIUM</span>
+      <span class="fid">F19</span>
+      <span class="title">DETACHED bypass 在 load() 线程 eager 整 region 读进 RAM</span>
+      <span class="layer">集成层</span>
+    </div>
+    <div class="votes">来源 — 数据流再审 2026-06-01</div>
+    <div class="impact">CH REMOTE_FS_READ_BYPASS_CACHE 逐 buffer 流式拉取、整 region 不常驻；Velox load() 命中 bypass 时 bypassBuffer.resize(region.length)+对整 region 单次同步 pread，消费者拉取前已全读入 RAM。峰值内存=每 stream 整个 bypass region，即使只读一部分也整段预取。F10/F11 区域级 bypass 的内存足迹新角度。</div>
+  </div>
+
+  <div class="card slim" id="F20">
+    <div class="card-head">
+      <span class="badge" style="background:#7fb4ff">LOW</span>
+      <span class="fid">F20</span>
+      <span class="title">新段首写不带 O_TRUNC（lseek SEEK_END 续写）</span>
+      <span class="layer">集成层</span>
+    </div>
+    <div class="votes">来源 — 数据流再审 2026-06-01</div>
+    <div class="impact">CH 首写（downloaded_size==0）以截断打开陈旧文件保证从零；Velox WriteBufferFromFile 用 LocalWriteFile(path,false,false)→O_WRONLY|O_CREAT+lseek(SEEK_END)，计算的 flags 被 unused 丢弃，无 O_TRUNC。复核下调 LOW：淘汰即 fs::remove(path)、downloadedSize==0 时断言文件不存在、启动 loadMetadata 以 file_size() 对账，已前置兜底；仅 F3 半写残留/崩溃后陈旧文件在对账前被复用时才咬。</div>
+  </div>
+
+  <div class="card slim" id="F21">
+    <div class="card-head">
+      <span class="badge" style="background:#7fb4ff">LOW</span>
+      <span class="fid">F21</span>
+      <span class="title">LocalWriteFile::append 单次 ::write，无 EINTR/部分写重试</span>
+      <span class="layer">集成层</span>
+    </div>
+    <div class="votes">来源 — 数据流再审 2026-06-01</div>
+    <div class="impact">CH WriteBufferFromFileDescriptor::nextImpl 用 ::write 循环重试 EINTR、累加短写；Velox append 单次 ::write+VELOX_CHECK_EQ，把可恢复瞬态变永久段失败。复核下调 LOW：Linux 普通文件缓冲写几乎不被信号中断，短写主要源于 ENOSPC（属 F3 范畴），实际触发概率低。</div>
+  </div>
+
   <h2>已核验一致 / 剔除的假阳性</h2>
   <ul class="consistent">
 <li>LRUFileCachePriority::canFit 两边逐字一致；LRU/SLRU/Split/EvictionCandidates 队列移动、候选账目、边界比较未见可证实的算法不一致。</li>
@@ -480,7 +575,8 @@ FileCacheQueryLimit::tryGetQueryContext(<span class="k">const</span> CacheStateG
 <li>FileCache::tryReserve / doTryReserve 主流程一致：HoldSpace / EvictionCandidates 提交回滚、catch(...) 僵尸条目 invalidate 保护、锁顺序 cacheStateGuard → cacheGuard.writeLock。</li>
 <li>range() 闭区间语义（right inclusive，+1 转开区间）无 off-by-one；downloadFromReader 的 reserve-先于-consume 不变量成立，无丢字节风险。</li>
 <li>所有默认常量逐项相符（32MiB 段、4MiB 对齐、SLRU 0.6、max_elements 1e7 等）；FileCacheUtils roundUp/roundDown 数学一致。</li>
-<li>剔除的假阳性：后台下载「未 reset reader/downloader」实由 complete() 完成；WriteBufferFromFile 无 O_TRUNC + lseek 到末尾，不截断；错误码折叠为 VELOX_FAIL 属正常适配。</li>
+<li>剔除的假阳性：后台下载「未 reset reader/downloader」实由 complete() 完成；错误码折叠为 VELOX_FAIL 属正常适配。（注：WriteBufferFromFile 的「无 O_TRUNC + lseek 到末尾」原列为忠实，2026-06-01 数据流再审改记为 LOW 级纵深防御缺口 F20。）</li>
+<li>【2026-06-01 数据流再审 R3】reserve→evict→commit/rollback、SLRU 升降级、HoldSpace、动态 resize 的 size/element 账目经第二遍逐跳核验完全守恒、与 CH 逐行一致；写数据流（FileSegment::write/WriteBufferFromFile/downloadFromReader）除 F20/F21 外无额外拷贝、忠实（与 F16 读路径多一趟拷贝相反）。</li>
   </ul>
 
   <h2>优先级建议</h2>
