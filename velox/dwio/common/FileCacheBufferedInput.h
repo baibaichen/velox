@@ -32,14 +32,16 @@ namespace facebook::velox::ch {
 class FileCacheBufferedInput final
     : public facebook::velox::dwio::common::BufferedInput {
  public:
-  /// fileCache and readFile must outlive this BufferedInput; ownership stays
-  /// with the caller. load() downloads cache misses synchronously on the calling
-  /// thread (ClickHouse-faithful: no dedicated foreground download pool), so
-  /// callers that want overlap submit load() to their own IO executor.
-  /// ioStats (optional) receives per-query operator-level IO counters mirroring
-  /// CachedBufferedInput: ssdRead() for cache hits, read()/prefetch() for source
-  /// downloads. nullptr disables Layer A recording (e.g. in the benchmark, which
-  /// reads backend aggregates via FileCache::stats() instead).
+  /// fileCache and readFile must outlive this BufferedInput and the streams it
+  /// returns; consume streams while this BufferedInput is alive. load() is a
+  /// planner: it resolves cache holders for the enqueued regions
+  /// (ClickHouse-faithful pull model) and downloads nothing -- each
+  /// FileCacheInputStream downloads its segments lazily on the consuming thread
+  /// and owns its segments holder (so the background tail-fill runs when that
+  /// stream finishes, mirroring CH ReadInfo::file_segments). ioStats (optional)
+  /// receives per-query operator-level IO counters mirroring
+  /// CachedBufferedInput: ssdRead() for cache hits, read()/prefetch() for
+  /// source downloads. nullptr disables Layer A recording.
   FileCacheBufferedInput(
       std::shared_ptr<ReadFile> readFile,
       memory::MemoryPool& pool,
@@ -85,6 +87,10 @@ class FileCacheBufferedInput final
   struct EnqueuedRegion {
     facebook::velox::common::Region region;
     FileSegmentsHolderPtr holder;
+    // Set true once load() resolved this slot. The holder is moved into the
+    // FileCacheInputStream at consume time (so it is then nullptr); this flag,
+    // not holder!=nullptr, gates re-resolution on a repeated load().
+    bool resolved{false};
     bool bypass{false};
     std::vector<char> bypassBuffer;
   };

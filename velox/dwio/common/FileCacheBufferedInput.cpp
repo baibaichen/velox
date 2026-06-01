@@ -18,25 +18,28 @@
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/dwio/common/FileCacheInputStream.h"
-#include "velox/dwio/common/ReadFileByteInputStream.h"
 
 #include <algorithm>
 #include <limits>
-#include <unordered_map>
 
 namespace facebook::velox::ch {
 
 namespace {
 
-constexpr size_t kReserveTimeoutMs{10000};
-
 class DeferredStream final
     : public facebook::velox::dwio::common::SeekableInputStream {
  public:
-  explicit DeferredStream(
+  DeferredStream(
       FileCacheBufferedInput::EnqueuedRegion* slot,
-      memory::MemoryPool* pool)
-      : slot_{slot}, pool_{pool} {}
+      memory::MemoryPool* pool,
+      std::shared_ptr<ReadFile> readFile,
+      FileCache* cache,
+      std::shared_ptr<facebook::velox::io::IoStatistics> ioStats)
+      : slot_{slot},
+        pool_{pool},
+        readFile_{std::move(readFile)},
+        cache_{cache},
+        ioStats_{std::move(ioStats)} {}
 
   bool Next(const void** data, int32_t* size) override {
     ensureWithData();
@@ -133,144 +136,31 @@ class DeferredStream final
           "Bypass buffer size must match region length");
       return;
     }
-
-    std::vector<FileSegmentPtr> segments;
-    for (const auto& segment : *slot_->holder) {
-      segments.push_back(segment);
-    }
+    // Move the holder into the stream so the inner FileCacheInputStream owns
+    // the segments holder. The EnqueuedRegion.resolved flag, not
+    // holder!=nullptr, gates re-resolution on a later load().
     inner_ = std::make_unique<FileCacheInputStream>(
-        std::move(segments), slot_->region.offset, slot_->region.length,
-        *pool_);
+        std::move(slot_->holder),
+        slot_->region.offset,
+        slot_->region.length,
+        *pool_,
+        readFile_,
+        cache_,
+        ioStats_);
     if (bytesConsumed_ > 0) {
       const bool ok = inner_->SkipInt64(static_cast<int64_t>(bytesConsumed_));
       VELOX_CHECK(ok, "Replaying pre-load skip past region end");
     }
   }
-
   FileCacheBufferedInput::EnqueuedRegion* const slot_;
   memory::MemoryPool* const pool_;
+  const std::shared_ptr<ReadFile> readFile_;
+  FileCache* const cache_;
+  const std::shared_ptr<facebook::velox::io::IoStatistics> ioStats_;
   std::unique_ptr<FileCacheInputStream> inner_;
   uint64_t bytesConsumed_{0};
   bool bypassActive_{false};
 };
-
-// Downloads the prefix [getCurrentWriteOffset, targetEnd) of `segment` from
-// `readFile`, guaranteeing the segment durably covers `targetEnd` before
-// returning (or that it has reached a terminal, non-resumable state).
-//
-// Several readers across threads can share one segment while requesting
-// different prefixes, and FileCacheInputStream only waits for the download --
-// it never drives it itself. A caller that loses the downloader race to another
-// thread must therefore still ensure its own `targetEnd` is satisfied: a
-// concurrent download that captured a shallower target could otherwise complete
-// first and strand a deeper reader (which the old whole-segment download never
-// did). Hence the retry loop: become the downloader and resume the gap, or wait
-// for whoever holds it and re-check, until `targetEnd` is met or the segment is
-// abandoned.
-void downloadSegmentPrefix(
-    const FileSegmentPtr& segment,
-    const std::shared_ptr<ReadFile>& readFile,
-    FileCache* cache,
-    const std::shared_ptr<facebook::velox::io::IoStatistics>& ioStats,
-    uint64_t targetEnd) {
-  const uint64_t segStart = segment->range().left;
-  VELOX_CHECK_GT(targetEnd, segStart);
-  // Required downloadedSize (range-relative) for the segment to cover targetEnd.
-  const uint64_t needBytes = targetEnd - segStart;
-  bool recordedMiss = false;
-
-  while (segment->getDownloadedSize() < needBytes) {
-    const auto downloaderId = segment->getOrSetDownloader();
-    if (downloaderId != FileSegment::getCallerId()) {
-      // Lost the race: another task holds the downloader. Wait for it to make
-      // progress, then re-check whether it covered our target or gave up.
-      const auto state = segment->wait(targetEnd - 1);
-      if (segment->getDownloadedSize() >= needBytes) {
-        return;
-      }
-      if (state == FileSegment::State::PARTIALLY_DOWNLOADED_NO_CONTINUATION ||
-          state == FileSegment::State::DETACHED ||
-          state == FileSegment::State::DOWNLOADED) {
-        // Terminal (or shrunk DOWNLOADED) without enough bytes: give up; the
-        // waiting reader surfaces the shortfall.
-        return;
-      }
-      // EMPTY / DOWNLOADING / PARTIALLY_DOWNLOADED: loop to acquire and resume.
-      continue;
-    }
-
-    // Won the downloader. Another task may have satisfied the target between the
-    // loop test and the acquisition; re-check before counting a miss or writing.
-    if (segment->getDownloadedSize() >= needBytes) {
-      segment->completePartAndResetDownloader();
-      return;
-    }
-    if (!recordedMiss) {
-      // A real source download for this segment (a cross-load partial resume
-      // counts as a further miss, mirroring "segments downloaded from source").
-      cache->recordMiss();
-      recordedMiss = true;
-    }
-
-    const uint64_t before = segment->getDownloadedSize();
-    try {
-      // Download only the requested prefix [currentWriteOffset, targetEnd);
-      // downloadFromReader resumes from the current write offset, so a partially
-      // downloaded segment continues rather than restarting. On a reserve
-      // failure it stops after moving the segment to a terminal state.
-      const uint64_t writeOffset = segment->getCurrentWriteOffset();
-      if (targetEnd > writeOffset) {
-        // Install a positioned reader on the segment (only the first downloader
-        // does; a later resume reuses it). The same reader serves this
-        // foreground prefix download and, after the holder is released, the
-        // background tail-fill that completes the segment to its background
-        // target size. It holds a shared_ptr to the source file, so it safely
-        // outlives this BufferedInput; downloader ownership serializes its use
-        // between the foreground and the background pool. Reaching a terminal or
-        // fully-downloaded state resets it inside FileSegment.
-        auto reader = segment->getRemoteFileReader();
-        if (reader == nullptr) {
-          reader = std::make_shared<ReadFileByteInputStream>(readFile);
-          segment->setRemoteFileReader(reader);
-        }
-        std::vector<char> scratch;
-        const size_t written = FileSegment::downloadFromReader(
-            *segment, *reader, targetEnd - writeOffset, scratch,
-            kReserveTimeoutMs);
-        // Bytes fetched from source and written into the cache (Layer B
-        // cumulative + Layer A: read() = source bytes, prefetch() = bytes pulled
-        // ahead into the cache, mirroring CachedBufferedInput).
-        cache->recordDownloadedBytes(written);
-        if (ioStats != nullptr) {
-          ioStats->read().increment(written);
-          ioStats->prefetch().increment(written);
-        }
-      }
-      if (segment->getDownloadedSize() == before &&
-          segment->getDownloadedSize() < needBytes) {
-        // No forward progress while we held the downloader (e.g. the source is
-        // shorter than targetEnd). Mark the segment failed so the reader stops
-        // waiting, instead of spinning on a target that can never be reached.
-        segment->setDownloadFailed();
-        segment->completePartAndResetDownloader();
-        return;
-      }
-      segment->completePartAndResetDownloader();
-    } catch (...) {
-      segment->setDownloadFailed();
-      segment->completePartAndResetDownloader();
-      return;
-    }
-
-    const auto state = segment->state();
-    if (state == FileSegment::State::PARTIALLY_DOWNLOADED_NO_CONTINUATION ||
-        state == FileSegment::State::DETACHED) {
-      // Reserve failed terminally; the segment cannot be continued.
-      return;
-    }
-    // Otherwise loop: re-check downloadedSize >= needBytes.
-  }
-}
 
 } // namespace
 
@@ -296,18 +186,24 @@ std::unique_ptr<facebook::velox::dwio::common::SeekableInputStream>
 FileCacheBufferedInput::enqueue(
     facebook::velox::common::Region region,
     const facebook::velox::dwio::common::StreamIdentifier* /*sid*/) {
-  enqueuedRegions_.push_back(EnqueuedRegion{region, nullptr, false, {}});
-  return std::make_unique<DeferredStream>(&enqueuedRegions_.back(), pool_);
+  enqueuedRegions_.push_back(EnqueuedRegion{region, nullptr, false, false, {}});
+  return std::make_unique<DeferredStream>(
+      &enqueuedRegions_.back(),
+      pool_,
+      input_->getReadFile(),
+      fileCache_,
+      ioStats_);
 }
 
 void FileCacheBufferedInput::load(
     facebook::velox::dwio::common::LogType /*logType*/) {
-  // Pass 1: resolve holders for newly enqueued regions and handle DETACHED
-  // bypass. Collect the regions resolved by THIS call so a repeated load() does
-  // not re-submit downloads for regions that were already resolved earlier.
-  std::vector<EnqueuedRegion*> pending;
+  // Pull model: load() is a planner. Resolve a holder for each newly enqueued
+  // region and handle DETACHED bypass. It downloads nothing -- each
+  // FileCacheInputStream downloads its segments lazily on the consuming thread.
+  // The `resolved` flag (not holder!=nullptr) guards against re-resolving a
+  // region whose holder was already moved into its stream at consume time.
   for (auto& enqueued : enqueuedRegions_) {
-    if (enqueued.holder != nullptr) {
+    if (enqueued.resolved) {
       continue;
     }
 
@@ -328,80 +224,23 @@ void FileCacheBufferedInput::load(
       }
     }
     if (enqueued.bypass) {
-      // Region-level bypass for DETACHED segments returned by getOrSet().
+      // Region-level bypass for DETACHED segments returned by getOrSet(): read
+      // the bytes straight from source into the slot buffer. Bypass is
+      // intentionally non-cacheable, so it is excluded from the hit/miss ratio;
+      // only surface its source bytes (Layer A).
       enqueued.bypassBuffer.resize(enqueued.region.length);
       input_->getReadFile()->pread(
           enqueued.region.offset,
           enqueued.region.length,
           enqueued.bypassBuffer.data());
-      // Bypass is intentionally non-cacheable, so it is excluded from the
-      // cache hit/miss ratio; only surface its source bytes (Layer A).
       if (ioStats_ != nullptr) {
         ioStats_->read().increment(enqueued.region.length);
       }
-      continue;
     }
-    pending.push_back(&enqueued);
-  }
-
-  // Pass 2: classify each newly resolved region's segments. Already-downloaded
-  // segments are cache hits; every other segment is folded into one coalesced
-  // download target.
-  //
-  // Coalescing: a segment can be shared by several regions; the foreground
-  // download must cover the furthest byte any of them needs, because
-  // FileCacheInputStream only waits for the download and fails if the segment
-  // reaches a terminal state with too few bytes -- it never drives the download
-  // itself. The target is the absolute end offset min(segmentEnd, regionEnd),
-  // maximized across the regions sharing the segment. Keep the FileSegmentPtr
-  // alongside the target so Pass 3 can hand it to downloadSegmentPrefix.
-  struct SegmentDownload {
-    FileSegmentPtr segment;
-    uint64_t targetEnd{0};
-  };
-  std::unordered_map<FileSegment*, SegmentDownload> segmentDownloads;
-  for (auto* enqueued : pending) {
-    const uint64_t regStart = enqueued->region.offset;
-    const uint64_t regEnd = regStart + enqueued->region.length;
-    for (const auto& segment : *enqueued->holder) {
-      const uint64_t segStart = segment->range().left;
-      const uint64_t segEnd = segStart + segment->range().size();
-      if (segment->state() == FileSegment::State::DOWNLOADED) {
-        // Cache hit: bytes are already on disk and will be served from the local
-        // cache file. Record one hit (Layer B) plus the overlapping bytes served
-        // from cache (Layer A, ssdRead -- FileCache is disk-backed). Hit
-        // accounting is per (region, segment) because a hit means the bytes a
-        // given region needs are already served from the local cache file.
-        fileCache_->recordHit();
-        if (ioStats_ != nullptr) {
-          const uint64_t lo = std::max(segStart, regStart);
-          const uint64_t hi = std::min(segEnd, regEnd);
-          if (hi > lo) {
-            ioStats_->ssdRead().increment(hi - lo);
-          }
-        }
-        continue;
-      }
-      auto& entry = segmentDownloads[segment.get()];
-      entry.segment = segment;
-      entry.targetEnd = std::max(entry.targetEnd, std::min(segEnd, regEnd));
-    }
-  }
-
-  // Pass 3: download each distinct miss segment up to its coalesced prefix.
-  // The download runs synchronously on the calling thread -- ClickHouse-faithful
-  // (no dedicated foreground download pool); callers overlap by submitting
-  // load() to their own IO executor. One call per segment (rather than per
-  // region) means no two of this load()'s downloads contend for the same
-  // segment's downloader.
-  auto readFile = input_->getReadFile();
-  for (auto& entry : segmentDownloads) {
-    downloadSegmentPrefix(
-        entry.second.segment,
-        readFile,
-        fileCache_,
-        ioStats_,
-        entry.second.targetEnd);
+    // Mark resolved only after the holder is assigned and any bypass buffer is
+    // populated, so a throw from getOrSet()/pread() leaves the slot retryable
+    // on a later load() (matching the old holder!=nullptr retry guard).
+    enqueued.resolved = true;
   }
 }
 

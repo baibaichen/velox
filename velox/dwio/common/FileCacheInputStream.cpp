@@ -17,15 +17,15 @@
 #include "velox/dwio/common/FileCacheInputStream.h"
 
 #include "velox/common/base/Exceptions.h"
+#include "velox/common/caching/filecache/FileCache.h"
 #include "velox/common/caching/filecache/FileSegment.h"
 #include "velox/common/file/File.h"
 #include "velox/common/memory/Allocation.h"
+#include "velox/dwio/common/ReadFileByteInputStream.h"
 
 #include <folly/Range.h>
 
 #include <algorithm>
-#include <chrono>
-#include <thread>
 #include <vector>
 
 namespace facebook::velox::ch {
@@ -34,6 +34,142 @@ namespace {
 // Slices below this size are read into a std::string instead of a pooled
 // Allocation, mirroring DirectInputStream's tiny-data path.
 constexpr uint64_t kTinySize = 4 * 1024;
+
+constexpr size_t kReserveTimeoutMs{10000};
+
+// Downloads the prefix [getCurrentWriteOffset, targetEnd) of `segment` from
+// `readFile`, guaranteeing the segment durably covers `targetEnd` before
+// returning (or that it has reached a terminal, non-resumable state).
+//
+// Several readers across threads can share one segment while requesting
+// different prefixes, and FileCacheInputStream only waits for the download --
+// it never drives it itself. A caller that loses the downloader race to another
+// thread must therefore still ensure its own `targetEnd` is satisfied: a
+// concurrent download that captured a shallower target could otherwise complete
+// first and strand a deeper reader (which the old whole-segment download never
+// did). Hence the retry loop: become the downloader and resume the gap, or wait
+// for whoever holds it and re-check, until `targetEnd` is met or the segment is
+// abandoned.
+void downloadSegmentPrefix(
+    const FileSegmentPtr& segment,
+    const std::shared_ptr<ReadFile>& readFile,
+    FileCache* cache,
+    const std::shared_ptr<facebook::velox::io::IoStatistics>& ioStats,
+    uint64_t targetEnd) {
+  const uint64_t segStart = segment->range().left;
+  VELOX_CHECK_GT(targetEnd, segStart);
+  // Required downloadedSize (range-relative) for the segment to cover
+  // targetEnd.
+  const uint64_t needBytes = targetEnd - segStart;
+  bool recordedMiss = false;
+
+  while (segment->getDownloadedSize() < needBytes) {
+    const auto downloaderId = segment->getOrSetDownloader();
+    if (downloaderId != FileSegment::getCallerId()) {
+      // Lost the race: another task holds the downloader. Wait for it to make
+      // progress, then re-check whether it covered our target or gave up.
+      const auto state = segment->wait(targetEnd - 1);
+      if (segment->getDownloadedSize() >= needBytes) {
+        return;
+      }
+      if (state == FileSegment::State::PARTIALLY_DOWNLOADED_NO_CONTINUATION ||
+          state == FileSegment::State::DETACHED ||
+          state == FileSegment::State::DOWNLOADED) {
+        // Terminal (or shrunk DOWNLOADED) without enough bytes: give up; the
+        // waiting reader surfaces the shortfall.
+        return;
+      }
+      // EMPTY / DOWNLOADING / PARTIALLY_DOWNLOADED: loop to acquire and resume.
+      continue;
+    }
+
+    // Won the downloader. Another task may have satisfied the target between
+    // the loop test and the acquisition; re-check before counting a miss or
+    // writing.
+    if (segment->getDownloadedSize() >= needBytes) {
+      segment->completePartAndResetDownloader();
+      return;
+    }
+    if (!recordedMiss) {
+      // A real source download for this segment (a cross-load partial resume
+      // counts as a further miss, mirroring "segments downloaded from source").
+      cache->recordMiss();
+      recordedMiss = true;
+    }
+
+    const uint64_t before = segment->getDownloadedSize();
+    try {
+      // Download only the requested prefix [currentWriteOffset, targetEnd);
+      // downloadFromReader resumes from the current write offset, so a
+      // partially downloaded segment continues rather than restarting. On a
+      // reserve failure it stops after moving the segment to a terminal state.
+      const uint64_t writeOffset = segment->getCurrentWriteOffset();
+      if (targetEnd > writeOffset) {
+        // Install a positioned reader on the segment (only the first downloader
+        // does; a later resume reuses it). The same reader serves this
+        // foreground prefix download and, after the holder is released, the
+        // background tail-fill that completes the segment to its background
+        // target size. It holds a shared_ptr to the source file, so it safely
+        // outlives this BufferedInput; downloader ownership serializes its use
+        // between the foreground and the background pool. Reaching a terminal
+        // or fully-downloaded state resets it inside FileSegment.
+        auto reader = segment->getRemoteFileReader();
+        if (reader == nullptr) {
+          reader = std::make_shared<ReadFileByteInputStream>(readFile);
+          segment->setRemoteFileReader(reader);
+        }
+        std::vector<char> scratch;
+        const size_t written = FileSegment::downloadFromReader(
+            *segment,
+            *reader,
+            targetEnd - writeOffset,
+            scratch,
+            kReserveTimeoutMs);
+        // Bytes fetched from source and written into the cache (Layer B
+        // cumulative + Layer A: read() = source bytes, prefetch() = bytes
+        // pulled ahead into the cache, mirroring CachedBufferedInput).
+        cache->recordDownloadedBytes(written);
+        if (ioStats != nullptr) {
+          ioStats->read().increment(written);
+          ioStats->prefetch().increment(written);
+        }
+      }
+      if (segment->getDownloadedSize() == before &&
+          segment->getDownloadedSize() < needBytes) {
+        // No forward progress while we held the downloader (e.g. the source is
+        // shorter than targetEnd). Mark the segment failed so the reader stops
+        // waiting, instead of spinning on a target that can never be reached.
+        segment->setDownloadFailed();
+        segment->completePartAndResetDownloader();
+        return;
+      }
+      segment->completePartAndResetDownloader();
+    } catch (...) {
+      segment->setDownloadFailed();
+      segment->completePartAndResetDownloader();
+      return;
+    }
+
+    const auto state = segment->state();
+    if (state == FileSegment::State::PARTIALLY_DOWNLOADED_NO_CONTINUATION ||
+        state == FileSegment::State::DETACHED) {
+      // Reserve failed terminally; the segment cannot be continued.
+      return;
+    }
+    // Otherwise loop: re-check downloadedSize >= needBytes.
+  }
+}
+
+// Builds the in-region segment views from the holder, in list order.
+std::vector<FileSegmentPtr> collectSegments(
+    const FileSegmentsHolderPtr& holder) {
+  VELOX_CHECK_NOT_NULL(holder, "FileCacheInputStream requires a holder");
+  std::vector<FileSegmentPtr> segments;
+  for (const auto& segment : *holder) {
+    segments.push_back(segment);
+  }
+  return segments;
+}
 
 // Builds ranges covering EXACTLY `length` bytes from the front of `data`,
 // stopping as soon as `length` is reached. The reused allocation may be larger
@@ -57,15 +193,24 @@ std::vector<folly::Range<char*>> makeCappedRanges(
 } // namespace
 
 FileCacheInputStream::FileCacheInputStream(
-    std::vector<FileSegmentPtr> segments,
+    FileSegmentsHolderPtr holder,
     uint64_t regionOffset,
     uint64_t regionLength,
-    memory::MemoryPool& pool)
-    : segments_{std::move(segments)},
+    memory::MemoryPool& pool,
+    std::shared_ptr<ReadFile> readFile,
+    FileCache* cache,
+    std::shared_ptr<facebook::velox::io::IoStatistics> ioStats)
+    : holder_{std::move(holder)},
+      segments_{collectSegments(holder_)},
       regionOffset_{regionOffset},
       regionLength_{regionLength},
-      pool_{pool} {
+      pool_{pool},
+      readFile_{std::move(readFile)},
+      cache_{cache},
+      ioStats_{std::move(ioStats)} {
   VELOX_CHECK(!segments_.empty(), "FileCacheInputStream requires >=1 segment");
+  VELOX_CHECK_NOT_NULL(cache_, "FileCacheInputStream requires a FileCache");
+  VELOX_CHECK_NOT_NULL(readFile_, "FileCacheInputStream requires a ReadFile");
   // Precompute, for each segment, the slice of the requested region it covers:
   // its length (as a prefix sum) and its offset within the on-disk segment
   // file. Both endpoints are clipped because outer segments may be aligned
@@ -101,44 +246,36 @@ void FileCacheInputStream::loadSegment(size_t index) {
   const uint64_t length =
       sliceStartInRegion_[index + 1] - sliceStartInRegion_[index];
   const uint64_t segmentOffset = sliceOffsetInSegment_[index];
-
-  // Wait until the writer has persisted the last byte this slice needs. Treat
-  // DOWNLOADING as a retryable wait. EMPTY and (resumable) PARTIALLY_DOWNLOADED
-  // are also transient: a download task is pending or a later load() resumes the
-  // gap, so back off briefly (bounded) rather than failing. Only the terminal
-  // states (PARTIALLY_DOWNLOADED_NO_CONTINUATION / DETACHED) mean the writer
-  // truly abandoned the download; fail once the segment reaches one of those
-  // without enough durable bytes.
   const uint64_t segStart = segment->range().left;
+  // Range-relative bytes the cache must hold to cover this slice, and its
+  // absolute end offset in the source file.
   const uint64_t needed = segmentOffset + length;
-  const auto resumeDeadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(60);
-  while (segment->getDownloadedSize() < needed) {
-    const auto state = segment->wait(segStart + needed - 1);
-    const auto downloadedSize = segment->getDownloadedSize();
-    if (downloadedSize >= needed) {
-      break;
+  const uint64_t targetEnd = segStart + needed;
+
+  if (segment->getDownloadedSize() >= needed) {
+    // Coverage-based cache hit (CH canStartFromCache = current_write_offset >
+    // offset): the slice is already on disk even if the segment is only
+    // PARTIALLY_DOWNLOADED. Count one hit plus the slice bytes served from the
+    // local cache file (Layer A ssdRead -- FileCache is disk-backed).
+    cache_->recordHit();
+    if (ioStats_ != nullptr) {
+      ioStats_->ssdRead().increment(length);
     }
-    if (state == FileSegment::State::EMPTY ||
-        state == FileSegment::State::PARTIALLY_DOWNLOADED) {
-      VELOX_CHECK(
-          std::chrono::steady_clock::now() < resumeDeadline,
-          "FileCacheInputStream: download did not progress; segment still "
-          "resumable ({}) after timeout (downloadedSize: {}, needed: {})",
-          FileSegment::stateToString(state),
-          downloadedSize,
-          needed);
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      continue;
-    }
-    if (state != FileSegment::State::DOWNLOADING) {
-      VELOX_FAIL(
-          "FileCacheInputStream: segment has fewer downloaded bytes than "
-          "required; writer abandoned the download (downloadedSize: {}, "
-          "needed: {})",
-          downloadedSize,
-          needed);
-    }
+  } else {
+    // Miss: drive the prefix download synchronously. downloadSegmentPrefix is
+    // the sole synchronous driver -- its holder/wait/recheck loop handles
+    // EMPTY/PARTIAL/DOWNLOADING back-off (become downloader and resume, or wait
+    // for whoever holds it), so no separate wait-gate is needed here. It
+    // records the miss + downloaded bytes + Layer A read/prefetch internally.
+    downloadSegmentPrefix(segment, readFile_, cache_, ioStats_, targetEnd);
+    VELOX_CHECK_GE(
+        segment->getDownloadedSize(),
+        needed,
+        "FileCacheInputStream: segment has fewer downloaded bytes than "
+        "required; writer abandoned the download (downloadedSize: {}, "
+        "needed: {})",
+        segment->getDownloadedSize(),
+        needed);
   }
 
   // Read the slice into reused storage. Pooled non-contiguous allocation lets

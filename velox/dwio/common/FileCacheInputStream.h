@@ -16,7 +16,9 @@
 
 #pragma once
 
-#include "velox/common/caching/filecache/FileCache_fwd_internal.h"
+#include "velox/common/caching/filecache/FileSegment.h"
+#include "velox/common/file/File.h"
+#include "velox/common/io/IoStatistics.h"
 #include "velox/common/memory/Allocation.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/dwio/common/SeekableInputStream.h"
@@ -30,14 +32,19 @@
 
 namespace facebook::velox::ch {
 
+class FileCache;
+
 class FileCacheInputStream final
     : public facebook::velox::dwio::common::SeekableInputStream {
  public:
   FileCacheInputStream(
-      std::vector<FileSegmentPtr> segments,
+      FileSegmentsHolderPtr holder,
       uint64_t regionOffset,
       uint64_t regionLength,
-      memory::MemoryPool& pool);
+      memory::MemoryPool& pool,
+      std::shared_ptr<ReadFile> readFile,
+      FileCache* cache,
+      std::shared_ptr<facebook::velox::io::IoStatistics> ioStats);
 
   bool Next(const void** data, int32_t* size) override;
   void BackUp(int32_t count) override;
@@ -61,10 +68,22 @@ class FileCacheInputStream final
   // (cursor must be < regionLength_).
   size_t segmentIndexFor(uint64_t cursor) const;
 
+  // Owns the segments holder so the stream is self-contained and may outlive
+  // the FileCacheBufferedInput that created it (mirrors CH
+  // ReadInfo::file_segments). Destruction runs completeAndPopFront / background
+  // tail-fill at end of read.
+  const FileSegmentsHolderPtr holder_;
+  // Views into holder_, in region order; sized/indexed by the slice tables
+  // below.
   const std::vector<FileSegmentPtr> segments_;
   const uint64_t regionOffset_;
   const uint64_t regionLength_;
   memory::MemoryPool& pool_;
+  // Source file + cache + per-query IO counters, used by loadSegment to drive
+  // the lazy download and classify hits/misses (consume-time accounting).
+  const std::shared_ptr<ReadFile> readFile_;
+  FileCache* const cache_;
+  const std::shared_ptr<facebook::velox::io::IoStatistics> ioStats_;
 
   // Prefix sums of per-segment slice lengths within the region; size
   // segments_.size()+1, front()==0, back()==regionLength_.

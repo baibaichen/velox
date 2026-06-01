@@ -152,6 +152,24 @@ class FileCacheBufferedInputTest : public testing::Test {
   std::shared_ptr<memory::MemoryPool> pool_;
 };
 
+// Builds an input wired with an IoStatistics sink so the Layer A operator-level
+// counters (read/ssdRead/prefetch) can be asserted alongside Layer B.
+FileCacheBufferedInput makeInputWithStats(
+    memory::MemoryPool& pool,
+    FileCache& cache,
+    const std::string& filePath,
+    const FileCacheKey& key,
+    std::shared_ptr<io::IoStatistics> ioStats) {
+  return FileCacheBufferedInput(
+      std::make_shared<LocalReadFile>(filePath),
+      pool,
+      &cache,
+      key,
+      FileCache::getCommonOrigin(),
+      CreateFileSegmentSettings{},
+      std::move(ioStats));
+}
+
 TEST_F(FileCacheBufferedInputTest, enqueueAndLoadReadsExpectedBytes) {
   const auto remotePath = path("remote.bin");
   const auto content = makeContent(1 << 20);
@@ -350,6 +368,89 @@ TEST_F(FileCacheBufferedInputTest, skipThenReadAfterLoad) {
   EXPECT_EQ(drain(*stream, 3096), content.substr(2000, 3096));
 }
 
+// Pull invariant: SkipInt64 over the whole region without ever calling Next()
+// must not download anything. Under the push model load() eagerly downloads the
+// region, so this fails until the download moves to the consume path.
+TEST_F(FileCacheBufferedInputTest, skipOnlyDoesNotDownload) {
+  const auto remotePath = path("remote.bin");
+  const auto content = makeContent(256 << 10);
+  writeFile(remotePath, content);
+
+  // Background download disabled so nothing is fetched unless the consume path
+  // drives it.
+  FileCache cache(
+      "skip_no_dl",
+      settings(
+          path("cache"),
+          64ULL << 20,
+          64ULL << 10,
+          64ULL << 10,
+          /*backgroundDownloadThreads=*/0));
+  cache.initialize();
+
+  {
+    auto input = makeInput(cache, remotePath);
+    auto stream = input.enqueue({0, 256 << 10});
+    input.load(LogType::FILE);
+    // Skip the entire region; never call Next(). Pull must not build the inner
+    // stream nor download.
+    ASSERT_TRUE(stream->SkipInt64(256 << 10));
+  }
+
+  EXPECT_EQ(cache.stats().downloadedBytes, 0u);
+}
+
+// Pull/coverage invariant: a slice that lies fully inside an already-downloaded
+// prefix is a CACHE HIT (CH canStartFromCache = coverage), even though the
+// owning segment is only PARTIALLY_DOWNLOADED. Under push, the hit path checks
+// state()==DOWNLOADED and the (already-covered) download path records nothing,
+// so the read counts as neither hit nor miss until the coverage criterion
+// lands.
+TEST_F(FileCacheBufferedInputTest, partiallyCoveredSliceCountsAsHit) {
+  const auto remotePath = path("remote.bin");
+  const auto content = makeContent(256 << 10);
+  writeFile(remotePath, content);
+
+  // One large (default-sized) segment, background disabled so the segment stays
+  // PARTIALLY_DOWNLOADED after the prime.
+  FileCache cache(
+      "partial_hit",
+      settings(
+          path("cache"),
+          64ULL << 20,
+          0,
+          0,
+          /*backgroundDownloadThreads=*/0));
+  cache.initialize();
+  const auto key = FileCacheKey::fromPath(remotePath);
+
+  // Prime: download the prefix [0, 200000) only.
+  {
+    auto input = makeInput(cache, remotePath, key);
+    auto stream = input.enqueue({0, 200000});
+    input.load(LogType::FILE);
+    EXPECT_EQ(drain(*stream, 200000), content.substr(0, 200000));
+  }
+  const auto afterPrime = cache.stats();
+  ASSERT_EQ(afterPrime.downloadedBytes, 200000u);
+
+  // A region fully inside the downloaded prefix must be served as a hit with no
+  // new source bytes.
+  auto ioStats = std::make_shared<io::IoStatistics>();
+  {
+    auto input = makeInputWithStats(*pool_, cache, remotePath, key, ioStats);
+    auto stream = input.enqueue({1000, 4096});
+    input.load(LogType::FILE);
+    EXPECT_EQ(drain(*stream, 4096), content.substr(1000, 4096));
+  }
+  const auto after = cache.stats();
+  EXPECT_GT(after.hits, afterPrime.hits);
+  EXPECT_EQ(after.misses, afterPrime.misses);
+  EXPECT_EQ(after.downloadedBytes, afterPrime.downloadedBytes);
+  EXPECT_EQ(ioStats->ssdRead().sum(), 4096u);
+  EXPECT_EQ(ioStats->read().sum(), 0u);
+}
+
 TEST_F(FileCacheBufferedInputTest, isBufferedAlwaysFalse) {
   const auto remotePath = path("remote.bin");
   writeFile(remotePath, makeContent(1024));
@@ -499,24 +600,6 @@ TEST_F(FileCacheBufferedInputTest, crossLoadResumeDownloadsRemainingGap) {
   EXPECT_EQ(stats.downloadedBytes, 212345u);
 }
 
-// Builds an input wired with an IoStatistics sink so the Layer A operator-level
-// counters (read/ssdRead/prefetch) can be asserted alongside Layer B.
-FileCacheBufferedInput makeInputWithStats(
-    memory::MemoryPool& pool,
-    FileCache& cache,
-    const std::string& filePath,
-    const FileCacheKey& key,
-    std::shared_ptr<io::IoStatistics> ioStats) {
-  return FileCacheBufferedInput(
-      std::make_shared<LocalReadFile>(filePath),
-      pool,
-      &cache,
-      key,
-      FileCache::getCommonOrigin(),
-      CreateFileSegmentSettings{},
-      std::move(ioStats));
-}
-
 TEST_F(FileCacheBufferedInputTest, metricsColdReadRecordsMissAndDownload) {
   const auto remotePath = path("remote.bin");
   const auto content = makeContent(256 << 10);
@@ -528,8 +611,8 @@ TEST_F(FileCacheBufferedInputTest, metricsColdReadRecordsMissAndDownload) {
   auto ioStats = std::make_shared<io::IoStatistics>();
 
   {
-    // load() downloads synchronously, so the miss/download counters are
-    // already final once it returns and drain() observes the bytes.
+    // Pull model: load() only plans; drain() drives the download on the
+    // consuming thread, so the miss/download counters are final after drain().
     auto input =
         makeInputWithStats(*pool_, cache, remotePath, key, ioStats);
     auto stream = input.enqueue({0, content.size()});
