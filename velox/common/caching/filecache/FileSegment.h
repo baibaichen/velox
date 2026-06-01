@@ -277,12 +277,29 @@ class FileSegment : private boost::noncopyable {
   /// reader is seeked to the segment's absolute write offset
   /// (`getCurrentWriteOffset()`), not a range-relative offset. `scratch` is a
   /// caller-owned, reusable buffer (grown as needed) used to copy each chunk.
+  ///
+  /// Optional `tee`: as each chunk is written to the cache, the intersection of
+  /// the absolute window [tee->absStart, tee->absStart + tee->length) with that
+  /// chunk is also copied into `tee->dest` (at offset `overlapStart -
+  /// absStart`), and `tee->copied` is advanced by the bytes copied. This lets a
+  /// foreground consumer obtain the bytes it just downloaded directly from
+  /// memory, without re-reading the cache file -- mirroring CH handing the
+  /// just-written working_buffer to the reader. A null `tee` (the default, used
+  /// by the background tail-fill pool) disables teeing.
+  struct DownloadTee {
+    size_t absStart{0};
+    size_t length{0};
+    char* dest{nullptr};
+    size_t copied{0};
+  };
   static size_t downloadFromReader(
       FileSegment& segment,
       velox::ByteInputStream& reader,
       size_t num_bytes,
       std::vector<char>& scratch,
-      size_t lock_wait_timeout_milliseconds);
+      size_t lock_wait_timeout_milliseconds,
+      DownloadTee* tee = nullptr);
+
 
   // Invariant: if state() != DOWNLOADING and remote file reader is present, the reader's
   // available() == 0, and getFileOffsetOfBufferEnd() == our getCurrentWriteOffset().

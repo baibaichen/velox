@@ -1046,6 +1046,39 @@ TEST_F(FileCacheBufferedInputTest, downloadFromReaderSeeksAbsoluteFileOffset) {
   EXPECT_EQ(readFileFully(segment.getPath()), content.substr(segOffset, segSize));
 }
 
+TEST_F(FileCacheBufferedInputTest, downloadFromReaderTeesRequestedWindow) {
+  // A multi-chunk download (> kDownloadChunk) with a tee window that straddles a
+  // chunk boundary: the helper must copy exactly the absolute window
+  // [winStart, winStart+winLen) into dest as it writes, so a foreground consumer
+  // obtains the just-downloaded bytes without re-reading the cache file.
+  const size_t fileSize = 3 * (1 << 20); // 3 MiB -> 3 download chunks
+  const size_t winStart = (3 * (1 << 20)) / 2; // 1.5 MiB, mid-chunk
+  const size_t winLen = 512 * 1024;
+  std::string content = makeContent(fileSize);
+
+  FileCache cache("download_tee", settings(path("cache")));
+  cache.initialize();
+  const auto key = FileCacheKey::fromPath("remote.bin");
+  FileSegmentsHolderPtr holder;
+  auto& segment = acquireDownloader(cache, holder, key, fileSize);
+
+  BufferInputStream reader({ByteRange{
+      reinterpret_cast<uint8_t*>(content.data()),
+      static_cast<int64_t>(content.size()),
+      0}});
+  std::vector<char> scratch;
+  std::vector<char> dest(winLen, '\0');
+  FileSegment::DownloadTee tee{winStart, winLen, dest.data(), 0};
+  const size_t written = FileSegment::downloadFromReader(
+      segment, reader, fileSize, scratch, 10000, &tee);
+
+  EXPECT_EQ(written, fileSize);
+  EXPECT_EQ(tee.copied, winLen);
+  EXPECT_EQ(
+      std::string(dest.begin(), dest.end()), content.substr(winStart, winLen));
+  segment.completePartAndResetDownloader();
+}
+
 // ===========================================================================
 // ReadFileByteInputStream — positioned, random-access ByteInputStream over a
 // shared ReadFile. seekp uses absolute file offsets and never reads the skipped

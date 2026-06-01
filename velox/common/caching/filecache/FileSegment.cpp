@@ -16,6 +16,7 @@
 #include "velox/common/caching/filecache/FileSegment.h"
 
 #include <algorithm>
+#include <cstring>
 #include <filesystem>
 #include <sstream>
 #include <utility>
@@ -465,7 +466,8 @@ size_t FileSegment::downloadFromReader(
     velox::ByteInputStream& reader,
     size_t num_bytes,
     std::vector<char>& scratch,
-    size_t lock_wait_timeout_milliseconds)
+    size_t lock_wait_timeout_milliseconds,
+    DownloadTee* tee)
 {
     // Per-write chunk cap. Bounds the scratch buffer and keeps each reserve()
     // small so a tight cache can satisfy it incrementally.
@@ -523,6 +525,24 @@ size_t FileSegment::downloadFromReader(
             reinterpret_cast<uint8_t*>(scratch.data()),
             static_cast<int32_t>(to_read));
         segment.write(scratch.data(), to_read, offset);
+
+        if (tee != nullptr && tee->length > 0)
+        {
+            // Copy the intersection of this chunk [offset, offset+to_read) with
+            // the requested absolute window into the caller's destination, so the
+            // foreground consumer serves these bytes from memory.
+            const size_t winEnd = tee->absStart + tee->length;
+            const size_t lo = std::max(offset, tee->absStart);
+            const size_t hi = std::min(offset + to_read, winEnd);
+            if (lo < hi)
+            {
+                std::memcpy(
+                    tee->dest + (lo - tee->absStart),
+                    scratch.data() + (lo - offset),
+                    hi - lo);
+                tee->copied += hi - lo;
+            }
+        }
 
         offset += to_read;
         num_bytes -= to_read;
