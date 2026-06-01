@@ -261,6 +261,7 @@
   - `velox/dwio/common/FileCacheInputStream.cpp:113,116-142`（`needed=segmentOffset+length`；阻塞等满）、`velox/dwio/common/FileCacheBufferedInput.cpp:182-200`（`downloadSegmentPrefix` 等满）
 - **差异/影响**：场景（b）部分命中、（h）第二并发 reader。CH 第二 reader 在写偏移越过其位置的瞬间即开始消费盘上前缀，与下载流水线重叠；Velox 第二 reader 被完全串行化——阻塞到整段 needed 落盘后才 pread。首字节延迟、并发读吞吐回退；**数据不损坏**。与 F16 不同角度：F16 是*下载方*回读自己刚下的字节，F17 是*非下载方*丢了流式前缀快路。
 - **判定**：集成层下载/供数解耦的衍生差异，待人确认。
+- **状态（2026-06-01）：部分解决 ⚠️**。S2 流式重写（提交 `04499e449`）去掉了 `loadSegment` 里 `while(getDownloadedSize() < segmentOffset+length)` 的整 slice 阻塞：`fillBuffer` CASE A 把 `step` 截到下载前沿（`min(step, downloaded-offsetInSegment)`），已落盘的前缀**按 buffer 直接供数、不等整段**（覆盖式命中即 CH 的 `canStartFromCache` 前缀可读）。**仍未解决**：非下载方在另一线程**正在下载**时边写边读地消费前缀（CH `:909-923` 追写偏移流式重叠）——当前下载仍串行（`downloadSegmentPrefix` 等满 `targetEnd`）。该并发重叠路径记为 S3，延后。
 
 ### F18 — 供数前对整 slice 单次 pread（LOW，集成层，数据流再审）
 
@@ -270,6 +271,7 @@
   - `velox/dwio/common/FileCacheInputStream.cpp:152-159,192-207`
 - **差异/影响**：多 MB 段首字节延迟升至整 slice 读、峰值常驻内存为整 slice；消费者只读前缀后 seek 走也已读全。纯性能/内存。**与已接受的 loadQuantum 偏差部分重叠**（此处是已定读内的供数/读取粒度，非预取大小），故记 LOW 备查。
 - **判定**：集成层重写衍生，LOW。
+- **状态（2026-06-01）：已解决 ✅**。S2 流式重写（提交 `04499e449`）用 `kBufferSize`（1MiB）上限的复用 `buf_` 取代整 slice `segData_`：`Next()` 每次只填/供一个 ≤1MiB working buffer，无整 slice 单次 `preadv`、无整 slice 常驻内存，首字节延迟降为一个 buffer 的读取。对齐 CH `nextImplStep` 的 `min(local_fs_buffer_size, remaining)` 供数粒度。
 
 ### F19 — DETACHED bypass 在 load() 线程上 eager 整 region 读进 RAM（MEDIUM，集成层，数据流再审）
 
