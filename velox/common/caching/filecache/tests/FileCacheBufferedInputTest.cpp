@@ -451,6 +451,76 @@ TEST_F(FileCacheBufferedInputTest, partiallyCoveredSliceCountsAsHit) {
   EXPECT_EQ(ioStats->read().sum(), 0u);
 }
 
+// Contrast to skipOnlyDoesNotDownload: skipping does not download, but the
+// first Next() after a skip DOES download the segment covering the landing
+// position (ensureWithData replays the skip, then loadPosition drives
+// loadSegment).
+TEST_F(FileCacheBufferedInputTest, skipThenNextDownloadsLandingSegment) {
+  const auto remotePath = path("remote.bin");
+  const auto content = makeContent(256 << 10);
+  writeFile(remotePath, content);
+
+  FileCache cache(
+      "skip_then_next",
+      settings(
+          path("cache"),
+          64ULL << 20,
+          64ULL << 10,
+          64ULL << 10,
+          /*backgroundDownloadThreads=*/0));
+  cache.initialize();
+  auto input = makeInput(cache, remotePath);
+
+  auto stream = input.enqueue({0, 256 << 10});
+  input.load(LogType::FILE);
+
+  ASSERT_TRUE(stream->SkipInt64(200 << 10)); // land in a later segment
+  EXPECT_EQ(cache.stats().downloadedBytes, 0u); // skip alone downloaded nothing
+
+  const void* data;
+  int32_t len;
+  ASSERT_TRUE(stream->Next(&data, &len)); // triggers landing-segment download
+  ASSERT_GT(len, 0);
+  EXPECT_GT(cache.stats().downloadedBytes, 0u);
+  EXPECT_EQ(
+      std::string(static_cast<const char*>(data), len),
+      content.substr(200 << 10, len));
+}
+
+// Decision B (per-read-event accounting): two streams over the SAME cold
+// segment each drive their own download, so each records a miss -- the pull
+// model does not coalesce the count across streams.
+TEST_F(FileCacheBufferedInputTest, sharedSegmentCountsMissPerStream) {
+  const auto remotePath = path("remote.bin");
+  const auto content = makeContent(256 << 10);
+  writeFile(remotePath, content);
+
+  // One large segment, background disabled.
+  FileCache cache(
+      "shared_seg",
+      settings(
+          path("cache"),
+          64ULL << 20,
+          0,
+          0,
+          /*backgroundDownloadThreads=*/0));
+  cache.initialize();
+  const auto key = FileCacheKey::fromPath(remotePath);
+  auto input = makeInput(cache, remotePath, key);
+
+  auto shallow = input.enqueue({0, 4096});
+  auto deep = input.enqueue({8192, 4096}); // same segment, deeper end
+  input.load(LogType::FILE);
+
+  EXPECT_EQ(drain(*shallow, 4096), content.substr(0, 4096));
+  EXPECT_EQ(drain(*deep, 4096), content.substr(8192, 4096));
+
+  // Two consume-time downloads of the same segment => two misses (decision B).
+  EXPECT_EQ(cache.stats().misses, 2u);
+  // Forward-resume downloads each gap once: bytes total to the deepest end.
+  EXPECT_EQ(cache.stats().downloadedBytes, 8192u + 4096u);
+}
+
 TEST_F(FileCacheBufferedInputTest, isBufferedAlwaysFalse) {
   const auto remotePath = path("remote.bin");
   writeFile(remotePath, makeContent(1024));
