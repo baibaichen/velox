@@ -299,9 +299,9 @@ TEST_F(FileCacheBufferedInputTest, streamingServesColdReadInBoundedChunksFromMem
 // Streaming, within a SINGLE stream over one large segment: read the first
 // buffer (advancing the download frontier), then SkipInt64 over an un-downloaded
 // prefix gap and read the remainder. The landing read sits above the frontier,
-// so CASE B must download the whole gap [frontier, landing) plus the served
-// window, tee only the window into memory, and still hand back the correct
-// bytes. Total downloaded covers the whole region (gap included).
+// so CASE B must download the whole gap [frontier, landing) (staged through
+// scratch) plus read the served window straight into the working buffer, and
+// still hand back the correct bytes. Total downloaded covers the whole region.
 TEST_F(FileCacheBufferedInputTest, streamingForwardGapDownloadsGapAndServesWindow) {
   const auto remotePath = path("remote.bin");
   const auto content = makeContent(3 << 20); // 3 MiB single segment
@@ -345,11 +345,11 @@ TEST_F(FileCacheBufferedInputTest, streamingForwardGapDownloadsGapAndServesWindo
   // The gap is downloaded too: the whole region ends up fetched once.
   EXPECT_EQ(cache.stats().downloadedBytes, content.size());
 
-  // The cold read above was served from the tee'd memory window, which could
-  // mask a bad/short write to the durable cache file (especially the gap). A
-  // fresh warm stream reads the WHOLE region straight from the cache file
-  // (CASE A) and must see the correct bytes, gap included -- proving the gap and
-  // window were durably written.
+  // The cold read above was served from the working buffer the window was read
+  // straight into, which could mask a bad/short write to the durable cache file
+  // (especially the gap). A fresh warm stream reads the WHOLE region straight
+  // from the cache file (CASE A) and must see the correct bytes, gap included --
+  // proving the gap and window were durably written.
   auto warmStats = std::make_shared<io::IoStatistics>();
   {
     auto input = makeInputWithStats(*pool_, cache, remotePath, key, warmStats);
@@ -1200,17 +1200,18 @@ TEST_F(FileCacheBufferedInputTest, downloadFromReaderSeeksAbsoluteFileOffset) {
   EXPECT_EQ(readFileFully(segment.getPath()), content.substr(segOffset, segSize));
 }
 
-TEST_F(FileCacheBufferedInputTest, downloadFromReaderTeesRequestedWindow) {
-  // A multi-chunk download (> kDownloadChunk) with a tee window that straddles a
-  // chunk boundary: the helper must copy exactly the absolute window
-  // [winStart, winStart+winLen) into dest as it writes, so a foreground consumer
-  // obtains the just-downloaded bytes without re-reading the cache file.
-  const size_t fileSize = 3 * (1 << 20); // 3 MiB -> 3 download chunks
-  const size_t winStart = (3 * (1 << 20)) / 2; // 1.5 MiB, mid-chunk
-  const size_t winLen = 512 * 1024;
+TEST_F(FileCacheBufferedInputTest, downloadFromReaderReadsWindowIntoOutputBuffer) {
+  // Reference semantics: once the frontier is aligned to the window start (the
+  // gap pre-filled), a window download reads its bytes straight into the
+  // caller's output buffer -- zero extra copy -- while still writing them to the
+  // cache file. That output buffer IS the consumer's working buffer, mirroring
+  // CH handing back the just-written working_buffer.
+  const size_t fileSize = 3 * (1 << 20); // 3 MiB
+  const size_t gapLen = (3 * (1 << 20)) / 2; // 1.5 MiB pre-filled into scratch
+  const size_t winLen = 512 * 1024; // < kDownloadChunk: a single direct chunk
   std::string content = makeContent(fileSize);
 
-  FileCache cache("download_tee", settings(path("cache")));
+  FileCache cache("download_direct_out", settings(path("cache")));
   cache.initialize();
   const auto key = FileCacheKey::fromPath("remote.bin");
   FileSegmentsHolderPtr holder;
@@ -1221,16 +1222,26 @@ TEST_F(FileCacheBufferedInputTest, downloadFromReaderTeesRequestedWindow) {
       static_cast<int64_t>(content.size()),
       0}});
   std::vector<char> scratch;
-  std::vector<char> dest(winLen, '\0');
-  FileSegment::DownloadTee tee{winStart, winLen, dest.data(), 0};
-  const size_t written = FileSegment::downloadFromReader(
-      segment, reader, fileSize, scratch, 10000, &tee);
 
-  EXPECT_EQ(written, fileSize);
-  EXPECT_EQ(tee.copied, winLen);
+  // Pre-fill the gap [0, gapLen) through scratch (no output buffer) to advance
+  // the frontier to the window start.
   EXPECT_EQ(
-      std::string(dest.begin(), dest.end()), content.substr(winStart, winLen));
+      FileSegment::downloadFromReader(segment, reader, gapLen, scratch, 10000),
+      gapLen);
+  EXPECT_EQ(segment.getDownloadedSize(), gapLen);
+
+  // Download the window [gapLen, gapLen + winLen) straight into 'out'.
+  std::vector<char> out(winLen, '\0');
+  const size_t written = FileSegment::downloadFromReader(
+      segment, reader, winLen, scratch, 10000,
+      folly::Range<char*>(out.data(), out.size()));
+
+  EXPECT_EQ(written, winLen);
+  EXPECT_EQ(std::string(out.begin(), out.end()), content.substr(gapLen, winLen));
   segment.completePartAndResetDownloader();
+  // The window bytes are also durable in the cache file.
+  EXPECT_EQ(
+      readFileFully(segment.getPath()), content.substr(0, gapLen + winLen));
 }
 
 // ===========================================================================

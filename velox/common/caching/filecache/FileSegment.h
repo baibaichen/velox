@@ -25,6 +25,7 @@
 
 #include <boost/noncopyable.hpp>
 #include <fmt/format.h>
+#include <folly/Range.h>
 
 #include "velox/common/caching/filecache/FileCacheKey.h"
 #include "velox/common/caching/filecache/Guards.h"
@@ -276,29 +277,33 @@ class FileSegment : private boost::noncopyable {
   /// in absolute file coordinates: position 0 is the start of the file, so the
   /// reader is seeked to the segment's absolute write offset
   /// (`getCurrentWriteOffset()`), not a range-relative offset. `scratch` is a
-  /// caller-owned, reusable buffer (grown as needed) used to copy each chunk.
+  /// caller-owned, reusable buffer (grown as needed) used to stage each chunk
+  /// when `out` is empty.
   ///
-  /// Optional `tee`: as each chunk is written to the cache, the intersection of
-  /// the absolute window [tee->absStart, tee->absStart + tee->length) with that
-  /// chunk is also copied into `tee->dest` (at offset `overlapStart -
-  /// absStart`), and `tee->copied` is advanced by the bytes copied. This lets a
-  /// foreground consumer obtain the bytes it just downloaded directly from
-  /// memory, without re-reading the cache file -- mirroring CH handing the
-  /// just-written working_buffer to the reader. A null `tee` (the default, used
-  /// by the background tail-fill pool) disables teeing.
-  struct DownloadTee {
-    size_t absStart{0};
-    size_t length{0};
-    char* dest{nullptr};
-    size_t copied{0};
-  };
+  /// Optional `out`: a caller-owned output buffer view (`folly::Range`) of at
+  /// least `num_bytes` bytes. When non-empty, each chunk is read straight into
+  /// `out` (at the running offset from the first downloaded byte) and the cache
+  /// file is written from those same bytes -- reference semantics: the
+  /// downloaded bytes ARE the consumer's working buffer, with zero extra copy,
+  /// mirroring CH handing back the just-written working_buffer. The caller must
+  /// first align the segment's write frontier to the start of the window it
+  /// wants in `out` (download any preceding gap separately, with an empty
+  /// `out`). An empty `out` (the default, used by the background tail-fill pool)
+  /// stages each chunk through `scratch`.
+  ///
+  /// Reference semantics are safe only because the cache write is synchronous:
+  /// the bytes are durable before `out` is handed to the consumer, so a single
+  /// reused `out` buffer cannot be overwritten by a later read while a writeback
+  /// still needs it. A future async writeback would instead manage these buffers
+  /// in a pool with reference counts (consumer + writeback each hold one;
+  /// returned to the pool when both are done).
   static size_t downloadFromReader(
       FileSegment& segment,
       velox::ByteInputStream& reader,
       size_t num_bytes,
       std::vector<char>& scratch,
       size_t lock_wait_timeout_milliseconds,
-      DownloadTee* tee = nullptr);
+      folly::Range<char*> out = {});
 
 
   // Invariant: if state() != DOWNLOADING and remote file reader is present, the reader's

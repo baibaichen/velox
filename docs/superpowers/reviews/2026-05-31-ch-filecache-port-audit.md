@@ -251,6 +251,7 @@
   2. **下载方 reader 被耦合到写**：velox 消费者卡在 `getDownloadedSize()`（写落盘后才推进）→ 才能 pread；CH 下载方从 working_buffer 取字节，与回读无关。这是冷写关键路径上"写挡读"的结构性来源（详见 `docs`/session 冷写性能调查）。
   3. 数据**不损坏**、语义正确——纯性能/架构偏差。
 - **判定**：待人确认。属集成读路径重写的衍生差异，但 spec **未将其列为已知偏差**（§7 只列 coalesceIo / loadQuantum）。修复方向 = serve-from-memory（回归 CH，Option 1）+ 可选异步写（超出 CH，Option 2）。
+- **状态（2026-06-01）：已解决 ✅（引用语义）**。`FileSegment::downloadFromReader` 新增可选 `folly::Range<char*> out` 输出 buffer：窗口那段 chunk 直接 `readBytes` 进消费者复用 buffer（`ReadFileByteInputStream` 的 readBytes 就是一次定位 pread，等价 CH "远端→working_buffer"），并从同一份字节写盘——**零额外拷贝**，对齐 CH 把写好的 working_buffer 直接交回。`FileCacheInputStream::fillBuffer` 在下载前沿（CASE B）先把前缀 gap 下进 throwaway scratch 让前沿对齐窗口起点，再把窗口直读进 `buf_` 供数；竞态败者（窗口被他人写过）回退到从缓存文件 pread。引用语义仅在**同步写**下成立（字节落盘后才交出 `buf_`，单块复用 buffer 不会在写盘未完成时被覆盖）；未来异步写需池化 + 引用计数管理 buffer。冷读保持 `ssdRead==0`（从 `buf_` 内存供数）。提交 `8e3f3c800`（流式 core 雏形）、`04499e449`（集成流式）、引用语义重构（本次提交）。
 
 ### F17 — 无 `canStartFromCache` 流式前缀快路径（MEDIUM，集成层，数据流再审）
 

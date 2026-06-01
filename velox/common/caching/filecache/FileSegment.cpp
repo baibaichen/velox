@@ -16,7 +16,6 @@
 #include "velox/common/caching/filecache/FileSegment.h"
 
 #include <algorithm>
-#include <cstring>
 #include <filesystem>
 #include <sstream>
 #include <utility>
@@ -467,7 +466,7 @@ size_t FileSegment::downloadFromReader(
     size_t num_bytes,
     std::vector<char>& scratch,
     size_t lock_wait_timeout_milliseconds,
-    DownloadTee* tee)
+    folly::Range<char*> out)
 {
     // Per-write chunk cap. Bounds the scratch buffer and keeps each reserve()
     // small so a tight cache can satisfy it incrementally.
@@ -519,30 +518,27 @@ size_t FileSegment::downloadFromReader(
             break;
         }
 
-        if (scratch.size() < to_read)
-            scratch.resize(to_read);
-        reader.readBytes(
-            reinterpret_cast<uint8_t*>(scratch.data()),
-            static_cast<int32_t>(to_read));
-        segment.write(scratch.data(), to_read, offset);
-
-        if (tee != nullptr && tee->length > 0)
+        // Reference semantics: when the caller supplies an output buffer, read
+        // the chunk straight into it (at the running offset from the first
+        // downloaded byte) and write the cache file from those same bytes, so
+        // the foreground consumer serves them from memory with zero extra copy.
+        // Otherwise stage through the reusable scratch buffer.
+        char* target;
+        if (!out.empty())
         {
-            // Copy the intersection of this chunk [offset, offset+to_read) with
-            // the requested absolute window into the caller's destination, so the
-            // foreground consumer serves these bytes from memory.
-            const size_t winEnd = tee->absStart + tee->length;
-            const size_t lo = std::max(offset, tee->absStart);
-            const size_t hi = std::min(offset + to_read, winEnd);
-            if (lo < hi)
-            {
-                std::memcpy(
-                    tee->dest + (lo - tee->absStart),
-                    scratch.data() + (lo - offset),
-                    hi - lo);
-                tee->copied += hi - lo;
-            }
+            VELOX_CHECK_LE(written + to_read, out.size());
+            target = out.data() + written;
         }
+        else
+        {
+            if (scratch.size() < to_read)
+                scratch.resize(to_read);
+            target = scratch.data();
+        }
+        reader.readBytes(
+            reinterpret_cast<uint8_t*>(target),
+            static_cast<int32_t>(to_read));
+        segment.write(target, to_read, offset);
 
         offset += to_read;
         num_bytes -= to_read;

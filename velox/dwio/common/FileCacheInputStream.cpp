@@ -26,6 +26,8 @@
 #include <memory>
 #include <vector>
 
+#include <folly/Range.h>
+
 namespace facebook::velox::ch {
 
 namespace {
@@ -54,8 +56,10 @@ void downloadSegmentPrefix(
     FileCache* cache,
     const std::shared_ptr<facebook::velox::io::IoStatistics>& ioStats,
     uint64_t targetEnd,
-    FileSegment::DownloadTee* tee = nullptr,
-    bool* missGuard = nullptr) {
+    bool* missGuard = nullptr,
+    folly::Range<char*> window = {},
+    uint64_t windowAbsStart = 0,
+    size_t* outFilled = nullptr) {
   const uint64_t segStart = segment->range().left;
   VELOX_CHECK_GT(targetEnd, segStart);
   // Required downloadedSize (range-relative) for the segment to cover
@@ -126,13 +130,25 @@ void downloadSegmentPrefix(
           segment->setRemoteFileReader(reader);
         }
         std::vector<char> scratch;
+        // When a window output buffer is set, read this round's bytes straight
+        // into it at the offset matching the current write frontier (reference
+        // semantics, zero extra copy). writeOffset >= windowAbsStart because the
+        // caller pre-filled any gap before the window start.
+        folly::Range<char*> outForRound;
+        if (!window.empty()) {
+          VELOX_CHECK_GE(writeOffset, windowAbsStart);
+          outForRound = window.subpiece(writeOffset - windowAbsStart);
+        }
         const size_t written = FileSegment::downloadFromReader(
             *segment,
             *reader,
             targetEnd - writeOffset,
             scratch,
             kReserveTimeoutMs,
-            tee);
+            outForRound);
+        if (outFilled != nullptr) {
+          *outFilled += written;
+        }
         // Bytes fetched from source and written into the cache (Layer B
         // cumulative + Layer A: read() = source bytes, prefetch() = bytes
         // pulled ahead into the cache, mirroring CachedBufferedInput).
@@ -281,19 +297,34 @@ void FileCacheInputStream::fillBuffer(uint64_t cursor) {
       ioStats_->ssdRead().increment(step);
     }
   } else {
-    // At or beyond the download frontier: drive the prefix download to cover
-    // [offsetInSegment, offsetInSegment + step), teeing the requested window
-    // straight into the working buffer so the just-downloaded bytes are served
-    // from memory (CH hands the written working_buffer back) rather than
-    // re-read from the cache file. A forward seek past the frontier downloads
-    // the intervening gap too; the tee copies only the requested window. The
+    // At or beyond the download frontier. Reference semantics: download the
+    // window [offsetInSegment, offsetInSegment + step) straight into the working
+    // buffer so the just-downloaded bytes ARE what we serve (CH hands back the
+    // written working_buffer), with zero extra copy. A forward seek past the
+    // frontier first downloads the intervening gap into throwaway scratch (the
+    // consumer does not read it) so the frontier aligns to the window start. The
     // download accounting (miss + downloaded/read/prefetch) happens inside
     // downloadSegmentPrefix.
-    const uint64_t targetEnd = segStart + offsetInSegment + step;
-    FileSegment::DownloadTee tee{segStart + offsetInSegment, step, dst, 0};
+    const uint64_t windowStart = segStart + offsetInSegment;
     bool missGuard = sliceMissRecorded_[index] != 0;
+    if (offsetInSegment > downloaded) {
+      // Pre-fill the gap [downloaded, offsetInSegment); no output buffer, so it
+      // stages through scratch and is not served to the consumer.
+      downloadSegmentPrefix(
+          segment, readFile_, cache_, ioStats_, windowStart, &missGuard);
+    }
+    const uint64_t targetEnd = windowStart + step;
+    size_t filled = 0;
     downloadSegmentPrefix(
-        segment, readFile_, cache_, ioStats_, targetEnd, &tee, &missGuard);
+        segment,
+        readFile_,
+        cache_,
+        ioStats_,
+        targetEnd,
+        &missGuard,
+        folly::Range<char*>(dst, step),
+        windowStart,
+        &filled);
     sliceMissRecorded_[index] = missGuard ? 1 : 0;
     VELOX_CHECK_GE(
         segment->getDownloadedSize(),
@@ -303,10 +334,10 @@ void FileCacheInputStream::fillBuffer(uint64_t cursor) {
         "needed: {})",
         segment->getDownloadedSize(),
         offsetInSegment + step);
-    if (tee.copied < step) {
+    if (filled < step) {
       // Race-loser fallback: another thread wrote (part of) this window while we
-      // waited, so it was not teed into memory. The bytes are now durable; read
-      // them from the cache file instead (Layer A ssdRead).
+      // waited, so it was not read into the working buffer. The bytes are now
+      // durable; read them from the cache file instead (Layer A ssdRead).
       const auto got = cacheFileFor(index).pread(offsetInSegment, step, dst);
       VELOX_CHECK_EQ(got.size(), step, "short pread of cache segment slice");
       if (ioStats_ != nullptr) {
