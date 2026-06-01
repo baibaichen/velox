@@ -16,10 +16,10 @@
 
 #pragma once
 
+#include "velox/buffer/Buffer.h"
 #include "velox/common/caching/filecache/FileSegment.h"
 #include "velox/common/file/File.h"
 #include "velox/common/io/IoStatistics.h"
-#include "velox/common/memory/Allocation.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/dwio/common/SeekableInputStream.h"
 
@@ -56,17 +56,18 @@ class FileCacheInputStream final
   size_t positionSize() const override;
 
  private:
-  // Loads the segment slice at `index` into reused storage (segData_/tinyData_),
-  // waiting for the download to cover the slice first.
-  void loadSegment(size_t index);
-
-  // Ensures the byte at regionCursor_ is resident and sets the run_/runSize_/
-  // offsetInRun_ view onto it, loading the owning segment if needed.
-  void loadPosition();
+  // Ensures the working buffer covers absolute region offset `cursor` (which
+  // must be < regionLength_): fills buf_ with up to kBufferSize bytes starting
+  // at `cursor`, either from the durable cache file (already-downloaded prefix)
+  // or, at the download frontier, straight from the just-downloaded bytes.
+  void fillBuffer(uint64_t cursor);
 
   // Index of the segment slice covering absolute region offset `cursor`
   // (cursor must be < regionLength_).
   size_t segmentIndexFor(uint64_t cursor) const;
+
+  // Lazily opens (and caches) the on-disk cache file backing segment `index`.
+  LocalReadFile& cacheFileFor(size_t index);
 
   // Owns the segments holder so the stream is self-contained and may outlive
   // the FileCacheBufferedInput that created it (mirrors CH
@@ -79,7 +80,7 @@ class FileCacheInputStream final
   const uint64_t regionOffset_;
   const uint64_t regionLength_;
   memory::MemoryPool& pool_;
-  // Source file + cache + per-query IO counters, used by loadSegment to drive
+  // Source file + cache + per-query IO counters, used by fillBuffer to drive
   // the lazy download and classify hits/misses (consume-time accounting).
   const std::shared_ptr<ReadFile> readFile_;
   FileCache* const cache_;
@@ -90,21 +91,27 @@ class FileCacheInputStream final
   std::vector<uint64_t> sliceStartInRegion_;
   // Offset of each segment's slice within its on-disk segment file.
   std::vector<uint64_t> sliceOffsetInSegment_;
+  // Per-slice "already recorded a hit/miss in this stream" guards, so a slice
+  // served across several working buffers still counts as one hit/one miss
+  // (matches the one-event-per-segment-slice accounting of the old whole-slice
+  // load). Sized segments_.size().
+  std::vector<uint8_t> sliceHitRecorded_;
+  std::vector<uint8_t> sliceMissRecorded_;
 
-  // Reused destination for the currently loaded segment slice. segData_ holds
-  // slices >= kTinySize; tinyData_ holds smaller ones.
-  memory::Allocation segData_;
-  std::string tinyData_;
-  size_t loadedIndex_{std::numeric_limits<size_t>::max()};
-  uint64_t loadedSliceLen_{0};
+  // Single reused contiguous working buffer (CH working_buffer): holds up to
+  // kBufferSize bytes of the region, describing the absolute region window
+  // [bufStartInRegion_, bufStartInRegion_ + bufLen_). Next() serves a pointer
+  // into it; the next fill overwrites it (ZeroCopyInputStream contract).
+  BufferPtr buf_;
+  uint64_t bufStartInRegion_{0};
+  uint64_t bufLen_{0};
+
+  // Lazily opened cache file for the slice currently backing buf_ reads.
+  std::unique_ptr<LocalReadFile> cacheFile_;
+  size_t cacheFileIndex_{std::numeric_limits<size_t>::max()};
 
   // Absolute consumed position within the region: [0, regionLength_].
   uint64_t regionCursor_{0};
-
-  // Run view of the loaded slice for the current position.
-  uint8_t* run_{nullptr};
-  uint32_t runSize_{0};
-  uint64_t offsetInRun_{0};
 };
 
 } // namespace facebook::velox::ch

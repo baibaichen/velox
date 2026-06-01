@@ -20,20 +20,18 @@
 #include "velox/common/caching/filecache/FileCache.h"
 #include "velox/common/caching/filecache/FileSegment.h"
 #include "velox/common/file/File.h"
-#include "velox/common/memory/Allocation.h"
 #include "velox/dwio/common/ReadFileByteInputStream.h"
 
-#include <folly/Range.h>
-
 #include <algorithm>
+#include <memory>
 #include <vector>
 
 namespace facebook::velox::ch {
 
 namespace {
-// Slices below this size are read into a std::string instead of a pooled
-// Allocation, mirroring DirectInputStream's tiny-data path.
-constexpr uint64_t kTinySize = 4 * 1024;
+// CH-style working-buffer cap: the stream serves at most this many bytes per
+// Next() and fills its reusable buffer in units of this size.
+constexpr uint64_t kBufferSize = 1ULL << 20;
 
 constexpr size_t kReserveTimeoutMs{10000};
 
@@ -55,13 +53,19 @@ void downloadSegmentPrefix(
     const std::shared_ptr<ReadFile>& readFile,
     FileCache* cache,
     const std::shared_ptr<facebook::velox::io::IoStatistics>& ioStats,
-    uint64_t targetEnd) {
+    uint64_t targetEnd,
+    FileSegment::DownloadTee* tee = nullptr,
+    bool* missGuard = nullptr) {
   const uint64_t segStart = segment->range().left;
   VELOX_CHECK_GT(targetEnd, segStart);
   // Required downloadedSize (range-relative) for the segment to cover
   // targetEnd.
   const uint64_t needBytes = targetEnd - segStart;
-  bool recordedMiss = false;
+  // A slice served across several working buffers must count as a single miss;
+  // missGuard carries that "already recorded" state across the per-buffer calls
+  // (a null guard falls back to once-per-call dedup, used by callers that drive
+  // a whole slice in one shot).
+  bool recordedMiss = (missGuard != nullptr) ? (*missGuard != 0) : false;
 
   while (segment->getDownloadedSize() < needBytes) {
     const auto downloaderId = segment->getOrSetDownloader();
@@ -95,6 +99,9 @@ void downloadSegmentPrefix(
       // counts as a further miss, mirroring "segments downloaded from source").
       cache->recordMiss();
       recordedMiss = true;
+      if (missGuard != nullptr) {
+        *missGuard = 1;
+      }
     }
 
     const uint64_t before = segment->getDownloadedSize();
@@ -124,7 +131,8 @@ void downloadSegmentPrefix(
             *reader,
             targetEnd - writeOffset,
             scratch,
-            kReserveTimeoutMs);
+            kReserveTimeoutMs,
+            tee);
         // Bytes fetched from source and written into the cache (Layer B
         // cumulative + Layer A: read() = source bytes, prefetch() = bytes
         // pulled ahead into the cache, mirroring CachedBufferedInput).
@@ -170,26 +178,6 @@ std::vector<FileSegmentPtr> collectSegments(
   }
   return segments;
 }
-
-// Builds ranges covering EXACTLY `length` bytes from the front of `data`,
-// stopping as soon as `length` is reached. The reused allocation may be larger
-// than the current slice, so this must not emit surplus ranges.
-std::vector<folly::Range<char*>> makeCappedRanges(
-    uint64_t length,
-    memory::Allocation& data) {
-  std::vector<folly::Range<char*>> buffers;
-  uint64_t remaining = length;
-  for (int32_t i = 0; i < data.numRuns() && remaining > 0; ++i) {
-    auto run = data.runAt(i);
-    const uint64_t runBytes =
-        memory::AllocationTraits::pageBytes(run.numPages());
-    const uint64_t take = std::min(runBytes, remaining);
-    buffers.push_back(folly::Range<char*>(run.data<char>(), take));
-    remaining -= take;
-  }
-  VELOX_CHECK_EQ(remaining, 0, "Allocation too small for segment slice");
-  return buffers;
-}
 } // namespace
 
 FileCacheInputStream::FileCacheInputStream(
@@ -218,6 +206,8 @@ FileCacheInputStream::FileCacheInputStream(
   // and load segments lazily by absolute region cursor.
   sliceStartInRegion_.reserve(segments_.size() + 1);
   sliceOffsetInSegment_.reserve(segments_.size());
+  sliceHitRecorded_.assign(segments_.size(), 0);
+  sliceMissRecorded_.assign(segments_.size(), 0);
   uint64_t acc = 0;
   for (const auto& segment : segments_) {
     const uint64_t segStart = segment->range().left;
@@ -241,89 +231,92 @@ size_t FileCacheInputStream::segmentIndexFor(uint64_t cursor) const {
   return static_cast<size_t>(it - sliceStartInRegion_.begin()) - 1;
 }
 
-void FileCacheInputStream::loadSegment(size_t index) {
-  const auto& segment = segments_[index];
-  const uint64_t length =
-      sliceStartInRegion_[index + 1] - sliceStartInRegion_[index];
-  const uint64_t segmentOffset = sliceOffsetInSegment_[index];
-  const uint64_t segStart = segment->range().left;
-  // Range-relative bytes the cache must hold to cover this slice, and its
-  // absolute end offset in the source file.
-  const uint64_t needed = segmentOffset + length;
-  const uint64_t targetEnd = segStart + needed;
+LocalReadFile& FileCacheInputStream::cacheFileFor(size_t index) {
+  if (cacheFileIndex_ != index) {
+    cacheFile_ = std::make_unique<LocalReadFile>(segments_[index]->getPath());
+    cacheFileIndex_ = index;
+  }
+  return *cacheFile_;
+}
 
-  if (segment->getDownloadedSize() >= needed) {
-    // Coverage-based cache hit (CH canStartFromCache = current_write_offset >
-    // offset): the slice is already on disk even if the segment is only
-    // PARTIALLY_DOWNLOADED. Count one hit plus the slice bytes served from the
-    // local cache file (Layer A ssdRead -- FileCache is disk-backed).
-    cache_->recordHit();
+void FileCacheInputStream::fillBuffer(uint64_t cursor) {
+  const size_t index = segmentIndexFor(cursor);
+  const auto& segment = segments_[index];
+  const uint64_t segStart = segment->range().left;
+  const uint64_t sliceStart = sliceStartInRegion_[index];
+  const uint64_t sliceLen = sliceStartInRegion_[index + 1] - sliceStart;
+  const uint64_t offsetInSlice = cursor - sliceStart;
+  // The cache file stores a segment's bytes at range-relative offsets, so a
+  // slice byte at offsetInSlice lives at cache-file/range offset
+  // segmentOffset + offsetInSlice.
+  const uint64_t offsetInSegment = sliceOffsetInSegment_[index] + offsetInSlice;
+
+  // One working buffer never crosses the 1MiB cap or the slice boundary; it is
+  // further capped below at the downloaded/frontier boundary so its bytes come
+  // from a single source (all cache file, or all just-downloaded memory).
+  uint64_t step = std::min<uint64_t>(kBufferSize, sliceLen - offsetInSlice);
+
+  if (buf_ == nullptr) {
+    const uint64_t capacity = std::min<uint64_t>(kBufferSize, regionLength_);
+    buf_ = AlignedBuffer::allocate<char>(capacity, &pool_);
+  }
+  char* dst = buf_->asMutable<char>();
+
+  const uint64_t downloaded = segment->getDownloadedSize();
+  if (offsetInSegment < downloaded) {
+    // Already-downloaded prefix: serve this buffer from the durable cache file
+    // (Layer A ssdRead). Cap the buffer at the frontier so it stays single
+    // source; the next fill picks up at the frontier.
+    step = std::min<uint64_t>(step, downloaded - offsetInSegment);
+    if (sliceHitRecorded_[index] == 0) {
+      // Coverage-based cache hit (CH canStartFromCache): the slice prefix is on
+      // disk even if the segment is only PARTIALLY_DOWNLOADED. Count it once per
+      // slice in this stream.
+      cache_->recordHit();
+      sliceHitRecorded_[index] = 1;
+    }
+    const auto got = cacheFileFor(index).pread(offsetInSegment, step, dst);
+    VELOX_CHECK_EQ(got.size(), step, "short pread of cache segment slice");
     if (ioStats_ != nullptr) {
-      ioStats_->ssdRead().increment(length);
+      ioStats_->ssdRead().increment(step);
     }
   } else {
-    // Miss: drive the prefix download synchronously. downloadSegmentPrefix is
-    // the sole synchronous driver -- its holder/wait/recheck loop handles
-    // EMPTY/PARTIAL/DOWNLOADING back-off (become downloader and resume, or wait
-    // for whoever holds it), so no separate wait-gate is needed here. It
-    // records the miss + downloaded bytes + Layer A read/prefetch internally.
-    downloadSegmentPrefix(segment, readFile_, cache_, ioStats_, targetEnd);
+    // At or beyond the download frontier: drive the prefix download to cover
+    // [offsetInSegment, offsetInSegment + step), teeing the requested window
+    // straight into the working buffer so the just-downloaded bytes are served
+    // from memory (CH hands the written working_buffer back) rather than
+    // re-read from the cache file. A forward seek past the frontier downloads
+    // the intervening gap too; the tee copies only the requested window. The
+    // download accounting (miss + downloaded/read/prefetch) happens inside
+    // downloadSegmentPrefix.
+    const uint64_t targetEnd = segStart + offsetInSegment + step;
+    FileSegment::DownloadTee tee{segStart + offsetInSegment, step, dst, 0};
+    bool missGuard = sliceMissRecorded_[index] != 0;
+    downloadSegmentPrefix(
+        segment, readFile_, cache_, ioStats_, targetEnd, &tee, &missGuard);
+    sliceMissRecorded_[index] = missGuard ? 1 : 0;
     VELOX_CHECK_GE(
         segment->getDownloadedSize(),
-        needed,
+        offsetInSegment + step,
         "FileCacheInputStream: segment has fewer downloaded bytes than "
         "required; writer abandoned the download (downloadedSize: {}, "
         "needed: {})",
         segment->getDownloadedSize(),
-        needed);
+        offsetInSegment + step);
+    if (tee.copied < step) {
+      // Race-loser fallback: another thread wrote (part of) this window while we
+      // waited, so it was not teed into memory. The bytes are now durable; read
+      // them from the cache file instead (Layer A ssdRead).
+      const auto got = cacheFileFor(index).pread(offsetInSegment, step, dst);
+      VELOX_CHECK_EQ(got.size(), step, "short pread of cache segment slice");
+      if (ioStats_ != nullptr) {
+        ioStats_->ssdRead().increment(step);
+      }
+    }
   }
 
-  // Read the slice into reused storage. Pooled non-contiguous allocation lets
-  // the MmapAllocator reuse resident pages across reads (no per-read
-  // zero-fill page faults); tiny slices use a small std::string instead.
-  LocalReadFile file(segment->getPath());
-  if (length < kTinySize) {
-    tinyData_.resize(length);
-    const auto got = file.pread(segmentOffset, length, tinyData_.data());
-    VELOX_CHECK_EQ(got.size(), length, "short pread of cache segment slice");
-  } else {
-    const auto numPages = memory::AllocationTraits::numPages(length);
-    if (numPages > segData_.numPages()) {
-      pool_.allocateNonContiguous(numPages, segData_); // grow-only
-    }
-    auto ranges = makeCappedRanges(length, segData_);
-    const uint64_t read = file.preadv(segmentOffset, ranges);
-    VELOX_CHECK_EQ(read, length, "short preadv of cache segment slice");
-  }
-  loadedIndex_ = index;
-  loadedSliceLen_ = length;
-}
-
-void FileCacheInputStream::loadPosition() {
-  const size_t index = segmentIndexFor(regionCursor_);
-  if (index != loadedIndex_) {
-    loadSegment(index);
-  }
-  const uint64_t offsetInSlice = regionCursor_ - sliceStartInRegion_[index];
-  if (loadedSliceLen_ < kTinySize) {
-    run_ = reinterpret_cast<uint8_t*>(tinyData_.data());
-    runSize_ = static_cast<uint32_t>(loadedSliceLen_);
-    offsetInRun_ = offsetInSlice;
-  } else {
-    int32_t runIndex = 0;
-    int32_t inRun = 0;
-    segData_.findRun(offsetInSlice, &runIndex, &inRun);
-    auto run = segData_.runAt(runIndex);
-    run_ = run.data();
-    runSize_ = static_cast<uint32_t>(
-        memory::AllocationTraits::pageBytes(run.numPages()));
-    const uint64_t offsetOfRun = offsetInSlice - static_cast<uint64_t>(inRun);
-    if (offsetOfRun + runSize_ > loadedSliceLen_) {
-      runSize_ = static_cast<uint32_t>(loadedSliceLen_ - offsetOfRun);
-    }
-    offsetInRun_ = static_cast<uint64_t>(inRun);
-  }
-  VELOX_CHECK_LT(offsetInRun_, runSize_);
+  bufStartInRegion_ = cursor;
+  bufLen_ = step;
 }
 
 bool FileCacheInputStream::Next(const void** data, int32_t* size) {
@@ -331,14 +324,14 @@ bool FileCacheInputStream::Next(const void** data, int32_t* size) {
     *size = 0;
     return false;
   }
-  loadPosition();
-  uint64_t chunk = runSize_ - offsetInRun_;
-  if (regionCursor_ + chunk > regionLength_) {
-    chunk = regionLength_ - regionCursor_;
+  if (regionCursor_ < bufStartInRegion_ ||
+      regionCursor_ >= bufStartInRegion_ + bufLen_) {
+    fillBuffer(regionCursor_);
   }
-  *data = run_ + offsetInRun_;
+  const uint64_t posInBuf = regionCursor_ - bufStartInRegion_;
+  const uint64_t chunk = bufLen_ - posInBuf;
+  *data = buf_->as<char>() + posInBuf;
   *size = static_cast<int32_t>(chunk);
-  offsetInRun_ += chunk;
   regionCursor_ += chunk;
   return true;
 }
@@ -346,7 +339,13 @@ bool FileCacheInputStream::Next(const void** data, int32_t* size) {
 void FileCacheInputStream::BackUp(int32_t count) {
   VELOX_CHECK_GE(count, 0);
   const uint64_t unsignedCount = static_cast<uint64_t>(count);
-  VELOX_CHECK_LE(unsignedCount, offsetInRun_, "Can't backup that much!");
+  // Backing up is bounded to the bytes served from the current working buffer
+  // (everything between its start and the cursor), mirroring the
+  // ZeroCopyInputStream contract that BackUp follows a single Next().
+  VELOX_CHECK_LE(
+      unsignedCount,
+      regionCursor_ - bufStartInRegion_,
+      "Can't backup that much!");
   regionCursor_ -= unsignedCount;
 }
 

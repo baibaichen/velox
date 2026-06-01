@@ -256,6 +256,160 @@ TEST_F(FileCacheBufferedInputTest, multiSegmentRegionRoundTripsInChunks) {
   EXPECT_GT(chunks.size(), 1u);
 }
 
+// CH-aligned streaming: a multi-MiB cold read of a SINGLE large segment is
+// served one <=1MiB working buffer at a time straight from the just-downloaded
+// bytes (serve-from-memory). Every Next() chunk is therefore bounded by the 1MiB
+// streaming buffer (so a 3MiB region comes back in >=3 chunks), and the cold
+// read re-reads no durable cache-file bytes (ssdRead stays 0).
+TEST_F(FileCacheBufferedInputTest, streamingServesColdReadInBoundedChunksFromMemory) {
+  const auto remotePath = path("remote.bin");
+  const auto content = makeContent(3 << 20); // 3 MiB, one 32MiB-max segment
+  writeFile(remotePath, content);
+
+  FileCache cache(
+      "streaming_cold",
+      settings(
+          path("cache"),
+          64ULL << 20,
+          0,
+          0,
+          /*backgroundDownloadThreads=*/0));
+  cache.initialize();
+  const auto key = FileCacheKey::fromPath(remotePath);
+  auto ioStats = std::make_shared<io::IoStatistics>();
+
+  {
+    auto input = makeInputWithStats(*pool_, cache, remotePath, key, ioStats);
+    auto stream = input.enqueue({0, content.size()});
+    input.load(LogType::FILE);
+
+    std::vector<int32_t> chunks;
+    const auto got = drainRecordingChunks(*stream, content.size(), chunks);
+    EXPECT_EQ(got, content);
+    EXPECT_GE(chunks.size(), 3u);
+    for (auto len : chunks) {
+      EXPECT_LE(len, 1 << 20);
+    }
+  }
+
+  EXPECT_EQ(ioStats->ssdRead().sum(), 0u);
+  EXPECT_EQ(cache.stats().downloadedBytes, content.size());
+}
+
+// Streaming, within a SINGLE stream over one large segment: read the first
+// buffer (advancing the download frontier), then SkipInt64 over an un-downloaded
+// prefix gap and read the remainder. The landing read sits above the frontier,
+// so CASE B must download the whole gap [frontier, landing) plus the served
+// window, tee only the window into memory, and still hand back the correct
+// bytes. Total downloaded covers the whole region (gap included).
+TEST_F(FileCacheBufferedInputTest, streamingForwardGapDownloadsGapAndServesWindow) {
+  const auto remotePath = path("remote.bin");
+  const auto content = makeContent(3 << 20); // 3 MiB single segment
+  writeFile(remotePath, content);
+
+  FileCache cache(
+      "streaming_gap",
+      settings(
+          path("cache"),
+          64ULL << 20,
+          0,
+          0,
+          /*backgroundDownloadThreads=*/0));
+  cache.initialize();
+  const auto key = FileCacheKey::fromPath(remotePath);
+  auto ioStats = std::make_shared<io::IoStatistics>();
+
+  {
+    auto input = makeInputWithStats(*pool_, cache, remotePath, key, ioStats);
+    auto stream = input.enqueue({0, content.size()});
+    input.load(LogType::FILE);
+
+    // First Next downloads and serves the leading 1MiB buffer from memory.
+    const void* data;
+    int32_t len;
+    ASSERT_TRUE(stream->Next(&data, &len));
+    EXPECT_EQ(std::string(static_cast<const char*>(data), len),
+              content.substr(0, len));
+    const uint64_t firstEnd = static_cast<uint64_t>(len);
+
+    // Skip a half-MiB un-downloaded gap, then read the rest. The landing offset
+    // is above the frontier -> CASE B downloads the gap + window.
+    const uint64_t gap = 512 << 10;
+    ASSERT_TRUE(stream->SkipInt64(gap));
+    const uint64_t landing = firstEnd + gap;
+    EXPECT_EQ(
+        drain(*stream, content.size() - landing),
+        content.substr(landing, content.size() - landing));
+  }
+
+  // The gap is downloaded too: the whole region ends up fetched once.
+  EXPECT_EQ(cache.stats().downloadedBytes, content.size());
+
+  // The cold read above was served from the tee'd memory window, which could
+  // mask a bad/short write to the durable cache file (especially the gap). A
+  // fresh warm stream reads the WHOLE region straight from the cache file
+  // (CASE A) and must see the correct bytes, gap included -- proving the gap and
+  // window were durably written.
+  auto warmStats = std::make_shared<io::IoStatistics>();
+  {
+    auto input = makeInputWithStats(*pool_, cache, remotePath, key, warmStats);
+    auto stream = input.enqueue({0, content.size()});
+    input.load(LogType::FILE);
+    EXPECT_EQ(drain(*stream, content.size()), content);
+  }
+  EXPECT_EQ(warmStats->ssdRead().sum(), content.size());
+  EXPECT_EQ(warmStats->read().sum(), 0u);
+  // Warm pass re-downloaded nothing: everything was already durable.
+  EXPECT_EQ(cache.stats().downloadedBytes, content.size());
+}
+
+// Streaming with a region whose length is NOT a multiple of the 1MiB working
+// buffer: the trailing partial buffer (here 0.5MiB) must be served correctly,
+// so a 2.5MiB region comes back as 1MiB + 1MiB + 0.5MiB.
+TEST_F(FileCacheBufferedInputTest, streamingServesSubBufferTrailingChunk) {
+  const auto remotePath = path("remote.bin");
+  const auto content = makeContent((2 << 20) + (512 << 10)); // 2.5 MiB
+  writeFile(remotePath, content);
+
+  FileCache cache(
+      "streaming_tail",
+      settings(
+          path("cache"),
+          64ULL << 20,
+          0,
+          0,
+          /*backgroundDownloadThreads=*/0));
+  cache.initialize();
+  auto input = makeInput(cache, remotePath);
+
+  auto stream = input.enqueue({0, content.size()});
+  input.load(LogType::FILE);
+
+  std::vector<int32_t> chunks;
+  const auto got = drainRecordingChunks(*stream, content.size(), chunks);
+  EXPECT_EQ(got, content);
+  for (auto len : chunks) {
+    EXPECT_LE(len, 1 << 20);
+  }
+  // 2.5MiB tiled by a 1MiB buffer => 1MiB + 1MiB + 0.5MiB.
+  ASSERT_EQ(chunks.size(), 3u);
+  EXPECT_EQ(chunks[2], 512 << 10);
+
+  // Re-read warm straight from the cache file (CASE A) to prove the trailing
+  // 0.5MiB chunk was durably written, not just served from memory.
+  auto warmStats = std::make_shared<io::IoStatistics>();
+  {
+    const auto key = FileCacheKey::fromPath(remotePath);
+    auto warmInput =
+        makeInputWithStats(*pool_, cache, remotePath, key, warmStats);
+    auto warmStream = warmInput.enqueue({0, content.size()});
+    warmInput.load(LogType::FILE);
+    EXPECT_EQ(drain(*warmStream, content.size()), content);
+  }
+  EXPECT_EQ(warmStats->ssdRead().sum(), content.size());
+  EXPECT_EQ(warmStats->read().sum(), 0u);
+}
+
 // SkipInt64 that crosses several whole segments, then read the remainder.
 TEST_F(FileCacheBufferedInputTest, skipSpanningSegmentsThenRead) {
   const auto remotePath = path("remote.bin");
