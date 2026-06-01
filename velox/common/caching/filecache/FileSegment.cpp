@@ -52,7 +52,17 @@ class WriteBufferFromFile {
   }
 
   void finalize() {
-    file_.flush();
+    // ClickHouse-faithful: do NOT fsync on segment completion. Upstream CH's
+    // WriteBufferFromFileDescriptor::finalizeImpl() only flushes the userspace
+    // buffer to the fd (::write); fsync lives in a separate sync() that the
+    // download path never calls. Durability is intentionally not required: a
+    // crash drops only the unwritten tail, and startup recovery treats the
+    // on-disk file_size() as the authoritative downloaded size (see
+    // FileCache::loadMetadataForKey), re-downloading any missing tail on demand.
+    // append() already does a direct ::write into the page cache, so readers'
+    // pread hits the data without an fsync. The previously-present file_.flush()
+    // (=::fsync) was a port-introduced deviation that made cold writes ~10x
+    // slower.
     file_.close();
   }
 
