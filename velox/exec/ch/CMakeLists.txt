@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-velox_add_library(velox_exec_ch INTERFACE HEADERS RowRef.h)
+velox_add_library(velox_exec_ch Arena.cpp HEADERS Arena.h RowRef.h)
+velox_link_libraries(velox_exec_ch PUBLIC velox_memory)
 
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)
