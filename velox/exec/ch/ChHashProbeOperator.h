@@ -17,44 +17,51 @@
 #pragma once
 
 #include "velox/exec/Operator.h"
+#include "velox/exec/ch/ChHashJoinBridge.h"
 #include "velox/exec/ch/ChHashJoinNode.h"
+#include "velox/exec/ch/EmitGather.h"
 
 namespace facebook::velox::exec::ch {
 
-class ChHashProbeOperator : public exec::Operator {
+class ChHashProbeOperator final : public exec::Operator {
  public:
   ChHashProbeOperator(
       int32_t operatorId,
       exec::DriverCtx* driverCtx,
-      ChHashJoinNodePtr joinNode)
-      : Operator(
-            driverCtx,
-            joinNode->outputType(),
-            operatorId,
-            joinNode->id(),
-            "ChHashProbe") {}
+      ChHashJoinNodePtr joinNode);
 
-  bool needsInput() const override {
-    return false;
-  }
+  ChHashProbeOperator(
+      int32_t operatorId,
+      exec::DriverCtx* driverCtx,
+      ChHashJoinNodePtr joinNode,
+      std::shared_ptr<ChHashJoinBridge> joinBridge);
 
-  void addInput(RowVectorPtr /* input */) override {}
+  bool needsInput() const override;
 
-  void noMoreInput() override {
-    Operator::noMoreInput();
-  }
+  void addInput(RowVectorPtr input) override;
 
-  RowVectorPtr getOutput() override {
-    return nullptr;
-  }
+  void noMoreInput() override;
 
-  BlockingReason isBlocked(ContinueFuture* /* future */) override {
-    return BlockingReason::kNotBlocked;
-  }
+  RowVectorPtr getOutput() override;
 
-  bool isFinished() override {
-    return true;
-  }
+  BlockingReason isBlocked(ContinueFuture* future) override;
+
+  bool isFinished() override;
+
+ private:
+  RowVectorPtr nextPendingOutput();
+
+  ChHashJoinNodePtr joinNode_;
+  std::shared_ptr<ChHashJoinBridge> joinBridge_;
+  ChHashJoinBridge::ChBuildResult buildTable_;
+  column_index_t keyChannel_;
+  std::vector<column_index_t> buildProjections_;
+  std::vector<column_index_t> probeProjections_;
+  std::optional<EmitGather> emitGather_;
+  RowVectorPtr input_;
+  std::vector<RowVectorPtr> pendingOutput_;
+  size_t nextOutput_{0};
+  bool tableReady_{false};
 };
 
 } // namespace facebook::velox::exec::ch

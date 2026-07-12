@@ -19,6 +19,7 @@ add_executable(
   ChHashBuildOperatorTest.cpp
   ChHashJoinRegistrationTest.cpp
   ChHashProbeTest.cpp
+  ChHashProbeOperatorTest.cpp
   EmitGatherTest.cpp
   HashMapTest.cpp
   HashTableTest.cpp
