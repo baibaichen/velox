@@ -18,7 +18,9 @@
 #include <folly/init/Init.h>
 #include <gflags/gflags.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -30,6 +32,7 @@
 #include "velox/exec/VectorHasher.h"
 #include "velox/exec/ch/ChHashBuild.h"
 #include "velox/exec/ch/ChHashProbe.h"
+#include "velox/exec/ch/EmitGather.h"
 #include "velox/vector/DecodedVector.h"
 #include "velox/vector/SelectivityVector.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
@@ -48,6 +51,10 @@ DEFINE_int32(
     measure_iterations,
     50,
     "Iterations in the reported probe sample; use enough to amortize warmup.");
+DEFINE_double(
+    filter_selectivity,
+    0.1,
+    "Fraction of emitted rows retained before delayed materialization.");
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -147,6 +154,88 @@ class ChHashJoinBenchmark : public VectorTestBase {
   }
 
   uint64_t probeNative() {
+    return collectNativeMatches(nullptr, nullptr);
+  }
+
+  void prepareEmit() {
+    coordinateMatches_ =
+        ch::probeHashBuild(*coordinateBuild_, probeVector_, 0);
+    collectNativeMatches(&nativeInputRows_, &nativeHits_);
+    VELOX_CHECK_EQ(coordinateMatches_.size(), expectedMatches());
+    VELOX_CHECK_EQ(nativeHits_.size(), expectedMatches());
+
+    emitPool_ = rootPool_->addLeafChild("ChHashEmit");
+    std::vector<column_index_t> buildProjections;
+    std::vector<std::string> outputNames;
+    std::vector<TypePtr> outputTypes;
+    buildProjections.reserve(payloadColumns_);
+    outputNames.reserve(payloadColumns_ + 1);
+    outputTypes.reserve(payloadColumns_ + 1);
+    for (int32_t column = 0; column < payloadColumns_; ++column) {
+      buildProjections.push_back(column + 1);
+      outputNames.push_back(fmt::format("build_payload_{}", column));
+      outputTypes.push_back(payloadType(column));
+    }
+    outputNames.push_back("probe_key");
+    outputTypes.push_back(BIGINT());
+    outputType_ = ROW(std::move(outputNames), std::move(outputTypes));
+    emitGather_ = std::make_unique<ch::EmitGather>(
+        coordinateBuild_->retainedIndex(),
+        std::move(buildProjections),
+        std::vector<column_index_t>{0},
+        outputType_,
+        emitPool_.get());
+  }
+
+  uint64_t emitCoordinateViews() const {
+    auto output = emitGather_->emit(coordinateMatches_, probeVector_);
+    return consumeOutput(output);
+  }
+
+  uint64_t emitCoordinateFlattenAll() const {
+    auto output = emitGather_->emit(coordinateMatches_, probeVector_);
+    return materializeCoordinate(std::move(output), 1.0);
+  }
+
+  uint64_t emitCoordinateFilterThenFlatten() const {
+    auto output = emitGather_->emit(coordinateMatches_, probeVector_);
+    return materializeCoordinate(
+        std::move(output), FLAGS_filter_selectivity);
+  }
+
+  uint64_t emitNativeCopy() const {
+    auto output = makeNativeOutput();
+    folly::doNotOptimizeAway(output.get());
+    return output->size();
+  }
+
+  uint64_t emitNativeCopyThenFilter() const {
+    auto output = makeNativeOutput();
+    auto filtered = filterOutput(output, FLAGS_filter_selectivity);
+    folly::doNotOptimizeAway(filtered.get());
+    return filtered->size();
+  }
+
+  uint64_t expectedFilteredMatches() const {
+    return selectedRows(expectedMatches(), FLAGS_filter_selectivity);
+  }
+
+  uint64_t expectedMatches() const {
+    return buildRows_;
+  }
+
+  vector_size_t probeRows() const {
+    return distinctKeys_;
+  }
+
+  uint64_t retainedVectorBytes() const {
+    return retainedVectorBytes_;
+  }
+
+ private:
+  uint64_t collectNativeMatches(
+      std::vector<vector_size_t>* allInputRows,
+      std::vector<char*>* allHits) {
     SelectivityVector rows(probeVector_->size());
     auto& hasher = nativeTable_->hashers().front();
     nativeLookup_->reset(probeVector_->size());
@@ -171,29 +260,141 @@ class ChHashJoinBenchmark : public VectorTestBase {
     std::vector<char*> hits(kOutputBatchRows);
     uint64_t matches = 0;
     while (!results.atEnd()) {
-      matches += nativeTable_->listJoinResults(
+      const auto batchMatches = nativeTable_->listJoinResults(
           results,
           false,
           folly::Range(inputRows.data(), inputRows.size()),
           folly::Range(hits.data(), hits.size()),
           std::numeric_limits<uint64_t>::max());
+      matches += batchMatches;
+      if (allInputRows != nullptr) {
+        allInputRows->insert(
+            allInputRows->end(),
+            inputRows.begin(),
+            inputRows.begin() + batchMatches);
+        allHits->insert(
+            allHits->end(), hits.begin(), hits.begin() + batchMatches);
+      }
     }
     return matches;
   }
 
-  uint64_t expectedMatches() const {
-    return buildRows_;
+  static vector_size_t selectedRows(
+      vector_size_t size,
+      double selectivity) {
+    return static_cast<vector_size_t>(
+        std::ceil(static_cast<double>(size) * selectivity));
   }
 
-  vector_size_t probeRows() const {
-    return distinctKeys_;
+  BufferPtr makeFilterIndices(
+      vector_size_t selected) const {
+    auto indices =
+        AlignedBuffer::allocate<vector_size_t>(selected, emitPool_.get());
+    auto* rawIndices = indices->asMutable<vector_size_t>();
+    for (vector_size_t row = 0; row < selected; ++row) {
+      rawIndices[row] = row;
+    }
+    return indices;
   }
 
-  uint64_t retainedVectorBytes() const {
-    return retainedVectorBytes_;
+  uint64_t consumeOutput(const std::vector<RowVectorPtr>& output) const {
+    uint64_t rows = 0;
+    for (const auto& batch : output) {
+      rows += batch->size();
+      folly::doNotOptimizeAway(batch.get());
+    }
+    return rows;
   }
 
- private:
+  uint64_t materializeCoordinate(
+      std::vector<RowVectorPtr> output,
+      double selectivity) const {
+    vector_size_t totalRows = 0;
+    for (const auto& batch : output) {
+      totalRows += batch->size();
+    }
+    auto rowsRemaining = selectedRows(totalRows, selectivity);
+    uint64_t materializedRows = 0;
+    for (auto& batch : output) {
+      const auto selected = std::min(batch->size(), rowsRemaining);
+      rowsRemaining -= selected;
+      if (selected == 0) {
+        break;
+      }
+      auto indices = makeFilterIndices(selected);
+      std::vector<VectorPtr> children;
+      children.reserve(batch->childrenSize());
+      for (int32_t column = 0; column < payloadColumns_; ++column) {
+        auto selectedView = BaseVector::wrapInDictionary(
+            nullptr, indices, selected, batch->childAt(column));
+        children.push_back(
+            BaseVector::copy(*selectedView, emitPool_.get()));
+      }
+      children.push_back(BaseVector::wrapInDictionary(
+          nullptr,
+          indices,
+          selected,
+          batch->childAt(payloadColumns_)));
+      batch = std::make_shared<RowVector>(
+          emitPool_.get(),
+          outputType_,
+          nullptr,
+          selected,
+          std::move(children));
+      materializedRows += selected;
+      folly::doNotOptimizeAway(batch.get());
+    }
+    VELOX_CHECK_EQ(rowsRemaining, 0);
+    return materializedRows;
+  }
+
+  RowVectorPtr makeNativeOutput() const {
+    const auto size = static_cast<vector_size_t>(nativeHits_.size());
+    std::vector<VectorPtr> children;
+    children.reserve(payloadColumns_ + 1);
+    auto rows = folly::Range<char* const*>(nativeHits_.data(), size);
+    for (int32_t column = 0; column < payloadColumns_; ++column) {
+      auto child =
+          BaseVector::create(payloadType(column), size, emitPool_.get());
+      nativeTable_->extractColumn(rows, column + 1, child);
+      children.push_back(std::move(child));
+    }
+
+    auto probeIndices =
+        AlignedBuffer::allocate<vector_size_t>(size, emitPool_.get());
+    std::copy(
+        nativeInputRows_.begin(),
+        nativeInputRows_.end(),
+        probeIndices->asMutable<vector_size_t>());
+    children.push_back(BaseVector::wrapInDictionary(
+        nullptr, probeIndices, size, probeVector_->childAt(0)));
+    return std::make_shared<RowVector>(
+        emitPool_.get(),
+        outputType_,
+        nullptr,
+        size,
+        std::move(children));
+  }
+
+  RowVectorPtr filterOutput(
+      const RowVectorPtr& output,
+      double selectivity) const {
+    const auto selected = selectedRows(output->size(), selectivity);
+    auto indices = makeFilterIndices(selected);
+    std::vector<VectorPtr> children;
+    children.reserve(output->childrenSize());
+    for (const auto& child : output->children()) {
+      children.push_back(BaseVector::wrapInDictionary(
+          nullptr, indices, selected, child));
+    }
+    return std::make_shared<RowVector>(
+        emitPool_.get(),
+        outputType_,
+        nullptr,
+        selected,
+        std::move(children));
+  }
+
   template <typename Rep, typename Period>
   static uint64_t toNanos(std::chrono::duration<Rep, Period> duration) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(duration)
@@ -296,9 +497,15 @@ class ChHashJoinBenchmark : public VectorTestBase {
   std::shared_ptr<memory::MemoryPool> coordinatePool_;
   std::shared_ptr<memory::MemoryPool> nativePool_;
   std::shared_ptr<memory::MemoryPool> scratchPool_;
+  std::shared_ptr<memory::MemoryPool> emitPool_;
   std::unique_ptr<ch::ChHashBuild> coordinateBuild_;
   std::unique_ptr<HashTable<true>> nativeTable_;
   std::unique_ptr<HashLookup> nativeLookup_;
+  std::vector<ch::ProbeMatch> coordinateMatches_;
+  std::vector<vector_size_t> nativeInputRows_;
+  std::vector<char*> nativeHits_;
+  RowTypePtr outputType_;
+  std::unique_ptr<ch::EmitGather> emitGather_;
 };
 
 std::unique_ptr<ChHashJoinBenchmark> benchmark;
@@ -309,6 +516,36 @@ BENCHMARK(CoordinateProbe) {
 
 BENCHMARK_RELATIVE(VeloxNativeRowProbe) {
   folly::doNotOptimizeAway(benchmark->probeNative());
+}
+
+BENCHMARK_DRAW_LINE();
+
+BENCHMARK(A_CoordinateViewOnly_CopyDeferred_NotEndToEnd) {
+  folly::doNotOptimizeAway(benchmark->emitCoordinateViews());
+}
+
+BENCHMARK_RELATIVE(A_VeloxNativeExtractCopy) {
+  folly::doNotOptimizeAway(benchmark->emitNativeCopy());
+}
+
+BENCHMARK_DRAW_LINE();
+
+BENCHMARK(B1_CoordinateFlattenAll) {
+  folly::doNotOptimizeAway(benchmark->emitCoordinateFlattenAll());
+}
+
+BENCHMARK_RELATIVE(B1_VeloxNativeExtractCopy) {
+  folly::doNotOptimizeAway(benchmark->emitNativeCopy());
+}
+
+BENCHMARK_DRAW_LINE();
+
+BENCHMARK(B2_CoordinateFilterThenFlatten) {
+  folly::doNotOptimizeAway(benchmark->emitCoordinateFilterThenFlatten());
+}
+
+BENCHMARK_RELATIVE(B2_VeloxNativeCopyThenFilter) {
+  folly::doNotOptimizeAway(benchmark->emitNativeCopyThenFilter());
 }
 
 template <typename Probe>
@@ -332,6 +569,8 @@ double measureThroughput(Probe&& probe, int32_t iterations, uint64_t expected) {
 int main(int argc, char** argv) {
   folly::Init init{&argc, &argv};
   VELOX_CHECK_GT(FLAGS_measure_iterations, 0);
+  VELOX_CHECK_GT(FLAGS_filter_selectivity, 0);
+  VELOX_CHECK_LE(FLAGS_filter_selectivity, 1);
 
   memory::MemoryManager::Options options;
   options.useMmapAllocator = true;
@@ -347,10 +586,21 @@ int main(int argc, char** argv) {
       FLAGS_batch_rows);
   const auto coordinateBuild = benchmark->buildCoordinate();
   const auto nativeBuild = benchmark->buildNative();
+  benchmark->prepareEmit();
 
   VELOX_CHECK_EQ(
       benchmark->probeCoordinate(), benchmark->expectedMatches());
   VELOX_CHECK_EQ(benchmark->probeNative(), benchmark->expectedMatches());
+  VELOX_CHECK_EQ(
+      benchmark->emitCoordinateViews(), benchmark->expectedMatches());
+  VELOX_CHECK_EQ(
+      benchmark->emitNativeCopy(), benchmark->expectedMatches());
+  VELOX_CHECK_EQ(
+      benchmark->emitCoordinateFilterThenFlatten(),
+      benchmark->expectedFilteredMatches());
+  VELOX_CHECK_EQ(
+      benchmark->emitNativeCopyThenFilter(),
+      benchmark->expectedFilteredMatches());
 
   const auto coordinateIterationsPerSecond = measureThroughput(
       [] { return benchmark->probeCoordinate(); },
@@ -363,12 +613,13 @@ int main(int argc, char** argv) {
 
   std::cout << fmt::format(
       "CONFIG build_rows={} probe_rows={} payload_columns={} fanout={} "
-      "batch_rows={} output_materialization=false\n",
+      "batch_rows={} filter_selectivity={:.3f}\n",
       FLAGS_build_rows,
       benchmark->probeRows(),
       FLAGS_payload_columns,
       FLAGS_fanout,
-      FLAGS_batch_rows);
+      FLAGS_batch_rows,
+      FLAGS_filter_selectivity);
   std::cout << fmt::format(
       "BUILD arm=coordinate elapsed_ms={:.3f} peak_bytes={} "
       "retained_vector_bytes={}\n",
@@ -389,6 +640,11 @@ int main(int argc, char** argv) {
       "matches_per_second={:.0f}\n",
       nativeIterationsPerSecond * benchmark->probeRows(),
       nativeIterationsPerSecond * benchmark->expectedMatches());
+  std::cout
+      << "EMIT_NOTE A measures copy deferral only, not end-to-end savings; "
+         "B1 materializes all build rows; B2 materializes only rows surviving "
+         "the downstream filter. Lazy-output benefit depends on downstream "
+         "filtering or dictionary consumption.\n";
 
   folly::runBenchmarks();
   benchmark.reset();
