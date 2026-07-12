@@ -122,6 +122,7 @@ struct ZeroValueStorage<true, Cell> {
     VELOX_CHECK(!hasZero_);
     hasZero_ = true;
     new (zeroValue()) Cell();
+    zeroValue()->setZero();
   }
 
   void clearHasZero() {
@@ -193,25 +194,16 @@ class HashTable : protected Hash,
       Grower::initial_count * sizeof(Cell);
 
   explicit HashTable(memory::MemoryPool* pool) : Allocator(pool) {
-    if constexpr (Cell::need_zero_value_storage) {
-      this->zeroValue()->setZero();
-    }
     alloc(grower_);
   }
 
   HashTable(memory::MemoryPool* pool, const Grower& grower)
       : Allocator(pool), grower_(grower) {
-    if constexpr (Cell::need_zero_value_storage) {
-      this->zeroValue()->setZero();
-    }
     alloc(grower_);
   }
 
   HashTable(memory::MemoryPool* pool, size_t reserveForNumElements)
       : Allocator(pool) {
-    if constexpr (Cell::need_zero_value_storage) {
-      this->zeroValue()->setZero();
-    }
     grower_.set(reserveForNumElements);
     alloc(grower_);
   }
