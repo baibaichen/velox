@@ -12,13 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_executable(velox_exec_ch_test ArenaTest.cpp RowRefTest.cpp RowRefListTest.cpp)
+add_executable(
+  velox_exec_ch_test
+  ArenaTest.cpp
+  RetainedVectorsIndexTest.cpp
+  RowRefTest.cpp
+  RowRefListTest.cpp
+)
 
 target_link_libraries(
   velox_exec_ch_test
   velox_exec_ch
   GTest::gtest
   GTest::gtest_main
+  velox_vector_test_lib
 )
 
 add_test(NAME velox_exec_ch_test COMMAND velox_exec_ch_test)

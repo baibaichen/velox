@@ -12,8 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-velox_add_library(velox_exec_ch Arena.cpp RowRefList.cpp HEADERS Arena.h RowRef.h RowRefList.h)
-velox_link_libraries(velox_exec_ch PUBLIC velox_memory)
+velox_add_library(
+  velox_exec_ch
+  Arena.cpp
+  RetainedVectorsIndex.cpp
+  RowRefList.cpp
+  HEADERS Arena.h RetainedVectorsIndex.h RowRef.h RowRefList.h
+)
+velox_link_libraries(velox_exec_ch PUBLIC velox_memory velox_vector)
 
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)
