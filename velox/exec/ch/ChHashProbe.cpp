@@ -27,6 +27,15 @@ std::vector<ProbeMatch> probeHashBuild(
     const ChHashBuild& build,
     const RowVectorPtr& probe,
     column_index_t probeKeyChannel) {
+  return probeHashBuild(
+      build.rowsByKey(), build.retainedIndex(), probe, probeKeyChannel);
+}
+
+std::vector<ProbeMatch> probeHashBuild(
+    const ChHashBuild::JoinMap& map,
+    const RetainedVectorsIndex& retained,
+    const RowVectorPtr& probe,
+    column_index_t probeKeyChannel) {
   VELOX_CHECK_NOT_NULL(probe);
   VELOX_CHECK_LT(probeKeyChannel, probe->childrenSize());
 
@@ -39,7 +48,6 @@ std::vector<ProbeMatch> probeHashBuild(
   SelectivityVector rows(probe->size());
   DecodedVector decodedKey(*keyVector, rows);
   std::vector<ProbeMatch> matches;
-  const auto& map = build.rowsByKey();
 
   rows.applyToSelected([&](vector_size_t probeRow) {
     if (decodedKey.isNullAt(probeRow)) {
@@ -56,7 +64,7 @@ std::vector<ProbeMatch> probeHashBuild(
     for (const auto refWord : cell->getMapped()) {
       const auto blockNo = refWordBlockNo(refWord);
       const auto rowNo = refWordRowNo(refWord);
-      const auto* buildBatch = build.retainedIndex().at(
+      const auto* buildBatch = retained.at(
           unpackDriverNo(blockNo), unpackBatchNo(blockNo));
       VELOX_CHECK_LT(rowNo, buildBatch->size());
       matches.push_back({probeRow, blockNo, rowNo});

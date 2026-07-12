@@ -34,4 +34,10 @@ std::vector<ProbeMatch> probeHashBuild(
     const RowVectorPtr& probe,
     column_index_t probeKeyChannel);
 
+std::vector<ProbeMatch> probeHashBuild(
+    const ChHashBuild::JoinMap& map,
+    const RetainedVectorsIndex& retained,
+    const RowVectorPtr& probe,
+    column_index_t probeKeyChannel);
+
 } // namespace facebook::velox::exec::ch

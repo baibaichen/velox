@@ -19,6 +19,7 @@ velox_add_library(
   ChHashBuildOperator.cpp
   ChHashJoinBridge.cpp
   ChHashProbe.cpp
+  ChHashProbeOperator.cpp
   EmitGather.cpp
   RetainedVectorsIndex.cpp
   RowRefList.cpp
