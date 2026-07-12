@@ -12,32 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-velox_add_library(
+add_executable(velox_exec_ch_hash_join_benchmark ChHashJoinBenchmark.cpp)
+
+target_link_libraries(
+  velox_exec_ch_hash_join_benchmark
   velox_exec_ch
-  Arena.cpp
-  ChHashBuild.cpp
-  ChHashProbe.cpp
-  RetainedVectorsIndex.cpp
-  RowRefList.cpp
-  HEADERS
-    Arena.h
-    ChHashBuild.h
-    ChHashProbe.h
-    HashMap.h
-    HashTable.h
-    HashTableAllocatorAdapter.h
-    RetainedVectorsIndex.h
-    RowRef.h
-    RowRefList.h
+  velox_exec
+  velox_vector_test_lib
+  Folly::follybenchmark
 )
-velox_link_libraries(velox_exec_ch PUBLIC velox_memory velox_vector)
-
-if(${VELOX_BUILD_TESTING})
-  add_subdirectory(tests)
-endif()
-
-if(${VELOX_ENABLE_BENCHMARKS})
-  add_subdirectory(benchmarks)
-endif()
-
-velox_install_library_headers()
