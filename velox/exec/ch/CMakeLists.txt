@@ -16,11 +16,13 @@ velox_add_library(
   velox_exec_ch
   Arena.cpp
   ChHashBuild.cpp
+  ChHashProbe.cpp
   RetainedVectorsIndex.cpp
   RowRefList.cpp
   HEADERS
     Arena.h
     ChHashBuild.h
+    ChHashProbe.h
     HashMap.h
     HashTable.h
     HashTableAllocatorAdapter.h
