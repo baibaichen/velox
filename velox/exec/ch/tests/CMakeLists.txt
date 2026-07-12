@@ -16,6 +16,7 @@ add_executable(
   velox_exec_ch_test
   ArenaTest.cpp
   ChHashBuildTest.cpp
+  HashMapTest.cpp
   HashTableTest.cpp
   RetainedVectorsIndexTest.cpp
   RowRefTest.cpp

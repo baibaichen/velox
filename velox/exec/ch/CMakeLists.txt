@@ -21,6 +21,7 @@ velox_add_library(
   HEADERS
     Arena.h
     ChHashBuild.h
+    HashMap.h
     HashTable.h
     HashTableAllocatorAdapter.h
     RetainedVectorsIndex.h
