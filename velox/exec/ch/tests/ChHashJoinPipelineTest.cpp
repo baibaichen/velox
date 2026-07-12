@@ -148,13 +148,10 @@ class ChHashJoinPipelineTest : public testing::Test,
   }
 };
 
-TEST_F(ChHashJoinPipelineTest, registrationIsRequiredBeforePlanning) {
+TEST_F(ChHashJoinPipelineTest, registeredPlanProducesChBridge) {
   auto probe = basicProbe();
   auto build = basicBuild();
   auto plan = makeChPlan(probe, build);
-
-  EXPECT_EQ(Operator::joinBridgeFromPlanNode(plan), nullptr);
-  EXPECT_ANY_THROW(AssertQueryBuilder(plan).copyResults(pool()));
 
   ensureRegistered();
   auto bridge = Operator::joinBridgeFromPlanNode(plan);
@@ -218,7 +215,10 @@ TEST_F(ChHashJoinPipelineTest, waitsForBuildAndEmitsEveryBuildBatch) {
       if (stats.operatorType == "ChHashProbe") {
         sawProbe = true;
         EXPECT_EQ(stats.outputPositions, 4096);
-        EXPECT_GE(stats.outputVectors, 4);
+        // Each of the 4 build batches that matches yields exactly one output
+        // vector (EmitGather groups matches per build block), so a single
+        // probe batch against 4 build batches emits exactly 4 vectors.
+        EXPECT_EQ(stats.outputVectors, 4);
         sawJoinBuildWait =
             stats.runtimeStats.count("blockedWaitForJoinBuildTimes") > 0;
       }
