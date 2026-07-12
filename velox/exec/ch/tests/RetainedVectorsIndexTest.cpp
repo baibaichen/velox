@@ -112,6 +112,71 @@ TEST_F(RetainedVectorsIndexTest, mergeFromRejectsOccupiedDriverSlot) {
   EXPECT_EQ(index.at(0, 0), original.get());
 }
 
+TEST_F(RetainedVectorsIndexTest, resolvesSelectedColumnsForSingleBatch) {
+  RetainedVectorsIndex index(0);
+  auto vector = makeRowVector({
+      makeFlatVector<int64_t>({1, 2}),
+      makeFlatVector<double>({1.5, 2.5}),
+      makeFlatVector<std::string>({"a", "b"}),
+  });
+  index.add(vector);
+
+  const auto columns = index.resolveEmitColumns({0, 2});
+
+  ASSERT_EQ(columns.emit.size(), 2);
+  ASSERT_EQ(columns.emit[0].size(), 1);
+  ASSERT_EQ(columns.emit[0][0].size(), 1);
+  EXPECT_EQ(columns.emit[0][0][0], index.at(0, 0)->childAt(0).get());
+  EXPECT_EQ(columns.emit[1][0][0], index.at(0, 0)->childAt(2).get());
+}
+
+TEST_F(RetainedVectorsIndexTest, resolvesEachRetainedBatch) {
+  RetainedVectorsIndex index(0);
+  for (int64_t value = 0; value < 3; ++value) {
+    index.add(makeRowVector({
+        makeFlatVector<int64_t>({value}),
+        makeFlatVector<double>({static_cast<double>(value)}),
+    }));
+  }
+
+  const auto columns = index.resolveEmitColumns({1});
+
+  ASSERT_EQ(columns.emit.size(), 1);
+  ASSERT_EQ(columns.emit[0][0].size(), 3);
+  for (uint32_t batch = 0; batch < 3; ++batch) {
+    EXPECT_EQ(
+        columns.emit[0][0][batch],
+        index.at(0, batch)->childAt(1).get());
+  }
+  EXPECT_NE(columns.emit[0][0][0], columns.emit[0][0][1]);
+  EXPECT_NE(columns.emit[0][0][1], columns.emit[0][0][2]);
+}
+
+TEST_F(RetainedVectorsIndexTest, preservesDriverAndProjectionOrder) {
+  RetainedVectorsIndex driver0(0);
+  RetainedVectorsIndex driver1(1);
+  driver0.add(makeRowVector({
+      makeFlatVector<int64_t>({10}),
+      makeFlatVector<double>({10.5}),
+      makeFlatVector<std::string>({"d0"}),
+  }));
+  driver1.add(makeRowVector({
+      makeFlatVector<int64_t>({20}),
+      makeFlatVector<double>({20.5}),
+      makeFlatVector<std::string>({"d1"}),
+  }));
+  driver0.mergeFrom(std::move(driver1));
+
+  const auto columns = driver0.resolveEmitColumns({2, 0});
+
+  ASSERT_EQ(columns.emit.size(), 2);
+  ASSERT_EQ(columns.emit[0].size(), 2);
+  EXPECT_EQ(columns.emit[0][0][0], driver0.at(0, 0)->childAt(2).get());
+  EXPECT_EQ(columns.emit[0][1][0], driver0.at(1, 0)->childAt(2).get());
+  EXPECT_EQ(columns.emit[1][0][0], driver0.at(0, 0)->childAt(0).get());
+  EXPECT_EQ(columns.emit[1][1][0], driver0.at(1, 0)->childAt(0).get());
+}
+
 TEST_F(RetainedVectorsIndexTest, rejectsOutOfRangeDriver) {
   EXPECT_ANY_THROW(RetainedVectorsIndex(kMaxDriverNo + 1));
 }
