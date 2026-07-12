@@ -30,6 +30,7 @@ void ChHashJoinBridge::setChTable(
   std::vector<ContinuePromise> promises;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    VELOX_CHECK(started_);
     VELOX_CHECK(!buildResult_.has_value(), "setChTable may be called only once");
     buildResult_ = ChBuildResult{std::move(map), std::move(retained)};
     promises = std::move(promises_);
@@ -41,6 +42,7 @@ std::optional<ChHashJoinBridge::ChBuildResult>
 ChHashJoinBridge::tableOrFuture(ContinueFuture* future) {
   VELOX_CHECK_NOT_NULL(future);
   std::lock_guard<std::mutex> lock(mutex_);
+  VELOX_CHECK(started_);
   VELOX_CHECK(!cancelled_, "Getting CH hash table after join is aborted");
   if (buildResult_.has_value()) {
     return buildResult_;

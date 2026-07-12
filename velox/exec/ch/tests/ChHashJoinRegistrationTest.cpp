@@ -20,6 +20,8 @@
 #include "velox/common/memory/Memory.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
+#include <folly/synchronization/CallOnce.h>
+
 #include <gtest/gtest.h>
 
 namespace facebook::velox::exec::ch {
@@ -34,6 +36,12 @@ class ChHashJoinRegistrationTest : public testing::Test,
       options.trackDefaultUsage = true;
       memory::MemoryManager::initialize(options);
     }
+    // Register the Ch hash-join translator once for the whole suite. This does
+    // NOT wipe the process-global translator registry (no
+    // unregisterAllOperators()), so it will not pollute other tests running
+    // later in the same binary.
+    static folly::once_flag registerFlag;
+    folly::call_once(registerFlag, [] { registerChHashJoin(); });
   }
 
   core::PlanNodePtr valuesNode(
@@ -97,12 +105,17 @@ TEST_F(ChHashJoinRegistrationTest, translatorCreatesBridgeAndBuildSupplier) {
   EXPECT_EQ(
       translator.toOperatorSupplier(node->sources()[0]),
       nullptr);
+
+  // Exercise the probe toOperator dispatch. Constructing the operator for the
+  // matching node would require a live DriverCtx (a full Task/Driver), which is
+  // out of scope at this placeholder stage; the non-Ch node path returns before
+  // touching the ctx, so it can be exercised cleanly with a null ctx.
+  EXPECT_EQ(translator.toOperator(nullptr, 0, node->sources()[0]), nullptr);
 }
 
 TEST_F(ChHashJoinRegistrationTest, registrationMakesBridgeDiscoverable) {
-  Operator::unregisterAllOperators();
-  registerChHashJoin();
-
+  // The translator was registered once in SetUpTestSuite() without clearing the
+  // global registry, so the bridge must be discoverable via the registry.
   auto bridge = Operator::joinBridgeFromPlanNode(makeJoinNode());
   ASSERT_NE(bridge, nullptr);
   EXPECT_NE(dynamic_cast<ChHashJoinBridge*>(bridge.get()), nullptr);
@@ -110,6 +123,7 @@ TEST_F(ChHashJoinRegistrationTest, registrationMakesBridgeDiscoverable) {
 
 TEST_F(ChHashJoinRegistrationTest, bridgeWakesWaiterAndPreservesTable) {
   ChHashJoinBridge bridge;
+  bridge.start();
   ContinueFuture future = ContinueFuture::makeEmpty();
 
   EXPECT_FALSE(bridge.tableOrFuture(&future).has_value());
