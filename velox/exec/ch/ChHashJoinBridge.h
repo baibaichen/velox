@@ -55,6 +55,8 @@ class ChHashJoinTranslator : public exec::Operator::PlanNodeTranslator {
 
   exec::OperatorSupplier toOperatorSupplier(
       const core::PlanNodePtr& node) override;
+
+  std::optional<uint32_t> maxDrivers(const core::PlanNodePtr& node) override;
 };
 
 void registerChHashJoin();

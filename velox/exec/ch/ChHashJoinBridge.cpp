@@ -31,15 +31,16 @@ void ChHashJoinBridge::setChTable(
   {
     std::lock_guard<std::mutex> lock(mutex_);
     VELOX_CHECK(started_);
-    VELOX_CHECK(!buildResult_.has_value(), "setChTable may be called only once");
+    VELOX_CHECK(
+        !buildResult_.has_value(), "setChTable may be called only once");
     buildResult_ = ChBuildResult{std::move(map), std::move(retained)};
     promises = std::move(promises_);
   }
   notify(std::move(promises));
 }
 
-std::optional<ChHashJoinBridge::ChBuildResult>
-ChHashJoinBridge::tableOrFuture(ContinueFuture* future) {
+std::optional<ChHashJoinBridge::ChBuildResult> ChHashJoinBridge::tableOrFuture(
+    ContinueFuture* future) {
   VELOX_CHECK_NOT_NULL(future);
   std::lock_guard<std::mutex> lock(mutex_);
   VELOX_CHECK(started_);
@@ -56,8 +57,7 @@ std::unique_ptr<exec::Operator> ChHashJoinTranslator::toOperator(
     exec::DriverCtx* ctx,
     int32_t id,
     const core::PlanNodePtr& node) {
-  if (auto joinNode =
-          std::dynamic_pointer_cast<const ChHashJoinNode>(node)) {
+  if (auto joinNode = std::dynamic_pointer_cast<const ChHashJoinNode>(node)) {
     return std::make_unique<ChHashProbeOperator>(id, ctx, std::move(joinNode));
   }
   return nullptr;
@@ -73,20 +73,24 @@ std::unique_ptr<exec::JoinBridge> ChHashJoinTranslator::toJoinBridge(
 
 exec::OperatorSupplier ChHashJoinTranslator::toOperatorSupplier(
     const core::PlanNodePtr& node) {
-  if (auto joinNode =
-          std::dynamic_pointer_cast<const ChHashJoinNode>(node)) {
+  if (auto joinNode = std::dynamic_pointer_cast<const ChHashJoinNode>(node)) {
     return [joinNode = std::move(joinNode)](
                int32_t operatorId, exec::DriverCtx* ctx) {
-      return std::make_unique<ChHashBuildOperator>(
-          operatorId, ctx, joinNode);
+      return std::make_unique<ChHashBuildOperator>(operatorId, ctx, joinNode);
     };
   }
   return nullptr;
 }
 
+std::optional<uint32_t> ChHashJoinTranslator::maxDrivers(
+    const core::PlanNodePtr& node) {
+  return std::dynamic_pointer_cast<const ChHashJoinNode>(node)
+      ? std::optional<uint32_t>{1}
+      : std::nullopt;
+}
+
 void registerChHashJoin() {
-  exec::Operator::registerOperator(
-      std::make_unique<ChHashJoinTranslator>());
+  exec::Operator::registerOperator(std::make_unique<ChHashJoinTranslator>());
 }
 
 } // namespace facebook::velox::exec::ch

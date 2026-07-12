@@ -295,6 +295,14 @@ uint32_t maxDriversForConsumer(const core::PlanNodePtr& node) {
     // MergeJoinNode must run single-threaded.
     return 1;
   }
+  if (auto result = Operator::maxDrivers(node)) {
+    VELOX_CHECK_GT(
+        *result,
+        0,
+        "maxDrivers must be greater than 0. Plan node: {}",
+        node->toString());
+    return *result;
+  }
   return std::numeric_limits<uint32_t>::max();
 }
 

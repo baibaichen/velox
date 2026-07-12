@@ -49,8 +49,8 @@ class ChHashJoinRegistrationTest : public testing::Test,
       const std::string& keyName) {
     return std::make_shared<core::ValuesNode>(
         id,
-        std::vector<RowVectorPtr>{makeRowVector(
-            {keyName}, {makeFlatVector<int64_t>({1, 2, 3})})});
+        std::vector<RowVectorPtr>{
+            makeRowVector({keyName}, {makeFlatVector<int64_t>({1, 2, 3})})});
   }
 
   std::shared_ptr<const ChHashJoinNode> makeJoinNode() {
@@ -82,8 +82,7 @@ TEST_F(ChHashJoinRegistrationTest, exposesJoinPlanContract) {
   EXPECT_EQ(node->leftKeys()[0]->name(), "leftKey");
   EXPECT_EQ(node->rightKeys()[0]->name(), "rightKey");
   EXPECT_EQ(node->filter(), nullptr);
-  auto expectedType =
-      ROW({"leftKey", "rightKey"}, {BIGINT(), BIGINT()});
+  auto expectedType = ROW({"leftKey", "rightKey"}, {BIGINT(), BIGINT()});
   EXPECT_TRUE(node->outputType()->equivalent(*expectedType));
   ASSERT_EQ(node->sources().size(), 2);
   EXPECT_EQ(node->sources()[0]->id(), "left");
@@ -99,12 +98,10 @@ TEST_F(ChHashJoinRegistrationTest, translatorCreatesBridgeAndBuildSupplier) {
   ASSERT_NE(bridge, nullptr);
   EXPECT_NE(dynamic_cast<ChHashJoinBridge*>(bridge.get()), nullptr);
   EXPECT_NE(translator.toOperatorSupplier(node), nullptr);
-  EXPECT_EQ(
-      translator.toJoinBridge(node->sources()[0]),
-      nullptr);
-  EXPECT_EQ(
-      translator.toOperatorSupplier(node->sources()[0]),
-      nullptr);
+  EXPECT_EQ(translator.toJoinBridge(node->sources()[0]), nullptr);
+  EXPECT_EQ(translator.toOperatorSupplier(node->sources()[0]), nullptr);
+  EXPECT_EQ(translator.maxDrivers(node), 1);
+  EXPECT_EQ(translator.maxDrivers(node->sources()[0]), std::nullopt);
 
   // Exercise the probe toOperator dispatch. Constructing the operator for the
   // matching node would require a live DriverCtx (a full Task/Driver), which is
