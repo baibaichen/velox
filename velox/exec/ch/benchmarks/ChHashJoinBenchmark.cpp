@@ -19,6 +19,7 @@
 #include <gflags/gflags.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <iostream>
@@ -27,12 +28,18 @@
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/memory/Memory.h"
+#include "velox/core/Expressions.h"
 #include "velox/exec/HashTable.h"
 #include "velox/exec/OperatorUtils.h"
 #include "velox/exec/VectorHasher.h"
 #include "velox/exec/ch/ChHashBuild.h"
 #include "velox/exec/ch/ChHashProbe.h"
 #include "velox/exec/ch/EmitGather.h"
+#include "velox/exec/ch/ChHashJoinBridge.h"
+#include "velox/exec/Cursor.h"
+#include "velox/functions/prestosql/registration/RegistrationFunctions.h"
+#include "velox/parse/ExpressionsParser.h"
+#include "velox/parse/TypeResolver.h"
 #include "velox/vector/DecodedVector.h"
 #include "velox/vector/SelectivityVector.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
@@ -55,6 +62,14 @@ DEFINE_double(
     filter_selectivity,
     0.1,
     "Fraction of emitted rows retained before delayed materialization.");
+DEFINE_bool(
+    run_e2e,
+    true,
+    "Run real Task/Driver end-to-end join benchmarks before microbenchmarks.");
+DEFINE_int32(
+    e2e_iterations,
+    5,
+    "Measured query executions per arm and selectivity.");
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -65,6 +80,22 @@ namespace {
 struct BuildResult {
   uint64_t elapsedNanos;
   uint64_t peakBytes;
+};
+
+struct E2EResult {
+  double medianElapsedMs;
+  uint64_t queryPeakBytes;
+  uint64_t resultPeakBytes;
+  uint64_t observedTotalPeakBytes;
+  uint64_t rows;
+};
+
+struct QueryResult {
+  std::shared_ptr<Task> task;
+  uint64_t rows{0};
+  uint64_t hashSum{0};
+  uint64_t hashXor{0};
+  uint64_t observedTotalPeakBytes{0};
 };
 
 class ChHashJoinBenchmark : public VectorTestBase {
@@ -90,6 +121,134 @@ class ChHashJoinBenchmark : public VectorTestBase {
     for (const auto& batch : buildVectors_) {
       retainedVectorBytes_ += batch->retainedSize();
     }
+    e2eInputBytes_ = retainedVectorBytes_ + probeVector_->retainedSize();
+  }
+
+  core::PlanNodePtr makeE2EPlan(
+      bool coordinate,
+      int32_t selectivityPercent) const {
+    VELOX_CHECK_GT(selectivityPercent, 0);
+    VELOX_CHECK_LE(selectivityPercent, 100);
+    auto buildNode = std::make_shared<core::ValuesNode>(
+        "0", buildVectors_, true);
+    auto probeNode = std::make_shared<core::ValuesNode>(
+        "1", std::vector<RowVectorPtr>{probeVector_}, true);
+    auto probeKey = std::make_shared<core::FieldAccessTypedExpr>(
+        BIGINT(), "p_key");
+    auto buildKey = std::make_shared<core::FieldAccessTypedExpr>(
+        BIGINT(), "b_key");
+    core::PlanNodePtr joinNode;
+    if (coordinate) {
+      joinNode = std::make_shared<ch::ChHashJoinNode>(
+          "2",
+          core::JoinType::kInner,
+          std::vector<core::FieldAccessTypedExprPtr>{probeKey},
+          std::vector<core::FieldAccessTypedExprPtr>{buildKey},
+          nullptr,
+          probeNode,
+          buildNode,
+          e2eOutputType_);
+    } else {
+      joinNode = std::make_shared<core::HashJoinNode>(
+          "2",
+          core::JoinType::kInner,
+          false,
+          std::vector<core::FieldAccessTypedExprPtr>{probeKey},
+          std::vector<core::FieldAccessTypedExprPtr>{buildKey},
+          nullptr,
+          probeNode,
+          buildNode,
+          e2eOutputType_);
+    }
+    auto untypedFilter = parse::DuckSqlExpressionsParser().parseExpr(
+        fmt::format("p_key % 100 < {}", selectivityPercent));
+    auto filter = core::Expressions::inferTypes(
+        untypedFilter, e2eOutputType_, pool());
+    return std::make_shared<core::FilterNode>("3", filter, joinNode);
+  }
+
+  QueryResult runE2EPlan(
+      const core::PlanNodePtr& plan,
+      const std::shared_ptr<memory::MemoryPool>& resultPool,
+      bool computeSignature) const {
+    CursorParameters params;
+    params.planNode = plan;
+    params.maxDrivers = 1;
+    params.copyResult = false;
+    auto cursor = TaskCursor::create(params);
+    cursor->setNoMoreSplits();
+
+    QueryResult result;
+    result.task = cursor->task();
+    while (cursor->moveNext()) {
+      const auto& output = cursor->current();
+      auto materialized =
+          BaseVector::create<RowVector>(
+              output->type(), output->size(), resultPool.get());
+      materialized->copy(output.get(), 0, 0, output->size());
+      result.rows += materialized->size();
+      if (computeSignature) {
+        for (vector_size_t row = 0; row < materialized->size(); ++row) {
+          uint64_t rowHash = 0;
+          for (const auto& child : materialized->children()) {
+            const auto childHash = child->hashValueAt(row);
+            rowHash ^= childHash + 0x9e3779b97f4a7c15ULL +
+                (rowHash << 6) + (rowHash >> 2);
+          }
+          result.hashSum += rowHash;
+          result.hashXor ^= rowHash;
+        }
+      }
+      result.observedTotalPeakBytes = std::max<uint64_t>(
+          result.observedTotalPeakBytes,
+          e2eInputBytes_ + result.task->pool()->usedBytes() +
+              resultPool->usedBytes());
+      folly::doNotOptimizeAway(materialized.get());
+    }
+    return result;
+  }
+
+  void verifyE2EEquivalent(int32_t selectivityPercent) {
+    auto nativePool = rootPool_->addLeafChild(
+        fmt::format("E2EVerifyNative-{}", selectivityPercent));
+    auto coordinatePool = rootPool_->addLeafChild(
+        fmt::format("E2EVerifyCoordinate-{}", selectivityPercent));
+    const auto native =
+        runE2EPlan(makeE2EPlan(false, selectivityPercent), nativePool, true);
+    const auto coordinate =
+        runE2EPlan(makeE2EPlan(true, selectivityPercent), coordinatePool, true);
+    VELOX_CHECK_EQ(coordinate.rows, native.rows);
+    VELOX_CHECK_EQ(coordinate.hashSum, native.hashSum);
+    VELOX_CHECK_EQ(coordinate.hashXor, native.hashXor);
+  }
+
+  E2EResult measureE2EOnce(
+      bool coordinate,
+      int32_t selectivityPercent,
+      int32_t iteration) {
+    auto resultPool = rootPool_->addLeafChild(fmt::format(
+        "E2EResult-{}-{}-{}",
+        coordinate ? "coordinate" : "native",
+        selectivityPercent,
+        iteration));
+    const auto plan = makeE2EPlan(coordinate, selectivityPercent);
+    const auto start = std::chrono::steady_clock::now();
+    const auto result = runE2EPlan(plan, resultPool, false);
+    const auto elapsedMs = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - start)
+                               .count();
+    VELOX_CHECK_NOT_NULL(result.task);
+    VELOX_CHECK_EQ(result.rows, expectedE2ERows(selectivityPercent));
+    const auto queryPeakBytes =
+        static_cast<uint64_t>(result.task->pool()->peakBytes());
+    const auto observedTotalPeakBytes = std::max(
+        result.observedTotalPeakBytes, e2eInputBytes_ + queryPeakBytes);
+    return {
+        elapsedMs,
+        queryPeakBytes,
+        static_cast<uint64_t>(resultPool->peakBytes()),
+        observedTotalPeakBytes,
+        result.rows};
   }
 
   BuildResult buildCoordinate() {
@@ -224,12 +383,26 @@ class ChHashJoinBenchmark : public VectorTestBase {
     return buildRows_;
   }
 
+  uint64_t expectedE2ERows(int32_t selectivityPercent) const {
+    uint64_t selectedProbeRows = 0;
+    for (vector_size_t key = 0; key < distinctKeys_; ++key) {
+      if (key % 100 < selectivityPercent) {
+        ++selectedProbeRows;
+      }
+    }
+    return selectedProbeRows * fanout_;
+  }
+
   vector_size_t probeRows() const {
     return distinctKeys_;
   }
 
   uint64_t retainedVectorBytes() const {
     return retainedVectorBytes_;
+  }
+
+  uint64_t e2eInputBytes() const {
+    return e2eInputBytes_;
   }
 
  private:
@@ -413,6 +586,17 @@ class ChHashJoinBenchmark : public VectorTestBase {
   }
 
   std::vector<RowVectorPtr> makeBuildVectors() {
+    std::vector<std::string> names{"b_key"};
+    std::vector<TypePtr> types{BIGINT()};
+    for (int32_t column = 0; column < payloadColumns_; ++column) {
+      names.push_back(fmt::format("b_payload_{}", column));
+      types.push_back(payloadType(column));
+    }
+    auto outputNames = names;
+    outputNames.push_back("p_key");
+    types.push_back(BIGINT());
+    e2eOutputType_ = ROW(std::move(outputNames), std::move(types));
+
     std::vector<RowVectorPtr> batches;
     for (vector_size_t start = 0; start < buildRows_; start += batchRows_) {
       const auto size = std::min(batchRows_, buildRows_ - start);
@@ -447,14 +631,16 @@ class ChHashJoinBenchmark : public VectorTestBase {
               }));
         }
       }
-      batches.push_back(makeRowVector(children));
+      batches.push_back(makeRowVector(names, children));
     }
     return batches;
   }
 
   RowVectorPtr makeProbeVector() {
-    return makeRowVector({makeFlatVector<int64_t>(
-        distinctKeys_, [](vector_size_t row) { return row; })});
+    return makeRowVector(
+        {"p_key"},
+        {makeFlatVector<int64_t>(
+            distinctKeys_, [](vector_size_t row) { return row; })});
   }
 
   void copyToNativeTable(const RowVectorPtr& batch) {
@@ -494,6 +680,7 @@ class ChHashJoinBenchmark : public VectorTestBase {
   std::vector<RowVectorPtr> buildVectors_;
   RowVectorPtr probeVector_;
   uint64_t retainedVectorBytes_{0};
+  uint64_t e2eInputBytes_{0};
   std::shared_ptr<memory::MemoryPool> coordinatePool_;
   std::shared_ptr<memory::MemoryPool> nativePool_;
   std::shared_ptr<memory::MemoryPool> scratchPool_;
@@ -504,6 +691,7 @@ class ChHashJoinBenchmark : public VectorTestBase {
   std::vector<ch::ProbeMatch> coordinateMatches_;
   std::vector<vector_size_t> nativeInputRows_;
   std::vector<char*> nativeHits_;
+  RowTypePtr e2eOutputType_;
   RowTypePtr outputType_;
   std::unique_ptr<ch::EmitGather> emitGather_;
 };
@@ -564,6 +752,83 @@ double measureThroughput(Probe&& probe, int32_t iterations, uint64_t expected) {
   return iterations / elapsed;
 }
 
+E2EResult summarizeE2E(std::vector<E2EResult> samples) {
+  VELOX_CHECK(!samples.empty());
+  std::sort(
+      samples.begin(),
+      samples.end(),
+      [](const auto& left, const auto& right) {
+        return left.medianElapsedMs < right.medianElapsedMs;
+      });
+  E2EResult result = samples[samples.size() / 2];
+  for (const auto& sample : samples) {
+    VELOX_CHECK_EQ(sample.rows, result.rows);
+    result.queryPeakBytes =
+        std::max(result.queryPeakBytes, sample.queryPeakBytes);
+    result.resultPeakBytes =
+        std::max(result.resultPeakBytes, sample.resultPeakBytes);
+    result.observedTotalPeakBytes = std::max(
+        result.observedTotalPeakBytes, sample.observedTotalPeakBytes);
+  }
+  return result;
+}
+
+void runE2EBenchmarks() {
+  constexpr std::array<int32_t, 4> kSelectivities{1, 10, 50, 100};
+  std::cout << fmt::format(
+      "E2E_CONFIG build_rows={} probe_rows={} payload_columns={} fanout={} "
+      "batch_rows={} max_drivers=1 iterations={} consumer=flatten_copy "
+      "shared_input_bytes={}\n",
+      FLAGS_build_rows,
+      benchmark->probeRows(),
+      FLAGS_payload_columns,
+      FLAGS_fanout,
+      FLAGS_batch_rows,
+      FLAGS_e2e_iterations,
+      benchmark->e2eInputBytes());
+  for (const auto selectivity : kSelectivities) {
+    benchmark->verifyE2EEquivalent(selectivity);
+    std::vector<E2EResult> coordinateSamples;
+    std::vector<E2EResult> nativeSamples;
+    coordinateSamples.reserve(FLAGS_e2e_iterations);
+    nativeSamples.reserve(FLAGS_e2e_iterations);
+    for (int32_t iteration = 0; iteration < FLAGS_e2e_iterations; ++iteration) {
+      auto measure = [&](bool coordinate) {
+        auto sample =
+            benchmark->measureE2EOnce(
+                coordinate, selectivity, iteration);
+        (coordinate ? coordinateSamples : nativeSamples)
+            .push_back(std::move(sample));
+      };
+      if (iteration % 2 == 0) {
+        measure(true);
+        measure(false);
+      } else {
+        measure(false);
+        measure(true);
+      }
+    }
+    const auto coordinate = summarizeE2E(std::move(coordinateSamples));
+    const auto native = summarizeE2E(std::move(nativeSamples));
+    for (const auto& [arm, result] :
+         std::array<std::pair<const char*, E2EResult>, 2>{
+             std::pair{"coordinate", coordinate},
+             std::pair{"velox_native", native}}) {
+      std::cout << fmt::format(
+          "E2E selectivity_percent={} arm={} median_wall_ms={:.3f} "
+          "query_peak_bytes={} result_peak_bytes={} "
+          "observed_total_peak_bytes={} output_rows={}\n",
+          selectivity,
+          arm,
+          result.medianElapsedMs,
+          result.queryPeakBytes,
+          result.resultPeakBytes,
+          result.observedTotalPeakBytes,
+          result.rows);
+    }
+  }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -571,6 +836,7 @@ int main(int argc, char** argv) {
   VELOX_CHECK_GT(FLAGS_measure_iterations, 0);
   VELOX_CHECK_GT(FLAGS_filter_selectivity, 0);
   VELOX_CHECK_LE(FLAGS_filter_selectivity, 1);
+  VELOX_CHECK_GT(FLAGS_e2e_iterations, 0);
 
   memory::MemoryManager::Options options;
   options.useMmapAllocator = true;
@@ -578,6 +844,10 @@ int main(int argc, char** argv) {
   options.useMmapArena = true;
   options.mmapArenaCapacityRatio = 1;
   memory::MemoryManager::initialize(options);
+
+  functions::prestosql::registerAllScalarFunctions();
+  parse::registerTypeResolver();
+  ch::registerChHashJoin();
 
   benchmark = std::make_unique<ChHashJoinBenchmark>(
       FLAGS_build_rows,
@@ -601,6 +871,10 @@ int main(int argc, char** argv) {
   VELOX_CHECK_EQ(
       benchmark->emitNativeCopyThenFilter(),
       benchmark->expectedFilteredMatches());
+
+  if (FLAGS_run_e2e) {
+    runE2EBenchmarks();
+  }
 
   const auto coordinateIterationsPerSecond = measureThroughput(
       [] { return benchmark->probeCoordinate(); },
