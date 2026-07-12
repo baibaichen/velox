@@ -18,18 +18,14 @@
 
 #include "velox/common/memory/MemoryPool.h"
 #include "velox/exec/ch/Arena.h"
+#include "velox/exec/ch/HashMap.h"
 #include "velox/exec/ch/RetainedVectorsIndex.h"
-#include "velox/exec/ch/RowRefList.h"
-
-#include <folly/container/F14Map.h>
-
-#include <cstdint>
 
 namespace facebook::velox::exec::ch {
 
 class ChHashBuild {
  public:
-  using PlaceholderMap = folly::F14FastMap<uint64_t, RowRefList>;
+  using JoinMap = HashMapAll_key64;
 
   ChHashBuild(
       uint32_t driverNo,
@@ -46,7 +42,7 @@ class ChHashBuild {
     return needsInput_;
   }
 
-  const PlaceholderMap& rowsByKey() const {
+  const JoinMap& rowsByKey() const {
     return rowsByKey_;
   }
 
@@ -59,7 +55,7 @@ class ChHashBuild {
   column_index_t keyChannel_;
   RetainedVectorsIndex retainedIndex_;
   Arena arena_;
-  PlaceholderMap rowsByKey_;
+  JoinMap rowsByKey_;
   bool needsInput_{true};
 };
 

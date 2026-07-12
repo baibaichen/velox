@@ -64,8 +64,10 @@ TEST_F(ChHashBuildTest, coordinatesResolveToOriginalRowsAcrossBatches) {
   build.addInput(second);
 
   uint32_t decodedRows = 0;
-  for (const auto& [mapKey, refs] : build.rowsByKey()) {
-    for (const auto refWord : refs) {
+  for (const auto& cell : build.rowsByKey()) {
+    const auto mapKey = cell.getKey();
+    const auto& mapped = cell.getMapped();
+    for (const auto refWord : mapped) {
       ASSERT_TRUE(refWordIsInline(refWord));
       const auto blockNo = refWordBlockNo(refWord);
       const auto driverNo = unpackDriverNo(blockNo);
@@ -90,13 +92,13 @@ TEST_F(ChHashBuildTest, duplicateKeyUsesRowRefListChain) {
   build.addInput(first);
   build.addInput(second);
 
-  const auto it = build.rowsByKey().find(kDuplicateKey);
-  ASSERT_NE(it, build.rowsByKey().end());
-  EXPECT_FALSE(it->second.isInline());
-  EXPECT_EQ(it->second.rows(), 13);
+  const auto* cell = build.rowsByKey().find(kDuplicateKey);
+  ASSERT_NE(cell, nullptr);
+  EXPECT_FALSE(cell->getMapped().isInline());
+  EXPECT_EQ(cell->getMapped().rows(), 13);
 
   uint32_t matches = 0;
-  for (const auto refWord : it->second) {
+  for (const auto refWord : cell->getMapped()) {
     const auto blockNo = refWordBlockNo(refWord);
     const auto* retained = build.retainedIndex().at(
         unpackDriverNo(blockNo), unpackBatchNo(blockNo));

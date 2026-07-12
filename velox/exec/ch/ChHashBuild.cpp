@@ -30,7 +30,8 @@ ChHashBuild::ChHashBuild(
     : driverNo_(driverNo),
       keyChannel_(keyChannel),
       retainedIndex_(driverNo),
-      arena_(pool) {}
+      arena_(pool),
+      rowsByKey_(pool) {}
 
 void ChHashBuild::addInput(RowVectorPtr input) {
   VELOX_CHECK(needsInput_, "Cannot add input after noMoreInput");
@@ -41,7 +42,7 @@ void ChHashBuild::addInput(RowVectorPtr input) {
   VELOX_CHECK_EQ(
       keyVector->typeKind(),
       TypeKind::BIGINT,
-      "ChHashBuild placeholder map supports one BIGINT key channel");
+      "ChHashBuild supports one BIGINT key channel");
 
   SelectivityVector rows(input->size());
   DecodedVector decodedKey(*keyVector, rows);
@@ -57,7 +58,8 @@ void ChHashBuild::addInput(RowVectorPtr input) {
         static_cast<uint64_t>(decodedKey.valueAt<int64_t>(rowNo));
     const uint64_t refWord =
         RowRef(blockNo, static_cast<uint32_t>(rowNo)).encode();
-    rowsByKey_[key].insert(refWord, arena_);
+    auto& mapped = rowsByKey_.emplace(key);
+    mapped.insert(refWord, arena_);
   });
 }
 
