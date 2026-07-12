@@ -16,6 +16,7 @@ velox_add_library(
   velox_exec_ch
   Arena.cpp
   ChHashBuild.cpp
+  ChHashJoinBridge.cpp
   ChHashProbe.cpp
   EmitGather.cpp
   RetainedVectorsIndex.cpp
@@ -23,7 +24,11 @@ velox_add_library(
   HEADERS
     Arena.h
     ChHashBuild.h
+    ChHashBuildOperator.h
+    ChHashJoinBridge.h
+    ChHashJoinNode.h
     ChHashProbe.h
+    ChHashProbeOperator.h
     EmitGather.h
     HashMap.h
     HashTable.h
@@ -32,7 +37,7 @@ velox_add_library(
     RowRef.h
     RowRefList.h
 )
-velox_link_libraries(velox_exec_ch PUBLIC velox_memory velox_vector)
+velox_link_libraries(velox_exec_ch PUBLIC velox_exec velox_memory velox_vector)
 
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)
