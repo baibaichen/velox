@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "velox/type/Type.h"
 #include "velox/vector/ComplexVector.h"
 
 #include <cstddef>
@@ -24,6 +25,10 @@
 #include <vector>
 
 namespace facebook::velox::exec::ch {
+
+struct EmitColumns {
+  std::vector<std::vector<std::vector<const BaseVector*>>> emit;
+};
 
 class RetainedVectorsIndex {
  public:
@@ -35,9 +40,8 @@ class RetainedVectorsIndex {
 
   void mergeFrom(RetainedVectorsIndex&& peer);
 
-  void resolveEmitColumns(
-      const std::vector<size_t>& positions,
-      std::vector<const BaseVector* const*>& outColumns) const;
+  EmitColumns resolveEmitColumns(
+      const std::vector<column_index_t>& positions) const;
 
  private:
   uint32_t driverNo_;

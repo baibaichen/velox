@@ -68,8 +68,23 @@ void RetainedVectorsIndex::mergeFrom(RetainedVectorsIndex&& peer) {
       std::move(peer.retained_[peer.driverNo_]);
 }
 
-void RetainedVectorsIndex::resolveEmitColumns(
-    const std::vector<size_t>&,
-    std::vector<const BaseVector* const*>&) const {}
+EmitColumns RetainedVectorsIndex::resolveEmitColumns(
+    const std::vector<column_index_t>& positions) const {
+  EmitColumns columns;
+  columns.emit.resize(positions.size());
+  for (size_t i = 0; i < positions.size(); ++i) {
+    auto& byDriver = columns.emit[i];
+    byDriver.resize(retained_.size());
+    for (size_t driverNo = 0; driverNo < retained_.size(); ++driverNo) {
+      const auto& batches = retained_[driverNo];
+      auto& byBatch = byDriver[driverNo];
+      byBatch.reserve(batches.size());
+      for (const auto& batch : batches) {
+        byBatch.push_back(batch->childAt(positions[i]).get());
+      }
+    }
+  }
+  return columns;
+}
 
 } // namespace facebook::velox::exec::ch
