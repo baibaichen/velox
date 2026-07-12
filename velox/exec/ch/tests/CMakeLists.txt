@@ -17,6 +17,7 @@ add_executable(
   ArenaTest.cpp
   ChHashBuildTest.cpp
   ChHashProbeTest.cpp
+  EmitGatherTest.cpp
   HashMapTest.cpp
   HashTableTest.cpp
   RetainedVectorsIndexTest.cpp
