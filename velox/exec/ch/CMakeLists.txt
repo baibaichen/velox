@@ -15,9 +15,10 @@
 velox_add_library(
   velox_exec_ch
   Arena.cpp
+  ChHashBuild.cpp
   RetainedVectorsIndex.cpp
   RowRefList.cpp
-  HEADERS Arena.h RetainedVectorsIndex.h RowRef.h RowRefList.h
+  HEADERS Arena.h ChHashBuild.h RetainedVectorsIndex.h RowRef.h RowRefList.h
 )
 velox_link_libraries(velox_exec_ch PUBLIC velox_memory velox_vector)
 
