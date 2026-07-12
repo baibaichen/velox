@@ -17,6 +17,7 @@ add_executable(
   ArenaTest.cpp
   ChHashBuildTest.cpp
   ChHashBuildOperatorTest.cpp
+  ChHashJoinPipelineTest.cpp
   ChHashJoinRegistrationTest.cpp
   ChHashProbeTest.cpp
   ChHashProbeOperatorTest.cpp
