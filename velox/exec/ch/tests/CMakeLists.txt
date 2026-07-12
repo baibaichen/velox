@@ -16,11 +16,13 @@ add_executable(
   velox_exec_ch_test
   ArenaTest.cpp
   ChHashBuildTest.cpp
+  ChHashBuildOperatorTest.cpp
   ChHashJoinRegistrationTest.cpp
   ChHashProbeTest.cpp
   EmitGatherTest.cpp
   HashMapTest.cpp
   HashTableTest.cpp
+  Main.cpp
   RetainedVectorsIndexTest.cpp
   RowRefTest.cpp
   RowRefListTest.cpp
@@ -29,8 +31,8 @@ add_executable(
 target_link_libraries(
   velox_exec_ch_test
   velox_exec_ch
+  velox_exec_test_lib
   GTest::gtest
-  GTest::gtest_main
   velox_vector_test_lib
 )
 

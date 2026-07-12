@@ -43,19 +43,32 @@ class ChHashBuild {
   }
 
   const JoinMap& rowsByKey() const {
-    return rowsByKey_;
+    VELOX_CHECK_NOT_NULL(storage_);
+    return storage_->rowsByKey;
   }
 
   const RetainedVectorsIndex& retainedIndex() const {
-    return retainedIndex_;
+    VELOX_CHECK_NOT_NULL(retainedIndex_);
+    return *retainedIndex_;
   }
 
+  std::shared_ptr<JoinMap> takeMap();
+
+  std::shared_ptr<RetainedVectorsIndex> takeRetained();
+
  private:
+  struct BuildStorage {
+    explicit BuildStorage(memory::MemoryPool* pool)
+        : arena(pool), rowsByKey(pool) {}
+
+    Arena arena;
+    JoinMap rowsByKey;
+  };
+
   uint32_t driverNo_;
   column_index_t keyChannel_;
-  RetainedVectorsIndex retainedIndex_;
-  Arena arena_;
-  JoinMap rowsByKey_;
+  std::shared_ptr<RetainedVectorsIndex> retainedIndex_;
+  std::shared_ptr<BuildStorage> storage_;
   bool needsInput_{true};
 };
 

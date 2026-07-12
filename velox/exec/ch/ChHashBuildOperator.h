@@ -17,32 +17,26 @@
 #pragma once
 
 #include "velox/exec/Operator.h"
+#include "velox/exec/ch/ChHashBuild.h"
+#include "velox/exec/ch/ChHashJoinBridge.h"
 #include "velox/exec/ch/ChHashJoinNode.h"
 
 namespace facebook::velox::exec::ch {
 
-class ChHashBuildOperator : public exec::Operator {
+class ChHashBuildOperator final : public exec::Operator {
  public:
   ChHashBuildOperator(
       int32_t operatorId,
       exec::DriverCtx* driverCtx,
-      ChHashJoinNodePtr joinNode)
-      : Operator(
-            driverCtx,
-            nullptr,
-            operatorId,
-            joinNode->id(),
-            "ChHashBuild") {}
+      ChHashJoinNodePtr joinNode);
 
-  bool needsInput() const override {
-    return false;
-  }
+  void initialize() override;
 
-  void addInput(RowVectorPtr /* input */) override {}
+  bool needsInput() const override;
 
-  void noMoreInput() override {
-    Operator::noMoreInput();
-  }
+  void addInput(RowVectorPtr input) override;
+
+  void noMoreInput() override;
 
   RowVectorPtr getOutput() override {
     return nullptr;
@@ -52,9 +46,15 @@ class ChHashBuildOperator : public exec::Operator {
     return BlockingReason::kNotBlocked;
   }
 
-  bool isFinished() override {
-    return true;
-  }
+  bool isFinished() override;
+
+ private:
+  ChHashJoinNodePtr joinNode_;
+  std::shared_ptr<ChHashJoinBridge> joinBridge_;
+  uint32_t driverNo_;
+  column_index_t keyChannel_;
+  std::unique_ptr<ChHashBuild> chBuild_;
+  bool handedOff_{false};
 };
 
 } // namespace facebook::velox::exec::ch

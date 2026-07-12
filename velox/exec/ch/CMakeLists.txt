@@ -16,6 +16,7 @@ velox_add_library(
   velox_exec_ch
   Arena.cpp
   ChHashBuild.cpp
+  ChHashBuildOperator.cpp
   ChHashJoinBridge.cpp
   ChHashProbe.cpp
   EmitGather.cpp

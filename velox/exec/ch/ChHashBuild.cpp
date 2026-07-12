@@ -29,9 +29,8 @@ ChHashBuild::ChHashBuild(
     memory::MemoryPool* pool)
     : driverNo_(driverNo),
       keyChannel_(keyChannel),
-      retainedIndex_(driverNo),
-      arena_(pool),
-      rowsByKey_(pool) {}
+      retainedIndex_(std::make_shared<RetainedVectorsIndex>(driverNo)),
+      storage_(std::make_shared<BuildStorage>(pool)) {}
 
 void ChHashBuild::addInput(RowVectorPtr input) {
   VELOX_CHECK(needsInput_, "Cannot add input after noMoreInput");
@@ -46,7 +45,7 @@ void ChHashBuild::addInput(RowVectorPtr input) {
 
   SelectivityVector rows(input->size());
   DecodedVector decodedKey(*keyVector, rows);
-  const uint32_t batchNo = retainedIndex_.add(input);
+  const uint32_t batchNo = retainedIndex_->add(input);
   const uint32_t blockNo = packBlockNo(driverNo_, batchNo);
 
   rows.applyToSelected([&](vector_size_t rowNo) {
@@ -58,9 +57,25 @@ void ChHashBuild::addInput(RowVectorPtr input) {
         static_cast<uint64_t>(decodedKey.valueAt<int64_t>(rowNo));
     const uint64_t refWord =
         RowRef(blockNo, static_cast<uint32_t>(rowNo)).encode();
-    auto& mapped = rowsByKey_.emplace(key);
-    mapped.insert(refWord, arena_);
+    auto& mapped = storage_->rowsByKey.emplace(key);
+    mapped.insert(refWord, storage_->arena);
   });
+}
+
+std::shared_ptr<ChHashBuild::JoinMap> ChHashBuild::takeMap() {
+  VELOX_CHECK(!needsInput_, "Cannot take map before noMoreInput");
+  VELOX_CHECK_NOT_NULL(storage_, "Map has already been taken");
+
+  auto map = std::shared_ptr<JoinMap>(storage_, &storage_->rowsByKey);
+  storage_.reset();
+  return map;
+}
+
+std::shared_ptr<RetainedVectorsIndex> ChHashBuild::takeRetained() {
+  VELOX_CHECK(!needsInput_, "Cannot take retained vectors before noMoreInput");
+  VELOX_CHECK_NOT_NULL(
+      retainedIndex_, "Retained vectors have already been taken");
+  return std::move(retainedIndex_);
 }
 
 } // namespace facebook::velox::exec::ch
