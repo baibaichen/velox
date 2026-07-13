@@ -146,9 +146,8 @@ RowVectorPtr ChHashProbeOperator::getOutput() {
   VELOX_CHECK(emitGather_.has_value());
 
   auto input = std::move(input_);
-  auto matches =
-      probeHashBuild(
-          *buildTable_.map, *buildTable_.retained, input, keyChannel_);
+  auto hits = joinProbe(*buildTable_.map, input, keyChannel_);
+  auto matches = listJoinResults(hits, *buildTable_.retained);
   pendingOutput_ = emitGather_->emit(matches, input);
   return nextPendingOutput();
 }

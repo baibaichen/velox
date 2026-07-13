@@ -23,11 +23,30 @@
 
 namespace facebook::velox::exec::ch {
 
+struct ProbeHit {
+  vector_size_t probeRow;
+  const RowRefList* matched;
+};
+
 struct ProbeMatch {
   vector_size_t probeRow;
   uint32_t buildBlockNo;
   uint32_t buildRowNo;
 };
+
+std::vector<ProbeHit> joinProbe(
+    const ChHashBuild& build,
+    const RowVectorPtr& probe,
+    column_index_t probeKeyChannel);
+
+std::vector<ProbeHit> joinProbe(
+    const ChHashBuild::JoinMap& map,
+    const RowVectorPtr& probe,
+    column_index_t probeKeyChannel);
+
+std::vector<ProbeMatch> listJoinResults(
+    const std::vector<ProbeHit>& hits,
+    const RetainedVectorsIndex& retained);
 
 std::vector<ProbeMatch> probeHashBuild(
     const ChHashBuild& build,
