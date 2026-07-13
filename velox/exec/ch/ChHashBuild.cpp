@@ -18,8 +18,6 @@
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/exec/ch/RowRef.h"
-#include "velox/vector/DecodedVector.h"
-#include "velox/vector/SelectivityVector.h"
 
 namespace facebook::velox::exec::ch {
 
@@ -31,6 +29,56 @@ ChHashBuild::ChHashBuild(
       keyChannel_(keyChannel),
       retainedIndex_(std::make_shared<RetainedVectorsIndex>(driverNo)),
       storage_(std::make_shared<BuildStorage>(pool)) {}
+
+void ChHashBuild::prepareJoinTable(
+    const DecodedVector& decodedKey,
+    const SelectivityVector& rows) {
+  VELOX_CHECK(needsInput_, "Cannot prepare table after noMoreInput");
+  VELOX_CHECK_EQ(
+      decodedKey.base()->typeKind(),
+      TypeKind::BIGINT,
+      "ChHashBuild supports one BIGINT key channel");
+
+  rows.applyToSelected([&](vector_size_t rowNo) {
+    if (decodedKey.isNullAt(rowNo)) {
+      return;
+    }
+
+    const auto key =
+        static_cast<uint64_t>(decodedKey.valueAt<int64_t>(rowNo));
+    storage_->rowsByKey.emplace(key);
+  });
+}
+
+void ChHashBuild::addRowReferences(
+    RowVectorPtr input,
+    const DecodedVector& decodedKey,
+    const SelectivityVector& rows) {
+  VELOX_CHECK(needsInput_, "Cannot add row references after noMoreInput");
+  VELOX_CHECK_NOT_NULL(input);
+  VELOX_CHECK_EQ(rows.size(), input->size());
+  VELOX_CHECK_EQ(
+      decodedKey.base()->typeKind(),
+      TypeKind::BIGINT,
+      "ChHashBuild supports one BIGINT key channel");
+
+  const uint32_t batchNo = retainedIndex_->add(std::move(input));
+  const uint32_t blockNo = packBlockNo(driverNo_, batchNo);
+  rows.applyToSelected([&](vector_size_t rowNo) {
+    if (decodedKey.isNullAt(rowNo)) {
+      return;
+    }
+
+    const auto key =
+        static_cast<uint64_t>(decodedKey.valueAt<int64_t>(rowNo));
+    auto* cell = storage_->rowsByKey.find(key, storage_->rowsByKey.hash(key));
+    VELOX_CHECK_NOT_NULL(
+        cell, "Key must be prepared before adding row references");
+    const auto refWord =
+        RowRef(blockNo, static_cast<uint32_t>(rowNo)).encode();
+    cell->getMapped().insert(refWord, storage_->arena);
+  });
+}
 
 void ChHashBuild::addInput(RowVectorPtr input) {
   VELOX_CHECK(needsInput_, "Cannot add input after noMoreInput");
@@ -45,21 +93,8 @@ void ChHashBuild::addInput(RowVectorPtr input) {
 
   SelectivityVector rows(input->size());
   DecodedVector decodedKey(*keyVector, rows);
-  const uint32_t batchNo = retainedIndex_->add(input);
-  const uint32_t blockNo = packBlockNo(driverNo_, batchNo);
-
-  rows.applyToSelected([&](vector_size_t rowNo) {
-    if (decodedKey.isNullAt(rowNo)) {
-      return;
-    }
-
-    const uint64_t key =
-        static_cast<uint64_t>(decodedKey.valueAt<int64_t>(rowNo));
-    const uint64_t refWord =
-        RowRef(blockNo, static_cast<uint32_t>(rowNo)).encode();
-    auto& mapped = storage_->rowsByKey.emplace(key);
-    mapped.insert(refWord, storage_->arena);
-  });
+  prepareJoinTable(decodedKey, rows);
+  addRowReferences(std::move(input), decodedKey, rows);
 }
 
 std::shared_ptr<ChHashBuild::JoinMap> ChHashBuild::takeMap() {
