@@ -52,6 +52,11 @@ DEFINE_int32(
     payload_columns,
     39,
     "Number of build payload columns, cycling BIGINT/DOUBLE/VARCHAR.");
+DEFINE_bool(
+    payload_all_bigint,
+    false,
+    "If true, all payload columns are BIGINT (harshest baseline for "
+    "coordinate arm); if false, cycle BIGINT/DOUBLE/VARCHAR by column%3.");
 DEFINE_int32(fanout, 4, "Build rows per distinct join key.");
 DEFINE_int32(batch_rows, 20'000, "Rows per build input batch.");
 DEFINE_int32(
@@ -575,6 +580,9 @@ class ChHashJoinBenchmark : public VectorTestBase {
   }
 
   TypePtr payloadType(int32_t column) const {
+    if (FLAGS_payload_all_bigint) {
+      return BIGINT();
+    }
     switch (column % 3) {
       case 0:
         return BIGINT();
@@ -609,12 +617,13 @@ class ChHashJoinBenchmark : public VectorTestBase {
           }));
 
       for (int32_t column = 0; column < payloadColumns_; ++column) {
-        if (column % 3 == 0) {
+        const auto payloadKind = payloadType(column)->kind();
+        if (payloadKind == TypeKind::BIGINT) {
           children.push_back(makeFlatVector<int64_t>(
               size, [=](vector_size_t row) {
                 return (start + row) * 101 + column;
               }));
-        } else if (column % 3 == 1) {
+        } else if (payloadKind == TypeKind::DOUBLE) {
           children.push_back(makeFlatVector<double>(
               size, [=](vector_size_t row) {
                 return static_cast<double>(start + row) * 0.25 + column;
