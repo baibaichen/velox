@@ -13,6 +13,8 @@
 # limitations under the License.
 
 add_executable(velox_exec_ch_hash_join_benchmark ChHashJoinBenchmark.cpp)
+add_executable(
+  velox_exec_ch_hashtable_layer_benchmark ChHashTableLayerBenchmark.cpp)
 
 find_package(DuckDB CONFIG REQUIRED)
 if(NOT TARGET duckdb_static)
@@ -31,6 +33,10 @@ target_link_directories(
   velox_exec_ch_hash_join_benchmark
   PRIVATE "${CH_BENCHMARK_DUCKDB_LIB_DIR}"
 )
+target_link_directories(
+  velox_exec_ch_hashtable_layer_benchmark
+  PRIVATE "${CH_BENCHMARK_DUCKDB_LIB_DIR}"
+)
 
 target_link_libraries(
   velox_exec_ch_hash_join_benchmark
@@ -40,6 +46,15 @@ target_link_libraries(
   velox_functions_prestosql
   velox_parse_parser
   velox_parse_utils
+  velox_vector_test_lib
+  Folly::follybenchmark
+  duckdb_static
+)
+
+target_link_libraries(
+  velox_exec_ch_hashtable_layer_benchmark
+  velox_exec_ch
+  velox_exec
   velox_vector_test_lib
   Folly::follybenchmark
   duckdb_static
