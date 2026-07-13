@@ -197,5 +197,79 @@ TEST_F(ChHashProbeTest, matchesMultipleFixedWidthKeyChannels) {
   EXPECT_EQ(matches[3].buildRowNo, 3);
 }
 
+TEST_F(ChHashProbeTest, matchesSerializedStringKeysIncludingEmpty) {
+  auto buildInput = makeRowVector({
+      makeFlatVector<std::string>({"", "alpha", "alpha", "long-string"}),
+  });
+  ChHashBuild build(
+      kDriverNo,
+      std::vector<column_index_t>{0},
+      std::vector<TypePtr>{VARCHAR()},
+      pool());
+  build.addInput(buildInput);
+
+  auto probe = makeRowVector({
+      makeFlatVector<std::string>({"alpha", "", "missing"}),
+  });
+  const auto matches = probeHashBuild(build, probe, 0);
+
+  ASSERT_EQ(matches.size(), 3);
+  EXPECT_EQ(matches[0].probeRow, 0);
+  EXPECT_EQ(matches[0].buildRowNo, 1);
+  EXPECT_EQ(matches[1].probeRow, 0);
+  EXPECT_EQ(matches[1].buildRowNo, 2);
+  EXPECT_EQ(matches[2].probeRow, 1);
+  EXPECT_EQ(matches[2].buildRowNo, 0);
+}
+
+TEST_F(ChHashProbeTest, matchesSerializedMixedKeys) {
+  auto buildInput = makeRowVector({
+      makeFlatVector<int64_t>({1, 1, 2}),
+      makeFlatVector<std::string>({"one", "uno", "two"}),
+  });
+  ChHashBuild build(
+      kDriverNo,
+      std::vector<column_index_t>{0, 1},
+      std::vector<TypePtr>{BIGINT(), VARCHAR()},
+      pool());
+  build.addInput(buildInput);
+
+  auto probe = makeRowVector({
+      makeFlatVector<int64_t>({1, 2, 1}),
+      makeFlatVector<std::string>({"uno", "two", "missing"}),
+  });
+  const auto matches = probeHashBuild(
+      build, probe, std::vector<column_index_t>{0, 1});
+
+  ASSERT_EQ(matches.size(), 2);
+  EXPECT_EQ(matches[0].buildRowNo, 1);
+  EXPECT_EQ(matches[1].buildRowNo, 2);
+}
+
+TEST_F(ChHashProbeTest, matchesSerializedOverwideFixedKeys) {
+  std::vector<VectorPtr> buildColumns;
+  std::vector<VectorPtr> probeColumns;
+  for (int64_t column = 0; column < 5; ++column) {
+    buildColumns.push_back(makeFlatVector<int64_t>({column, column + 10}));
+    probeColumns.push_back(makeFlatVector<int64_t>({column + 10, column + 20}));
+  }
+  auto buildInput = makeRowVector(std::move(buildColumns));
+  ChHashBuild build(
+      kDriverNo,
+      std::vector<column_index_t>{0, 1, 2, 3, 4},
+      std::vector<TypePtr>{
+          BIGINT(), BIGINT(), BIGINT(), BIGINT(), BIGINT()},
+      pool());
+  build.addInput(buildInput);
+
+  const auto matches = probeHashBuild(
+      build,
+      makeRowVector(std::move(probeColumns)),
+      std::vector<column_index_t>{0, 1, 2, 3, 4});
+
+  ASSERT_EQ(matches.size(), 1);
+  EXPECT_EQ(matches[0].probeRow, 0);
+  EXPECT_EQ(matches[0].buildRowNo, 1);
+}
 } // namespace
 } // namespace facebook::velox::exec::ch

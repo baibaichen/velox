@@ -36,6 +36,7 @@ velox_add_library(
     FixedKey.h
     HashTable.h
     FixedKeyMap.h
+    SerializedKey.h
     HashTableAllocatorAdapter.h
     RetainedVectorsIndex.h
     RowRef.h

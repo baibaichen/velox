@@ -46,7 +46,7 @@ DEFINE_string(
 DEFINE_string(
     key_layout,
     "bigint",
-    "Key layout: bigint, 2xbigint, or bigint_2xint.");
+    "Key layout: fixed, VARCHAR short/long low/high, overwide, or mixed.");
 DEFINE_int32(
     probe_iterations,
     10,
@@ -181,8 +181,11 @@ class VeloxEngine {
       const std::vector<RowVectorPtr>& batches)
       : pool_(pool) {
     const auto numKeys = batches.front()->childrenSize();
+    std::vector<TypePtr> keyTypes;
+    keyTypes.reserve(numKeys);
     std::vector<std::unique_ptr<VectorHasher>> hashers;
     for (column_index_t channel = 0; channel < numKeys; ++channel) {
+      keyTypes.push_back(batches.front()->childAt(channel)->type());
       hashers.push_back(std::make_unique<VectorHasher>(
           batches.front()->childAt(channel)->type(), channel));
     }
@@ -195,6 +198,7 @@ class VeloxEngine {
         1'000,
         pool_);
 
+    const bool requireGenericHash = ch::useSerializedKey(keyTypes);
     decodedKeys_.reserve(batches.size());
     selectedRows_.reserve(batches.size());
     for (const auto& batch : batches) {
@@ -207,7 +211,7 @@ class VeloxEngine {
             *batch->childAt(channel), *selectedRows_.back()));
         auto& hasher = table_->hashers()[channel];
         hasher->decode(*batch->childAt(channel), *selectedRows_.back());
-        if (hasher->mayUseValueIds()) {
+        if (!requireGenericHash && hasher->mayUseValueIds()) {
           raw_vector<uint64_t> valueIds(batch->size(), pool_);
           hasher->computeValueIds(*selectedRows_.back(), valueIds);
         }
@@ -307,8 +311,14 @@ class LayerBenchmark : public VectorTestBase {
         "key_distribution must be uniform or sequential");
     VELOX_CHECK(
         FLAGS_key_layout == "bigint" || FLAGS_key_layout == "2xbigint" ||
-            FLAGS_key_layout == "bigint_2xint",
-        "key_layout must be bigint, 2xbigint, or bigint_2xint");
+            FLAGS_key_layout == "bigint_2xint" ||
+            FLAGS_key_layout == "varchar_short_low" ||
+            FLAGS_key_layout == "varchar_short_high" ||
+            FLAGS_key_layout == "varchar_long_low" ||
+            FLAGS_key_layout == "varchar_long_high" ||
+            FLAGS_key_layout == "5xbigint" ||
+            FLAGS_key_layout == "bigint_varchar",
+        "unsupported key_layout");
     makeInputs();
   }
 
@@ -346,8 +356,30 @@ class LayerBenchmark : public VectorTestBase {
     return static_cast<int64_t>(splitMix64(static_cast<uint64_t>(row)));
   }
 
+  std::string stringKeyAt(vector_size_t row) const {
+    const bool lowCardinality = FLAGS_key_layout.ends_with("_low");
+    const bool longString = FLAGS_key_layout.find("_long_") != std::string::npos;
+    const auto value = lowCardinality
+        ? static_cast<uint64_t>(row % 1'024)
+        : static_cast<uint64_t>(keyAt(row));
+    auto key = std::to_string(value);
+    if (longString && key.size() < 128) {
+      key.append(128 - key.size(), static_cast<char>('a' + value % 26));
+    }
+    return key;
+  }
+
   std::vector<VectorPtr> makeKeys(vector_size_t start, vector_size_t size) {
     std::vector<VectorPtr> keys;
+    if (FLAGS_key_layout.starts_with("varchar_")) {
+      keys.push_back(makeFlatVector<std::string>(
+          size,
+          [this, start](vector_size_t row) {
+            return stringKeyAt(start + row);
+          }));
+      return keys;
+    }
+
     keys.push_back(makeFlatVector<int64_t>(
         size, [this, start](vector_size_t row) { return keyAt(start + row); }));
     if (FLAGS_key_layout == "2xbigint") {
@@ -361,10 +393,23 @@ class LayerBenchmark : public VectorTestBase {
       keys.push_back(makeFlatVector<int32_t>(size, [start](auto row) {
         return static_cast<int32_t>((start + row) * 17);
       }));
+    } else if (FLAGS_key_layout == "5xbigint") {
+      for (uint64_t salt = 1; salt < 5; ++salt) {
+        keys.push_back(makeFlatVector<int64_t>(
+            size, [this, start, salt](auto row) {
+              return keyAt(start + row) ^
+                  static_cast<int64_t>(splitMix64(salt));
+            }));
+      }
+    } else if (FLAGS_key_layout == "bigint_varchar") {
+      keys.push_back(makeFlatVector<std::string>(
+          size,
+          [this, start](vector_size_t row) {
+            return stringKeyAt(start + row);
+          }));
     }
     return keys;
   }
-
   void makeInputs() {
     probeVector_ = makeRowVector(makeKeys(0, buildRows_));
 

@@ -18,6 +18,7 @@
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/exec/ch/RowRef.h"
+#include "velox/exec/ch/SerializedKey.h"
 #include "velox/vector/DecodedVector.h"
 #include "velox/vector/SelectivityVector.h"
 
@@ -26,7 +27,12 @@ namespace facebook::velox::exec::ch {
 namespace {
 constexpr vector_size_t kPrefetchLookAhead = 16;
 constexpr size_t kMinTableBytesForPrefetch = 8UL << 20;
+
+StringRef stringRef(const std::string& bytes) {
+  VELOX_CHECK_LE(bytes.size(), std::numeric_limits<uint32_t>::max());
+  return {bytes.data(), static_cast<uint32_t>(bytes.size())};
 }
+} // namespace
 
 std::vector<ProbeHit> joinProbe(
     const ChHashBuild& build,
@@ -56,6 +62,34 @@ std::vector<ProbeHit> joinProbe(
     const std::vector<column_index_t>& probeKeyChannels) {
   VELOX_CHECK_NOT_NULL(probe);
   SelectivityVector rows(probe->size());
+
+  if (map.serialized()) {
+    SerializedKeyDecoder decoder(
+        probe, probeKeyChannels, map.keyTypes(), rows);
+    std::vector<ProbeHit> hits;
+    hits.reserve(probe->size());
+    const bool usePrefetch =
+        map.getBufferSizeInBytes() > kMinTableBytesForPrefetch;
+    std::string prefetchBytes;
+    std::string keyBytes;
+    for (vector_size_t probeRow = 0; probeRow < probe->size(); ++probeRow) {
+      const auto prefetchRow = probeRow + kPrefetchLookAhead;
+      if (usePrefetch && prefetchRow < probe->size() &&
+          decoder.serialize(prefetchRow, prefetchBytes)) {
+        map.prefetch(stringRef(prefetchBytes));
+      }
+
+      if (!decoder.serialize(probeRow, keyBytes)) {
+        continue;
+      }
+      const auto* cell = map.find(stringRef(keyBytes));
+      if (cell != nullptr) {
+        hits.push_back({probeRow, &cell->getMapped()});
+      }
+    }
+    return hits;
+  }
+
   FixedKeyDecoder decoder(probe, probeKeyChannels, rows);
   VELOX_CHECK(decoder.width() == map.width());
 

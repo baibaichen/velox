@@ -29,6 +29,7 @@ add_executable(
   RetainedVectorsIndexTest.cpp
   RowRefTest.cpp
   RowRefListTest.cpp
+  SerializedKeyTest.cpp
 )
 
 target_link_libraries(

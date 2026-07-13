@@ -18,8 +18,18 @@
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/exec/ch/RowRef.h"
+#include "velox/exec/ch/SerializedKey.h"
 
 namespace facebook::velox::exec::ch {
+
+namespace {
+
+StringRef stringRef(const std::string& bytes) {
+  VELOX_CHECK_LE(bytes.size(), std::numeric_limits<uint32_t>::max());
+  return {bytes.data(), static_cast<uint32_t>(bytes.size())};
+}
+
+} // namespace
 
 ChHashBuild::ChHashBuild(
     uint32_t driverNo,
@@ -35,9 +45,8 @@ ChHashBuild::ChHashBuild(
     : driverNo_(driverNo),
       keyChannels_(std::move(keyChannels)),
       keyTypes_(std::move(keyTypes)),
-      keyWidth_(fixedKeyWidth(keyTypes_)),
       retainedIndex_(std::make_shared<RetainedVectorsIndex>(driverNo)),
-      storage_(std::make_shared<BuildStorage>(pool, keyWidth_)) {
+      storage_(std::make_shared<BuildStorage>(pool, keyTypes_)) {
   VELOX_USER_CHECK_EQ(keyChannels_.size(), keyTypes_.size());
 }
 
@@ -51,7 +60,8 @@ void ChHashBuild::prepareJoinTable(
     const DecodedVector& decodedKey,
     const SelectivityVector& rows) {
   VELOX_CHECK(needsInput_, "Cannot prepare table after noMoreInput");
-  VELOX_CHECK(keyWidth_ == FixedKeyWidth::k64);
+  VELOX_CHECK(!storage_->rowsByKey.serialized());
+  VELOX_CHECK(storage_->rowsByKey.width() == FixedKeyWidth::k64);
   VELOX_CHECK_EQ(
       decodedKey.base()->typeKind(),
       TypeKind::BIGINT,
@@ -75,7 +85,8 @@ void ChHashBuild::addRowReferences(
   VELOX_CHECK(needsInput_, "Cannot add row references after noMoreInput");
   VELOX_CHECK_NOT_NULL(input);
   VELOX_CHECK_EQ(rows.size(), input->size());
-  VELOX_CHECK(keyWidth_ == FixedKeyWidth::k64);
+  VELOX_CHECK(!storage_->rowsByKey.serialized());
+  VELOX_CHECK(storage_->rowsByKey.width() == FixedKeyWidth::k64);
   VELOX_CHECK_EQ(
       decodedKey.base()->typeKind(),
       TypeKind::BIGINT,
@@ -103,12 +114,43 @@ void ChHashBuild::addInput(RowVectorPtr input) {
   VELOX_CHECK(needsInput_, "Cannot add input after noMoreInput");
   VELOX_CHECK_NOT_NULL(input);
   SelectivityVector rows(input->size());
-  FixedKeyDecoder decoder(input, keyChannels_, rows);
-  VELOX_CHECK(decoder.width() == keyWidth_);
   for (size_t i = 0; i < keyChannels_.size(); ++i) {
     VELOX_CHECK_EQ(input->childAt(keyChannels_[i])->type(), keyTypes_[i]);
   }
 
+  if (storage_->rowsByKey.serialized()) {
+    SerializedKeyDecoder decoder(input, keyChannels_, keyTypes_, rows);
+    std::string bytes;
+    rows.applyToSelected([&](vector_size_t rowNo) {
+      if (!decoder.serialize(rowNo, bytes)) {
+        return;
+      }
+      const auto temporary = stringRef(bytes);
+      if (storage_->rowsByKey.find(temporary) == nullptr) {
+        const StringRef persisted{
+            storage_->arena.insert(temporary.data, temporary.size),
+            temporary.size};
+        storage_->rowsByKey.emplace(persisted);
+      }
+    });
+
+    const uint32_t batchNo = retainedIndex_->add(input);
+    const uint32_t blockNo = packBlockNo(driverNo_, batchNo);
+    rows.applyToSelected([&](vector_size_t rowNo) {
+      if (!decoder.serialize(rowNo, bytes)) {
+        return;
+      }
+      auto* cell = storage_->rowsByKey.find(stringRef(bytes));
+      VELOX_CHECK_NOT_NULL(cell);
+      cell->getMapped().insert(
+          RowRef(blockNo, static_cast<uint32_t>(rowNo)).encode(),
+          storage_->arena);
+    });
+    return;
+  }
+
+  FixedKeyDecoder decoder(input, keyChannels_, rows);
+  VELOX_CHECK(decoder.width() == storage_->rowsByKey.width());
   const auto prepare = [&]<typename Key>() {
     rows.applyToSelected([&](vector_size_t rowNo) {
       Key key;
@@ -117,7 +159,7 @@ void ChHashBuild::addInput(RowVectorPtr input) {
       }
     });
   };
-  switch (keyWidth_) {
+  switch (storage_->rowsByKey.width()) {
     case FixedKeyWidth::k64:
       prepare.template operator()<uint64_t>();
       break;
@@ -144,7 +186,7 @@ void ChHashBuild::addInput(RowVectorPtr input) {
           storage_->arena);
     });
   };
-  switch (keyWidth_) {
+  switch (storage_->rowsByKey.width()) {
     case FixedKeyWidth::k64:
       attach.template operator()<uint64_t>();
       break;

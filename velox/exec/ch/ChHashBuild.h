@@ -75,8 +75,16 @@ class ChHashBuild {
     return keyChannels_;
   }
 
+  const std::vector<TypePtr>& keyTypes() const {
+    return keyTypes_;
+  }
+
   FixedKeyWidth keyWidth() const {
-    return keyWidth_;
+    return rowsByKey().width();
+  }
+
+  bool usesSerializedKeys() const {
+    return rowsByKey().serialized();
   }
 
   std::shared_ptr<JoinMap> takeMap();
@@ -85,8 +93,8 @@ class ChHashBuild {
 
  private:
   struct BuildStorage {
-    BuildStorage(memory::MemoryPool* pool, FixedKeyWidth width)
-        : arena(pool), rowsByKey(pool, width) {}
+    BuildStorage(memory::MemoryPool* pool, const std::vector<TypePtr>& keyTypes)
+        : arena(pool), rowsByKey(pool, keyTypes) {}
 
     Arena arena;
     JoinMap rowsByKey;
@@ -95,7 +103,6 @@ class ChHashBuild {
   uint32_t driverNo_;
   std::vector<column_index_t> keyChannels_;
   std::vector<TypePtr> keyTypes_;
-  FixedKeyWidth keyWidth_;
   std::shared_ptr<RetainedVectorsIndex> retainedIndex_;
   std::shared_ptr<BuildStorage> storage_;
   bool needsInput_{true};
