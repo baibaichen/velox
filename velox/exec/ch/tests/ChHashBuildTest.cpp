@@ -58,6 +58,15 @@ class ChHashBuildTest : public testing::Test,
   }
 };
 
+TEST_F(ChHashBuildTest, reservesForExpectedDistinctKeys) {
+  ChHashBuild build(kDriverNo, 0, pool());
+
+  build.reserve(4'096);
+
+  EXPECT_EQ(build.rowsByKey().getBufferSizeInCells(), 8'192);
+  EXPECT_TRUE(build.rowsByKey().empty());
+}
+
 TEST_F(ChHashBuildTest, prepareJoinTableOnlyCreatesProbeableKeys) {
   ChHashBuild build(kDriverNo, 0, pool());
   auto input = makeInput(1'000, 8);

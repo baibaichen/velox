@@ -30,6 +30,12 @@ ChHashBuild::ChHashBuild(
       retainedIndex_(std::make_shared<RetainedVectorsIndex>(driverNo)),
       storage_(std::make_shared<BuildStorage>(pool)) {}
 
+void ChHashBuild::reserve(size_t expectedDistinctKeys) {
+  VELOX_CHECK(needsInput_, "Cannot reserve after noMoreInput");
+  VELOX_CHECK(storage_->rowsByKey.empty(), "Cannot reserve after build starts");
+  storage_->rowsByKey.reserve(expectedDistinctKeys);
+}
+
 void ChHashBuild::prepareJoinTable(
     const DecodedVector& decodedKey,
     const SelectivityVector& rows) {
