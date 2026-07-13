@@ -49,6 +49,10 @@ DEFINE_int32(
     200'000,
     "Number of build rows. Must be divisible by fanout.");
 DEFINE_int32(
+    probe_rows,
+    50'000,
+    "Number of probe rows. Must not exceed the number of distinct build keys.");
+DEFINE_int32(
     payload_columns,
     39,
     "Number of build payload columns, cycling BIGINT/DOUBLE/VARCHAR.");
@@ -107,19 +111,23 @@ class ChHashJoinBenchmark : public VectorTestBase {
  public:
   ChHashJoinBenchmark(
       vector_size_t buildRows,
+      vector_size_t probeRows,
       int32_t payloadColumns,
       int32_t fanout,
       vector_size_t batchRows)
       : buildRows_(buildRows),
+        probeRows_(probeRows),
         payloadColumns_(payloadColumns),
         fanout_(fanout),
         batchRows_(batchRows),
         distinctKeys_(buildRows / fanout) {
     VELOX_CHECK_GT(buildRows_, 0);
+    VELOX_CHECK_GT(probeRows_, 0);
     VELOX_CHECK_GT(payloadColumns_, 0);
     VELOX_CHECK_GT(fanout_, 0);
     VELOX_CHECK_GT(batchRows_, 0);
     VELOX_CHECK_EQ(buildRows_ % fanout_, 0);
+    VELOX_CHECK_LE(probeRows_, distinctKeys_);
 
     buildVectors_ = makeBuildVectors();
     probeVector_ = makeProbeVector();
@@ -385,12 +393,12 @@ class ChHashJoinBenchmark : public VectorTestBase {
   }
 
   uint64_t expectedMatches() const {
-    return buildRows_;
+    return probeRows_ * fanout_;
   }
 
   uint64_t expectedE2ERows(int32_t selectivityPercent) const {
     uint64_t selectedProbeRows = 0;
-    for (vector_size_t key = 0; key < distinctKeys_; ++key) {
+    for (vector_size_t key = 0; key < probeRows_; ++key) {
       if (key % 100 < selectivityPercent) {
         ++selectedProbeRows;
       }
@@ -399,7 +407,7 @@ class ChHashJoinBenchmark : public VectorTestBase {
   }
 
   vector_size_t probeRows() const {
-    return distinctKeys_;
+    return probeRows_;
   }
 
   uint64_t retainedVectorBytes() const {
@@ -649,7 +657,7 @@ class ChHashJoinBenchmark : public VectorTestBase {
     return makeRowVector(
         {"p_key"},
         {makeFlatVector<int64_t>(
-            distinctKeys_, [](vector_size_t row) { return row; })});
+            probeRows_, [](vector_size_t row) { return row; })});
   }
 
   void copyToNativeTable(const RowVectorPtr& batch) {
@@ -682,6 +690,7 @@ class ChHashJoinBenchmark : public VectorTestBase {
   }
 
   const vector_size_t buildRows_;
+  const vector_size_t probeRows_;
   const int32_t payloadColumns_;
   const int32_t fanout_;
   const vector_size_t batchRows_;
@@ -860,6 +869,7 @@ int main(int argc, char** argv) {
 
   benchmark = std::make_unique<ChHashJoinBenchmark>(
       FLAGS_build_rows,
+      FLAGS_probe_rows,
       FLAGS_payload_columns,
       FLAGS_fanout,
       FLAGS_batch_rows);
