@@ -85,6 +85,7 @@ BuildResult runBuild(
     Engine& engine,
     const std::vector<RowVectorPtr>& batches) {
   const auto start = std::chrono::steady_clock::now();
+  engine.startBuild();
   for (size_t i = 0; i < batches.size(); ++i) {
     engine.buildBatch(i);
   }
@@ -112,6 +113,14 @@ class ChEngine {
       decodedKeys_.push_back(std::make_unique<DecodedVector>(
           *batch->childAt(0), *selectedRows_.back()));
     }
+  }
+
+  void startBuild() {
+    size_t expectedKeys = 0;
+    for (const auto& batch : batches_) {
+      expectedKeys += batch->size();
+    }
+    build_.reserve(expectedKeys);
   }
 
   void buildBatch(size_t index) {
@@ -194,6 +203,8 @@ class VeloxEngine {
       decodedKeys_.push_back(std::move(decoded));
     }
   }
+
+  void startBuild() {}
 
   void buildBatch(size_t index) {
     auto* rows = table_->rows();

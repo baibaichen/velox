@@ -34,6 +34,8 @@ class ChHashBuild {
       column_index_t keyChannel,
       memory::MemoryPool* pool);
 
+  void reserve(size_t expectedDistinctKeys);
+
   void prepareJoinTable(
       const DecodedVector& decodedKey,
       const SelectivityVector& rows);
