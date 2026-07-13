@@ -20,6 +20,8 @@
 #include "velox/exec/ch/Arena.h"
 #include "velox/exec/ch/HashMap.h"
 #include "velox/exec/ch/RetainedVectorsIndex.h"
+#include "velox/vector/DecodedVector.h"
+#include "velox/vector/SelectivityVector.h"
 
 namespace facebook::velox::exec::ch {
 
@@ -31,6 +33,15 @@ class ChHashBuild {
       uint32_t driverNo,
       column_index_t keyChannel,
       memory::MemoryPool* pool);
+
+  void prepareJoinTable(
+      const DecodedVector& decodedKey,
+      const SelectivityVector& rows);
+
+  void addRowReferences(
+      RowVectorPtr input,
+      const DecodedVector& decodedKey,
+      const SelectivityVector& rows);
 
   void addInput(RowVectorPtr input);
 

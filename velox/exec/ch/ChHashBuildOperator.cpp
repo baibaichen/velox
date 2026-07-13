@@ -17,6 +17,8 @@
 #include "velox/exec/ch/ChHashBuildOperator.h"
 
 #include "velox/exec/Task.h"
+#include "velox/vector/DecodedVector.h"
+#include "velox/vector/SelectivityVector.h"
 
 namespace facebook::velox::exec::ch {
 namespace {
@@ -62,7 +64,19 @@ bool ChHashBuildOperator::needsInput() const {
 
 void ChHashBuildOperator::addInput(RowVectorPtr input) {
   VELOX_CHECK_NOT_NULL(chBuild_);
-  chBuild_->addInput(std::move(input));
+  VELOX_CHECK_NOT_NULL(input);
+  VELOX_CHECK_LT(keyChannel_, input->childrenSize());
+
+  auto keyVector = input->childAt(keyChannel_)->loadedVector();
+  VELOX_CHECK_EQ(
+      keyVector->typeKind(),
+      TypeKind::BIGINT,
+      "ChHashBuild supports one BIGINT key channel");
+
+  SelectivityVector rows(input->size());
+  DecodedVector decodedKey(*keyVector, rows);
+  chBuild_->prepareJoinTable(decodedKey, rows);
+  chBuild_->addRowReferences(std::move(input), decodedKey, rows);
 }
 
 void ChHashBuildOperator::noMoreInput() {

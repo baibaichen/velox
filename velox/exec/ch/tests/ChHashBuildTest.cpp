@@ -18,6 +18,8 @@
 
 #include "velox/common/memory/Memory.h"
 #include "velox/exec/ch/RowRef.h"
+#include "velox/vector/DecodedVector.h"
+#include "velox/vector/SelectivityVector.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
 #include <gtest/gtest.h>
@@ -55,6 +57,46 @@ class ChHashBuildTest : public testing::Test,
     return vector->childAt(0)->asFlatVector<int64_t>()->valueAt(row);
   }
 };
+
+TEST_F(ChHashBuildTest, prepareJoinTableOnlyCreatesProbeableKeys) {
+  ChHashBuild build(kDriverNo, 0, pool());
+  auto input = makeInput(1'000, 8);
+  const auto inputUseCount = input.use_count();
+  auto keyVector = input->childAt(0)->loadedVector();
+  SelectivityVector rows(input->size());
+  DecodedVector decodedKey(*keyVector, rows);
+
+  build.prepareJoinTable(decodedKey, rows);
+
+  const auto* duplicateCell = build.rowsByKey().find(kDuplicateKey);
+  ASSERT_NE(duplicateCell, nullptr);
+  EXPECT_EQ(duplicateCell->getMapped().rows(), 0);
+  EXPECT_NE(build.rowsByKey().find(1'008), nullptr);
+  EXPECT_EQ(input.use_count(), inputUseCount);
+}
+
+TEST_F(ChHashBuildTest, addRowReferencesAttachesCoordinatesAndRetainsInput) {
+  ChHashBuild build(kDriverNo, 0, pool());
+  auto input = makeInput(1'000, 8);
+  const auto inputUseCount = input.use_count();
+  auto keyVector = input->childAt(0)->loadedVector();
+  SelectivityVector rows(input->size());
+  DecodedVector decodedKey(*keyVector, rows);
+  build.prepareJoinTable(decodedKey, rows);
+
+  build.addRowReferences(input, decodedKey, rows);
+
+  EXPECT_EQ(input.use_count(), inputUseCount + 1);
+  EXPECT_EQ(build.retainedIndex().at(kDriverNo, 0), input.get());
+  const auto* duplicateCell = build.rowsByKey().find(kDuplicateKey);
+  ASSERT_NE(duplicateCell, nullptr);
+  EXPECT_EQ(duplicateCell->getMapped().rows(), 8);
+  for (const auto refWord : duplicateCell->getMapped()) {
+    EXPECT_EQ(unpackDriverNo(refWordBlockNo(refWord)), kDriverNo);
+    EXPECT_EQ(unpackBatchNo(refWordBlockNo(refWord)), 0);
+    EXPECT_LT(refWordRowNo(refWord), 8);
+  }
+}
 
 TEST_F(ChHashBuildTest, coordinatesResolveToOriginalRowsAcrossBatches) {
   ChHashBuild build(kDriverNo, 0, pool());
