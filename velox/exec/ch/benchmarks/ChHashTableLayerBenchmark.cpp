@@ -103,7 +103,7 @@ uint64_t runProbeL1(Engine& engine, const RowVectorPtr& probes) {
 class ChEngine {
  public:
   ChEngine(memory::MemoryPool* pool, const std::vector<RowVectorPtr>& batches)
-      : pool_(pool), build_(0, 0, pool) {
+      : pool_(pool), batches_(batches), build_(0, 0, pool) {
     decodedKeys_.reserve(batches.size());
     selectedRows_.reserve(batches.size());
     for (const auto& batch : batches) {
@@ -116,6 +116,8 @@ class ChEngine {
 
   void buildBatch(size_t index) {
     build_.prepareJoinTable(*decodedKeys_[index], *selectedRows_[index]);
+    build_.addRowReferences(
+        batches_[index], *decodedKeys_[index], *selectedRows_[index]);
   }
 
   void finishBuild() {
@@ -150,6 +152,7 @@ class ChEngine {
 
  private:
   memory::MemoryPool* pool_;
+  std::vector<RowVectorPtr> batches_;
   ch::ChHashBuild build_;
   std::vector<std::unique_ptr<SelectivityVector>> selectedRows_;
   std::vector<std::unique_ptr<DecodedVector>> decodedKeys_;
@@ -219,7 +222,11 @@ class VeloxEngine {
     table_->joinProbe(*lookup_);
 
     folly::doNotOptimizeAway(lookup_->hits.data());
-    return lookup_->rows.size();
+    uint64_t hits = 0;
+    for (const auto row : lookup_->rows) {
+      hits += lookup_->hits[row] != nullptr;
+    }
+    return hits;
   }
 
   void verifyAllHits(uint64_t expected) const {
@@ -288,16 +295,18 @@ class LayerBenchmark : public VectorTestBase {
 
     uint64_t probeNanos = 0;
     uint64_t totalHits = 0;
+    uint64_t measuredHits = 0;
     for (int32_t i = 0; i < FLAGS_probe_iterations; ++i) {
       const auto hits = runProbeL1(engine, probeVector_);
       VELOX_CHECK_EQ(hits, buildRows_);
       probeNanos += engine.lastProbeNanos();
       totalHits += hits;
+      measuredHits = hits;
     }
     folly::doNotOptimizeAway(totalHits);
     engine.verifyAllHits(buildRows_);
     return {
-        build, probeNanos, buildRows_, engine.peakBytes(), engine.hashModeName()};
+        build, probeNanos, measuredHits, engine.peakBytes(), engine.hashModeName()};
   }
 
  private:
