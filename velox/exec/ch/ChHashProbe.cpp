@@ -23,17 +23,15 @@
 
 namespace facebook::velox::exec::ch {
 
-std::vector<ProbeMatch> probeHashBuild(
+std::vector<ProbeHit> joinProbe(
     const ChHashBuild& build,
     const RowVectorPtr& probe,
     column_index_t probeKeyChannel) {
-  return probeHashBuild(
-      build.rowsByKey(), build.retainedIndex(), probe, probeKeyChannel);
+  return joinProbe(build.rowsByKey(), probe, probeKeyChannel);
 }
 
-std::vector<ProbeMatch> probeHashBuild(
+std::vector<ProbeHit> joinProbe(
     const ChHashBuild::JoinMap& map,
-    const RetainedVectorsIndex& retained,
     const RowVectorPtr& probe,
     column_index_t probeKeyChannel) {
   VELOX_CHECK_NOT_NULL(probe);
@@ -47,7 +45,8 @@ std::vector<ProbeMatch> probeHashBuild(
 
   SelectivityVector rows(probe->size());
   DecodedVector decodedKey(*keyVector, rows);
-  std::vector<ProbeMatch> matches;
+  std::vector<ProbeHit> hits;
+  hits.reserve(probe->size());
 
   rows.applyToSelected([&](vector_size_t probeRow) {
     if (decodedKey.isNullAt(probeRow)) {
@@ -61,17 +60,52 @@ std::vector<ProbeMatch> probeHashBuild(
       return;
     }
 
-    for (const auto refWord : cell->getMapped()) {
+    hits.push_back({probeRow, &cell->getMapped()});
+  });
+
+  return hits;
+}
+
+std::vector<ProbeMatch> listJoinResults(
+    const std::vector<ProbeHit>& hits,
+    const RetainedVectorsIndex& retained) {
+  std::vector<ProbeMatch> matches;
+
+  size_t numMatches = 0;
+  for (const auto& hit : hits) {
+    VELOX_CHECK_NOT_NULL(hit.matched);
+    numMatches += hit.matched->rows();
+  }
+  matches.reserve(numMatches);
+
+  for (const auto& hit : hits) {
+    for (const auto refWord : *hit.matched) {
       const auto blockNo = refWordBlockNo(refWord);
       const auto rowNo = refWordRowNo(refWord);
       const auto* buildBatch = retained.at(
           unpackDriverNo(blockNo), unpackBatchNo(blockNo));
       VELOX_CHECK_LT(rowNo, buildBatch->size());
-      matches.push_back({probeRow, blockNo, rowNo});
+      matches.push_back({hit.probeRow, blockNo, rowNo});
     }
-  });
+  }
 
   return matches;
+}
+
+std::vector<ProbeMatch> probeHashBuild(
+    const ChHashBuild& build,
+    const RowVectorPtr& probe,
+    column_index_t probeKeyChannel) {
+  return listJoinResults(
+      joinProbe(build, probe, probeKeyChannel), build.retainedIndex());
+}
+
+std::vector<ProbeMatch> probeHashBuild(
+    const ChHashBuild::JoinMap& map,
+    const RetainedVectorsIndex& retained,
+    const RowVectorPtr& probe,
+    column_index_t probeKeyChannel) {
+  return listJoinResults(joinProbe(map, probe, probeKeyChannel), retained);
 }
 
 } // namespace facebook::velox::exec::ch

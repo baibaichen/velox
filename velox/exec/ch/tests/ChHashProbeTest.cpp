@@ -66,6 +66,40 @@ class ChHashProbeTest : public testing::Test,
   }
 };
 
+TEST_F(ChHashProbeTest, separatesProbeHitsFromDuplicateExpansion) {
+  ChHashBuild build(kDriverNo, 0, pool());
+  build.addInput(makeInput({10, 20, 20, std::nullopt}, 100));
+  build.addInput(makeInput({20, 30, 10}, 200));
+
+  auto probe = makeInput({20, 99, std::nullopt, 10});
+  const auto hits = joinProbe(build.rowsByKey(), probe, 0);
+
+  ASSERT_EQ(hits.size(), 2);
+  EXPECT_EQ(hits[0].probeRow, 0);
+  EXPECT_EQ(hits[0].matched->rows(), 3);
+  EXPECT_EQ(hits[1].probeRow, 3);
+  EXPECT_EQ(hits[1].matched->rows(), 2);
+
+  const auto matches = listJoinResults(hits, build.retainedIndex());
+  ASSERT_EQ(matches.size(), 5);
+  const std::vector<std::tuple<vector_size_t, uint32_t, uint32_t>> expected{
+      {0, packBlockNo(kDriverNo, 0), 1},
+      {0, packBlockNo(kDriverNo, 0), 2},
+      {0, packBlockNo(kDriverNo, 1), 0},
+      {3, packBlockNo(kDriverNo, 0), 0},
+      {3, packBlockNo(kDriverNo, 1), 2},
+  };
+
+  for (size_t i = 0; i < matches.size(); ++i) {
+    EXPECT_EQ(
+        std::make_tuple(
+            matches[i].probeRow,
+            matches[i].buildBlockNo,
+            matches[i].buildRowNo),
+        expected[i]);
+  }
+}
+
 TEST_F(ChHashProbeTest, resolvesMatchesAcrossBuildBatches) {
   ChHashBuild build(kDriverNo, 0, pool());
   build.addInput(makeInput({10, 20, 20, std::nullopt}, 100));
