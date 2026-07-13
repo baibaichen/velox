@@ -22,6 +22,7 @@ add_executable(
   ChHashProbeTest.cpp
   ChHashProbeOperatorTest.cpp
   EmitGatherTest.cpp
+  FixedKeyTest.cpp
   HashMapTest.cpp
   HashTableTest.cpp
   Main.cpp

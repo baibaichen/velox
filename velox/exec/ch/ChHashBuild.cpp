@@ -25,10 +25,21 @@ ChHashBuild::ChHashBuild(
     uint32_t driverNo,
     column_index_t keyChannel,
     memory::MemoryPool* pool)
+    : ChHashBuild(driverNo, {keyChannel}, {BIGINT()}, pool) {}
+
+ChHashBuild::ChHashBuild(
+    uint32_t driverNo,
+    std::vector<column_index_t> keyChannels,
+    std::vector<TypePtr> keyTypes,
+    memory::MemoryPool* pool)
     : driverNo_(driverNo),
-      keyChannel_(keyChannel),
+      keyChannels_(std::move(keyChannels)),
+      keyTypes_(std::move(keyTypes)),
+      keyWidth_(fixedKeyWidth(keyTypes_)),
       retainedIndex_(std::make_shared<RetainedVectorsIndex>(driverNo)),
-      storage_(std::make_shared<BuildStorage>(pool)) {}
+      storage_(std::make_shared<BuildStorage>(pool, keyWidth_)) {
+  VELOX_USER_CHECK_EQ(keyChannels_.size(), keyTypes_.size());
+}
 
 void ChHashBuild::reserve(size_t expectedDistinctKeys) {
   VELOX_CHECK(needsInput_, "Cannot reserve after noMoreInput");
@@ -40,6 +51,7 @@ void ChHashBuild::prepareJoinTable(
     const DecodedVector& decodedKey,
     const SelectivityVector& rows) {
   VELOX_CHECK(needsInput_, "Cannot prepare table after noMoreInput");
+  VELOX_CHECK(keyWidth_ == FixedKeyWidth::k64);
   VELOX_CHECK_EQ(
       decodedKey.base()->typeKind(),
       TypeKind::BIGINT,
@@ -63,6 +75,7 @@ void ChHashBuild::addRowReferences(
   VELOX_CHECK(needsInput_, "Cannot add row references after noMoreInput");
   VELOX_CHECK_NOT_NULL(input);
   VELOX_CHECK_EQ(rows.size(), input->size());
+  VELOX_CHECK(keyWidth_ == FixedKeyWidth::k64);
   VELOX_CHECK_EQ(
       decodedKey.base()->typeKind(),
       TypeKind::BIGINT,
@@ -77,7 +90,7 @@ void ChHashBuild::addRowReferences(
 
     const auto key =
         static_cast<uint64_t>(decodedKey.valueAt<int64_t>(rowNo));
-    auto* cell = storage_->rowsByKey.find(key, storage_->rowsByKey.hash(key));
+    auto* cell = storage_->rowsByKey.find(key);
     VELOX_CHECK_NOT_NULL(
         cell, "Key must be prepared before adding row references");
     const auto refWord =
@@ -89,18 +102,59 @@ void ChHashBuild::addRowReferences(
 void ChHashBuild::addInput(RowVectorPtr input) {
   VELOX_CHECK(needsInput_, "Cannot add input after noMoreInput");
   VELOX_CHECK_NOT_NULL(input);
-  VELOX_CHECK_LT(keyChannel_, input->childrenSize());
-
-  auto keyVector = input->childAt(keyChannel_)->loadedVector();
-  VELOX_CHECK_EQ(
-      keyVector->typeKind(),
-      TypeKind::BIGINT,
-      "ChHashBuild supports one BIGINT key channel");
-
   SelectivityVector rows(input->size());
-  DecodedVector decodedKey(*keyVector, rows);
-  prepareJoinTable(decodedKey, rows);
-  addRowReferences(std::move(input), decodedKey, rows);
+  FixedKeyDecoder decoder(input, keyChannels_, rows);
+  VELOX_CHECK(decoder.width() == keyWidth_);
+  for (size_t i = 0; i < keyChannels_.size(); ++i) {
+    VELOX_CHECK_EQ(input->childAt(keyChannels_[i])->type(), keyTypes_[i]);
+  }
+
+  const auto prepare = [&]<typename Key>() {
+    rows.applyToSelected([&](vector_size_t rowNo) {
+      Key key;
+      if (decoder.pack(rowNo, key)) {
+        storage_->rowsByKey.emplace(key);
+      }
+    });
+  };
+  switch (keyWidth_) {
+    case FixedKeyWidth::k64:
+      prepare.template operator()<uint64_t>();
+      break;
+    case FixedKeyWidth::k128:
+      prepare.template operator()<UInt128>();
+      break;
+    case FixedKeyWidth::k256:
+      prepare.template operator()<UInt256>();
+      break;
+  }
+
+  const uint32_t batchNo = retainedIndex_->add(input);
+  const uint32_t blockNo = packBlockNo(driverNo_, batchNo);
+  const auto attach = [&]<typename Key>() {
+    rows.applyToSelected([&](vector_size_t rowNo) {
+      Key key;
+      if (!decoder.pack(rowNo, key)) {
+        return;
+      }
+      auto* cell = storage_->rowsByKey.find(key);
+      VELOX_CHECK_NOT_NULL(cell);
+      cell->getMapped().insert(
+          RowRef(blockNo, static_cast<uint32_t>(rowNo)).encode(),
+          storage_->arena);
+    });
+  };
+  switch (keyWidth_) {
+    case FixedKeyWidth::k64:
+      attach.template operator()<uint64_t>();
+      break;
+    case FixedKeyWidth::k128:
+      attach.template operator()<UInt128>();
+      break;
+    case FixedKeyWidth::k256:
+      attach.template operator()<UInt256>();
+      break;
+  }
 }
 
 std::shared_ptr<ChHashBuild::JoinMap> ChHashBuild::takeMap() {

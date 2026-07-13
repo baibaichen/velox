@@ -54,7 +54,7 @@ class ChHashProbeOperator final : public exec::Operator {
   ChHashJoinNodePtr joinNode_;
   std::shared_ptr<ChHashJoinBridge> joinBridge_;
   ChHashJoinBridge::ChBuildResult buildTable_;
-  column_index_t keyChannel_;
+  std::vector<column_index_t> keyChannels_;
   std::vector<column_index_t> buildProjections_;
   std::vector<column_index_t> probeProjections_;
   std::optional<EmitGather> emitGather_;

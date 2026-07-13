@@ -33,7 +33,9 @@ velox_add_library(
     ChHashProbeOperator.h
     EmitGather.h
     HashMap.h
+    FixedKey.h
     HashTable.h
+    FixedKeyMap.h
     HashTableAllocatorAdapter.h
     RetainedVectorsIndex.h
     RowRef.h

@@ -43,6 +43,10 @@ DEFINE_string(
     key_distribution,
     "uniform",
     "Key distribution: uniform or sequential.");
+DEFINE_string(
+    key_layout,
+    "bigint",
+    "Key layout: bigint, 2xbigint, or bigint_2xint.");
 DEFINE_int32(
     probe_iterations,
     10,
@@ -104,15 +108,18 @@ uint64_t runProbeL1(Engine& engine, const RowVectorPtr& probes) {
 class ChEngine {
  public:
   ChEngine(memory::MemoryPool* pool, const std::vector<RowVectorPtr>& batches)
-      : pool_(pool), batches_(batches), build_(0, 0, pool) {
-    decodedKeys_.reserve(batches.size());
-    selectedRows_.reserve(batches.size());
-    for (const auto& batch : batches) {
-      selectedRows_.push_back(
-          std::make_unique<SelectivityVector>(batch->size()));
-      decodedKeys_.push_back(std::make_unique<DecodedVector>(
-          *batch->childAt(0), *selectedRows_.back()));
+      : pool_(pool), batches_(batches), build_(makeBuild(pool, batches)) {}
+
+  static ch::ChHashBuild makeBuild(
+      memory::MemoryPool* pool,
+      const std::vector<RowVectorPtr>& batches) {
+    std::vector<column_index_t> channels(batches.front()->childrenSize());
+    std::iota(channels.begin(), channels.end(), 0);
+    std::vector<TypePtr> types;
+    for (const auto& child : batches.front()->children()) {
+      types.push_back(child->type());
     }
+    return ch::ChHashBuild(0, std::move(channels), std::move(types), pool);
   }
 
   void startBuild() {
@@ -124,9 +131,7 @@ class ChEngine {
   }
 
   void buildBatch(size_t index) {
-    build_.prepareJoinTable(*decodedKeys_[index], *selectedRows_[index]);
-    build_.addRowReferences(
-        batches_[index], *decodedKeys_[index], *selectedRows_[index]);
+    build_.addInput(batches_[index]);
   }
 
   void finishBuild() {
@@ -134,7 +139,9 @@ class ChEngine {
   }
 
   uint64_t probeL1(const RowVectorPtr& probes) {
-    const auto hits = ch::joinProbe(build_, probes, 0);
+    std::vector<column_index_t> channels(probes->childrenSize());
+    std::iota(channels.begin(), channels.end(), 0);
+    const auto hits = ch::joinProbe(build_, probes, channels);
     folly::doNotOptimizeAway(hits.data());
     return lastHits_ = hits.size();
   }
@@ -163,8 +170,6 @@ class ChEngine {
   memory::MemoryPool* pool_;
   std::vector<RowVectorPtr> batches_;
   ch::ChHashBuild build_;
-  std::vector<std::unique_ptr<SelectivityVector>> selectedRows_;
-  std::vector<std::unique_ptr<DecodedVector>> decodedKeys_;
   uint64_t lastProbeNanos_{0};
   uint64_t lastHits_{0};
 };
@@ -175,8 +180,12 @@ class VeloxEngine {
       memory::MemoryPool* pool,
       const std::vector<RowVectorPtr>& batches)
       : pool_(pool) {
+    const auto numKeys = batches.front()->childrenSize();
     std::vector<std::unique_ptr<VectorHasher>> hashers;
-    hashers.push_back(std::make_unique<VectorHasher>(BIGINT(), 0));
+    for (column_index_t channel = 0; channel < numKeys; ++channel) {
+      hashers.push_back(std::make_unique<VectorHasher>(
+          batches.front()->childAt(channel)->type(), channel));
+    }
     table_ = HashTable<true>::createForJoin(
         std::move(hashers),
         {},
@@ -191,14 +200,17 @@ class VeloxEngine {
     for (const auto& batch : batches) {
       selectedRows_.push_back(
           std::make_unique<SelectivityVector>(batch->size()));
-      auto decoded = std::make_unique<DecodedVector>(
-          *batch->childAt(0), *selectedRows_.back());
-      table_->hashers().front()->decode(
-          *batch->childAt(0), *selectedRows_.back());
-      if (table_->hashers().front()->mayUseValueIds()) {
-        raw_vector<uint64_t> valueIds(batch->size(), pool_);
-        table_->hashers().front()->computeValueIds(
-            *selectedRows_.back(), valueIds);
+      std::vector<std::unique_ptr<DecodedVector>> decoded;
+      decoded.reserve(numKeys);
+      for (column_index_t channel = 0; channel < numKeys; ++channel) {
+        decoded.push_back(std::make_unique<DecodedVector>(
+            *batch->childAt(channel), *selectedRows_.back()));
+        auto& hasher = table_->hashers()[channel];
+        hasher->decode(*batch->childAt(channel), *selectedRows_.back());
+        if (hasher->mayUseValueIds()) {
+          raw_vector<uint64_t> valueIds(batch->size(), pool_);
+          hasher->computeValueIds(*selectedRows_.back(), valueIds);
+        }
       }
       decodedKeys_.push_back(std::move(decoded));
     }
@@ -213,7 +225,9 @@ class VeloxEngine {
       if (rows->nextOffset()) {
         *reinterpret_cast<char**>(newRow + rows->nextOffset()) = nullptr;
       }
-      rows->store(*decodedKeys_[index], row, newRow, 0);
+      for (size_t key = 0; key < decodedKeys_[index].size(); ++key) {
+        rows->store(*decodedKeys_[index][key], row, newRow, key);
+      }
     });
   }
 
@@ -277,7 +291,7 @@ class VeloxEngine {
   std::unique_ptr<HashTable<true>> table_;
   std::unique_ptr<HashLookup> lookup_;
   std::vector<std::unique_ptr<SelectivityVector>> selectedRows_;
-  std::vector<std::unique_ptr<DecodedVector>> decodedKeys_;
+  std::vector<std::vector<std::unique_ptr<DecodedVector>>> decodedKeys_;
   uint64_t lastProbeNanos_{0};
 };
 
@@ -291,6 +305,10 @@ class LayerBenchmark : public VectorTestBase {
         FLAGS_key_distribution == "uniform" ||
             FLAGS_key_distribution == "sequential",
         "key_distribution must be uniform or sequential");
+    VELOX_CHECK(
+        FLAGS_key_layout == "bigint" || FLAGS_key_layout == "2xbigint" ||
+            FLAGS_key_layout == "bigint_2xint",
+        "key_layout must be bigint, 2xbigint, or bigint_2xint");
     makeInputs();
   }
 
@@ -328,19 +346,31 @@ class LayerBenchmark : public VectorTestBase {
     return static_cast<int64_t>(splitMix64(static_cast<uint64_t>(row)));
   }
 
+  std::vector<VectorPtr> makeKeys(vector_size_t start, vector_size_t size) {
+    std::vector<VectorPtr> keys;
+    keys.push_back(makeFlatVector<int64_t>(
+        size, [this, start](vector_size_t row) { return keyAt(start + row); }));
+    if (FLAGS_key_layout == "2xbigint") {
+      keys.push_back(makeFlatVector<int64_t>(size, [this, start](auto row) {
+        return keyAt(start + row) ^ 0x5a5a5a5a5a5a5a5aLL;
+      }));
+    } else if (FLAGS_key_layout == "bigint_2xint") {
+      keys.push_back(makeFlatVector<int32_t>(size, [start](auto row) {
+        return static_cast<int32_t>(start + row);
+      }));
+      keys.push_back(makeFlatVector<int32_t>(size, [start](auto row) {
+        return static_cast<int32_t>((start + row) * 17);
+      }));
+    }
+    return keys;
+  }
+
   void makeInputs() {
-    std::vector<VectorPtr> probeChildren;
-    probeChildren.push_back(makeFlatVector<int64_t>(
-        buildRows_, [this](vector_size_t row) { return keyAt(row); }));
-    probeVector_ = makeRowVector({"key"}, std::move(probeChildren));
+    probeVector_ = makeRowVector(makeKeys(0, buildRows_));
 
     for (vector_size_t start = 0; start < buildRows_; start += batchRows_) {
       const auto size = std::min(batchRows_, buildRows_ - start);
-      std::vector<VectorPtr> children;
-      children.push_back(makeFlatVector<int64_t>(
-          size,
-          [this, start](vector_size_t row) { return keyAt(start + row); }));
-      buildVectors_.push_back(makeRowVector({"key"}, std::move(children)));
+      buildVectors_.push_back(makeRowVector(makeKeys(start, size)));
     }
   }
 
@@ -358,6 +388,7 @@ void printResult(const char* arm, const ArmResult& result) {
       static_cast<double>(FLAGS_build_rows) * FLAGS_probe_iterations;
   const auto probeThroughput = probeKeys / probeSeconds;
   std::cout << "RESULT distribution=" << FLAGS_key_distribution
+            << " key_layout=" << FLAGS_key_layout
             << " build_rows=" << FLAGS_build_rows << " fanout=1 arm=" << arm
             << " build_wall_ms=" << result.build.elapsedNanos / 1e6
             << " build_keys_per_s=" << buildThroughput
@@ -366,7 +397,13 @@ void printResult(const char* arm, const ArmResult& result) {
             << " probe_keys_per_s=" << probeThroughput
             << " hits=" << result.hits
             << " peak_bytes=" << result.peakBytes
-            << " hash_mode=" << result.hashMode << '\n';
+            << " hash_mode=" << result.hashMode
+            << " comparison="
+            << (std::string_view(arm) != "velox"
+                    ? "not-applicable"
+                    : result.hashMode == "hash" ? "apples-to-apples"
+                                                : "apples-to-oranges")
+            << '\n';
 }
 
 } // namespace

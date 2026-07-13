@@ -23,13 +23,14 @@
 namespace facebook::velox::exec::ch {
 namespace {
 
-column_index_t buildKeyChannel(const ChHashJoinNode& joinNode) {
-  VELOX_CHECK_EQ(
-      joinNode.rightKeys().size(),
-      1,
-      "ChHashBuildOperator supports one build key");
-  return exprToChannel(
-      joinNode.rightKeys().front().get(), joinNode.sources()[1]->outputType());
+std::vector<column_index_t> buildKeyChannels(const ChHashJoinNode& joinNode) {
+  std::vector<column_index_t> channels;
+  channels.reserve(joinNode.rightKeys().size());
+  for (const auto& key : joinNode.rightKeys()) {
+    channels.push_back(
+        exprToChannel(key.get(), joinNode.sources()[1]->outputType()));
+  }
+  return channels;
 }
 
 std::shared_ptr<ChHashJoinBridge> getJoinBridge(
@@ -51,11 +52,17 @@ ChHashBuildOperator::ChHashBuildOperator(
     : Operator(driverCtx, nullptr, operatorId, joinNode->id(), "ChHashBuild"),
       joinNode_(std::move(joinNode)),
       driverNo_(driverCtx->partitionId),
-      keyChannel_(buildKeyChannel(*joinNode_)) {}
+      keyChannels_(buildKeyChannels(*joinNode_)) {}
 
 void ChHashBuildOperator::initialize() {
   Operator::initialize();
-  chBuild_ = std::make_unique<ChHashBuild>(driverNo_, keyChannel_, pool());
+  std::vector<TypePtr> keyTypes;
+  keyTypes.reserve(joinNode_->rightKeys().size());
+  for (const auto& key : joinNode_->rightKeys()) {
+    keyTypes.push_back(key->type());
+  }
+  chBuild_ = std::make_unique<ChHashBuild>(
+      driverNo_, keyChannels_, std::move(keyTypes), pool());
 }
 
 bool ChHashBuildOperator::needsInput() const {
@@ -65,18 +72,7 @@ bool ChHashBuildOperator::needsInput() const {
 void ChHashBuildOperator::addInput(RowVectorPtr input) {
   VELOX_CHECK_NOT_NULL(chBuild_);
   VELOX_CHECK_NOT_NULL(input);
-  VELOX_CHECK_LT(keyChannel_, input->childrenSize());
-
-  auto keyVector = input->childAt(keyChannel_)->loadedVector();
-  VELOX_CHECK_EQ(
-      keyVector->typeKind(),
-      TypeKind::BIGINT,
-      "ChHashBuild supports one BIGINT key channel");
-
-  SelectivityVector rows(input->size());
-  DecodedVector decodedKey(*keyVector, rows);
-  chBuild_->prepareJoinTable(decodedKey, rows);
-  chBuild_->addRowReferences(std::move(input), decodedKey, rows);
+  chBuild_->addInput(std::move(input));
 }
 
 void ChHashBuildOperator::noMoreInput() {

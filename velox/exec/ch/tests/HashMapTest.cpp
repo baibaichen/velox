@@ -103,6 +103,35 @@ TEST_F(HashMapTest, storesZeroKeySeparately) {
   EXPECT_FALSE(inserted);
 }
 
+TEST_F(HashMapTest, wideKeysSupportInsertFindAndZeroKey) {
+  HashMapAll_keys128 map128(mapPool_.get());
+  HashMapAll_keys256 map256(mapPool_.get());
+  Arena arena(arenaPool_.get());
+
+  const UInt128 key128{{11, 22}};
+  const UInt256 key256{{33, 44, 55, 66}};
+  map128.emplace(key128).insert(refWord(1, 2), arena);
+  map128.emplace(key128).insert(refWord(1, 3), arena);
+  map256.emplace(key256).insert(refWord(4, 5), arena);
+
+  ASSERT_NE(map128.find(key128), nullptr);
+  EXPECT_EQ(map128.find(key128)->getMapped().rows(), 2);
+  ASSERT_NE(map256.find(key256), nullptr);
+  EXPECT_EQ(map256.find(key256)->getMapped().firstWord(), refWord(4, 5));
+  EXPECT_EQ(map128.find(UInt128{{99, 0}}), nullptr);
+  EXPECT_EQ(map256.find(UInt256{{99, 0, 0, 0}}), nullptr);
+
+  bool inserted = false;
+  map128.emplace(UInt128{}, inserted).word = refWord(7, 8);
+  ASSERT_TRUE(inserted);
+  map256.emplace(UInt256{}, inserted).word = refWord(9, 10);
+  ASSERT_TRUE(inserted);
+  ASSERT_NE(map128.find(UInt128{}), nullptr);
+  EXPECT_EQ(map128.find(UInt128{})->getMapped().firstWord(), refWord(7, 8));
+  ASSERT_NE(map256.find(UInt256{}), nullptr);
+  EXPECT_EQ(map256.find(UInt256{})->getMapped().firstWord(), refWord(9, 10));
+}
+
 TEST_F(HashMapTest, duplicateCoordinatesUseRowRefListChain) {
   HashMapAll_key64 map(mapPool_.get());
   Arena arena(arenaPool_.get());

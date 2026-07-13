@@ -40,9 +40,19 @@ std::vector<ProbeHit> joinProbe(
     column_index_t probeKeyChannel);
 
 std::vector<ProbeHit> joinProbe(
+    const ChHashBuild& build,
+    const RowVectorPtr& probe,
+    const std::vector<column_index_t>& probeKeyChannels);
+
+std::vector<ProbeHit> joinProbe(
     const ChHashBuild::JoinMap& map,
     const RowVectorPtr& probe,
     column_index_t probeKeyChannel);
+
+std::vector<ProbeHit> joinProbe(
+    const ChHashBuild::JoinMap& map,
+    const RowVectorPtr& probe,
+    const std::vector<column_index_t>& probeKeyChannels);
 
 std::vector<ProbeMatch> listJoinResults(
     const std::vector<ProbeHit>& hits,
@@ -52,6 +62,11 @@ std::vector<ProbeMatch> probeHashBuild(
     const ChHashBuild& build,
     const RowVectorPtr& probe,
     column_index_t probeKeyChannel);
+
+std::vector<ProbeMatch> probeHashBuild(
+    const ChHashBuild& build,
+    const RowVectorPtr& probe,
+    const std::vector<column_index_t>& probeKeyChannels);
 
 std::vector<ProbeMatch> probeHashBuild(
     const ChHashBuild::JoinMap& map,

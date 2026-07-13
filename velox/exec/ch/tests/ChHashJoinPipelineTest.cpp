@@ -134,6 +134,45 @@ class ChHashJoinPipelineTest : public testing::Test,
         })};
   }
 
+  core::PlanNodePtr makeMultiKeyPlan(
+      const std::vector<RowVectorPtr>& probe,
+      const std::vector<RowVectorPtr>& build,
+      bool native) {
+    auto idGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    auto buildNode = PlanBuilder(idGenerator).values(build, true).planNode();
+    if (native) {
+      return PlanBuilder(idGenerator)
+          .values(probe, true)
+          .hashJoin(
+              {"p_key1", "p_key2"},
+              {"b_key1", "b_key2"},
+              buildNode,
+              "",
+              {"b_key1", "b_key2", "b_value", "p_key1", "p_key2", "p_value"})
+          .planNode();
+    }
+    return PlanBuilder(idGenerator)
+        .values(probe, true)
+        .addNode([buildNode](std::string id, core::PlanNodePtr probeNode) {
+          return std::make_shared<ChHashJoinNode>(
+              id,
+              core::JoinType::kInner,
+              std::vector<core::FieldAccessTypedExprPtr>{
+                  std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "p_key1"),
+                  std::make_shared<core::FieldAccessTypedExpr>(INTEGER(), "p_key2")},
+              std::vector<core::FieldAccessTypedExprPtr>{
+                  std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "b_key1"),
+                  std::make_shared<core::FieldAccessTypedExpr>(INTEGER(), "b_key2")},
+              nullptr,
+              std::move(probeNode),
+              buildNode,
+              ROW(
+                  {"b_key1", "b_key2", "b_value", "p_key1", "p_key2", "p_value"},
+                  {BIGINT(), INTEGER(), BIGINT(), BIGINT(), INTEGER(), BIGINT()}));
+        })
+        .planNode();
+  }
+
   void assertMatchesNative(
       const core::PlanNodePtr& chPlan,
       const core::PlanNodePtr& nativePlan,
@@ -166,6 +205,24 @@ TEST_F(ChHashJoinPipelineTest, innerJoinMatchesNativeWithNullsAndDuplicates) {
 
   assertMatchesNative(
       makeChPlan(probe, build), makeNativePlan(probe, build));
+}
+
+TEST_F(ChHashJoinPipelineTest, multipleFixedKeysMatchNative) {
+  ensureRegistered();
+  auto build = std::vector<RowVectorPtr>{makeRowVector(
+      {"b_key1", "b_key2", "b_value"},
+      {makeFlatVector<int64_t>({0, 1, 1, 2}),
+       makeNullableFlatVector<int32_t>({0, 10, 10, std::nullopt}),
+       makeFlatVector<int64_t>({100, 110, 111, 120})})};
+  auto probe = std::vector<RowVectorPtr>{makeRowVector(
+      {"p_key1", "p_key2", "p_value"},
+      {makeFlatVector<int64_t>({0, 1, 2, 9}),
+       makeNullableFlatVector<int32_t>({0, 10, std::nullopt, 9}),
+       makeFlatVector<int64_t>({200, 210, 220, 290})})};
+
+  assertMatchesNative(
+      makeMultiKeyPlan(probe, build, false),
+      makeMultiKeyPlan(probe, build, true));
 }
 
 TEST_F(ChHashJoinPipelineTest, waitsForBuildAndEmitsEveryBuildBatch) {

@@ -165,5 +165,37 @@ TEST_F(ChHashProbeTest, skipsUnmatchedAndNullKeys) {
   EXPECT_TRUE(matches.empty());
 }
 
+TEST_F(ChHashProbeTest, matchesMultipleFixedWidthKeyChannels) {
+  auto buildInput = makeRowVector({
+      makeFlatVector<int64_t>({0, 1, 1, 2}),
+      makeFlatVector<int32_t>({0, 10, 10, 20}),
+      makeFlatVector<int32_t>({0, 100, 100, 200}),
+  });
+  ChHashBuild build(
+      kDriverNo,
+      std::vector<column_index_t>{0, 1, 2},
+      std::vector<TypePtr>{BIGINT(), INTEGER(), INTEGER()},
+      pool());
+  build.addInput(buildInput);
+
+  auto probe = makeRowVector({
+      makeFlatVector<int64_t>({0, 1, 2, 9}),
+      makeFlatVector<int32_t>({0, 10, 20, 9}),
+      makeFlatVector<int32_t>({0, 100, 200, 9}),
+  });
+  const auto matches = probeHashBuild(
+      build, probe, std::vector<column_index_t>{0, 1, 2});
+
+  ASSERT_EQ(matches.size(), 4);
+  EXPECT_EQ(matches[0].probeRow, 0);
+  EXPECT_EQ(matches[0].buildRowNo, 0);
+  EXPECT_EQ(matches[1].probeRow, 1);
+  EXPECT_EQ(matches[1].buildRowNo, 1);
+  EXPECT_EQ(matches[2].probeRow, 1);
+  EXPECT_EQ(matches[2].buildRowNo, 2);
+  EXPECT_EQ(matches[3].probeRow, 2);
+  EXPECT_EQ(matches[3].buildRowNo, 3);
+}
+
 } // namespace
 } // namespace facebook::velox::exec::ch

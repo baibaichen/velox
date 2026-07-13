@@ -17,6 +17,7 @@
 #pragma once
 
 #include "velox/common/base/SimdUtil.h"
+#include "velox/exec/ch/FixedKey.h"
 #include "velox/exec/ch/HashTable.h"
 #include "velox/exec/ch/HashTableAllocatorAdapter.h"
 #include "velox/exec/ch/RowRefList.h"
@@ -39,6 +40,19 @@ struct HashCRC32 {
         std::is_integral_v<T> && std::is_unsigned_v<T> &&
         sizeof(T) <= sizeof(UInt64));
     return simd::crc32U64(0, static_cast<UInt64>(key));
+  }
+};
+
+template <typename T>
+struct HashWide {
+  size_t operator()(const T& key) const {
+    static_assert(
+        std::is_same_v<T, UInt128> || std::is_same_v<T, UInt256>);
+    uint64_t hash = 0;
+    for (const auto word : key.words) {
+      hash = simd::crc32U64(hash, word);
+    }
+    return hash;
   }
 };
 
@@ -226,9 +240,13 @@ using HashMapAll = HashMapTable<
 
 using HashMapAll_key32 = HashMapAll<UInt32>;
 using HashMapAll_key64 = HashMapAll<UInt64>;
+using HashMapAll_keys128 = HashMapAll<UInt128, HashWide<UInt128>>;
+using HashMapAll_keys256 = HashMapAll<UInt256, HashWide<UInt256>>;
 
 static_assert(std::is_trivially_copyable_v<RowRefList>);
 static_assert(std::is_trivially_copyable_v<HashMapAll_key32::cell_type>);
 static_assert(std::is_trivially_copyable_v<HashMapAll_key64::cell_type>);
+static_assert(std::is_trivially_copyable_v<HashMapAll_keys128::cell_type>);
+static_assert(std::is_trivially_copyable_v<HashMapAll_keys256::cell_type>);
 
 } // namespace facebook::velox::exec::ch

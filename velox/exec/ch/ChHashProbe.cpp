@@ -32,55 +32,68 @@ std::vector<ProbeHit> joinProbe(
     const ChHashBuild& build,
     const RowVectorPtr& probe,
     column_index_t probeKeyChannel) {
-  return joinProbe(build.rowsByKey(), probe, probeKeyChannel);
+  return joinProbe(build, probe, std::vector<column_index_t>{probeKeyChannel});
+}
+
+std::vector<ProbeHit> joinProbe(
+    const ChHashBuild& build,
+    const RowVectorPtr& probe,
+    const std::vector<column_index_t>& probeKeyChannels) {
+  VELOX_CHECK_EQ(build.keyChannels().size(), probeKeyChannels.size());
+  return joinProbe(build.rowsByKey(), probe, probeKeyChannels);
 }
 
 std::vector<ProbeHit> joinProbe(
     const ChHashBuild::JoinMap& map,
     const RowVectorPtr& probe,
     column_index_t probeKeyChannel) {
+  return joinProbe(map, probe, std::vector<column_index_t>{probeKeyChannel});
+}
+
+std::vector<ProbeHit> joinProbe(
+    const ChHashBuild::JoinMap& map,
+    const RowVectorPtr& probe,
+    const std::vector<column_index_t>& probeKeyChannels) {
   VELOX_CHECK_NOT_NULL(probe);
-  VELOX_CHECK_LT(probeKeyChannel, probe->childrenSize());
-
-  auto keyVector = probe->childAt(probeKeyChannel)->loadedVector();
-  VELOX_CHECK_EQ(
-      keyVector->typeKind(),
-      TypeKind::BIGINT,
-      "ChHashProbe supports one BIGINT key channel");
-
   SelectivityVector rows(probe->size());
-  DecodedVector decodedKey(*keyVector, rows);
-  std::vector<ProbeHit> hits;
-  hits.reserve(probe->size());
+  FixedKeyDecoder decoder(probe, probeKeyChannels, rows);
+  VELOX_CHECK(decoder.width() == map.width());
 
-  const bool usePrefetch =
-      map.getBufferSizeInBytes() > kMinTableBytesForPrefetch;
-  for (vector_size_t probeRow = 0; probeRow < probe->size(); ++probeRow) {
-    const auto prefetchRow = probeRow + kPrefetchLookAhead;
-    if (
-        usePrefetch &&
-        prefetchRow < probe->size() &&
-        !decodedKey.isNullAt(prefetchRow)) {
-      const auto prefetchKey =
-          static_cast<uint64_t>(decodedKey.valueAt<int64_t>(prefetchRow));
-      map.prefetchByHash(map.hash(prefetchKey));
+  const auto probeKeys = [&]<typename Key>() {
+    std::vector<ProbeHit> hits;
+    hits.reserve(probe->size());
+    const bool usePrefetch =
+        map.getBufferSizeInBytes() > kMinTableBytesForPrefetch;
+    for (vector_size_t probeRow = 0; probeRow < probe->size(); ++probeRow) {
+      const auto prefetchRow = probeRow + kPrefetchLookAhead;
+      if (usePrefetch && prefetchRow < probe->size()) {
+        Key prefetchKey;
+        if (decoder.pack(prefetchRow, prefetchKey)) {
+          map.prefetch(prefetchKey);
+        }
+      }
+
+      Key key;
+      if (!decoder.pack(probeRow, key)) {
+        continue;
+      }
+      const auto* cell = map.find(key);
+      if (cell != nullptr) {
+        hits.push_back({probeRow, &cell->getMapped()});
+      }
     }
+    return hits;
+  };
 
-    if (decodedKey.isNullAt(probeRow)) {
-      continue;
-    }
-
-    const auto key =
-        static_cast<uint64_t>(decodedKey.valueAt<int64_t>(probeRow));
-    const auto* cell = map.find(key, map.hash(key));
-    if (cell == nullptr) {
-      continue;
-    }
-
-    hits.push_back({probeRow, &cell->getMapped()});
+  switch (map.width()) {
+    case FixedKeyWidth::k64:
+      return probeKeys.template operator()<uint64_t>();
+    case FixedKeyWidth::k128:
+      return probeKeys.template operator()<UInt128>();
+    case FixedKeyWidth::k256:
+      return probeKeys.template operator()<UInt256>();
   }
-
-  return hits;
+  VELOX_UNREACHABLE();
 }
 
 std::vector<ProbeMatch> listJoinResults(
@@ -123,6 +136,14 @@ std::vector<ProbeMatch> probeHashBuild(
     const RowVectorPtr& probe,
     column_index_t probeKeyChannel) {
   return listJoinResults(joinProbe(map, probe, probeKeyChannel), retained);
+}
+
+std::vector<ProbeMatch> probeHashBuild(
+    const ChHashBuild& build,
+    const RowVectorPtr& probe,
+    const std::vector<column_index_t>& probeKeyChannels) {
+  return listJoinResults(
+      joinProbe(build, probe, probeKeyChannels), build.retainedIndex());
 }
 
 } // namespace facebook::velox::exec::ch

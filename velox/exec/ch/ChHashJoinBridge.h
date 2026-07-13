@@ -18,15 +18,15 @@
 
 #include "velox/exec/JoinBridge.h"
 #include "velox/exec/Operator.h"
+#include "velox/exec/ch/ChHashBuild.h"
 #include "velox/exec/ch/ChHashJoinNode.h"
-#include "velox/exec/ch/HashMap.h"
 #include "velox/exec/ch/RetainedVectorsIndex.h"
 
 namespace facebook::velox::exec::ch {
 
 class ChHashJoinBridge : public exec::JoinBridge {
  public:
-  using JoinMap = HashMapAll_key64;
+  using JoinMap = ChHashBuild::JoinMap;
 
   struct ChBuildResult {
     std::shared_ptr<JoinMap> map;

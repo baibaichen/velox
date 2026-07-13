@@ -21,13 +21,14 @@
 namespace facebook::velox::exec::ch {
 namespace {
 
-column_index_t probeKeyChannel(const ChHashJoinNode& joinNode) {
-  VELOX_CHECK_EQ(
-      joinNode.leftKeys().size(),
-      1,
-      "ChHashProbeOperator supports one probe key");
-  return exprToChannel(
-      joinNode.leftKeys().front().get(), joinNode.sources()[0]->outputType());
+std::vector<column_index_t> probeKeyChannels(const ChHashJoinNode& joinNode) {
+  std::vector<column_index_t> channels;
+  channels.reserve(joinNode.leftKeys().size());
+  for (const auto& key : joinNode.leftKeys()) {
+    channels.push_back(
+        exprToChannel(key.get(), joinNode.sources()[0]->outputType()));
+  }
+  return channels;
 }
 
 void resolveOutputProjections(
@@ -91,7 +92,7 @@ ChHashProbeOperator::ChHashProbeOperator(
           "ChHashProbe"),
       joinNode_(std::move(joinNode)),
       joinBridge_(std::move(joinBridge)),
-      keyChannel_(probeKeyChannel(*joinNode_)) {
+      keyChannels_(probeKeyChannels(*joinNode_)) {
   VELOX_CHECK_EQ(
       joinNode_->joinType(),
       core::JoinType::kInner,
@@ -146,7 +147,7 @@ RowVectorPtr ChHashProbeOperator::getOutput() {
   VELOX_CHECK(emitGather_.has_value());
 
   auto input = std::move(input_);
-  auto hits = joinProbe(*buildTable_.map, input, keyChannel_);
+  auto hits = joinProbe(*buildTable_.map, input, keyChannels_);
   auto matches = listJoinResults(hits, *buildTable_.retained);
   pendingOutput_ = emitGather_->emit(matches, input);
   return nextPendingOutput();

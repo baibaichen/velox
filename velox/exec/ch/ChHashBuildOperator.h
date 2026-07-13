@@ -52,7 +52,7 @@ class ChHashBuildOperator final : public exec::Operator {
   ChHashJoinNodePtr joinNode_;
   std::shared_ptr<ChHashJoinBridge> joinBridge_;
   uint32_t driverNo_;
-  column_index_t keyChannel_;
+  std::vector<column_index_t> keyChannels_;
   std::unique_ptr<ChHashBuild> chBuild_;
   bool handedOff_{false};
 };

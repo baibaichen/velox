@@ -18,7 +18,7 @@
 
 #include "velox/common/memory/MemoryPool.h"
 #include "velox/exec/ch/Arena.h"
-#include "velox/exec/ch/HashMap.h"
+#include "velox/exec/ch/FixedKeyMap.h"
 #include "velox/exec/ch/RetainedVectorsIndex.h"
 #include "velox/vector/DecodedVector.h"
 #include "velox/vector/SelectivityVector.h"
@@ -27,11 +27,17 @@ namespace facebook::velox::exec::ch {
 
 class ChHashBuild {
  public:
-  using JoinMap = HashMapAll_key64;
+  using JoinMap = FixedKeyMap;
 
   ChHashBuild(
       uint32_t driverNo,
       column_index_t keyChannel,
+      memory::MemoryPool* pool);
+
+  ChHashBuild(
+      uint32_t driverNo,
+      std::vector<column_index_t> keyChannels,
+      std::vector<TypePtr> keyTypes,
       memory::MemoryPool* pool);
 
   void reserve(size_t expectedDistinctKeys);
@@ -65,21 +71,31 @@ class ChHashBuild {
     return *retainedIndex_;
   }
 
+  const std::vector<column_index_t>& keyChannels() const {
+    return keyChannels_;
+  }
+
+  FixedKeyWidth keyWidth() const {
+    return keyWidth_;
+  }
+
   std::shared_ptr<JoinMap> takeMap();
 
   std::shared_ptr<RetainedVectorsIndex> takeRetained();
 
  private:
   struct BuildStorage {
-    explicit BuildStorage(memory::MemoryPool* pool)
-        : arena(pool), rowsByKey(pool) {}
+    BuildStorage(memory::MemoryPool* pool, FixedKeyWidth width)
+        : arena(pool), rowsByKey(pool, width) {}
 
     Arena arena;
     JoinMap rowsByKey;
   };
 
   uint32_t driverNo_;
-  column_index_t keyChannel_;
+  std::vector<column_index_t> keyChannels_;
+  std::vector<TypePtr> keyTypes_;
+  FixedKeyWidth keyWidth_;
   std::shared_ptr<RetainedVectorsIndex> retainedIndex_;
   std::shared_ptr<BuildStorage> storage_;
   bool needsInput_{true};
