@@ -23,6 +23,11 @@
 
 namespace facebook::velox::exec::ch {
 
+namespace {
+constexpr vector_size_t kPrefetchLookAhead = 16;
+constexpr size_t kMinTableBytesForPrefetch = 8UL << 20;
+}
+
 std::vector<ProbeHit> joinProbe(
     const ChHashBuild& build,
     const RowVectorPtr& probe,
@@ -48,20 +53,32 @@ std::vector<ProbeHit> joinProbe(
   std::vector<ProbeHit> hits;
   hits.reserve(probe->size());
 
-  rows.applyToSelected([&](vector_size_t probeRow) {
+  const bool usePrefetch =
+      map.getBufferSizeInBytes() > kMinTableBytesForPrefetch;
+  for (vector_size_t probeRow = 0; probeRow < probe->size(); ++probeRow) {
+    const auto prefetchRow = probeRow + kPrefetchLookAhead;
+    if (
+        usePrefetch &&
+        prefetchRow < probe->size() &&
+        !decodedKey.isNullAt(prefetchRow)) {
+      const auto prefetchKey =
+          static_cast<uint64_t>(decodedKey.valueAt<int64_t>(prefetchRow));
+      map.prefetchByHash(map.hash(prefetchKey));
+    }
+
     if (decodedKey.isNullAt(probeRow)) {
-      return;
+      continue;
     }
 
     const auto key =
         static_cast<uint64_t>(decodedKey.valueAt<int64_t>(probeRow));
     const auto* cell = map.find(key, map.hash(key));
     if (cell == nullptr) {
-      return;
+      continue;
     }
 
     hits.push_back({probeRow, &cell->getMapped()});
-  });
+  }
 
   return hits;
 }
