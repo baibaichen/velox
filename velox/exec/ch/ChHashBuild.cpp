@@ -43,24 +43,11 @@ ChHashBuild::ChHashBuild(
     std::vector<column_index_t> keyChannels,
     std::vector<TypePtr> keyTypes,
     memory::MemoryPool* pool)
-    : ChHashBuild(
-          driverNo,
-          std::move(keyChannels),
-          std::move(keyTypes),
-          pool,
-          ArbitraryKeyMode::kSerialized) {}
-
-ChHashBuild::ChHashBuild(
-    uint32_t driverNo,
-    std::vector<column_index_t> keyChannels,
-    std::vector<TypePtr> keyTypes,
-    memory::MemoryPool* pool,
-    ArbitraryKeyMode arbitraryMode)
     : driverNo_(driverNo),
       keyChannels_(std::move(keyChannels)),
       keyTypes_(std::move(keyTypes)),
       retainedIndex_(std::make_shared<RetainedVectorsIndex>(driverNo)),
-      storage_(std::make_shared<BuildStorage>(pool, keyTypes_, arbitraryMode)) {
+      storage_(std::make_shared<BuildStorage>(pool, keyTypes_)) {
   VELOX_USER_CHECK_EQ(keyChannels_.size(), keyTypes_.size());
 }
 void ChHashBuild::reserve(size_t expectedDistinctKeys) {
@@ -73,8 +60,7 @@ void ChHashBuild::prepareJoinTable(
     const DecodedVector& decodedKey,
     const SelectivityVector& rows) {
   VELOX_CHECK(needsInput_, "Cannot prepare table after noMoreInput");
-  VELOX_CHECK(!storage_->rowsByKey.serialized());
-  VELOX_CHECK(storage_->rowsByKey.width() == FixedKeyWidth::k64);
+  VELOX_CHECK(storage_->rowsByKey.type() == FixedKeyMap::Type::key64);
   VELOX_CHECK_EQ(
       decodedKey.base()->typeKind(),
       TypeKind::BIGINT,
@@ -98,8 +84,7 @@ void ChHashBuild::addRowReferences(
   VELOX_CHECK(needsInput_, "Cannot add row references after noMoreInput");
   VELOX_CHECK_NOT_NULL(input);
   VELOX_CHECK_EQ(rows.size(), input->size());
-  VELOX_CHECK(!storage_->rowsByKey.serialized());
-  VELOX_CHECK(storage_->rowsByKey.width() == FixedKeyWidth::k64);
+  VELOX_CHECK(storage_->rowsByKey.type() == FixedKeyMap::Type::key64);
   VELOX_CHECK_EQ(
       decodedKey.base()->typeKind(),
       TypeKind::BIGINT,
@@ -131,7 +116,7 @@ void ChHashBuild::addInput(RowVectorPtr input) {
     VELOX_CHECK_EQ(input->childAt(keyChannels_[i])->type(), keyTypes_[i]);
   }
 
-  if (storage_->rowsByKey.hashed()) {
+  if (storage_->rowsByKey.type() == FixedKeyMap::Type::hashed) {
     HashedKeyDecoder decoder(input, keyChannels_, keyTypes_, rows);
     const uint32_t batchNo = retainedIndex_->add(input);
     const uint32_t blockNo = packBlockNo(driverNo_, batchNo);
@@ -146,7 +131,7 @@ void ChHashBuild::addInput(RowVectorPtr input) {
     });
     return;
   }
-  if (storage_->rowsByKey.serialized()) {
+  if (storage_->rowsByKey.type() == FixedKeyMap::Type::key_string) {
     SerializedKeyDecoder decoder(input, keyChannels_, keyTypes_, rows);
     std::string bytes;
     rows.applyToSelected([&](vector_size_t rowNo) {

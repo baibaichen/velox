@@ -64,7 +64,7 @@ std::vector<ProbeHit> joinProbe(
   VELOX_CHECK_NOT_NULL(probe);
   SelectivityVector rows(probe->size());
 
-  if (map.hashed()) {
+  if (map.type() == FixedKeyMap::Type::hashed) {
     HashedKeyDecoder decoder(probe, probeKeyChannels, map.keyTypes(), rows);
     std::vector<ProbeHit> hits;
     hits.reserve(probe->size());
@@ -80,7 +80,7 @@ std::vector<ProbeHit> joinProbe(
     }
     return hits;
   }
-  if (map.serialized()) {
+  if (map.type() == FixedKeyMap::Type::key_string) {
     SerializedKeyDecoder decoder(
         probe, probeKeyChannels, map.keyTypes(), rows);
     std::vector<ProbeHit> hits;

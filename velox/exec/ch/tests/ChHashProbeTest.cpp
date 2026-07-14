@@ -197,6 +197,48 @@ TEST_F(ChHashProbeTest, matchesMultipleFixedWidthKeyChannels) {
   EXPECT_EQ(matches[3].buildRowNo, 3);
 }
 
+TEST_F(ChHashProbeTest, routesKeyTypesToMaps) {
+  ChHashBuild singleBigint(
+      kDriverNo, std::vector<column_index_t>{0}, {BIGINT()}, pool());
+  EXPECT_EQ(singleBigint.keyMapType(), FixedKeyMap::Type::key64);
+
+  ChHashBuild singleString(
+      kDriverNo, std::vector<column_index_t>{0}, {VARCHAR()}, pool());
+  EXPECT_EQ(singleString.keyMapType(), FixedKeyMap::Type::key_string);
+
+  ChHashBuild mixed(
+      kDriverNo,
+      std::vector<column_index_t>{0, 1},
+      {BIGINT(), VARCHAR()},
+      pool());
+  EXPECT_EQ(mixed.keyMapType(), FixedKeyMap::Type::hashed);
+}
+
+TEST_F(ChHashProbeTest, matchesSingleIntegerKeys) {
+  // A single 4-byte INTEGER key routes to Type::key32, which is carried by the
+  // 64-bit map today; verify build and probe still resolve matches.
+  auto buildInput = makeRowVector({
+      makeFlatVector<int32_t>({10, 20, 20, 30}),
+  });
+  ChHashBuild build(
+      kDriverNo, std::vector<column_index_t>{0}, {INTEGER()}, pool());
+  EXPECT_EQ(build.keyMapType(), FixedKeyMap::Type::key32);
+  build.addInput(buildInput);
+
+  auto probe = makeRowVector({
+      makeFlatVector<int32_t>({20, 99, 10}),
+  });
+  const auto matches = probeHashBuild(build, probe, 0);
+
+  ASSERT_EQ(matches.size(), 3);
+  EXPECT_EQ(matches[0].probeRow, 0);
+  EXPECT_EQ(matches[0].buildRowNo, 1);
+  EXPECT_EQ(matches[1].probeRow, 0);
+  EXPECT_EQ(matches[1].buildRowNo, 2);
+  EXPECT_EQ(matches[2].probeRow, 2);
+  EXPECT_EQ(matches[2].buildRowNo, 0);
+}
+
 TEST_F(ChHashProbeTest, matchesSerializedStringKeysIncludingEmpty) {
   auto buildInput = makeRowVector({
       makeFlatVector<std::string>({"", "alpha", "alpha", "long-string"}),
@@ -280,11 +322,10 @@ TEST_F(ChHashProbeTest, matchesHashedStringKeysIncludingDuplicatesAndEmpty) {
       kDriverNo,
       std::vector<column_index_t>{0},
       std::vector<TypePtr>{VARCHAR()},
-      pool(),
-      ArbitraryKeyMode::kHashed);
+      pool());
   build.addInput(buildInput);
 
-  EXPECT_TRUE(build.usesHashedKeys());
+  EXPECT_EQ(build.keyMapType(), FixedKeyMap::Type::key_string);
   auto probe = makeRowVector({
       makeFlatVector<std::string>({"alpha", "", "missing"}),
   });
@@ -308,10 +349,9 @@ TEST_F(ChHashProbeTest, matchesHashedMixedAndOverwideKeys) {
       kDriverNo,
       std::vector<column_index_t>{0, 1},
       std::vector<TypePtr>{BIGINT(), VARCHAR()},
-      pool(),
-      ArbitraryKeyMode::kHashed);
+      pool());
   mixed.addInput(mixedBuild);
-  EXPECT_TRUE(mixed.usesHashedKeys());
+  EXPECT_EQ(mixed.keyMapType(), FixedKeyMap::Type::hashed);
   auto mixedProbe = makeRowVector({
       makeFlatVector<int64_t>({1, 2, 1}),
       makeFlatVector<std::string>({"uno", "two", "missing"}),
@@ -334,8 +374,7 @@ TEST_F(ChHashProbeTest, matchesHashedMixedAndOverwideKeys) {
       std::vector<column_index_t>{0, 1, 2, 3, 4},
       std::vector<TypePtr>{
           BIGINT(), BIGINT(), BIGINT(), BIGINT(), BIGINT()},
-      pool(),
-      ArbitraryKeyMode::kHashed);
+      pool());
   wide.addInput(makeRowVector(std::move(buildColumns)));
   const auto wideMatches = probeHashBuild(
       wide,
@@ -353,8 +392,7 @@ TEST_F(ChHashProbeTest, hashedKeysSkipNullsEndToEnd) {
       kDriverNo,
       std::vector<column_index_t>{0},
       std::vector<TypePtr>{VARCHAR()},
-      pool(),
-      ArbitraryKeyMode::kHashed);
+      pool());
   build.addInput(buildInput);
 
   auto probe = makeRowVector({makeNullableFlatVector<std::string>(

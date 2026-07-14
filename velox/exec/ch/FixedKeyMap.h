@@ -20,7 +20,6 @@
 #include "velox/exec/ch/HashMap.h"
 
 #include <algorithm>
-#include <optional>
 #include <variant>
 
 namespace facebook::velox::exec::ch {
@@ -56,39 +55,36 @@ class FixedKeyMap {
   using KeyStringMap = HashMapAll_key_string;
   using HashedMap = HashMapAll_hashed;
 
-  explicit FixedKeyMap(memory::MemoryPool* pool)
-      : FixedKeyMap(pool, FixedKeyWidth::k64) {}
-
-  FixedKeyMap(memory::MemoryPool* pool, FixedKeyWidth width)
-      : width_(width), maps_(makeFixedMap(pool, width)) {}
-
   FixedKeyMap(memory::MemoryPool* pool, std::vector<TypePtr> keyTypes)
-      : FixedKeyMap(
-            pool, std::move(keyTypes), ArbitraryKeyMode::kSerialized) {}
-
-  FixedKeyMap(
-      memory::MemoryPool* pool,
-      std::vector<TypePtr> keyTypes,
-      ArbitraryKeyMode arbitraryMode)
       : keyTypes_(std::move(keyTypes)),
-        width_(useSerializedKey(keyTypes_)
-                   ? std::nullopt
-                   : std::optional<FixedKeyWidth>(fixedKeyWidth(keyTypes_))),
-        arbitraryMode_(arbitraryMode),
-        maps_(makeMap(pool, width_, arbitraryMode_)) {}
+        type_(chooseType(keyTypes_)),
+        maps_(makeMap(pool, type_)) {}
 
-  bool serialized() const {
-    return !width_.has_value() &&
-        arbitraryMode_ == ArbitraryKeyMode::kSerialized;
+  /// Returns the concrete map variant chosen for the join keys. All dispatch is
+  /// driven off this authoritative value, mirroring ClickHouse's chooseMethod.
+  Type type() const {
+    return type_;
   }
 
-  bool hashed() const {
-    return !width_.has_value() && arbitraryMode_ == ArbitraryKeyMode::kHashed;
-  }
-
+  /// Returns the packed-key width for a fixed-width integer map. Only valid when
+  /// type() is one of the packed integer families; used by the FixedKeyDecoder
+  /// pack path to size the packed key.
   FixedKeyWidth width() const {
-    VELOX_CHECK(width_.has_value(), "Arbitrary map has no fixed key width");
-    return *width_;
+    switch (type_) {
+      // Narrow single/packed integer keys are carried by the 64-bit map because
+      // the FixedKeyDecoder does not pack into UInt32; see makeMap.
+      case Type::key32:
+      case Type::keys32:
+      case Type::keys64:
+      case Type::key64:
+        return FixedKeyWidth::k64;
+      case Type::keys128:
+        return FixedKeyWidth::k128;
+      case Type::keys256:
+        return FixedKeyWidth::k256;
+      default:
+        VELOX_FAIL("Map has no fixed key width: {}", static_cast<int>(type_));
+    }
   }
 
   const std::vector<TypePtr>& keyTypes() const {
@@ -200,28 +196,34 @@ class FixedKeyMap {
   using Maps =
       std::variant<Map64, Map128, Map256, KeyStringMap, HashedMap>;
 
-  static Maps makeFixedMap(memory::MemoryPool* pool, FixedKeyWidth width) {
-    switch (width) {
-      case FixedKeyWidth::k64:
+  static Maps makeMap(memory::MemoryPool* pool, Type type) {
+    switch (type) {
+      // Narrow integer keys (single 4-byte, or packs totaling <= 8 bytes) are
+      // carried by the 64-bit map: the FixedKeyDecoder packs into uint64_t and
+      // does not instantiate uint32_t. Wiring a real Map32 (HashMapAll_key32)
+      // requires teaching FixedKeyDecoder to pack into UInt32 first.
+      case Type::key32:
+      case Type::keys32:
+      case Type::keys64:
+      case Type::key64:
         return Maps(std::in_place_type<Map64>, pool);
-      case FixedKeyWidth::k128:
+      case Type::keys128:
         return Maps(std::in_place_type<Map128>, pool);
-      case FixedKeyWidth::k256:
+      case Type::keys256:
         return Maps(std::in_place_type<Map256>, pool);
+      case Type::key_string:
+        return Maps(std::in_place_type<KeyStringMap>, pool);
+      case Type::hashed:
+        return Maps(std::in_place_type<HashedMap>, pool);
+      case Type::key8:
+      case Type::key16:
+        // ClickHouse routes 1/2-byte single keys to a FixedHashMap (direct
+        // address array). That container is not ported yet.
+        VELOX_NYI(
+            "1/2-byte single-integer join keys are not supported yet: {}",
+            static_cast<int>(type));
     }
     VELOX_UNREACHABLE();
-  }
-
-  static Maps makeMap(
-      memory::MemoryPool* pool,
-      const std::optional<FixedKeyWidth>& width,
-      ArbitraryKeyMode arbitraryMode) {
-    if (width.has_value()) {
-      return makeFixedMap(pool, *width);
-    }
-    return arbitraryMode == ArbitraryKeyMode::kHashed
-        ? Maps(std::in_place_type<HashedMap>, pool)
-        : Maps(std::in_place_type<KeyStringMap>, pool);
   }
 
   template <typename Key>
@@ -270,8 +272,7 @@ class FixedKeyMap {
   }
 
   std::vector<TypePtr> keyTypes_;
-  std::optional<FixedKeyWidth> width_;
-  ArbitraryKeyMode arbitraryMode_{ArbitraryKeyMode::kSerialized};
+  Type type_;
   Maps maps_;
 };
 

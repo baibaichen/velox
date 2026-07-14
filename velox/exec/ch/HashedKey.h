@@ -31,10 +31,6 @@
 
 namespace facebook::velox::exec::ch {
 
-// kHashed stores only a non-cryptographic XXH3 128-bit digest and accepts
-// the approximate 2^-128 accidental-collision risk; adversarial keys are unsafe.
-enum class ArbitraryKeyMode : uint8_t { kSerialized, kHashed };
-
 class HashedKeyDecoder {
  public:
   // Digesting again for prefetch would scan every variable-width key twice.

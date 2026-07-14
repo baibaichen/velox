@@ -127,7 +127,8 @@ TEST_F(ChHashJoinRegistrationTest, bridgeWakesWaiterAndPreservesTable) {
   EXPECT_TRUE(future.valid());
   EXPECT_FALSE(future.isReady());
 
-  auto map = std::make_shared<ChHashJoinBridge::JoinMap>(pool());
+  auto map = std::make_shared<ChHashJoinBridge::JoinMap>(
+      pool(), std::vector<TypePtr>{BIGINT()});
   auto retained = std::make_shared<RetainedVectorsIndex>(0);
   bridge.setChTable(map, retained);
 

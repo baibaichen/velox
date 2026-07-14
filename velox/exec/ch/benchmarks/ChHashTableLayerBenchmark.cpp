@@ -105,7 +105,6 @@ uint64_t runProbeL1(Engine& engine, const RowVectorPtr& probes) {
   return hits;
 }
 
-template <ch::ArbitraryKeyMode Mode>
 class ChEngine {
  public:
   ChEngine(memory::MemoryPool* pool, const std::vector<RowVectorPtr>& batches)
@@ -120,8 +119,7 @@ class ChEngine {
     for (const auto& child : batches.front()->children()) {
       types.push_back(child->type());
     }
-    return ch::ChHashBuild(
-        0, std::move(channels), std::move(types), pool, Mode);
+    return ch::ChHashBuild(0, std::move(channels), std::move(types), pool);
   }
 
   void startBuild() {
@@ -165,8 +163,14 @@ class ChEngine {
   }
 
   const char* hashModeName() const {
-    return build_.usesHashedKeys() ? "digest128"
-        : build_.usesSerializedKeys() ? "saved_hash" : "fixed";
+    switch (build_.keyMapType()) {
+      case ch::FixedKeyMap::Type::hashed:
+        return "digest128";
+      case ch::FixedKeyMap::Type::key_string:
+        return "saved_hash";
+      default:
+        return "fixed";
+    }
   }
 
  private:
@@ -466,13 +470,9 @@ int main(int argc, char** argv) {
 
   LayerBenchmark benchmark(
       static_cast<vector_size_t>(FLAGS_build_rows), FLAGS_batch_rows);
-  const auto serialized = benchmark.runArm<
-      ChEngine<ch::ArbitraryKeyMode::kSerialized>>("ChSerializedLayer1");
-  const auto hashed = benchmark.runArm<
-      ChEngine<ch::ArbitraryKeyMode::kHashed>>("ChHashedLayer1");
+  const auto ch = benchmark.runArm<ChEngine>("ChLayer1");
   const auto velox = benchmark.runArm<VeloxEngine>("VeloxLayer1");
-  printResult("ch_serialized", serialized);
-  printResult("ch_hashed", hashed);
+  printResult("ch", ch);
   printResult("velox", velox);
   return 0;
 }
