@@ -107,5 +107,21 @@ TEST_F(HashedKeyTest, mapStoresDigestWithoutSavedHash) {
   EXPECT_FALSE(HashedKeyDecoder::hasCheapKeyCalculation);
 }
 
+TEST_F(HashedKeyTest, pinsDigestForFixedKey) {
+  // Characterization test: pins the actual 128-bit digest of a concrete
+  // single-column VARCHAR key ("x") so any change to the hash
+  // function/seed/word-extraction is caught. The distinctness tests above
+  // only prove different keys map to different digests; this locks the
+  // exact mapping. Update these literals if the hash function/seed
+  // intentionally changes.
+  auto strings = makeRowVector({makeFlatVector<std::string>({"x"})});
+  SelectivityVector rows(strings->size());
+  HashedKeyDecoder decoder(strings, {0}, {VARCHAR()}, rows);
+  UInt128 digest;
+  ASSERT_TRUE(decoder.hash(0, digest));
+  EXPECT_EQ(digest.words[0], 0x305d1ecd260d8a7dULL);
+  EXPECT_EQ(digest.words[1], 0x4ff80a75f079d4dfULL);
+}
+
 } // namespace
 } // namespace facebook::velox::exec::ch
