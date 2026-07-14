@@ -314,7 +314,7 @@ TEST_F(ChHashProbeTest, matchesSerializedOverwideFixedKeys) {
   EXPECT_EQ(matches[0].buildRowNo, 1);
 }
 
-TEST_F(ChHashProbeTest, matchesHashedStringKeysIncludingDuplicatesAndEmpty) {
+TEST_F(ChHashProbeTest, matchesStringKeysIncludingDuplicatesAndEmpty) {
   auto buildInput = makeRowVector({
       makeFlatVector<std::string>({"", "alpha", "alpha", "long-string"}),
   });

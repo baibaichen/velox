@@ -30,8 +30,9 @@ class FixedKeyMap {
   /// mirroring ClickHouse's HashJoin method selection. The value is decided
   /// once via chooseType and then dispatched on.
   enum class Type {
-    // TODO: key8/key16/key32/keys32/keys64 are selected by chooseType but not
-    // yet routed to a concrete map; they are placeholders for later tasks.
+    // key32/keys32/keys64 are routed to the 64-bit map via a width fallback;
+    // a dedicated Map32 awaits uint32_t pack support in FixedKeyDecoder.
+    // key8/key16 have no ported map yet and are true NYI placeholders.
     key8,
     key16,
     key32,
