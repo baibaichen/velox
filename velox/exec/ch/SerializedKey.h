@@ -209,8 +209,8 @@ class StringViewKeyDecoder {
 
  private:
   std::unique_ptr<DecodedVector> decoded_;
-  // Backing storage for inlined (< 13-byte) keys read by at().
-  mutable std::array<char, StringView::kInlineSize> inlineStorage_;
+  // Backing storage for inlined keys read by at(); valid until the next at().
+  mutable std::array<char, StringView::kInlineSize> inlineStorage_{};
 };
 
 } // namespace facebook::velox::exec::ch

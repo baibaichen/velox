@@ -85,6 +85,9 @@ std::vector<ProbeHit> joinProbe(
       const auto prefetchRow = probeRow + kPrefetchLookAhead;
       if (usePrefetch && prefetchRow < probe->size()) {
         StringRef prefetchKey;
+        // at() reuses the decoder's inline storage across calls, so prefetchKey
+        // must be consumed (hashed) before the at(probeRow) call below reads the
+        // next row into the same storage.
         if (decoder.at(prefetchRow, prefetchKey)) {
           map.prefetchString(map.hashString(prefetchKey));
         }

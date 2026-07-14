@@ -128,6 +128,8 @@ void ChHashBuild::addInput(RowVectorPtr input) {
     const uint32_t blockNo = packBlockNo(driverNo_, batchNo);
     rows.applyToSelected([&](vector_size_t rowNo) {
       StringRef key;
+      // Each iteration holds a single key; at() reuses the decoder's inline
+      // storage, so key must be fully consumed before the next at() call.
       if (!decoder.at(rowNo, key)) {
         return;
       }
