@@ -16,28 +16,6 @@ add_executable(velox_exec_ch_hash_join_benchmark ChHashJoinBenchmark.cpp)
 add_executable(
   velox_exec_ch_hashtable_layer_benchmark ChHashTableLayerBenchmark.cpp)
 
-find_package(DuckDB CONFIG REQUIRED)
-if(NOT TARGET duckdb_static)
-  include("${DuckDB_DIR}/DuckDBExports.cmake")
-endif()
-
-get_target_property(
-  CH_BENCHMARK_DUCKDB_STATIC
-  duckdb_static
-  IMPORTED_LOCATION_RELEASE
-)
-get_filename_component(
-  CH_BENCHMARK_DUCKDB_LIB_DIR "${CH_BENCHMARK_DUCKDB_STATIC}" DIRECTORY
-)
-target_link_directories(
-  velox_exec_ch_hash_join_benchmark
-  PRIVATE "${CH_BENCHMARK_DUCKDB_LIB_DIR}"
-)
-target_link_directories(
-  velox_exec_ch_hashtable_layer_benchmark
-  PRIVATE "${CH_BENCHMARK_DUCKDB_LIB_DIR}"
-)
-
 target_link_libraries(
   velox_exec_ch_hash_join_benchmark
   velox_exec_ch
