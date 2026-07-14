@@ -305,7 +305,10 @@ inline FixedKeyMap::Type FixedKeyMap::chooseType(
         type->toString());
   }
 
-  // Single numeric key: route by its byte width.
+  // Single numeric key: route to the scalar keyN family by its byte width. The
+  // composite keysN family (below) is reserved for multi-column keys, so this
+  // width test does not overlap with the packing branch — matching ClickHouse's
+  // chooseMethod, which keeps single-key and packed-key paths distinct.
   if (keyTypes.size() == 1 && detail::isFixedIntegerKind(keyTypes[0]->kind())) {
     switch (fixedKeyTypeSize(keyTypes[0]->kind())) {
       case 1:
