@@ -19,6 +19,7 @@
 #include "velox/exec/ch/HashedKey.h"
 #include "velox/exec/ch/HashMap.h"
 
+#include <algorithm>
 #include <optional>
 #include <variant>
 
@@ -26,6 +27,29 @@ namespace facebook::velox::exec::ch {
 
 class FixedKeyMap {
  public:
+  /// Identifies the concrete hash-map variant chosen for the join keys,
+  /// mirroring ClickHouse's HashJoin method selection. The value is decided
+  /// once via chooseType and then dispatched on.
+  enum class Type {
+    // TODO: key8/key16/key32/keys32/keys64 are selected by chooseType but not
+    // yet routed to a concrete map; they are placeholders for later tasks.
+    key8,
+    key16,
+    key32,
+    key64,
+    keys32,
+    keys64,
+    keys128,
+    keys256,
+    key_string,
+    hashed,
+  };
+
+  /// Chooses the map type for the given key columns, faithfully porting
+  /// ClickHouse's chooseMethod decision order. Fails for key kinds outside the
+  /// supported set (integer fixed-width and VARCHAR).
+  static Type chooseType(const std::vector<TypePtr>& keyTypes);
+
   using Map64 = HashMapAll_key64;
   using Map128 = HashMapAll_keys128;
   using Map256 = HashMapAll_keys256;
@@ -250,5 +274,85 @@ class FixedKeyMap {
   ArbitraryKeyMode arbitraryMode_{ArbitraryKeyMode::kSerialized};
   Maps maps_;
 };
+
+namespace detail {
+
+// Returns true when the kind is one of the fixed-width integer kinds supported
+// as a hash-join key.
+inline bool isFixedIntegerKind(TypeKind kind) {
+  switch (kind) {
+    case TypeKind::TINYINT:
+    case TypeKind::SMALLINT:
+    case TypeKind::INTEGER:
+    case TypeKind::BIGINT:
+      return true;
+    default:
+      return false;
+  }
+}
+
+} // namespace detail
+
+inline FixedKeyMap::Type FixedKeyMap::chooseType(
+    const std::vector<TypePtr>& keyTypes) {
+  VELOX_USER_CHECK(!keyTypes.empty(), "hash join requires at least one key");
+  for (const auto& type : keyTypes) {
+    VELOX_USER_CHECK_NOT_NULL(type);
+    VELOX_USER_CHECK(
+        detail::isFixedIntegerKind(type->kind()) ||
+            type->kind() == TypeKind::VARCHAR,
+        "hash join key supports integer fixed-width and VARCHAR keys, got {}",
+        type->toString());
+  }
+
+  // Single numeric key: route by its byte width.
+  if (keyTypes.size() == 1 && detail::isFixedIntegerKind(keyTypes[0]->kind())) {
+    switch (fixedKeyTypeSize(keyTypes[0]->kind())) {
+      case 1:
+        return Type::key8;
+      case 2:
+        return Type::key16;
+      case 4:
+        return Type::key32;
+      case 8:
+        return Type::key64;
+    }
+    VELOX_UNREACHABLE();
+  }
+
+  // All keys are fixed-width integers: pack by total bytes.
+  const bool allFixedInteger = std::all_of(
+      keyTypes.begin(), keyTypes.end(), [](const TypePtr& type) {
+        return detail::isFixedIntegerKind(type->kind());
+      });
+  if (allFixedInteger) {
+    size_t bytes = 0;
+    for (const auto& type : keyTypes) {
+      bytes += fixedKeyTypeSize(type->kind());
+    }
+    if (bytes <= 4) {
+      return Type::keys32;
+    }
+    if (bytes <= 8) {
+      return Type::keys64;
+    }
+    if (bytes <= 16) {
+      return Type::keys128;
+    }
+    if (bytes <= 32) {
+      return Type::keys256;
+    }
+    // Fixed keys totaling more than 32 bytes fall back to hashed.
+    return Type::hashed;
+  }
+
+  // Single VARCHAR key.
+  if (keyTypes.size() == 1 && keyTypes[0]->kind() == TypeKind::VARCHAR) {
+    return Type::key_string;
+  }
+
+  // Multiple strings, a string+int mix, or any other combination.
+  return Type::hashed;
+}
 
 } // namespace facebook::velox::exec::ch
