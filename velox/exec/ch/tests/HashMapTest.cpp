@@ -78,6 +78,17 @@ TEST_F(HashMapTest, fixedWidthCellsDoNotStoreSavedHash) {
   EXPECT_EQ(sizeof(HashMapAll_keys256::cell_type), 40);
 }
 
+TEST_F(HashMapTest, hashedDigestUsesLowWordWithoutRehashing) {
+  const UInt128 digest{{0x0123456789abcdefULL, 0xfedcba9876543210ULL}};
+  EXPECT_EQ(UInt128TrivialHash{}(digest), digest.words[0]);
+
+  HashMapAll_hashed map(mapPool_.get());
+  EXPECT_EQ(map.hash(digest), digest.words[0]);
+  EXPECT_TRUE((std::is_same_v<
+               HashMapAll_hashed::cell_type,
+               HashMapCell<UInt128, RowRefList, UInt128TrivialHash>>));
+}
+
 TEST_F(HashMapTest, emplaceReturnsLiveCoordinateMapping) {
   HashMapAll_key64 map(mapPool_.get());
   Arena arena(arenaPool_.get());

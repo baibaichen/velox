@@ -56,6 +56,11 @@ struct HashWide {
     return hash;
   }
 };
+struct UInt128TrivialHash {
+  size_t operator()(const UInt128& key) const {
+    return key.words[0];
+  }
+};
 
 template <typename First, typename Second>
 struct PairNoInit {
@@ -250,9 +255,9 @@ using HashMapAll_serialized = HashMapTable<
 // Digest equality is final: hashed cells intentionally retain no original key bytes
 // or saved hash and therefore cannot verify collisions. Keep a distinct map
 // type because FixedKeyMap stores hashed and fixed UInt128 maps in one variant.
-class HashMapAll_hashed : public HashMapAll<UInt128, HashWide<UInt128>> {
+class HashMapAll_hashed : public HashMapAll<UInt128, UInt128TrivialHash> {
  public:
-  using HashMapAll<UInt128, HashWide<UInt128>>::HashMapAll;
+  using HashMapAll<UInt128, UInt128TrivialHash>::HashMapAll;
 };
 
 static_assert(std::is_trivially_copyable_v<RowRefList>);
