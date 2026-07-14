@@ -34,6 +34,7 @@ velox_add_library(
     EmitGather.h
     HashMap.h
     FixedKey.h
+    HashedKey.h
     HashTable.h
     FixedKeyMap.h
     SerializedKey.h

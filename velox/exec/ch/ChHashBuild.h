@@ -40,6 +40,13 @@ class ChHashBuild {
       std::vector<TypePtr> keyTypes,
       memory::MemoryPool* pool);
 
+  ChHashBuild(
+      uint32_t driverNo,
+      std::vector<column_index_t> keyChannels,
+      std::vector<TypePtr> keyTypes,
+      memory::MemoryPool* pool,
+      ArbitraryKeyMode arbitraryMode);
+
   void reserve(size_t expectedDistinctKeys);
 
   void prepareJoinTable(
@@ -87,14 +94,21 @@ class ChHashBuild {
     return rowsByKey().serialized();
   }
 
+  bool usesHashedKeys() const {
+    return rowsByKey().hashed();
+  }
+
   std::shared_ptr<JoinMap> takeMap();
 
   std::shared_ptr<RetainedVectorsIndex> takeRetained();
 
  private:
   struct BuildStorage {
-    BuildStorage(memory::MemoryPool* pool, const std::vector<TypePtr>& keyTypes)
-        : arena(pool), rowsByKey(pool, keyTypes) {}
+    BuildStorage(
+        memory::MemoryPool* pool,
+        const std::vector<TypePtr>& keyTypes,
+        ArbitraryKeyMode arbitraryMode)
+        : arena(pool), rowsByKey(pool, keyTypes, arbitraryMode) {}
 
     Arena arena;
     JoinMap rowsByKey;

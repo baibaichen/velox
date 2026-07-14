@@ -17,6 +17,7 @@
 #include "velox/exec/ch/ChHashProbe.h"
 
 #include "velox/common/base/Exceptions.h"
+#include "velox/exec/ch/HashedKey.h"
 #include "velox/exec/ch/RowRef.h"
 #include "velox/exec/ch/SerializedKey.h"
 #include "velox/vector/DecodedVector.h"
@@ -63,6 +64,22 @@ std::vector<ProbeHit> joinProbe(
   VELOX_CHECK_NOT_NULL(probe);
   SelectivityVector rows(probe->size());
 
+  if (map.hashed()) {
+    HashedKeyDecoder decoder(probe, probeKeyChannels, map.keyTypes(), rows);
+    std::vector<ProbeHit> hits;
+    hits.reserve(probe->size());
+    for (vector_size_t probeRow = 0; probeRow < probe->size(); ++probeRow) {
+      UInt128 digest;
+      if (!decoder.hash(probeRow, digest)) {
+        continue;
+      }
+      const auto* cell = map.findHashed(digest);
+      if (cell != nullptr) {
+        hits.push_back({probeRow, &cell->getMapped()});
+      }
+    }
+    return hits;
+  }
   if (map.serialized()) {
     SerializedKeyDecoder decoder(
         probe, probeKeyChannels, map.keyTypes(), rows);

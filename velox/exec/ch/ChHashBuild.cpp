@@ -17,6 +17,7 @@
 #include "velox/exec/ch/ChHashBuild.h"
 
 #include "velox/common/base/Exceptions.h"
+#include "velox/exec/ch/HashedKey.h"
 #include "velox/exec/ch/RowRef.h"
 #include "velox/exec/ch/SerializedKey.h"
 
@@ -42,14 +43,26 @@ ChHashBuild::ChHashBuild(
     std::vector<column_index_t> keyChannels,
     std::vector<TypePtr> keyTypes,
     memory::MemoryPool* pool)
+    : ChHashBuild(
+          driverNo,
+          std::move(keyChannels),
+          std::move(keyTypes),
+          pool,
+          ArbitraryKeyMode::kSerialized) {}
+
+ChHashBuild::ChHashBuild(
+    uint32_t driverNo,
+    std::vector<column_index_t> keyChannels,
+    std::vector<TypePtr> keyTypes,
+    memory::MemoryPool* pool,
+    ArbitraryKeyMode arbitraryMode)
     : driverNo_(driverNo),
       keyChannels_(std::move(keyChannels)),
       keyTypes_(std::move(keyTypes)),
       retainedIndex_(std::make_shared<RetainedVectorsIndex>(driverNo)),
-      storage_(std::make_shared<BuildStorage>(pool, keyTypes_)) {
+      storage_(std::make_shared<BuildStorage>(pool, keyTypes_, arbitraryMode)) {
   VELOX_USER_CHECK_EQ(keyChannels_.size(), keyTypes_.size());
 }
-
 void ChHashBuild::reserve(size_t expectedDistinctKeys) {
   VELOX_CHECK(needsInput_, "Cannot reserve after noMoreInput");
   VELOX_CHECK(storage_->rowsByKey.empty(), "Cannot reserve after build starts");
@@ -118,6 +131,21 @@ void ChHashBuild::addInput(RowVectorPtr input) {
     VELOX_CHECK_EQ(input->childAt(keyChannels_[i])->type(), keyTypes_[i]);
   }
 
+  if (storage_->rowsByKey.hashed()) {
+    HashedKeyDecoder decoder(input, keyChannels_, keyTypes_, rows);
+    const uint32_t batchNo = retainedIndex_->add(input);
+    const uint32_t blockNo = packBlockNo(driverNo_, batchNo);
+    rows.applyToSelected([&](vector_size_t rowNo) {
+      UInt128 digest;
+      if (!decoder.hash(rowNo, digest)) {
+        return;
+      }
+      storage_->rowsByKey.emplaceHashed(digest).insert(
+          RowRef(blockNo, static_cast<uint32_t>(rowNo)).encode(),
+          storage_->arena);
+    });
+    return;
+  }
   if (storage_->rowsByKey.serialized()) {
     SerializedKeyDecoder decoder(input, keyChannels_, keyTypes_, rows);
     std::string bytes;

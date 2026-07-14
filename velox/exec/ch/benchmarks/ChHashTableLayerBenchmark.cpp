@@ -105,6 +105,7 @@ uint64_t runProbeL1(Engine& engine, const RowVectorPtr& probes) {
   return hits;
 }
 
+template <ch::ArbitraryKeyMode Mode>
 class ChEngine {
  public:
   ChEngine(memory::MemoryPool* pool, const std::vector<RowVectorPtr>& batches)
@@ -119,7 +120,8 @@ class ChEngine {
     for (const auto& child : batches.front()->children()) {
       types.push_back(child->type());
     }
-    return ch::ChHashBuild(0, std::move(channels), std::move(types), pool);
+    return ch::ChHashBuild(
+        0, std::move(channels), std::move(types), pool, Mode);
   }
 
   void startBuild() {
@@ -163,7 +165,8 @@ class ChEngine {
   }
 
   const char* hashModeName() const {
-    return "saved_hash";
+    return build_.usesHashedKeys() ? "digest128"
+        : build_.usesSerializedKeys() ? "saved_hash" : "fixed";
   }
 
  private:
@@ -179,29 +182,25 @@ class VeloxEngine {
   VeloxEngine(
       memory::MemoryPool* pool,
       const std::vector<RowVectorPtr>& batches)
-      : pool_(pool) {
-    const auto numKeys = batches.front()->childrenSize();
-    std::vector<TypePtr> keyTypes;
-    keyTypes.reserve(numKeys);
+      : pool_(pool), batches_(batches) {
+    const auto numKeys = batches_.front()->childrenSize();
+    keyTypes_.reserve(numKeys);
     std::vector<std::unique_ptr<VectorHasher>> hashers;
     for (column_index_t channel = 0; channel < numKeys; ++channel) {
-      keyTypes.push_back(batches.front()->childAt(channel)->type());
+      keyTypes_.push_back(batches_.front()->childAt(channel)->type());
       hashers.push_back(std::make_unique<VectorHasher>(
-          batches.front()->childAt(channel)->type(), channel));
+          batches_.front()->childAt(channel)->type(), channel));
     }
     table_ = HashTable<true>::createForJoin(
-        std::move(hashers),
-        {},
-        true,
-        false,
-        false,
-        1'000,
-        pool_);
+        std::move(hashers), {}, true, false, false, 1'000, pool_);
+  }
 
-    const bool requireGenericHash = ch::useSerializedKey(keyTypes);
-    decodedKeys_.reserve(batches.size());
-    selectedRows_.reserve(batches.size());
-    for (const auto& batch : batches) {
+  void startBuild() {
+    const auto numKeys = batches_.front()->childrenSize();
+    const bool requireGenericHash = ch::useSerializedKey(keyTypes_);
+    decodedKeys_.reserve(batches_.size());
+    selectedRows_.reserve(batches_.size());
+    for (const auto& batch : batches_) {
       selectedRows_.push_back(
           std::make_unique<SelectivityVector>(batch->size()));
       std::vector<std::unique_ptr<DecodedVector>> decoded;
@@ -219,9 +218,6 @@ class VeloxEngine {
       decodedKeys_.push_back(std::move(decoded));
     }
   }
-
-  void startBuild() {}
-
   void buildBatch(size_t index) {
     auto* rows = table_->rows();
     selectedRows_[index]->applyToSelected([&](vector_size_t row) {
@@ -292,6 +288,8 @@ class VeloxEngine {
 
  private:
   memory::MemoryPool* pool_;
+  std::vector<RowVectorPtr> batches_;
+  std::vector<TypePtr> keyTypes_;
   std::unique_ptr<HashTable<true>> table_;
   std::unique_ptr<HashLookup> lookup_;
   std::vector<std::unique_ptr<SelectivityVector>> selectedRows_;
@@ -468,9 +466,13 @@ int main(int argc, char** argv) {
 
   LayerBenchmark benchmark(
       static_cast<vector_size_t>(FLAGS_build_rows), FLAGS_batch_rows);
-  const auto ch = benchmark.runArm<ChEngine>("ChLayer1");
+  const auto serialized = benchmark.runArm<
+      ChEngine<ch::ArbitraryKeyMode::kSerialized>>("ChSerializedLayer1");
+  const auto hashed = benchmark.runArm<
+      ChEngine<ch::ArbitraryKeyMode::kHashed>>("ChHashedLayer1");
   const auto velox = benchmark.runArm<VeloxEngine>("VeloxLayer1");
-  printResult("ch", ch);
+  printResult("ch_serialized", serialized);
+  printResult("ch_hashed", hashed);
   printResult("velox", velox);
   return 0;
 }

@@ -16,8 +16,8 @@
 
 #pragma once
 
+#include "velox/exec/ch/HashedKey.h"
 #include "velox/exec/ch/HashMap.h"
-#include "velox/exec/ch/SerializedKey.h"
 
 #include <optional>
 #include <variant>
@@ -30,6 +30,7 @@ class FixedKeyMap {
   using Map128 = HashMapAll_keys128;
   using Map256 = HashMapAll_keys256;
   using SerializedMap = HashMapAll_serialized;
+  using HashedMap = HashMapAll_hashed;
 
   explicit FixedKeyMap(memory::MemoryPool* pool)
       : FixedKeyMap(pool, FixedKeyWidth::k64) {}
@@ -38,18 +39,31 @@ class FixedKeyMap {
       : width_(width), maps_(makeFixedMap(pool, width)) {}
 
   FixedKeyMap(memory::MemoryPool* pool, std::vector<TypePtr> keyTypes)
+      : FixedKeyMap(
+            pool, std::move(keyTypes), ArbitraryKeyMode::kSerialized) {}
+
+  FixedKeyMap(
+      memory::MemoryPool* pool,
+      std::vector<TypePtr> keyTypes,
+      ArbitraryKeyMode arbitraryMode)
       : keyTypes_(std::move(keyTypes)),
         width_(useSerializedKey(keyTypes_)
                    ? std::nullopt
                    : std::optional<FixedKeyWidth>(fixedKeyWidth(keyTypes_))),
-        maps_(makeMap(pool, keyTypes_, width_)) {}
+        arbitraryMode_(arbitraryMode),
+        maps_(makeMap(pool, width_, arbitraryMode_)) {}
 
   bool serialized() const {
-    return !width_.has_value();
+    return !width_.has_value() &&
+        arbitraryMode_ == ArbitraryKeyMode::kSerialized;
+  }
+
+  bool hashed() const {
+    return !width_.has_value() && arbitraryMode_ == ArbitraryKeyMode::kHashed;
   }
 
   FixedKeyWidth width() const {
-    VELOX_CHECK(width_.has_value(), "Serialized map has no fixed key width");
+    VELOX_CHECK(width_.has_value(), "Arbitrary map has no fixed key width");
     return *width_;
   }
 
@@ -95,6 +109,10 @@ class FixedKeyMap {
     return serializedMap().emplace(key);
   }
 
+  RowRefList& emplaceHashed(const UInt128& key) {
+    return hashedMap().emplace(key);
+  }
+
   Map64::LookupResult find(uint64_t key) {
     return map64().find(key);
   }
@@ -127,6 +145,14 @@ class FixedKeyMap {
     return serializedMap().find(key);
   }
 
+  HashedMap::LookupResult findHashed(const UInt128& key) {
+    return hashedMap().find(key);
+  }
+
+  HashedMap::ConstLookupResult findHashed(const UInt128& key) const {
+    return hashedMap().find(key);
+  }
+
   auto begin() const {
     return map64().begin();
   }
@@ -147,7 +173,8 @@ class FixedKeyMap {
   }
 
  private:
-  using Maps = std::variant<Map64, Map128, Map256, SerializedMap>;
+  using Maps =
+      std::variant<Map64, Map128, Map256, SerializedMap, HashedMap>;
 
   static Maps makeFixedMap(memory::MemoryPool* pool, FixedKeyWidth width) {
     switch (width) {
@@ -163,10 +190,13 @@ class FixedKeyMap {
 
   static Maps makeMap(
       memory::MemoryPool* pool,
-      const std::vector<TypePtr>&,
-      const std::optional<FixedKeyWidth>& width) {
-    return width.has_value()
-        ? makeFixedMap(pool, *width)
+      const std::optional<FixedKeyWidth>& width,
+      ArbitraryKeyMode arbitraryMode) {
+    if (width.has_value()) {
+      return makeFixedMap(pool, *width);
+    }
+    return arbitraryMode == ArbitraryKeyMode::kHashed
+        ? Maps(std::in_place_type<HashedMap>, pool)
         : Maps(std::in_place_type<SerializedMap>, pool);
   }
 
@@ -208,9 +238,16 @@ class FixedKeyMap {
   const SerializedMap& serializedMap() const {
     return std::get<SerializedMap>(maps_);
   }
+  HashedMap& hashedMap() {
+    return std::get<HashedMap>(maps_);
+  }
+  const HashedMap& hashedMap() const {
+    return std::get<HashedMap>(maps_);
+  }
 
   std::vector<TypePtr> keyTypes_;
   std::optional<FixedKeyWidth> width_;
+  ArbitraryKeyMode arbitraryMode_{ArbitraryKeyMode::kSerialized};
   Maps maps_;
 };
 
