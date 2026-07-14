@@ -23,15 +23,6 @@
 
 namespace facebook::velox::exec::ch {
 
-namespace {
-
-StringRef stringRef(const std::string& bytes) {
-  VELOX_CHECK_LE(bytes.size(), std::numeric_limits<uint32_t>::max());
-  return {bytes.data(), static_cast<uint32_t>(bytes.size())};
-}
-
-} // namespace
-
 ChHashBuild::ChHashBuild(
     uint32_t driverNo,
     column_index_t keyChannel,
@@ -132,28 +123,26 @@ void ChHashBuild::addInput(RowVectorPtr input) {
     return;
   }
   if (storage_->rowsByKey.type() == FixedKeyMap::Type::key_string) {
-    SerializedKeyDecoder decoder(input, keyChannels_, keyTypes_, rows);
-    std::string bytes;
-    rows.applyToSelected([&](vector_size_t rowNo) {
-      if (!decoder.serialize(rowNo, bytes)) {
-        return;
-      }
-      const auto temporary = stringRef(bytes);
-      if (storage_->rowsByKey.find(temporary) == nullptr) {
-        const StringRef persisted{
-            storage_->arena.insert(temporary.data, temporary.size),
-            temporary.size};
-        storage_->rowsByKey.emplace(persisted);
-      }
-    });
-
+    StringViewKeyDecoder decoder(input, keyChannels_, keyTypes_, rows);
     const uint32_t batchNo = retainedIndex_->add(input);
     const uint32_t blockNo = packBlockNo(driverNo_, batchNo);
     rows.applyToSelected([&](vector_size_t rowNo) {
-      if (!decoder.serialize(rowNo, bytes)) {
+      StringRef key;
+      if (!decoder.at(rowNo, key)) {
         return;
       }
-      auto* cell = storage_->rowsByKey.find(stringRef(bytes));
+      // Hash once; reuse for the lookup, the emplace, and the re-find.
+      const auto hashValue = storage_->rowsByKey.hashString(key);
+      if (storage_->rowsByKey.find(key, hashValue) == nullptr) {
+        // Persist the key bytes: the input column buffer is released after the
+        // batch, but the transient StringRef is fine for the lookup above.
+        const StringRef persisted{
+            storage_->arena.insert(key.data, key.size), key.size};
+        storage_->rowsByKey.emplace(persisted, hashValue);
+      }
+      // Re-find after the possible emplace: an emplace may resize the table and
+      // invalidate any cell reference, so fetch the current cell before insert.
+      auto* cell = storage_->rowsByKey.find(key, hashValue);
       VELOX_CHECK_NOT_NULL(cell);
       cell->getMapped().insert(
           RowRef(blockNo, static_cast<uint32_t>(rowNo)).encode(),

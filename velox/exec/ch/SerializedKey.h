@@ -22,6 +22,7 @@
 #include "velox/vector/DecodedVector.h"
 #include "velox/vector/SelectivityVector.h"
 
+#include <array>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -154,6 +155,62 @@ class SerializedKeyDecoder {
   std::vector<column_index_t> channels_;
   std::vector<TypePtr> keyTypes_;
   std::vector<std::unique_ptr<DecodedVector>> decodedKeys_;
+};
+
+/// Zero-copy key decoder for a single VARCHAR key, mirroring ClickHouse's
+/// HashMethodString. Instead of serializing each row into a std::string, it
+/// exposes the column's own char buffer as a StringRef, avoiding a per-row
+/// copy. Only valid for the key_string map, which chooseType selects solely for
+/// a single VARCHAR key.
+class StringViewKeyDecoder {
+ public:
+  StringViewKeyDecoder(
+      const RowVectorPtr& input,
+      const std::vector<column_index_t>& channels,
+      const std::vector<TypePtr>& keyTypes,
+      const SelectivityVector& rows) {
+    VELOX_CHECK_NOT_NULL(input);
+    VELOX_USER_CHECK_EQ(
+        channels.size(), 1, "StringViewKeyDecoder requires a single key");
+    VELOX_USER_CHECK_EQ(keyTypes.size(), 1);
+    VELOX_USER_CHECK_EQ(
+        keyTypes[0]->kind(),
+        TypeKind::VARCHAR,
+        "StringViewKeyDecoder requires a VARCHAR key");
+    const auto channel = channels[0];
+    VELOX_USER_CHECK_LT(channel, input->childrenSize());
+    auto key = input->childAt(channel)->loadedVector();
+    VELOX_USER_CHECK_EQ(key->type(), keyTypes[0]);
+    decoded_ = std::make_unique<DecodedVector>(*key, rows);
+  }
+
+  /// Reads the key at the given row as a StringRef. Returns false for null
+  /// keys, matching the skip semantics of SerializedKeyDecoder::serialize. For
+  /// keys under 13 bytes StringView stores the bytes inline, so the returned
+  /// StringRef points into inlineStorage_; it stays valid until the next at()
+  /// call. Longer keys reference the column buffer directly (zero-copy).
+  bool at(vector_size_t row, StringRef& key) const {
+    if (decoded_->isNullAt(row)) {
+      return false;
+    }
+    const auto value = decoded_->valueAt<StringView>(row);
+    VELOX_USER_CHECK_LE(value.size(), std::numeric_limits<uint32_t>::max());
+    const auto size = static_cast<uint32_t>(value.size());
+    if (value.isInline()) {
+      // Inlined bytes live inside the temporary StringView; copy them into
+      // stable storage so the StringRef does not dangle across map operations.
+      std::memcpy(inlineStorage_.data(), value.data(), size);
+      key = StringRef{inlineStorage_.data(), size};
+    } else {
+      key = StringRef{value.data(), size};
+    }
+    return true;
+  }
+
+ private:
+  std::unique_ptr<DecodedVector> decoded_;
+  // Backing storage for inlined (< 13-byte) keys read by at().
+  mutable std::array<char, StringView::kInlineSize> inlineStorage_;
 };
 
 } // namespace facebook::velox::exec::ch

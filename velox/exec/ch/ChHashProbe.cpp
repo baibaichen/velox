@@ -28,11 +28,6 @@ namespace facebook::velox::exec::ch {
 namespace {
 constexpr vector_size_t kPrefetchLookAhead = 16;
 constexpr size_t kMinTableBytesForPrefetch = 8UL << 20;
-
-StringRef stringRef(const std::string& bytes) {
-  VELOX_CHECK_LE(bytes.size(), std::numeric_limits<uint32_t>::max());
-  return {bytes.data(), static_cast<uint32_t>(bytes.size())};
-}
 } // namespace
 
 std::vector<ProbeHit> joinProbe(
@@ -81,16 +76,25 @@ std::vector<ProbeHit> joinProbe(
     return hits;
   }
   if (map.type() == FixedKeyMap::Type::key_string) {
-    SerializedKeyDecoder decoder(
-        probe, probeKeyChannels, map.keyTypes(), rows);
+    StringViewKeyDecoder decoder(probe, probeKeyChannels, map.keyTypes(), rows);
     std::vector<ProbeHit> hits;
     hits.reserve(probe->size());
-    std::string keyBytes;
+    const bool usePrefetch =
+        map.getBufferSizeInBytes() > kMinTableBytesForPrefetch;
     for (vector_size_t probeRow = 0; probeRow < probe->size(); ++probeRow) {
-      if (!decoder.serialize(probeRow, keyBytes)) {
+      const auto prefetchRow = probeRow + kPrefetchLookAhead;
+      if (usePrefetch && prefetchRow < probe->size()) {
+        StringRef prefetchKey;
+        if (decoder.at(prefetchRow, prefetchKey)) {
+          map.prefetchString(map.hashString(prefetchKey));
+        }
+      }
+
+      StringRef key;
+      if (!decoder.at(probeRow, key)) {
         continue;
       }
-      const auto* cell = map.find(stringRef(keyBytes));
+      const auto* cell = map.find(key, map.hashString(key));
       if (cell != nullptr) {
         hits.push_back({probeRow, &cell->getMapped()});
       }

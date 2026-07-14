@@ -148,6 +148,15 @@ class FixedKeyMap {
     return keyStringMap().emplace(key);
   }
 
+  // Inserts a string key using a precomputed hash, avoiding a rehash. The key
+  // bytes must outlive the map (persisted in the arena).
+  RowRefList& emplace(const StringRef& key, size_t hashValue) {
+    KeyStringMap::LookupResult result;
+    bool inserted;
+    keyStringMap().emplace(key, result, inserted, hashValue);
+    return result->getMapped();
+  }
+
   RowRefList& emplaceHashed(const UInt128& key) {
     return hashedMap().emplace(key);
   }
@@ -208,6 +217,16 @@ class FixedKeyMap {
     return keyStringMap().find(key);
   }
 
+  // Looks up a string key using a precomputed hash, avoiding a rehash.
+  KeyStringMap::LookupResult find(const StringRef& key, size_t hashValue) {
+    return keyStringMap().find(key, hashValue);
+  }
+
+  KeyStringMap::ConstLookupResult find(const StringRef& key, size_t hashValue)
+      const {
+    return keyStringMap().find(key, hashValue);
+  }
+
   HashedMap::LookupResult findHashed(const UInt128& key) {
     return hashedMap().find(key);
   }
@@ -233,6 +252,17 @@ class FixedKeyMap {
   void prefetch(const Key& key) const {
     const auto& typedMap = map<Key>();
     typedMap.prefetchByHash(typedMap.hash(key));
+  }
+
+  // Returns the hash of a string key for the key_string map, letting callers
+  // compute it once and reuse it across find/emplace/prefetch.
+  size_t hashString(const StringRef& key) const {
+    return keyStringMap().hash(key);
+  }
+
+  // Prefetches the string map bucket for a precomputed hash.
+  void prefetchString(size_t hashValue) const {
+    keyStringMap().prefetchByHash(hashValue);
   }
 
  private:
