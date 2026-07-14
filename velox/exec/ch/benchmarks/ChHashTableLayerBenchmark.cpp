@@ -163,14 +163,31 @@ class ChEngine {
   }
 
   const char* hashModeName() const {
+    // Report the authoritative map Type one-to-one; no default so a future
+    // Type triggers -Wswitch.
     switch (build_.keyMapType()) {
-      case ch::FixedKeyMap::Type::hashed:
-        return "digest128";
+      case ch::FixedKeyMap::Type::key8:
+        return "key8";
+      case ch::FixedKeyMap::Type::key16:
+        return "key16";
+      case ch::FixedKeyMap::Type::key32:
+        return "key32";
+      case ch::FixedKeyMap::Type::key64:
+        return "key64";
+      case ch::FixedKeyMap::Type::keys32:
+        return "keys32";
+      case ch::FixedKeyMap::Type::keys64:
+        return "keys64";
+      case ch::FixedKeyMap::Type::keys128:
+        return "keys128";
+      case ch::FixedKeyMap::Type::keys256:
+        return "keys256";
       case ch::FixedKeyMap::Type::key_string:
-        return "saved_hash";
-      default:
-        return "fixed";
+        return "key_string";
+      case ch::FixedKeyMap::Type::hashed:
+        return "hashed";
     }
+    VELOX_UNREACHABLE();
   }
 
  private:
