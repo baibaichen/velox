@@ -230,10 +230,35 @@ class StringViewKeyDecoder {
     return true;
   }
 
+  /// Reads a look-ahead key for software prefetching. Behaves like at() but uses
+  /// a separate inline buffer, so it never clobbers the StringRef returned by
+  /// at() for the current row. The build path consumes the current row's key
+  /// (find/emplace/arena) after issuing the prefetch, so the two must not share
+  /// storage. The returned StringRef stays valid until the next atForPrefetch()
+  /// call.
+  bool atForPrefetch(vector_size_t row, StringRef& key) const {
+    if (decoded_->isNullAt(row)) {
+      return false;
+    }
+    const auto value = decoded_->valueAt<StringView>(row);
+    VELOX_USER_CHECK_LE(value.size(), std::numeric_limits<uint32_t>::max());
+    const auto size = static_cast<uint32_t>(value.size());
+    if (value.isInline()) {
+      std::memcpy(prefetchStorage_.data(), value.data(), size);
+      key = StringRef{prefetchStorage_.data(), size};
+    } else {
+      key = StringRef{value.data(), size};
+    }
+    return true;
+  }
+
  private:
   std::unique_ptr<DecodedVector> decoded_;
   // Backing storage for inlined keys read by at(); valid until the next at().
   mutable std::array<char, StringView::kInlineSize> inlineStorage_{};
+  // Separate backing storage for atForPrefetch(), so look-ahead reads do not
+  // clobber the current row's key held in inlineStorage_.
+  mutable std::array<char, StringView::kInlineSize> prefetchStorage_{};
 };
 
 } // namespace facebook::velox::exec::ch
