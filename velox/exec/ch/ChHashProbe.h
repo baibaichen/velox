@@ -54,6 +54,21 @@ std::vector<ProbeHit> joinProbe(
     const RowVectorPtr& probe,
     const std::vector<column_index_t>& probeKeyChannels);
 
+/// Probes the layer-1 hash table and returns only the number of matched probe
+/// rows, without materializing the matched RowRefLists into a ProbeHit vector.
+/// Mirrors joinProbe's find loop (including probe-side prefetch) so a caller
+/// that only needs the hit count pays no second-layer collection cost. Used by
+/// the layer benchmark to measure pure layer-1 probe work.
+size_t joinProbeCount(
+    const ChHashBuild::JoinMap& map,
+    const RowVectorPtr& probe,
+    const std::vector<column_index_t>& probeKeyChannels);
+
+size_t joinProbeCount(
+    const ChHashBuild& build,
+    const RowVectorPtr& probe,
+    const std::vector<column_index_t>& probeKeyChannels);
+
 std::vector<ProbeMatch> listJoinResults(
     const std::vector<ProbeHit>& hits,
     const RetainedVectorsIndex& retained);

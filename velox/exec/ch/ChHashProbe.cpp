@@ -154,6 +154,104 @@ std::vector<ProbeHit> joinProbe(
   VELOX_UNREACHABLE();
 }
 
+size_t joinProbeCount(
+    const ChHashBuild::JoinMap& map,
+    const RowVectorPtr& probe,
+    const std::vector<column_index_t>& probeKeyChannels) {
+  VELOX_CHECK_NOT_NULL(probe);
+  SelectivityVector rows(probe->size());
+
+  if (map.type() == FixedKeyMap::Type::hashed) {
+    HashedKeyDecoder decoder(probe, probeKeyChannels, map.keyTypes(), rows);
+    size_t count = 0;
+    for (vector_size_t probeRow = 0; probeRow < probe->size(); ++probeRow) {
+      UInt128 digest;
+      if (!decoder.hash(probeRow, digest)) {
+        continue;
+      }
+      count += map.findHashed(digest) != nullptr;
+    }
+    return count;
+  }
+  if (map.type() == FixedKeyMap::Type::key_string) {
+    StringViewKeyDecoder decoder(probe, probeKeyChannels, map.keyTypes(), rows);
+    size_t count = 0;
+    const bool usePrefetch =
+        map.getBufferSizeInBytes() > kMinTableBytesForPrefetch;
+    for (vector_size_t probeRow = 0; probeRow < probe->size(); ++probeRow) {
+      const auto prefetchRow = probeRow + kPrefetchLookAhead;
+      if (usePrefetch && prefetchRow < probe->size()) {
+        StringRef prefetchKey;
+        // at() reuses the decoder's inline storage across calls, so prefetchKey
+        // must be consumed (hashed) before the at(probeRow) call below reads the
+        // next row into the same storage.
+        if (decoder.at(prefetchRow, prefetchKey)) {
+          map.prefetchString(map.hashString(prefetchKey));
+        }
+      }
+
+      StringRef key;
+      if (!decoder.at(probeRow, key)) {
+        continue;
+      }
+      count += map.find(key, map.hashString(key)) != nullptr;
+    }
+    return count;
+  }
+
+  FixedKeyDecoder decoder(probe, probeKeyChannels, rows);
+  VELOX_CHECK(decoder.width() == map.width());
+
+  const auto probeKeys = [&]<typename Key>() -> size_t {
+    decoder.packAll<Key>();
+    size_t count = 0;
+    const bool usePrefetch =
+        FixedKeyDecoder::hasCheapKeyCalculation &&
+        map.getBufferSizeInBytes() > kMinTableBytesForPrefetch;
+    for (vector_size_t probeRow = 0; probeRow < probe->size(); ++probeRow) {
+      const auto prefetchRow = probeRow + kPrefetchLookAhead;
+      if (usePrefetch && prefetchRow < probe->size()) {
+        if (!decoder.mayHaveNulls() ||
+            decoder.hasPackedKeyAt(prefetchRow)) {
+          map.prefetch(decoder.packedAt<Key>(prefetchRow));
+        }
+      }
+
+      if (decoder.mayHaveNulls() &&
+          !decoder.hasPackedKeyAt(probeRow)) {
+        continue;
+      }
+      count += map.find(decoder.packedAt<Key>(probeRow)) != nullptr;
+    }
+    return count;
+  };
+
+  // Fixed-integer variants dispatch a second time by packed key width.
+  switch (map.width()) {
+    case FixedKeyWidth::k8:
+      return probeKeys.template operator()<uint8_t>();
+    case FixedKeyWidth::k16:
+      return probeKeys.template operator()<uint16_t>();
+    case FixedKeyWidth::k32:
+      return probeKeys.template operator()<uint32_t>();
+    case FixedKeyWidth::k64:
+      return probeKeys.template operator()<uint64_t>();
+    case FixedKeyWidth::k128:
+      return probeKeys.template operator()<UInt128>();
+    case FixedKeyWidth::k256:
+      return probeKeys.template operator()<UInt256>();
+  }
+  VELOX_UNREACHABLE();
+}
+
+size_t joinProbeCount(
+    const ChHashBuild& build,
+    const RowVectorPtr& probe,
+    const std::vector<column_index_t>& probeKeyChannels) {
+  VELOX_CHECK_EQ(build.keyChannels().size(), probeKeyChannels.size());
+  return joinProbeCount(build.rowsByKey(), probe, probeKeyChannels);
+}
+
 std::vector<ProbeMatch> listJoinResults(
     const std::vector<ProbeHit>& hits,
     const RetainedVectorsIndex& retained) {

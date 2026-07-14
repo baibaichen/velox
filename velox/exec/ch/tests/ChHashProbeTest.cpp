@@ -100,6 +100,20 @@ TEST_F(ChHashProbeTest, separatesProbeHitsFromDuplicateExpansion) {
   }
 }
 
+TEST_F(ChHashProbeTest, countsMatchedProbeRowsWithoutExpansion) {
+  ChHashBuild build(kDriverNo, 0, pool());
+  build.addInput(makeInput({10, 20, 20, std::nullopt}, 100));
+  build.addInput(makeInput({20, 30, 10}, 200));
+
+  auto probe = makeInput({20, 99, std::nullopt, 10});
+  // Two probe rows match (20 and 10); joinProbeCount counts matched probe rows,
+  // not the five expanded duplicates that joinProbe's hits fan out to.
+  const std::vector<column_index_t> channels{0};
+  EXPECT_EQ(joinProbeCount(build.rowsByKey(), probe, channels), 2);
+  EXPECT_EQ(joinProbeCount(build, probe, channels), 2);
+}
+
+
 TEST_F(ChHashProbeTest, resolvesMatchesAcrossBuildBatches) {
   ChHashBuild build(kDriverNo, 0, pool());
   build.addInput(makeInput({10, 20, 20, std::nullopt}, 100));

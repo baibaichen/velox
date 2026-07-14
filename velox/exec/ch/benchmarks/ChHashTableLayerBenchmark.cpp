@@ -141,9 +141,11 @@ class ChEngine {
   uint64_t probeL1(const RowVectorPtr& probes) {
     std::vector<column_index_t> channels(probes->childrenSize());
     std::iota(channels.begin(), channels.end(), 0);
-    const auto hits = ch::joinProbe(build_, probes, channels);
-    folly::doNotOptimizeAway(hits.data());
-    return lastHits_ = hits.size();
+    // Count hits only (layer-1 pure probe): no ProbeHit vector materialization,
+    // to match the velox and CH-native arms' "find + count" measurement scope.
+    const auto hits = ch::joinProbeCount(build_, probes, channels);
+    folly::doNotOptimizeAway(hits);
+    return lastHits_ = hits;
   }
 
   void verifyAllHits(uint64_t expected) const {
