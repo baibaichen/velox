@@ -100,6 +100,35 @@ TEST_F(RetainedVectorsIndexTest, mergeFromPreservesDriverBatchCoordinates) {
       d1b1.get());
 }
 
+// Pins the (driver_no, batch_no) bit-layout to CONCRETE literal integers so an
+// off-by-one in kBatchNoBits (the 6/25 driver/batch split) or a driver/batch
+// swap cannot slip through. The literals below are hand-computed from
+// kDriverNoBits=6, kBatchNoBits=25 (so kMaxBatchNo = (1<<25)-1 = 33554431);
+// they are NOT derived from the SUT constants, so they fail if the split moves.
+TEST_F(RetainedVectorsIndexTest, packBlockNoMatchesLiteralBitLayout) {
+  // driver=1, batch=0 must set the first driver bit at position kBatchNoBits=25,
+  // i.e. 1 << 25 = 33554432.
+  EXPECT_EQ(packBlockNo(1, 0), 33554432u);
+  // driver=0, batch=1 stays in the low bits.
+  EXPECT_EQ(packBlockNo(0, 1), 1u);
+  // Boundary: max batch_no with driver 0 fills exactly the low 25 bits.
+  EXPECT_EQ(packBlockNo(0, 33554431u), 33554431u);
+  // Boundary: driver=1 together with max batch_no occupies bits 0..25.
+  EXPECT_EQ(packBlockNo(1, 33554431u), 67108863u);
+  // A larger driver: driver=3 -> 3 << 25 = 100663296.
+  EXPECT_EQ(packBlockNo(3, 0), 100663296u);
+
+  // Unpack the literals back to confirm field boundaries are where we assert.
+  EXPECT_EQ(unpackDriverNo(33554432u), 1u);
+  EXPECT_EQ(unpackBatchNo(33554432u), 0u);
+  EXPECT_EQ(unpackDriverNo(67108863u), 1u);
+  EXPECT_EQ(unpackBatchNo(67108863u), 33554431u);
+  // A large row/batch value near the top of the batch field round-trips and
+  // stays inside driver 0.
+  EXPECT_EQ(unpackDriverNo(33554430u), 0u);
+  EXPECT_EQ(unpackBatchNo(33554430u), 33554430u);
+}
+
 TEST_F(RetainedVectorsIndexTest, mergeFromRejectsOccupiedDriverSlot) {
   RetainedVectorsIndex index(0);
   RetainedVectorsIndex duplicateDriver(0);

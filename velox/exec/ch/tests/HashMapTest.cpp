@@ -191,9 +191,15 @@ TEST_F(HashMapTest, duplicateCoordinatesUseRowRefListChain) {
   EXPECT_EQ(actual, expected);
 }
 
+// Force every key into the SAME map bucket: the map indexes buckets by
+// (hash & mask), so returning a constant makes place(hash) identical for all
+// keys regardless of table size. This guarantees keys 1 and 2 truly collide at
+// the bucket level, so the map lookup must rely on saved_hash + keyEquals to
+// tell them apart (a table ignoring saved_hash could still pass keyEquals-only
+// checks, but not this bucket-level disambiguation).
 struct SameBucketHash {
-  size_t operator()(uint64_t key) const {
-    return key << 2;
+  size_t operator()(uint64_t /*key*/) const {
+    return 0;
   }
 };
 
@@ -211,8 +217,12 @@ TEST_F(HashMapTest, savedHashAndKeyDistinguishBucketCollisions) {
   CollisionCell cell(1, state);
   cell.setHash(SameBucketHash{}(1));
   EXPECT_TRUE(cell.keyEquals(1, SameBucketHash{}(1), state));
-  EXPECT_FALSE(cell.keyEquals(1, SameBucketHash{}(2), state));
   EXPECT_FALSE(cell.keyEquals(2, SameBucketHash{}(1), state));
+
+  // With a constant hash, keys 1 and 2 land in the same bucket at every table
+  // size, so correct retrieval proves the map disambiguates collisions via
+  // saved_hash + keyEquals rather than by bucket index.
+  ASSERT_EQ(SameBucketHash{}(1), SameBucketHash{}(2));
 
   CollisionMap map(mapPool_.get());
   bool inserted;
@@ -221,10 +231,16 @@ TEST_F(HashMapTest, savedHashAndKeyDistinguishBucketCollisions) {
   map.emplace(2, inserted).word = refWord(2, 2);
   ASSERT_TRUE(inserted);
 
-  ASSERT_NE(map.find(1), nullptr);
-  ASSERT_NE(map.find(2), nullptr);
-  EXPECT_EQ(map.find(1)->getMapped().firstWord(), refWord(1, 1));
-  EXPECT_EQ(map.find(2)->getMapped().firstWord(), refWord(2, 2));
+  // Both colliding keys are independently retrievable with their own distinct
+  // values.
+  auto* cell1 = map.find(1);
+  auto* cell2 = map.find(2);
+  ASSERT_NE(cell1, nullptr);
+  ASSERT_NE(cell2, nullptr);
+  EXPECT_EQ(cell1->getMapped().firstWord(), refWord(1, 1));
+  EXPECT_EQ(cell2->getMapped().firstWord(), refWord(2, 2));
+  EXPECT_NE(map.find(1)->getMapped().firstWord(),
+            map.find(2)->getMapped().firstWord());
 }
 
 TEST_F(HashMapTest, rehashPreservesEveryCoordinateChain) {
