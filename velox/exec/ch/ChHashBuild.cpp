@@ -173,6 +173,7 @@ void ChHashBuild::addInput(RowVectorPtr input) {
       }
     });
   };
+  // Fixed-integer variants dispatch a second time by packed key width.
   switch (storage_->rowsByKey.width()) {
     case FixedKeyWidth::k64:
       prepare.template operator()<uint64_t>();
@@ -201,6 +202,7 @@ void ChHashBuild::addInput(RowVectorPtr input) {
           storage_->arena);
     });
   };
+  // Fixed-integer variants dispatch a second time by packed key width.
   switch (storage_->rowsByKey.width()) {
     case FixedKeyWidth::k64:
       attach.template operator()<uint64_t>();

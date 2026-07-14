@@ -129,6 +129,7 @@ std::vector<ProbeHit> joinProbe(
     return hits;
   };
 
+  // Fixed-integer variants dispatch a second time by packed key width.
   switch (map.width()) {
     case FixedKeyWidth::k64:
       return probeKeys.template operator()<uint64_t>();

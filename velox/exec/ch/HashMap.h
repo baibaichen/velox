@@ -253,8 +253,12 @@ using HashMapAll_key_string = HashMapTable<
     HashMapCellWithSavedHash<StringRef, RowRefList, StringRefHash>,
     StringRefHash>;
 // Digest equality is final: hashed cells intentionally retain no original key bytes
-// or saved hash and therefore cannot verify collisions. Keep a distinct map
-// type because FixedKeyMap stores hashed and fixed UInt128 maps in one variant.
+// Digest equality is final: hashed cells intentionally retain no original key bytes
+// or saved hash and therefore cannot verify collisions. The digest is a
+// non-cryptographic XXH3 128-bit value with ~2^-128 accidental-collision risk;
+// adversarial keys can be crafted to collide, so this path is unsafe for
+// untrusted input. Keep a distinct map type because FixedKeyMap stores hashed
+// and fixed UInt128 maps in one variant.
 class HashMapAll_hashed : public HashMapAll<UInt128, UInt128TrivialHash> {
  public:
   using HashMapAll<UInt128, UInt128TrivialHash>::HashMapAll;
