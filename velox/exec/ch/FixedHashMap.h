@@ -52,7 +52,10 @@ struct FixedDirectMapCell {
 /// 1 << (8 * sizeof(Key)) cells (256 for uint8_t, 65'536 for uint16_t), so
 /// there is no hashing, no probing, no rehashing, and no zero-key special case.
 /// The backing buffer is allocated once from the same memory pool as the other
-/// join maps so peak-bytes accounting is uniform. Drop-in replaceable for the
+/// join maps so peak-bytes accounting is uniform, and it relies on
+/// allocateZeroFilled leaving every cell with full == false and mapped in its
+/// valid default state (RowRefList's zero representation is a valid empty list).
+/// Drop-in replaceable for the
 /// HashMapTable variants: it exposes the same LookupResult, cell_type,
 /// mapped_type, find/emplace/reserve/size/empty and buffer-size accessors that
 /// FixedKeyMap dispatches on.
@@ -126,8 +129,10 @@ class FixedDirectMap {
   Mapped& emplace(const Key& key) {
     auto& cell = buffer_[key];
     if (!cell.full) {
+      // No placement-new is needed: the buffer is zero-filled at allocation, so
+      // cell.mapped is already a valid default RowRefList. This relies on the
+      // mapped type's zero representation matching its default-constructed state.
       cell.full = true;
-      new (&cell.mapped) Mapped();
       ++size_;
     }
     return cell.mapped;
@@ -143,7 +148,9 @@ class FixedDirectMap {
 
   /// Forward iterator over occupied cells. Skips empty slots and reconstructs
   /// the key from the slot index, matching ClickHouse's FixedHashTable
-  /// iterator. Only occupied cells are yielded.
+  /// iterator. Only occupied cells are yielded. Not used on any production
+  /// path (build and probe go through find; FixedKeyMap::begin/end delegate to
+  /// the 64-bit map); kept for port fidelity and future full-table scans.
   class Iterator {
    public:
     Iterator(cell_type* buffer, size_t index)
