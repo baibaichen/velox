@@ -44,7 +44,14 @@ static_assert(std::is_trivially_copyable_v<UInt256>);
 static_assert(sizeof(UInt128) == 16);
 static_assert(sizeof(UInt256) == 32);
 
-enum class FixedKeyWidth : uint8_t { k32 = 4, k64 = 8, k128 = 16, k256 = 32 };
+enum class FixedKeyWidth : uint8_t {
+  k8 = 1,
+  k16 = 2,
+  k32 = 4,
+  k64 = 8,
+  k128 = 16,
+  k256 = 32,
+};
 
 inline size_t fixedKeyTypeSize(TypeKind kind) {
   switch (kind) {
@@ -70,6 +77,18 @@ inline FixedKeyWidth fixedKeyWidth(const std::vector<TypePtr>& types) {
     bytes += fixedKeyTypeSize(type->kind());
   }
   VELOX_USER_CHECK_LE(bytes, sizeof(UInt256), "packFixed key exceeds 32 bytes");
+  // A single 1- or 2-byte integer key routes to the direct-address map, so its
+  // packed width is the narrow k8/k16. Multi-column packs never narrow below
+  // k32 even when their total is 1 or 2 bytes, matching FixedKeyMap::chooseType
+  // which reserves key8/key16 for single-column keys.
+  if (types.size() == 1) {
+    if (bytes == sizeof(uint8_t)) {
+      return FixedKeyWidth::k8;
+    }
+    if (bytes == sizeof(uint16_t)) {
+      return FixedKeyWidth::k16;
+    }
+  }
   if (bytes <= sizeof(uint32_t)) {
     return FixedKeyWidth::k32;
   }
@@ -250,6 +269,8 @@ class FixedKeyDecoder {
   std::vector<bool> packedKeyValid_;
   std::variant<
       std::monostate,
+      std::vector<uint8_t>,
+      std::vector<uint16_t>,
       std::vector<uint32_t>,
       std::vector<uint64_t>,
       std::vector<UInt128>,

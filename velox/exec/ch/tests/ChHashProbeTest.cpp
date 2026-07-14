@@ -240,6 +240,60 @@ TEST_F(ChHashProbeTest, matchesSingleIntegerKeys) {
   EXPECT_EQ(matches[2].buildRowNo, 0);
 }
 
+TEST_F(ChHashProbeTest, matchesSingleTinyintKeys) {
+  // A single 1-byte TINYINT key routes to Type::key8, backed by a direct-address
+  // Map8 table (256 slots, key == index); verify build and probe resolve
+  // matches, including duplicates and a miss, on that path.
+  auto buildInput = makeRowVector({
+      makeFlatVector<int8_t>({10, 20, 20, 30}),
+  });
+  ChHashBuild build(
+      kDriverNo, std::vector<column_index_t>{0}, {TINYINT()}, pool());
+  EXPECT_EQ(build.keyMapType(), FixedKeyMap::Type::key8);
+  EXPECT_EQ(build.keyMapWidth(), FixedKeyWidth::k8);
+  build.addInput(buildInput);
+
+  auto probe = makeRowVector({
+      makeFlatVector<int8_t>({20, 99, 10}),
+  });
+  const auto matches = probeHashBuild(build, probe, 0);
+
+  ASSERT_EQ(matches.size(), 3);
+  EXPECT_EQ(matches[0].probeRow, 0);
+  EXPECT_EQ(matches[0].buildRowNo, 1);
+  EXPECT_EQ(matches[1].probeRow, 0);
+  EXPECT_EQ(matches[1].buildRowNo, 2);
+  EXPECT_EQ(matches[2].probeRow, 2);
+  EXPECT_EQ(matches[2].buildRowNo, 0);
+}
+
+TEST_F(ChHashProbeTest, matchesSingleSmallintKeys) {
+  // A single 2-byte SMALLINT key routes to Type::key16, backed by a
+  // direct-address Map16 table (65'536 slots, key == index); verify build and
+  // probe resolve matches, including duplicates and a miss, on that path.
+  auto buildInput = makeRowVector({
+      makeFlatVector<int16_t>({10, 20, 20, 30}),
+  });
+  ChHashBuild build(
+      kDriverNo, std::vector<column_index_t>{0}, {SMALLINT()}, pool());
+  EXPECT_EQ(build.keyMapType(), FixedKeyMap::Type::key16);
+  EXPECT_EQ(build.keyMapWidth(), FixedKeyWidth::k16);
+  build.addInput(buildInput);
+
+  auto probe = makeRowVector({
+      makeFlatVector<int16_t>({20, 99, 10}),
+  });
+  const auto matches = probeHashBuild(build, probe, 0);
+
+  ASSERT_EQ(matches.size(), 3);
+  EXPECT_EQ(matches[0].probeRow, 0);
+  EXPECT_EQ(matches[0].buildRowNo, 1);
+  EXPECT_EQ(matches[1].probeRow, 0);
+  EXPECT_EQ(matches[1].buildRowNo, 2);
+  EXPECT_EQ(matches[2].probeRow, 2);
+  EXPECT_EQ(matches[2].buildRowNo, 0);
+}
+
 TEST_F(ChHashProbeTest, matchesSmallPackedKeys32) {
   // Two SMALLINT columns pack into 4 bytes and route to Type::keys32, backed by
   // the 32-bit Map32 table; verify the packed 32-bit path resolves matches.

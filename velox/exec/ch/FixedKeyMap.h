@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "velox/exec/ch/FixedHashMap.h"
 #include "velox/exec/ch/HashedKey.h"
 #include "velox/exec/ch/HashMap.h"
 
@@ -31,7 +32,7 @@ class FixedKeyMap {
   /// once via chooseType and then dispatched on.
   enum class Type {
     // key64/keys64 use the 64-bit map; key32/keys32 use a dedicated 32-bit
-    // Map32. key8/key16 have no ported map yet and are true NYI placeholders.
+    // Map32. Single 1-/2-byte keys use a direct-address Map8/Map16.
     key8,
     key16,
     key32,
@@ -49,6 +50,8 @@ class FixedKeyMap {
   /// supported set (integer fixed-width and VARCHAR).
   static Type chooseType(const std::vector<TypePtr>& keyTypes);
 
+  using Map8 = FixedDirectMap_key8;
+  using Map16 = FixedDirectMap_key16;
   using Map32 = HashMapAll_key32;
   using Map64 = HashMapAll_key64;
   using Map128 = HashMapAll_keys128;
@@ -72,6 +75,10 @@ class FixedKeyMap {
   /// pack path to size the packed key.
   FixedKeyWidth width() const {
     switch (type_) {
+      case Type::key8:
+        return FixedKeyWidth::k8;
+      case Type::key16:
+        return FixedKeyWidth::k16;
       case Type::key32:
       case Type::keys32:
         return FixedKeyWidth::k32;
@@ -113,6 +120,14 @@ class FixedKeyMap {
         [](const auto& map) { return map.getBufferSizeInBytes(); }, maps_);
   }
 
+  RowRefList& emplace(uint8_t key) {
+    return map8().emplace(key);
+  }
+
+  RowRefList& emplace(uint16_t key) {
+    return map16().emplace(key);
+  }
+
   RowRefList& emplace(uint32_t key) {
     return map32().emplace(key);
   }
@@ -135,6 +150,22 @@ class FixedKeyMap {
 
   RowRefList& emplaceHashed(const UInt128& key) {
     return hashedMap().emplace(key);
+  }
+
+  Map8::LookupResult find(uint8_t key) {
+    return map8().find(key);
+  }
+
+  Map8::ConstLookupResult find(uint8_t key) const {
+    return map8().find(key);
+  }
+
+  Map16::LookupResult find(uint16_t key) {
+    return map16().find(key);
+  }
+
+  Map16::ConstLookupResult find(uint16_t key) const {
+    return map16().find(key);
   }
 
   Map32::LookupResult find(uint32_t key) {
@@ -205,11 +236,23 @@ class FixedKeyMap {
   }
 
  private:
-  using Maps =
-      std::variant<Map32, Map64, Map128, Map256, KeyStringMap, HashedMap>;
+  using Maps = std::variant<
+      Map8,
+      Map16,
+      Map32,
+      Map64,
+      Map128,
+      Map256,
+      KeyStringMap,
+      HashedMap>;
 
   static Maps makeMap(memory::MemoryPool* pool, Type type) {
     switch (type) {
+      // Single 1-/2-byte keys use a direct-address Map8/Map16 (key == index).
+      case Type::key8:
+        return Maps(std::in_place_type<Map8>, pool);
+      case Type::key16:
+        return Maps(std::in_place_type<Map16>, pool);
       // Single 4-byte or packs totaling <= 4 bytes use the 32-bit Map32; packs
       // totaling <= 8 bytes use the 64-bit map. The FixedKeyDecoder packs into
       // uint32_t or uint64_t respectively.
@@ -227,20 +270,17 @@ class FixedKeyMap {
         return Maps(std::in_place_type<KeyStringMap>, pool);
       case Type::hashed:
         return Maps(std::in_place_type<HashedMap>, pool);
-      case Type::key8:
-      case Type::key16:
-        // ClickHouse routes 1/2-byte single keys to a FixedHashMap (direct
-        // address array). That container is not ported yet.
-        VELOX_NYI(
-            "1/2-byte single-integer join keys are not supported yet: {}",
-            static_cast<int>(type));
     }
     VELOX_UNREACHABLE();
   }
 
   template <typename Key>
   const auto& map() const {
-    if constexpr (std::is_same_v<Key, uint32_t>) {
+    if constexpr (std::is_same_v<Key, uint8_t>) {
+      return map8();
+    } else if constexpr (std::is_same_v<Key, uint16_t>) {
+      return map16();
+    } else if constexpr (std::is_same_v<Key, uint32_t>) {
       return map32();
     } else if constexpr (std::is_same_v<Key, uint64_t>) {
       return map64();
@@ -254,6 +294,18 @@ class FixedKeyMap {
     }
   }
 
+  Map8& map8() {
+    return std::get<Map8>(maps_);
+  }
+  const Map8& map8() const {
+    return std::get<Map8>(maps_);
+  }
+  Map16& map16() {
+    return std::get<Map16>(maps_);
+  }
+  const Map16& map16() const {
+    return std::get<Map16>(maps_);
+  }
   Map32& map32() {
     return std::get<Map32>(maps_);
   }
