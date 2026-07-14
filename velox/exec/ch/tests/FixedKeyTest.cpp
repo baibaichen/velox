@@ -46,6 +46,7 @@ TEST_F(FixedKeyTest, packsColumnsInOrderAndSelectsWidth) {
   FixedKeyDecoder decoder(input, {0, 1, 2}, rows);
 
   EXPECT_EQ(decoder.width(), FixedKeyWidth::k128);
+  EXPECT_FALSE(decoder.mayHaveNulls());
   UInt128 key;
   ASSERT_TRUE(decoder.pack(0, key));
   const std::array<uint8_t, 16> expected{
@@ -88,6 +89,35 @@ TEST_F(FixedKeyTest, decodesDictionaryAndConstantAndSkipsNull) {
   EXPECT_TRUE(decoder.pack(1, key));
   EXPECT_EQ(key.words[0], 11);
   EXPECT_FALSE(decoder.pack(2, key));
+}
+
+TEST_F(FixedKeyTest, batchPackingMatchesScalarPackingAndMarksNulls) {
+  auto first = makeNullableFlatVector<int64_t>(
+      {0x0102030405060708, 11, std::nullopt, 33});
+  auto indices = makeIndices({3, 0, 2, 1});
+  auto dictionary = BaseVector::wrapInDictionary(nullptr, indices, 4, first);
+  auto second = makeFlatVector<int32_t>({7, 8, 9, 10});
+  auto constantBase = makeFlatVector<int32_t>({17});
+  auto constant = BaseVector::wrapInConstant(4, 0, constantBase);
+  auto input = makeRowVector({dictionary, second, constant});
+  SelectivityVector rows(input->size());
+  FixedKeyDecoder decoder(input, {0, 1, 2}, rows);
+
+  EXPECT_TRUE(decoder.mayHaveNulls());
+  decoder.packAll<UInt128>();
+  for (vector_size_t row = 0; row < input->size(); ++row) {
+    UInt128 scalar;
+    const bool scalarIsValid = decoder.pack(row, scalar);
+    EXPECT_EQ(decoder.hasPackedKeyAt(row), scalarIsValid);
+    if (scalarIsValid) {
+      EXPECT_EQ(
+          std::memcmp(
+              &decoder.packedAt<UInt128>(row), &scalar, sizeof(UInt128)),
+          0);
+    }
+  }
+
+  EXPECT_FALSE(decoder.hasPackedKeyAt(2));
 }
 
 TEST_F(FixedKeyTest, rejectsUnsupportedAndOversizedKeys) {

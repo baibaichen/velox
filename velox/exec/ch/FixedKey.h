@@ -24,6 +24,7 @@
 #include <array>
 #include <cstring>
 #include <memory>
+#include <variant>
 #include <vector>
 
 namespace facebook::velox::exec::ch {
@@ -82,9 +83,14 @@ class FixedKeyDecoder {
       const RowVectorPtr& input,
       std::vector<column_index_t> channels,
       const SelectivityVector& rows)
-      : channels_(std::move(channels)) {
+      : channels_(std::move(channels)),
+        selectedRows_(rows.size(), false),
+        packedKeyValid_(rows.size(), false),
+        allRowsSelected_(rows.isAllSelected()) {
     VELOX_CHECK_NOT_NULL(input);
     VELOX_USER_CHECK(!channels_.empty(), "packFixed requires key channels");
+    rows.applyToSelected(
+        [&](vector_size_t row) { selectedRows_[row] = true; });
     std::vector<TypePtr> types;
     types.reserve(channels_.size());
     decodedKeys_.reserve(channels_.size());
@@ -94,14 +100,19 @@ class FixedKeyDecoder {
       auto key = input->childAt(channel)->loadedVector();
       types.push_back(key->type());
       keySizes_.push_back(fixedKeyTypeSize(key->typeKind()));
-      decodedKeys_.push_back(
-          std::make_unique<DecodedVector>(*key, rows));
+      auto decoded = std::make_unique<DecodedVector>(*key, rows);
+      mayHaveNulls_ |= decoded->mayHaveNulls();
+      decodedKeys_.push_back(std::move(decoded));
     }
     width_ = fixedKeyWidth(types);
   }
 
   FixedKeyWidth width() const {
     return width_;
+  }
+
+  bool mayHaveNulls() const {
+    return mayHaveNulls_;
   }
 
   template <typename Key>
@@ -120,7 +131,85 @@ class FixedKeyDecoder {
     return true;
   }
 
+  template <typename Key>
+  void packAll() {
+    VELOX_CHECK_EQ(sizeof(Key), static_cast<size_t>(width_));
+    preparedKeys_ = std::vector<Key>(selectedRows_.size());
+    auto& packedKeys = std::get<std::vector<Key>>(preparedKeys_);
+    preparedKeysData_ = packedKeys.data();
+    packedKeyValid_ = selectedRows_;
+
+    size_t offset = 0;
+    for (size_t i = 0; i < decodedKeys_.size(); ++i) {
+      copyColumn(*decodedKeys_[i], offset, packedKeys);
+      offset += keySizes_[i];
+    }
+  }
+
+  bool hasPackedKeyAt(vector_size_t row) const {
+    return packedKeyValid_[row];
+  }
+
+  template <typename Key>
+  const Key& packedAt(vector_size_t row) const {
+    return static_cast<const Key*>(preparedKeysData_)[row];
+  }
+
  private:
+  template <typename Value, typename Key>
+  void copyColumnValues(
+      const DecodedVector& decoded,
+      size_t offset,
+      std::vector<Key>& packedKeys) {
+    const auto* values = decoded.data<Value>();
+    if (allRowsSelected_ && !decoded.mayHaveNulls() &&
+        decoded.isIdentityMapping()) {
+      auto* destination =
+          reinterpret_cast<char*>(packedKeys.data()) + offset;
+      for (vector_size_t row = 0; row < packedKeys.size(); ++row) {
+        std::memcpy(
+            destination + row * sizeof(Key),
+            values + row,
+            sizeof(Value));
+      }
+      return;
+    }
+
+    for (vector_size_t row = 0; row < packedKeys.size(); ++row) {
+      if (!packedKeyValid_[row]) {
+        continue;
+      }
+      if (decoded.isNullAt(row)) {
+        packedKeyValid_[row] = false;
+        continue;
+      }
+      const auto value = decoded.valueAt<Value>(row);
+      std::memcpy(
+          reinterpret_cast<char*>(&packedKeys[row]) + offset,
+          &value,
+          sizeof(value));
+    }
+  }
+
+  template <typename Key>
+  void copyColumn(
+      const DecodedVector& decoded,
+      size_t offset,
+      std::vector<Key>& packedKeys) {
+    switch (decoded.base()->typeKind()) {
+      case TypeKind::TINYINT:
+        return copyColumnValues<int8_t>(decoded, offset, packedKeys);
+      case TypeKind::SMALLINT:
+        return copyColumnValues<int16_t>(decoded, offset, packedKeys);
+      case TypeKind::INTEGER:
+        return copyColumnValues<int32_t>(decoded, offset, packedKeys);
+      case TypeKind::BIGINT:
+        return copyColumnValues<int64_t>(decoded, offset, packedKeys);
+      default:
+        VELOX_UNREACHABLE();
+    }
+  }
+
   static void copyValue(
       const DecodedVector& decoded,
       vector_size_t row,
@@ -154,6 +243,17 @@ class FixedKeyDecoder {
   std::vector<column_index_t> channels_;
   std::vector<std::unique_ptr<DecodedVector>> decodedKeys_;
   std::vector<size_t> keySizes_;
+  std::vector<bool> selectedRows_;
+  std::vector<bool> packedKeyValid_;
+  std::variant<
+      std::monostate,
+      std::vector<uint64_t>,
+      std::vector<UInt128>,
+      std::vector<UInt256>>
+      preparedKeys_;
+  const void* preparedKeysData_{nullptr};
+  bool allRowsSelected_{false};
+  bool mayHaveNulls_{false};
   FixedKeyWidth width_{FixedKeyWidth::k64};
 };
 
