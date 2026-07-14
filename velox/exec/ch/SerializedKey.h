@@ -18,6 +18,7 @@
 
 #include "velox/common/base/BitUtil.h"
 #include "velox/common/base/Exceptions.h"
+#include "velox/common/base/SimdUtil.h"
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/DecodedVector.h"
 #include "velox/vector/SelectivityVector.h"
@@ -49,9 +50,31 @@ struct StringRef {
   }
 };
 
+// Hashes the key bytes with hardware CRC32 (simd::crc32U64), the same
+// primitive the fixed-width keys use (HashCRC32/HashWide). Feeds the bytes
+// eight at a time, then folds any tail of under eight bytes through a
+// zero-initialized word so no read runs past the key. Mirrors ClickHouse's
+// CRC32-based key_string hashing, whose length-dispatch-free loop keeps
+// branch prediction stable for variable-length short keys where
+// bits::hashBytes suffers heavy branch misses.
 struct StringRefHash {
   size_t operator()(const StringRef& key) const {
-    return bits::hashBytes(1, key.data, key.size);
+    uint64_t hash = 0;
+    const char* data = key.data;
+    uint32_t remaining = key.size;
+    while (remaining >= sizeof(uint64_t)) {
+      uint64_t word;
+      std::memcpy(&word, data, sizeof(word));
+      hash = simd::crc32U64(hash, word);
+      data += sizeof(uint64_t);
+      remaining -= sizeof(uint64_t);
+    }
+    if (remaining > 0) {
+      uint64_t tail = 0;
+      std::memcpy(&tail, data, remaining);
+      hash = simd::crc32U64(hash, tail);
+    }
+    return hash;
   }
 };
 

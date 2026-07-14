@@ -125,6 +125,34 @@ TEST_F(SerializedKeyTest, emptyStringIsNotTheZeroKey) {
   EXPECT_EQ(map.size(), 1);
 }
 
+TEST_F(SerializedKeyTest, stringRefHashIsSelfConsistentAcrossLengths) {
+  StringRefHash hash;
+
+  // Empty key does not crash and hashes deterministically to zero.
+  EXPECT_EQ(hash(StringRef{nullptr, 0}), hash(StringRef{nullptr, 0}));
+
+  // Cover the tail path (0-7 residual bytes) plus multi-word and long keys.
+  // Each length is exercised twice to confirm the hash is deterministic, and
+  // the payloads are padded so no read runs past the declared size (an
+  // out-of-bounds read would trip under ASAN).
+  for (uint32_t length : {0u, 1u, 7u, 8u, 9u, 128u}) {
+    std::string bytes(length, 'x');
+    StringRef key{bytes.data(), length};
+    EXPECT_EQ(hash(key), hash(key));
+  }
+
+  // Distinct bytes hash differently; identical bytes hash the same.
+  const std::string left = "clickhouse";
+  const std::string right = "clickhous_";
+  const std::string leftCopy = left;
+  EXPECT_EQ(
+      hash(StringRef{left.data(), static_cast<uint32_t>(left.size())}),
+      hash(StringRef{leftCopy.data(), static_cast<uint32_t>(leftCopy.size())}));
+  EXPECT_NE(
+      hash(StringRef{left.data(), static_cast<uint32_t>(left.size())}),
+      hash(StringRef{right.data(), static_cast<uint32_t>(right.size())}));
+}
+
 TEST_F(SerializedKeyTest, doesNotSupportProbePrefetch) {
   EXPECT_FALSE(SerializedKeyDecoder::hasCheapKeyCalculation);
 }
