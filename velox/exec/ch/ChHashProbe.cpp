@@ -18,6 +18,7 @@
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/exec/ch/HashedKey.h"
+#include "velox/exec/ch/Prefetching.h"
 #include "velox/exec/ch/RowRef.h"
 #include "velox/exec/ch/SerializedKey.h"
 #include "velox/vector/DecodedVector.h"
@@ -26,9 +27,6 @@
 namespace facebook::velox::exec::ch {
 
 namespace {
-constexpr vector_size_t kPrefetchLookAhead = 16;
-constexpr size_t kMinTableBytesForPrefetch = 8UL << 20;
-
 StringRef stringRef(const std::string& bytes) {
   VELOX_CHECK_LE(bytes.size(), std::numeric_limits<uint32_t>::max());
   return {bytes.data(), static_cast<uint32_t>(bytes.size())};
@@ -81,8 +79,7 @@ std::vector<ProbeHit> joinProbe(
     return hits;
   }
   if (map.serialized()) {
-    SerializedKeyDecoder decoder(
-        probe, probeKeyChannels, map.keyTypes(), rows);
+    SerializedKeyDecoder decoder(probe, probeKeyChannels, map.keyTypes(), rows);
     std::vector<ProbeHit> hits;
     hits.reserve(probe->size());
     std::string keyBytes;
@@ -104,17 +101,17 @@ std::vector<ProbeHit> joinProbe(
   const auto probeKeys = [&]<typename Key>() {
     std::vector<ProbeHit> hits;
     hits.reserve(probe->size());
-    const bool usePrefetch =
-        FixedKeyDecoder::hasCheapKeyCalculation &&
-        map.getBufferSizeInBytes() > kMinTableBytesForPrefetch;
+    const bool usePrefetch = FixedKeyDecoder::hasCheapKeyCalculation &&
+        map.getBufferSizeInBytes() > minTableBytesForPrefetch();
+    auto prefetcher =
+        makeJoinPrefetcher(usePrefetch, probe->size(), [&](size_t prefetchRow) {
+          Key prefetchKey;
+          if (decoder.pack(prefetchRow, prefetchKey)) {
+            map.prefetch(prefetchKey);
+          }
+        });
     for (vector_size_t probeRow = 0; probeRow < probe->size(); ++probeRow) {
-      const auto prefetchRow = probeRow + kPrefetchLookAhead;
-      if (usePrefetch && prefetchRow < probe->size()) {
-        Key prefetchKey;
-        if (decoder.pack(prefetchRow, prefetchKey)) {
-          map.prefetch(prefetchKey);
-        }
-      }
+      prefetcher.prefetchAt(probeRow);
 
       Key key;
       if (!decoder.pack(probeRow, key)) {
@@ -155,8 +152,8 @@ std::vector<ProbeMatch> listJoinResults(
     for (const auto refWord : *hit.matched) {
       const auto blockNo = refWordBlockNo(refWord);
       const auto rowNo = refWordRowNo(refWord);
-      const auto* buildBatch = retained.at(
-          unpackDriverNo(blockNo), unpackBatchNo(blockNo));
+      const auto* buildBatch =
+          retained.at(unpackDriverNo(blockNo), unpackBatchNo(blockNo));
       VELOX_CHECK_LT(rowNo, buildBatch->size());
       matches.push_back({hit.probeRow, blockNo, rowNo});
     }
