@@ -182,7 +182,14 @@ def render(cells):
         )
 
     lines.append("")
-    lines.append("## Peak memory (MB)")
+    lines.append("## Peak memory (MB) — Velox-process arms only, NOT three-way")
+    lines.append("")
+    lines.append(
+        "Both columns are measured inside the Velox benchmark process "
+        "(pool peakBytes): CH Port = the ch arm, Velox = the velox native arm. "
+        "The CH-native benchmark reports no memory, so this table does not "
+        "include it."
+    )
     lines.append("")
     lines.append("| dist | rows | key | CH map | CH Port | Velox |")
     lines.append("|---|---:|---|---|---:|---:|")
@@ -197,10 +204,20 @@ def render(cells):
     lines.append("")
     lines.append(
         "> CH Port = the single ch arm; CH map is the authoritative FixedKeyMap "
-        "Type it selected. CH native ms is gbench Time/1e6; same full-table unit "
-        "as the Velox-bench columns, so all ms columns compare directly. CH native "
-        "rows come from the build_n counter the CH bench emits, so they attach to "
-        "the exact matching cell."
+        "Type it selected. All ms columns are one full-table build / one "
+        "full-table probe, with data generation excluded from timing on both "
+        "sides and both probes counting hits without materializing results, so "
+        "the ms figures are same-unit. CH native rows come from the build_n "
+        "counter the CH bench emits, so they attach to the exact matching cell."
+    )
+    lines.append(
+        "> Cross-process caveat: the Velox arms are built with gcc -O3 (Release) "
+        "and the CH-native arm with clang -O2 -g -DNDEBUG (RelWithDebInfo). "
+        "Asserts are disabled on both (NDEBUG), but the differing compiler and "
+        "optimization level mean CH-native absolute ms is only a trend "
+        "reference, not a strict head-to-head with the Velox arms. The "
+        "CH-Port-vs-Velox comparison (same process, same compiler) is the "
+        "apples-to-apples one."
     )
     return "\n".join(lines)
 
