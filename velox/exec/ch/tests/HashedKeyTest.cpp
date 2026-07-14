@@ -100,9 +100,10 @@ TEST_F(HashedKeyTest, hashesEmptyStringAndOverwideFixedKey) {
 }
 
 TEST_F(HashedKeyTest, mapStoresDigestWithoutSavedHash) {
-  EXPECT_LT(
+  EXPECT_EQ(
       sizeof(HashMapAll_hashed::cell_type),
       sizeof(HashMapAll_keys128::cell_type));
+  EXPECT_FALSE((std::is_same_v<HashMapAll_hashed, HashMapAll_keys128>));
   EXPECT_FALSE(HashedKeyDecoder::hasCheapKeyCalculation);
 }
 

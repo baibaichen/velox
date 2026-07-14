@@ -53,6 +53,31 @@ class HashMapTest : public testing::Test {
   std::shared_ptr<memory::MemoryPool> arenaPool_;
 };
 
+TEST_F(HashMapTest, fixedWidthCellsDoNotStoreSavedHash) {
+  EXPECT_TRUE((std::is_same_v<
+               HashMapAll_key32::cell_type,
+               HashMapCell<UInt32, RowRefList, HashCRC32<UInt32>>>));
+  EXPECT_TRUE((std::is_same_v<
+               HashMapAll_key64::cell_type,
+               HashMapCell<UInt64, RowRefList, HashCRC32<UInt64>>>));
+  EXPECT_TRUE((std::is_same_v<
+               HashMapAll_keys128::cell_type,
+               HashMapCell<UInt128, RowRefList, HashWide<UInt128>>>));
+  EXPECT_TRUE((std::is_same_v<
+               HashMapAll_keys256::cell_type,
+               HashMapCell<UInt256, RowRefList, HashWide<UInt256>>>));
+  EXPECT_TRUE((std::is_same_v<
+               HashMapAll_serialized::cell_type,
+               HashMapCellWithSavedHash<
+                   StringRef,
+                   RowRefList,
+                   StringRefHash>>));
+  EXPECT_EQ(sizeof(HashMapAll_key32::cell_type), 16);
+  EXPECT_EQ(sizeof(HashMapAll_key64::cell_type), 16);
+  EXPECT_EQ(sizeof(HashMapAll_keys128::cell_type), 24);
+  EXPECT_EQ(sizeof(HashMapAll_keys256::cell_type), 40);
+}
+
 TEST_F(HashMapTest, emplaceReturnsLiveCoordinateMapping) {
   HashMapAll_key64 map(mapPool_.get());
   Arena arena(arenaPool_.get());

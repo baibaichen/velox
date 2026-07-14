@@ -234,7 +234,7 @@ template <
     typename Grower = HashTableGrower<>>
 using HashMapAll = HashMapTable<
     Key,
-    HashMapCellWithSavedHash<Key, RowRefList, Hash>,
+    HashMapCell<Key, RowRefList, Hash>,
     Hash,
     Grower,
     HashTableAllocatorAdapter>;
@@ -243,13 +243,17 @@ using HashMapAll_key32 = HashMapAll<UInt32>;
 using HashMapAll_key64 = HashMapAll<UInt64>;
 using HashMapAll_keys128 = HashMapAll<UInt128, HashWide<UInt128>>;
 using HashMapAll_keys256 = HashMapAll<UInt256, HashWide<UInt256>>;
-using HashMapAll_serialized = HashMapAll<StringRef, StringRefHash>;
+using HashMapAll_serialized = HashMapTable<
+    StringRef,
+    HashMapCellWithSavedHash<StringRef, RowRefList, StringRefHash>,
+    StringRefHash>;
 // Digest equality is final: hashed cells intentionally retain no original key bytes
-// or saved hash and therefore cannot verify collisions.
-using HashMapAll_hashed = HashMapTable<
-    UInt128,
-    HashMapCell<UInt128, RowRefList, HashWide<UInt128>>,
-    HashWide<UInt128>>;
+// or saved hash and therefore cannot verify collisions. Keep a distinct map
+// type because FixedKeyMap stores hashed and fixed UInt128 maps in one variant.
+class HashMapAll_hashed : public HashMapAll<UInt128, HashWide<UInt128>> {
+ public:
+  using HashMapAll<UInt128, HashWide<UInt128>>::HashMapAll;
+};
 
 static_assert(std::is_trivially_copyable_v<RowRefList>);
 static_assert(std::is_trivially_copyable_v<HashMapAll_key32::cell_type>);
