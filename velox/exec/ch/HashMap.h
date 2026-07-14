@@ -18,10 +18,10 @@
 
 #include "velox/common/base/SimdUtil.h"
 #include "velox/exec/ch/FixedKey.h"
-#include "velox/exec/ch/SerializedKey.h"
 #include "velox/exec/ch/HashTable.h"
 #include "velox/exec/ch/HashTableAllocatorAdapter.h"
 #include "velox/exec/ch/RowRefList.h"
+#include "velox/exec/ch/SerializedKey.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -47,8 +47,7 @@ struct HashCRC32 {
 template <typename T>
 struct HashWide {
   size_t operator()(const T& key) const {
-    static_assert(
-        std::is_same_v<T, UInt128> || std::is_same_v<T, UInt256>);
+    static_assert(std::is_same_v<T, UInt128> || std::is_same_v<T, UInt256>);
     uint64_t hash = 0;
     for (const auto word : key.words) {
       hash = simd::crc32U64(hash, word);
@@ -69,8 +68,7 @@ struct PairNoInit {
 
   PairNoInit() = default;
 
-  explicit PairNoInit(const First& firstValue)
-      : first(firstValue), second() {}
+  explicit PairNoInit(const First& firstValue) : first(firstValue), second() {}
 
   PairNoInit(const First& firstValue, const Second& secondValue)
       : first(firstValue), second(secondValue) {}
@@ -99,6 +97,15 @@ struct HashMapCell {
 
   const Key& getKey() const {
     return value.first;
+  }
+
+  // Overwrites the stored key with a byte-identical copy that lives in stable
+  // storage. Used after a string-key insert to swap the transient lookup key
+  // (which points at a per-batch buffer) for its arena-persisted copy. The new
+  // key must be byte-equal to the old one so the saved hash and all future
+  // keyEquals comparisons stay valid.
+  void setKey(const Key& key) {
+    value.first = key;
   }
 
   Mapped& getMapped() {
@@ -252,9 +259,8 @@ using HashMapAll_key_string = HashMapTable<
     StringRef,
     HashMapCellWithSavedHash<StringRef, RowRefList, StringRefHash>,
     StringRefHash>;
-// Digest equality is final: hashed cells intentionally retain no original key bytes
-// Digest equality is final: hashed cells intentionally retain no original key bytes
-// or saved hash and therefore cannot verify collisions. The digest is a
+// Digest equality is final: hashed cells intentionally retain no original key
+// bytes or saved hash and therefore cannot verify collisions. The digest is a
 // non-cryptographic XXH3 128-bit value with ~2^-128 accidental-collision risk;
 // adversarial keys can be crafted to collide, so this path is unsafe for
 // untrusted input. Keep a distinct map type because FixedKeyMap stores hashed

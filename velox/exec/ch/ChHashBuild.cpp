@@ -69,8 +69,7 @@ void ChHashBuild::prepareJoinTable(
       return;
     }
 
-    const auto key =
-        static_cast<uint64_t>(decodedKey.valueAt<int64_t>(rowNo));
+    const auto key = static_cast<uint64_t>(decodedKey.valueAt<int64_t>(rowNo));
     storage_->rowsByKey.emplace(key);
   });
 }
@@ -95,13 +94,11 @@ void ChHashBuild::addRowReferences(
       return;
     }
 
-    const auto key =
-        static_cast<uint64_t>(decodedKey.valueAt<int64_t>(rowNo));
+    const auto key = static_cast<uint64_t>(decodedKey.valueAt<int64_t>(rowNo));
     auto* cell = storage_->rowsByKey.find(key);
     VELOX_CHECK_NOT_NULL(
         cell, "Key must be prepared before adding row references");
-    const auto refWord =
-        RowRef(blockNo, static_cast<uint32_t>(rowNo)).encode();
+    const auto refWord = RowRef(blockNo, static_cast<uint32_t>(rowNo)).encode();
     cell->getMapped().insert(refWord, storage_->arena);
   });
 }
@@ -153,19 +150,22 @@ void ChHashBuild::addInput(RowVectorPtr input) {
       if (!decoder.at(rowNo, key)) {
         return;
       }
-      // Hash once; reuse for the lookup, the emplace, and the re-find.
+      // Hash once; reuse for the prefetch, the emplace, and the persist.
       const auto hashValue = storage_->rowsByKey.hashString(key);
-      if (storage_->rowsByKey.find(key, hashValue) == nullptr) {
-        // Persist the key bytes: the input column buffer is released after the
-        // batch, but the transient StringRef is fine for the lookup above.
-        const StringRef persisted{
-            storage_->arena.insert(key.data, key.size), key.size};
-        storage_->rowsByKey.emplace(persisted, hashValue);
-      }
-      // Re-find after the possible emplace: an emplace may resize the table and
-      // invalidate any cell reference, so fetch the current cell before insert.
-      auto* cell = storage_->rowsByKey.find(key, hashValue);
+      // Single emplace looks up or inserts and returns the resulting cell,
+      // mirroring ClickHouse insertAll (emplaceKey + ArenaKeyHolder). The
+      // transient key from the decoder is safe for the lookup and equality
+      // check, but a newly inserted cell would hold that per-batch pointer, so
+      // on insert we persist the bytes to the arena and swap the cell's key to
+      // the arena-owned copy. The bytes are identical, so the saved hash and
+      // future comparisons stay valid.
+      bool inserted;
+      auto* cell = storage_->rowsByKey.emplace(key, hashValue, inserted);
       VELOX_CHECK_NOT_NULL(cell);
+      if (inserted) {
+        cell->setKey(
+            StringRef{storage_->arena.insert(key.data, key.size), key.size});
+      }
       cell->getMapped().insert(
           RowRef(blockNo, static_cast<uint32_t>(rowNo)).encode(),
           storage_->arena);
@@ -187,8 +187,7 @@ void ChHashBuild::addInput(RowVectorPtr input) {
         }
       }
 
-      if (!decoder.mayHaveNulls() ||
-          decoder.hasPackedKeyAt(rowNo)) {
+      if (!decoder.mayHaveNulls() || decoder.hasPackedKeyAt(rowNo)) {
         storage_->rowsByKey.emplace(decoder.packedAt<Key>(rowNo));
       }
     });
@@ -228,12 +227,10 @@ void ChHashBuild::addInput(RowVectorPtr input) {
         }
       }
 
-      if (decoder.mayHaveNulls() &&
-          !decoder.hasPackedKeyAt(rowNo)) {
+      if (decoder.mayHaveNulls() && !decoder.hasPackedKeyAt(rowNo)) {
         return;
       }
-      auto* cell =
-          storage_->rowsByKey.find(decoder.packedAt<Key>(rowNo));
+      auto* cell = storage_->rowsByKey.find(decoder.packedAt<Key>(rowNo));
       VELOX_CHECK_NOT_NULL(cell);
       cell->getMapped().insert(
           RowRef(blockNo, static_cast<uint32_t>(rowNo)).encode(),

@@ -17,8 +17,8 @@
 #pragma once
 
 #include "velox/exec/ch/FixedHashMap.h"
-#include "velox/exec/ch/HashedKey.h"
 #include "velox/exec/ch/HashMap.h"
+#include "velox/exec/ch/HashedKey.h"
 
 #include <algorithm>
 #include <variant>
@@ -70,9 +70,9 @@ class FixedKeyMap {
     return type_;
   }
 
-  /// Returns the packed-key width for a fixed-width integer map. Only valid when
-  /// type() is one of the packed integer families; used by the FixedKeyDecoder
-  /// pack path to size the packed key.
+  /// Returns the packed-key width for a fixed-width integer map. Only valid
+  /// when type() is one of the packed integer families; used by the
+  /// FixedKeyDecoder pack path to size the packed key.
   FixedKeyWidth width() const {
     switch (type_) {
       case Type::key8:
@@ -148,13 +148,17 @@ class FixedKeyMap {
     return keyStringMap().emplace(key);
   }
 
-  // Inserts a string key using a precomputed hash, avoiding a rehash. The key
-  // bytes must outlive the map (persisted in the arena).
-  RowRefList& emplace(const StringRef& key, size_t hashValue) {
+  // Emplaces a string key using a precomputed hash, avoiding a rehash. Returns
+  // the cell (existing or newly inserted) and sets inserted accordingly. On
+  // insert the cell holds the caller-supplied key bytes, which must be
+  // persisted to outlive the map; the caller is expected to swap in an
+  // arena-owned copy via cell->setKey. Mirrors ClickHouse emplaceKey +
+  // ArenaKeyHolder: a single probe both looks up and inserts.
+  KeyStringMap::LookupResult
+  emplace(const StringRef& key, size_t hashValue, bool& inserted) {
     KeyStringMap::LookupResult result;
-    bool inserted;
     keyStringMap().emplace(key, result, inserted, hashValue);
-    return result->getMapped();
+    return result;
   }
 
   RowRefList& emplaceHashed(const UInt128& key) {
@@ -427,8 +431,8 @@ inline FixedKeyMap::Type FixedKeyMap::chooseType(
   }
 
   // All keys are fixed-width integers: pack by total bytes.
-  const bool allFixedInteger = std::all_of(
-      keyTypes.begin(), keyTypes.end(), [](const TypePtr& type) {
+  const bool allFixedInteger =
+      std::all_of(keyTypes.begin(), keyTypes.end(), [](const TypePtr& type) {
         return detail::isFixedIntegerKind(type->kind());
       });
   if (allFixedInteger) {

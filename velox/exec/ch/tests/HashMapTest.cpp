@@ -21,7 +21,10 @@
 #include "velox/exec/ch/RowRef.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <cstring>
+#include <string_view>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -41,8 +44,7 @@ class HashMapTest : public testing::Test {
 
   void SetUp() override {
     mapPool_ = memory::memoryManager()->addLeafPool("ch-hash-map-test");
-    arenaPool_ =
-        memory::memoryManager()->addLeafPool("ch-hash-map-arena-test");
+    arenaPool_ = memory::memoryManager()->addLeafPool("ch-hash-map-arena-test");
   }
 
   static uint64_t refWord(uint32_t block, uint32_t row) {
@@ -66,12 +68,10 @@ TEST_F(HashMapTest, fixedWidthCellsDoNotStoreSavedHash) {
   EXPECT_TRUE((std::is_same_v<
                HashMapAll_keys256::cell_type,
                HashMapCell<UInt256, RowRefList, HashWide<UInt256>>>));
-  EXPECT_TRUE((std::is_same_v<
-               HashMapAll_key_string::cell_type,
-               HashMapCellWithSavedHash<
-                   StringRef,
-                   RowRefList,
-                   StringRefHash>>));
+  EXPECT_TRUE(
+      (std::is_same_v<
+          HashMapAll_key_string::cell_type,
+          HashMapCellWithSavedHash<StringRef, RowRefList, StringRefHash>>));
   EXPECT_EQ(sizeof(HashMapAll_key32::cell_type), 16);
   EXPECT_EQ(sizeof(HashMapAll_key64::cell_type), 16);
   EXPECT_EQ(sizeof(HashMapAll_keys128::cell_type), 24);
@@ -106,6 +106,66 @@ TEST_F(HashMapTest, emplaceReturnsLiveCoordinateMapping) {
   auto& existing = map.emplace(42, inserted);
   EXPECT_FALSE(inserted);
   EXPECT_EQ(&existing, &cell->getMapped());
+}
+
+TEST_F(HashMapTest, stringEmplacePersistsInsertedKeyOnce) {
+  // Mirrors the build path: a single emplace with the transient key looks up or
+  // inserts; on insert the cell's key is swapped to an arena-owned copy so it
+  // does not dangle when the transient buffer is reused. Duplicate keys must
+  // return the same cell and accumulate row refs.
+  HashMapAll_key_string map(mapPool_.get());
+  Arena arena(arenaPool_.get());
+  StringRefHash hasher;
+
+  // Transient buffer reused across rows, imitating the decoder's inline
+  // storage.
+  std::array<char, 16> transient{};
+  const auto emplaceRow = [&](std::string_view text, uint64_t word) -> bool {
+    std::memcpy(transient.data(), text.data(), text.size());
+    StringRef key{transient.data(), static_cast<uint32_t>(text.size())};
+    const auto hashValue = hasher(key);
+    bool inserted = false;
+    typename HashMapAll_key_string::LookupResult cell;
+    map.emplace(key, cell, inserted, hashValue);
+    EXPECT_NE(cell, nullptr);
+    if (inserted) {
+      cell->setKey(StringRef{arena.insert(key.data, key.size), key.size});
+    }
+    cell->getMapped().insert(word, arena);
+    // Scribble over the transient buffer to expose any surviving reference to
+    // it (a dangling cell key would now mismatch on lookup).
+    transient.fill('\0');
+    return inserted;
+  };
+
+  EXPECT_TRUE(emplaceRow("alpha", refWord(1, 1)));
+  EXPECT_FALSE(emplaceRow("alpha", refWord(1, 2)));
+  EXPECT_TRUE(emplaceRow("beta", refWord(2, 3)));
+  EXPECT_TRUE(emplaceRow("alphabet", refWord(3, 4)));
+  EXPECT_EQ(map.size(), 3);
+
+  const auto findRefs = [&](std::string_view text) {
+    std::memcpy(transient.data(), text.data(), text.size());
+    StringRef key{transient.data(), static_cast<uint32_t>(text.size())};
+    auto* cell = map.find(key);
+    std::vector<uint64_t> words;
+    if (cell != nullptr) {
+      for (auto word : cell->getMapped()) {
+        words.push_back(word);
+      }
+      std::sort(words.begin(), words.end());
+    }
+    return words;
+  };
+
+  EXPECT_EQ(
+      findRefs("alpha"),
+      (std::vector<uint64_t>{
+          std::min(refWord(1, 1), refWord(1, 2)),
+          std::max(refWord(1, 1), refWord(1, 2))}));
+  EXPECT_EQ(findRefs("beta"), (std::vector<uint64_t>{refWord(2, 3)}));
+  EXPECT_EQ(findRefs("alphabet"), (std::vector<uint64_t>{refWord(3, 4)}));
+  EXPECT_TRUE(findRefs("missing").empty());
 }
 
 TEST_F(HashMapTest, usesVeloxCrc32ForFixedWidthKeys) {
@@ -260,9 +320,7 @@ TEST_F(HashMapTest, rehashPreservesEveryCoordinateChain) {
     for (auto word : cell->getMapped()) {
       words.push_back(word);
     }
-    EXPECT_EQ(
-        words,
-        (std::vector<uint64_t>{refWord(4, key), refWord(5, key)}));
+    EXPECT_EQ(words, (std::vector<uint64_t>{refWord(4, key), refWord(5, key)}));
   }
 }
 
