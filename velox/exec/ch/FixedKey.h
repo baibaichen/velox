@@ -44,7 +44,7 @@ static_assert(std::is_trivially_copyable_v<UInt256>);
 static_assert(sizeof(UInt128) == 16);
 static_assert(sizeof(UInt256) == 32);
 
-enum class FixedKeyWidth : uint8_t { k64 = 8, k128 = 16, k256 = 32 };
+enum class FixedKeyWidth : uint8_t { k32 = 4, k64 = 8, k128 = 16, k256 = 32 };
 
 inline size_t fixedKeyTypeSize(TypeKind kind) {
   switch (kind) {
@@ -70,6 +70,9 @@ inline FixedKeyWidth fixedKeyWidth(const std::vector<TypePtr>& types) {
     bytes += fixedKeyTypeSize(type->kind());
   }
   VELOX_USER_CHECK_LE(bytes, sizeof(UInt256), "packFixed key exceeds 32 bytes");
+  if (bytes <= sizeof(uint32_t)) {
+    return FixedKeyWidth::k32;
+  }
   return bytes <= sizeof(uint64_t)
       ? FixedKeyWidth::k64
       : bytes <= sizeof(UInt128) ? FixedKeyWidth::k128 : FixedKeyWidth::k256;
@@ -247,6 +250,7 @@ class FixedKeyDecoder {
   std::vector<bool> packedKeyValid_;
   std::variant<
       std::monostate,
+      std::vector<uint32_t>,
       std::vector<uint64_t>,
       std::vector<UInt128>,
       std::vector<UInt256>>

@@ -84,6 +84,12 @@ class ChHashBuild {
     return rowsByKey().type();
   }
 
+  /// Returns the packed-key width of the chosen fixed-integer map. Only valid
+  /// when keyMapType() is a packed integer family.
+  FixedKeyWidth keyMapWidth() const {
+    return rowsByKey().width();
+  }
+
   std::shared_ptr<JoinMap> takeMap();
 
   std::shared_ptr<RetainedVectorsIndex> takeRetained();

@@ -77,10 +77,11 @@ TEST_F(ChHashBuildTest, prepareJoinTableOnlyCreatesProbeableKeys) {
 
   build.prepareJoinTable(decodedKey, rows);
 
-  const auto* duplicateCell = build.rowsByKey().find(kDuplicateKey);
+  const auto* duplicateCell =
+      build.rowsByKey().find(static_cast<uint64_t>(kDuplicateKey));
   ASSERT_NE(duplicateCell, nullptr);
   EXPECT_EQ(duplicateCell->getMapped().rows(), 0);
-  EXPECT_NE(build.rowsByKey().find(1'008), nullptr);
+  EXPECT_NE(build.rowsByKey().find(uint64_t{1'008}), nullptr);
   EXPECT_EQ(input.use_count(), inputUseCount);
 }
 
@@ -97,7 +98,8 @@ TEST_F(ChHashBuildTest, addRowReferencesAttachesCoordinatesAndRetainsInput) {
 
   EXPECT_EQ(input.use_count(), inputUseCount + 1);
   EXPECT_EQ(build.retainedIndex().at(kDriverNo, 0), input.get());
-  const auto* duplicateCell = build.rowsByKey().find(kDuplicateKey);
+  const auto* duplicateCell =
+      build.rowsByKey().find(static_cast<uint64_t>(kDuplicateKey));
   ASSERT_NE(duplicateCell, nullptr);
   EXPECT_EQ(duplicateCell->getMapped().rows(), 8);
   for (const auto refWord : duplicateCell->getMapped()) {
@@ -143,7 +145,8 @@ TEST_F(ChHashBuildTest, duplicateKeyUsesRowRefListChain) {
   build.addInput(first);
   build.addInput(second);
 
-  const auto* cell = build.rowsByKey().find(kDuplicateKey);
+  const auto* cell =
+      build.rowsByKey().find(static_cast<uint64_t>(kDuplicateKey));
   ASSERT_NE(cell, nullptr);
   EXPECT_FALSE(cell->getMapped().isInline());
   EXPECT_EQ(cell->getMapped().rows(), 13);

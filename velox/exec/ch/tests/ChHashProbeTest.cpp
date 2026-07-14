@@ -215,14 +215,15 @@ TEST_F(ChHashProbeTest, routesKeyTypesToMaps) {
 }
 
 TEST_F(ChHashProbeTest, matchesSingleIntegerKeys) {
-  // A single 4-byte INTEGER key routes to Type::key32, which is carried by the
-  // 64-bit map today; verify build and probe still resolve matches.
+  // A single 4-byte INTEGER key routes to Type::key32, backed by a real 32-bit
+  // Map32 table; verify build and probe resolve matches on that path.
   auto buildInput = makeRowVector({
       makeFlatVector<int32_t>({10, 20, 20, 30}),
   });
   ChHashBuild build(
       kDriverNo, std::vector<column_index_t>{0}, {INTEGER()}, pool());
   EXPECT_EQ(build.keyMapType(), FixedKeyMap::Type::key32);
+  EXPECT_EQ(build.keyMapWidth(), FixedKeyWidth::k32);
   build.addInput(buildInput);
 
   auto probe = makeRowVector({
@@ -236,6 +237,38 @@ TEST_F(ChHashProbeTest, matchesSingleIntegerKeys) {
   EXPECT_EQ(matches[1].probeRow, 0);
   EXPECT_EQ(matches[1].buildRowNo, 2);
   EXPECT_EQ(matches[2].probeRow, 2);
+  EXPECT_EQ(matches[2].buildRowNo, 0);
+}
+
+TEST_F(ChHashProbeTest, matchesSmallPackedKeys32) {
+  // Two SMALLINT columns pack into 4 bytes and route to Type::keys32, backed by
+  // the 32-bit Map32 table; verify the packed 32-bit path resolves matches.
+  auto buildInput = makeRowVector({
+      makeFlatVector<int16_t>({1, 2, 2, 3}),
+      makeFlatVector<int16_t>({10, 20, 20, 30}),
+  });
+  ChHashBuild build(
+      kDriverNo,
+      std::vector<column_index_t>{0, 1},
+      std::vector<TypePtr>{SMALLINT(), SMALLINT()},
+      pool());
+  EXPECT_EQ(build.keyMapType(), FixedKeyMap::Type::keys32);
+  EXPECT_EQ(build.keyMapWidth(), FixedKeyWidth::k32);
+  build.addInput(buildInput);
+
+  auto probe = makeRowVector({
+      makeFlatVector<int16_t>({2, 1, 9}),
+      makeFlatVector<int16_t>({20, 10, 9}),
+  });
+  const auto matches =
+      probeHashBuild(build, probe, std::vector<column_index_t>{0, 1});
+
+  ASSERT_EQ(matches.size(), 3);
+  EXPECT_EQ(matches[0].probeRow, 0);
+  EXPECT_EQ(matches[0].buildRowNo, 1);
+  EXPECT_EQ(matches[1].probeRow, 0);
+  EXPECT_EQ(matches[1].buildRowNo, 2);
+  EXPECT_EQ(matches[2].probeRow, 1);
   EXPECT_EQ(matches[2].buildRowNo, 0);
 }
 

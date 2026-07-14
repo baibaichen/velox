@@ -224,7 +224,7 @@ TEST_F(ChHashBuildOperatorTest, handsBuiltTableToBridgeAndFinishesAfterInput) {
   ASSERT_NE(result->map, nullptr);
   ASSERT_NE(result->retained, nullptr);
 
-  const auto* cell = result->map->find(7);
+  const auto* cell = result->map->find(uint64_t{7});
   ASSERT_NE(cell, nullptr);
   EXPECT_EQ(cell->getMapped().rows(), 2);
 

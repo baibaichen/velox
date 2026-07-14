@@ -30,9 +30,8 @@ class FixedKeyMap {
   /// mirroring ClickHouse's HashJoin method selection. The value is decided
   /// once via chooseType and then dispatched on.
   enum class Type {
-    // key32/keys32/keys64 are routed to the 64-bit map via a width fallback;
-    // a dedicated Map32 awaits uint32_t pack support in FixedKeyDecoder.
-    // key8/key16 have no ported map yet and are true NYI placeholders.
+    // key64/keys64 use the 64-bit map; key32/keys32 use a dedicated 32-bit
+    // Map32. key8/key16 have no ported map yet and are true NYI placeholders.
     key8,
     key16,
     key32,
@@ -50,6 +49,7 @@ class FixedKeyMap {
   /// supported set (integer fixed-width and VARCHAR).
   static Type chooseType(const std::vector<TypePtr>& keyTypes);
 
+  using Map32 = HashMapAll_key32;
   using Map64 = HashMapAll_key64;
   using Map128 = HashMapAll_keys128;
   using Map256 = HashMapAll_keys256;
@@ -72,10 +72,9 @@ class FixedKeyMap {
   /// pack path to size the packed key.
   FixedKeyWidth width() const {
     switch (type_) {
-      // Narrow single/packed integer keys are carried by the 64-bit map because
-      // the FixedKeyDecoder does not pack into UInt32; see makeMap.
       case Type::key32:
       case Type::keys32:
+        return FixedKeyWidth::k32;
       case Type::keys64:
       case Type::key64:
         return FixedKeyWidth::k64;
@@ -114,6 +113,10 @@ class FixedKeyMap {
         [](const auto& map) { return map.getBufferSizeInBytes(); }, maps_);
   }
 
+  RowRefList& emplace(uint32_t key) {
+    return map32().emplace(key);
+  }
+
   RowRefList& emplace(uint64_t key) {
     return map64().emplace(key);
   }
@@ -132,6 +135,14 @@ class FixedKeyMap {
 
   RowRefList& emplaceHashed(const UInt128& key) {
     return hashedMap().emplace(key);
+  }
+
+  Map32::LookupResult find(uint32_t key) {
+    return map32().find(key);
+  }
+
+  Map32::ConstLookupResult find(uint32_t key) const {
+    return map32().find(key);
   }
 
   Map64::LookupResult find(uint64_t key) {
@@ -195,16 +206,16 @@ class FixedKeyMap {
 
  private:
   using Maps =
-      std::variant<Map64, Map128, Map256, KeyStringMap, HashedMap>;
+      std::variant<Map32, Map64, Map128, Map256, KeyStringMap, HashedMap>;
 
   static Maps makeMap(memory::MemoryPool* pool, Type type) {
     switch (type) {
-      // Narrow integer keys (single 4-byte, or packs totaling <= 8 bytes) are
-      // carried by the 64-bit map: the FixedKeyDecoder packs into uint64_t and
-      // does not instantiate uint32_t. Wiring a real Map32 (HashMapAll_key32)
-      // requires teaching FixedKeyDecoder to pack into UInt32 first.
+      // Single 4-byte or packs totaling <= 4 bytes use the 32-bit Map32; packs
+      // totaling <= 8 bytes use the 64-bit map. The FixedKeyDecoder packs into
+      // uint32_t or uint64_t respectively.
       case Type::key32:
       case Type::keys32:
+        return Maps(std::in_place_type<Map32>, pool);
       case Type::keys64:
       case Type::key64:
         return Maps(std::in_place_type<Map64>, pool);
@@ -229,7 +240,9 @@ class FixedKeyMap {
 
   template <typename Key>
   const auto& map() const {
-    if constexpr (std::is_same_v<Key, uint64_t>) {
+    if constexpr (std::is_same_v<Key, uint32_t>) {
+      return map32();
+    } else if constexpr (std::is_same_v<Key, uint64_t>) {
       return map64();
     } else if constexpr (std::is_same_v<Key, UInt128>) {
       return map128();
@@ -241,6 +254,12 @@ class FixedKeyMap {
     }
   }
 
+  Map32& map32() {
+    return std::get<Map32>(maps_);
+  }
+  const Map32& map32() const {
+    return std::get<Map32>(maps_);
+  }
   Map64& map64() {
     return std::get<Map64>(maps_);
   }
