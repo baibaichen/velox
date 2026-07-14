@@ -68,17 +68,8 @@ std::vector<ProbeHit> joinProbe(
         probe, probeKeyChannels, map.keyTypes(), rows);
     std::vector<ProbeHit> hits;
     hits.reserve(probe->size());
-    const bool usePrefetch =
-        map.getBufferSizeInBytes() > kMinTableBytesForPrefetch;
-    std::string prefetchBytes;
     std::string keyBytes;
     for (vector_size_t probeRow = 0; probeRow < probe->size(); ++probeRow) {
-      const auto prefetchRow = probeRow + kPrefetchLookAhead;
-      if (usePrefetch && prefetchRow < probe->size() &&
-          decoder.serialize(prefetchRow, prefetchBytes)) {
-        map.prefetch(stringRef(prefetchBytes));
-      }
-
       if (!decoder.serialize(probeRow, keyBytes)) {
         continue;
       }
@@ -97,6 +88,7 @@ std::vector<ProbeHit> joinProbe(
     std::vector<ProbeHit> hits;
     hits.reserve(probe->size());
     const bool usePrefetch =
+        FixedKeyDecoder::hasCheapKeyCalculation &&
         map.getBufferSizeInBytes() > kMinTableBytesForPrefetch;
     for (vector_size_t probeRow = 0; probeRow < probe->size(); ++probeRow) {
       const auto prefetchRow = probeRow + kPrefetchLookAhead;

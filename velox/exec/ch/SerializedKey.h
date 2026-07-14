@@ -84,6 +84,8 @@ inline bool useSerializedKey(const std::vector<TypePtr>& types) {
 
 class SerializedKeyDecoder {
  public:
+  static constexpr bool hasCheapKeyCalculation = false;
+
   SerializedKeyDecoder(
       const RowVectorPtr& input,
       std::vector<column_index_t> channels,

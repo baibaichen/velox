@@ -125,5 +125,9 @@ TEST_F(SerializedKeyTest, emptyStringIsNotTheZeroKey) {
   EXPECT_EQ(map.size(), 1);
 }
 
+TEST_F(SerializedKeyTest, doesNotSupportProbePrefetch) {
+  EXPECT_FALSE(SerializedKeyDecoder::hasCheapKeyCalculation);
+}
+
 } // namespace
 } // namespace facebook::velox::exec::ch

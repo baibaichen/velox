@@ -76,6 +76,8 @@ inline FixedKeyWidth fixedKeyWidth(const std::vector<TypePtr>& types) {
 
 class FixedKeyDecoder {
  public:
+  static constexpr bool hasCheapKeyCalculation = true;
+
   FixedKeyDecoder(
       const RowVectorPtr& input,
       std::vector<column_index_t> channels,

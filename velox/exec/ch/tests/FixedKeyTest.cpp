@@ -106,5 +106,9 @@ TEST_F(FixedKeyTest, rejectsUnsupportedAndOversizedKeys) {
   EXPECT_ANY_THROW(FixedKeyDecoder(oversized, channels, oversizedRows));
 }
 
+TEST_F(FixedKeyTest, supportsProbePrefetch) {
+  EXPECT_TRUE(FixedKeyDecoder::hasCheapKeyCalculation);
+}
+
 } // namespace
 } // namespace facebook::velox::exec::ch
