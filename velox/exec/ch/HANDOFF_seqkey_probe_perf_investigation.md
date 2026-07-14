@@ -41,7 +41,16 @@
 
 ## 真机复现步骤
 
+### 本机（ChangDev）复现步骤
 ```bash
+# 代码位置
+1. 当前文档位置: ../../../../ <=> ~/OpenSource/velox
+2. cmake 已经好了 => /usr/bin/cmake --build /home/chang/OpenSource/velox/cmake-build-release-gcc13 --target velox_exec_ch_hashtable_layer_benchmark -j 30
+```
+
+### 容器复现步骤
+```bash
+
 # 1. clone 分支
 git clone https://github.com/baibaichen/velox.git
 cd velox && git checkout ch-hashtable-layer-stage7   # commit d4e5e8ce8

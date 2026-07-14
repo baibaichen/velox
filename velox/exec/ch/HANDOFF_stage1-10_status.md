@@ -11,6 +11,17 @@
 ## 编译参数
 
 ### Velox
+
+#### 本机（ChangDev）复现步骤
+
+```bash
+# 代码位置
+1. 当前文档位置: ../../../../ <=> ~/OpenSource/velox
+2. cmake 已经好了 => /usr/bin/cmake --build /home/chang/OpenSource/velox/cmake-build-release-gcc13 --target velox_exec_ch_hashtable_layer_benchmark -j 30
+```
+
+#### 容器复现步骤
+
 封装脚本 `/root/oss/velox-help/build.sh`（自动 source `env.sh` 带全套 VCPKG env）：
 ```
 build.sh config             # 配 _build/debug
@@ -23,6 +34,18 @@ configure flag：`-DCMAKE_BUILD_TYPE=Debug/Release -DVELOX_GFLAGS_TYPE=static -D
 - 日志 `/tmp/velox-build-logs/`。链接慢（`libvelox.a` ~4.7G mono）——后台编。
 
 ### ClickHouse（原生 benchmark）
+
+#### 本机（ChangDev）复现步骤
+```bash
+# debug
+/home/chang/.local/share/JetBrains/Toolbox/apps/clion/bin/cmake/linux/x64/bin/cmake --build /home/chang/SourceCode/ClickHouse/cmake-build-debug-clang.21 --target ch_hj_bench -j 30
+
+# release
+/home/chang/.local/share/JetBrains/Toolbox/apps/clion/bin/cmake/linux/x64/bin/cmake --build /home/chang/SourceCode/ClickHouse/cmake-build-relwithdebinfo-clang.21 --target ch_hj_bench -j 30
+```
+
+#### 容器复现步骤
+
 | | Debug (`build_debug`) | Release (`build_release`) |
 |---|---|---|
 | BUILD_TYPE | Debug | Release |
