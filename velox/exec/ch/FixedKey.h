@@ -84,13 +84,15 @@ class FixedKeyDecoder {
       std::vector<column_index_t> channels,
       const SelectivityVector& rows)
       : channels_(std::move(channels)),
-        selectedRows_(rows.size(), false),
-        packedKeyValid_(rows.size(), false),
+        selectedRowsSize_(rows.size()),
         allRowsSelected_(rows.isAllSelected()) {
     VELOX_CHECK_NOT_NULL(input);
     VELOX_USER_CHECK(!channels_.empty(), "packFixed requires key channels");
-    rows.applyToSelected(
-        [&](vector_size_t row) { selectedRows_[row] = true; });
+    if (!allRowsSelected_) {
+      selectedRows_.assign(rows.size(), false);
+      rows.applyToSelected(
+          [&](vector_size_t row) { selectedRows_[row] = true; });
+    }
     std::vector<TypePtr> types;
     types.reserve(channels_.size());
     decodedKeys_.reserve(channels_.size());
@@ -105,6 +107,15 @@ class FixedKeyDecoder {
       decodedKeys_.push_back(std::move(decoded));
     }
     width_ = fixedKeyWidth(types);
+    if (decodedKeys_.size() == 1) {
+      const auto& decoded = *decodedKeys_.front();
+      if (decoded.isIdentityMapping() && !decoded.mayHaveNulls() &&
+          decoded.base()->isFlatEncoding()) {
+        useRawPointer_ = true;
+        rawValues_ = decoded.data<char>();
+        rawValueSize_ = keySizes_.front();
+      }
+    }
   }
 
   FixedKeyWidth width() const {
@@ -115,9 +126,44 @@ class FixedKeyDecoder {
     return mayHaveNulls_;
   }
 
+ private:
+  template <typename Key>
+  void packRaw(vector_size_t row, Key& key) const {
+    VELOX_CHECK_GE(sizeof(Key), rawValueSize_);
+    key = Key{};
+    const auto* value =
+        static_cast<const char*>(rawValues_) + row * rawValueSize_;
+    if (rawValueSize_ == sizeof(Key)) {
+      std::memcpy(&key, value, sizeof(Key));
+    } else {
+      std::memcpy(&key, value, rawValueSize_);
+    }
+  }
+
+ public:
+  template <typename Key>
+  bool packFast(vector_size_t row, Key& key) const {
+    if (!useRawPointer_) {
+      return false;
+    }
+    packRaw(row, key);
+    return true;
+  }
+
   template <typename Key>
   bool pack(vector_size_t row, Key& key) const {
     VELOX_CHECK_GE(sizeof(Key), static_cast<size_t>(width_));
+    if constexpr (sizeof(Key) == sizeof(uint64_t)) {
+      if (useRawPointer_) {
+        packRaw(row, key);
+        return true;
+      }
+    }
+    return packGeneric(row, key);
+  }
+
+  template <typename Key>
+  bool packGeneric(vector_size_t row, Key& key) const {
     key = Key{};
     size_t offset = 0;
     for (size_t i = 0; i < decodedKeys_.size(); ++i) {
@@ -134,10 +180,14 @@ class FixedKeyDecoder {
   template <typename Key>
   void packAll() {
     VELOX_CHECK_EQ(sizeof(Key), static_cast<size_t>(width_));
-    preparedKeys_ = std::vector<Key>(selectedRows_.size());
+    preparedKeys_ = std::vector<Key>(selectedRowsSize_);
     auto& packedKeys = std::get<std::vector<Key>>(preparedKeys_);
     preparedKeysData_ = packedKeys.data();
-    packedKeyValid_ = selectedRows_;
+    if (allRowsSelected_) {
+      packedKeyValid_.assign(selectedRowsSize_, true);
+    } else {
+      packedKeyValid_ = selectedRows_;
+    }
 
     size_t offset = 0;
     for (size_t i = 0; i < decodedKeys_.size(); ++i) {
@@ -244,6 +294,7 @@ class FixedKeyDecoder {
   std::vector<std::unique_ptr<DecodedVector>> decodedKeys_;
   std::vector<size_t> keySizes_;
   std::vector<bool> selectedRows_;
+  vector_size_t selectedRowsSize_{0};
   std::vector<bool> packedKeyValid_;
   std::variant<
       std::monostate,
@@ -253,6 +304,9 @@ class FixedKeyDecoder {
       preparedKeys_;
   const void* preparedKeysData_{nullptr};
   bool allRowsSelected_{false};
+  const void* rawValues_{nullptr};
+  size_t rawValueSize_{0};
+  bool useRawPointer_{false};
   bool mayHaveNulls_{false};
   FixedKeyWidth width_{FixedKeyWidth::k64};
 };

@@ -180,11 +180,10 @@ void ChHashBuild::addInput(RowVectorPtr input) {
   FixedKeyDecoder decoder(input, keyChannels_, rows);
   VELOX_CHECK(decoder.width() == storage_->rowsByKey.width());
   const auto prepare = [&]<typename Key>() {
-    decoder.packAll<Key>();
     rows.applyToSelected([&](vector_size_t rowNo) {
-      if (!decoder.mayHaveNulls() ||
-          decoder.hasPackedKeyAt(rowNo)) {
-        storage_->rowsByKey.emplace(decoder.packedAt<Key>(rowNo));
+      Key key;
+      if (decoder.pack(rowNo, key)) {
+        storage_->rowsByKey.emplace(key);
       }
     });
   };
@@ -204,12 +203,11 @@ void ChHashBuild::addInput(RowVectorPtr input) {
   const uint32_t blockNo = packBlockNo(driverNo_, batchNo);
   const auto attach = [&]<typename Key>() {
     rows.applyToSelected([&](vector_size_t rowNo) {
-      if (decoder.mayHaveNulls() &&
-          !decoder.hasPackedKeyAt(rowNo)) {
+      Key key;
+      if (!decoder.pack(rowNo, key)) {
         return;
       }
-      auto* cell =
-          storage_->rowsByKey.find(decoder.packedAt<Key>(rowNo));
+      auto* cell = storage_->rowsByKey.find(key);
       VELOX_CHECK_NOT_NULL(cell);
       cell->getMapped().insert(
           RowRef(blockNo, static_cast<uint32_t>(rowNo)).encode(),

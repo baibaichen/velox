@@ -102,7 +102,6 @@ std::vector<ProbeHit> joinProbe(
   VELOX_CHECK(decoder.width() == map.width());
 
   const auto probeKeys = [&]<typename Key>() {
-    decoder.packAll<Key>();
     std::vector<ProbeHit> hits;
     hits.reserve(probe->size());
     const bool usePrefetch =
@@ -111,17 +110,17 @@ std::vector<ProbeHit> joinProbe(
     for (vector_size_t probeRow = 0; probeRow < probe->size(); ++probeRow) {
       const auto prefetchRow = probeRow + kPrefetchLookAhead;
       if (usePrefetch && prefetchRow < probe->size()) {
-        if (!decoder.mayHaveNulls() ||
-            decoder.hasPackedKeyAt(prefetchRow)) {
-          map.prefetch(decoder.packedAt<Key>(prefetchRow));
+        Key prefetchKey;
+        if (decoder.pack(prefetchRow, prefetchKey)) {
+          map.prefetch(prefetchKey);
         }
       }
 
-      if (decoder.mayHaveNulls() &&
-          !decoder.hasPackedKeyAt(probeRow)) {
+      Key key;
+      if (!decoder.pack(probeRow, key)) {
         continue;
       }
-      const auto* cell = map.find(decoder.packedAt<Key>(probeRow));
+      const auto* cell = map.find(key);
       if (cell != nullptr) {
         hits.push_back({probeRow, &cell->getMapped()});
       }
