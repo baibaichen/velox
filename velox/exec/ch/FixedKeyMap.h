@@ -53,7 +53,7 @@ class FixedKeyMap {
   using Map64 = HashMapAll_key64;
   using Map128 = HashMapAll_keys128;
   using Map256 = HashMapAll_keys256;
-  using SerializedMap = HashMapAll_serialized;
+  using KeyStringMap = HashMapAll_key_string;
   using HashedMap = HashMapAll_hashed;
 
   explicit FixedKeyMap(memory::MemoryPool* pool)
@@ -130,7 +130,7 @@ class FixedKeyMap {
   }
 
   RowRefList& emplace(const StringRef& key) {
-    return serializedMap().emplace(key);
+    return keyStringMap().emplace(key);
   }
 
   RowRefList& emplaceHashed(const UInt128& key) {
@@ -161,12 +161,12 @@ class FixedKeyMap {
     return map256().find(key);
   }
 
-  SerializedMap::LookupResult find(const StringRef& key) {
-    return serializedMap().find(key);
+  KeyStringMap::LookupResult find(const StringRef& key) {
+    return keyStringMap().find(key);
   }
 
-  SerializedMap::ConstLookupResult find(const StringRef& key) const {
-    return serializedMap().find(key);
+  KeyStringMap::ConstLookupResult find(const StringRef& key) const {
+    return keyStringMap().find(key);
   }
 
   HashedMap::LookupResult findHashed(const UInt128& key) {
@@ -198,7 +198,7 @@ class FixedKeyMap {
 
  private:
   using Maps =
-      std::variant<Map64, Map128, Map256, SerializedMap, HashedMap>;
+      std::variant<Map64, Map128, Map256, KeyStringMap, HashedMap>;
 
   static Maps makeFixedMap(memory::MemoryPool* pool, FixedKeyWidth width) {
     switch (width) {
@@ -221,7 +221,7 @@ class FixedKeyMap {
     }
     return arbitraryMode == ArbitraryKeyMode::kHashed
         ? Maps(std::in_place_type<HashedMap>, pool)
-        : Maps(std::in_place_type<SerializedMap>, pool);
+        : Maps(std::in_place_type<KeyStringMap>, pool);
   }
 
   template <typename Key>
@@ -234,7 +234,7 @@ class FixedKeyMap {
       return map256();
     } else {
       static_assert(std::is_same_v<Key, StringRef>);
-      return serializedMap();
+      return keyStringMap();
     }
   }
 
@@ -256,11 +256,11 @@ class FixedKeyMap {
   const Map256& map256() const {
     return std::get<Map256>(maps_);
   }
-  SerializedMap& serializedMap() {
-    return std::get<SerializedMap>(maps_);
+  KeyStringMap& keyStringMap() {
+    return std::get<KeyStringMap>(maps_);
   }
-  const SerializedMap& serializedMap() const {
-    return std::get<SerializedMap>(maps_);
+  const KeyStringMap& keyStringMap() const {
+    return std::get<KeyStringMap>(maps_);
   }
   HashedMap& hashedMap() {
     return std::get<HashedMap>(maps_);

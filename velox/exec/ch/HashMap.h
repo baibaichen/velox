@@ -248,7 +248,7 @@ using HashMapAll_key32 = HashMapAll<UInt32>;
 using HashMapAll_key64 = HashMapAll<UInt64>;
 using HashMapAll_keys128 = HashMapAll<UInt128, HashWide<UInt128>>;
 using HashMapAll_keys256 = HashMapAll<UInt256, HashWide<UInt256>>;
-using HashMapAll_serialized = HashMapTable<
+using HashMapAll_key_string = HashMapTable<
     StringRef,
     HashMapCellWithSavedHash<StringRef, RowRefList, StringRefHash>,
     StringRefHash>;
@@ -265,7 +265,7 @@ static_assert(std::is_trivially_copyable_v<HashMapAll_key32::cell_type>);
 static_assert(std::is_trivially_copyable_v<HashMapAll_key64::cell_type>);
 static_assert(std::is_trivially_copyable_v<HashMapAll_keys128::cell_type>);
 static_assert(std::is_trivially_copyable_v<HashMapAll_keys256::cell_type>);
-static_assert(std::is_trivially_copyable_v<HashMapAll_serialized::cell_type>);
+static_assert(std::is_trivially_copyable_v<HashMapAll_key_string::cell_type>);
 static_assert(std::is_trivially_copyable_v<HashMapAll_hashed::cell_type>);
 
 } // namespace facebook::velox::exec::ch

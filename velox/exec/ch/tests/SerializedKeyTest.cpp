@@ -116,7 +116,7 @@ TEST_F(SerializedKeyTest, emptyStringIsNotTheZeroKey) {
   EXPECT_FALSE(ZeroTraits::check(temporary));
 
   Arena arena(pool());
-  HashMapAll_serialized map(pool());
+  HashMapAll_key_string map(pool());
   StringRef persisted{
       arena.insert(temporary.data, temporary.size), temporary.size};
   map.emplace(persisted);

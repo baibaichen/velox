@@ -67,7 +67,7 @@ TEST_F(HashMapTest, fixedWidthCellsDoNotStoreSavedHash) {
                HashMapAll_keys256::cell_type,
                HashMapCell<UInt256, RowRefList, HashWide<UInt256>>>));
   EXPECT_TRUE((std::is_same_v<
-               HashMapAll_serialized::cell_type,
+               HashMapAll_key_string::cell_type,
                HashMapCellWithSavedHash<
                    StringRef,
                    RowRefList,
