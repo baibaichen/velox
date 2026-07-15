@@ -26,7 +26,6 @@ add_executable(
   HashedKeyTest.cpp
   HashMapTest.cpp
   HashTableTest.cpp
-  PrefetchingTest.cpp
   Main.cpp
   RetainedVectorsIndexTest.cpp
   RowRefTest.cpp

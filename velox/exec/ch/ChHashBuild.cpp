@@ -18,7 +18,6 @@
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/exec/ch/HashedKey.h"
-#include "velox/exec/ch/Prefetching.h"
 #include "velox/exec/ch/RowRef.h"
 #include "velox/exec/ch/SerializedKey.h"
 
@@ -86,7 +85,8 @@ void ChHashBuild::prepareJoinTable(
       return;
     }
 
-    const auto key = static_cast<uint64_t>(decodedKey.valueAt<int64_t>(rowNo));
+    const auto key =
+        static_cast<uint64_t>(decodedKey.valueAt<int64_t>(rowNo));
     storage_->rowsByKey.emplace(key);
   });
 }
@@ -112,11 +112,13 @@ void ChHashBuild::addRowReferences(
       return;
     }
 
-    const auto key = static_cast<uint64_t>(decodedKey.valueAt<int64_t>(rowNo));
+    const auto key =
+        static_cast<uint64_t>(decodedKey.valueAt<int64_t>(rowNo));
     auto* cell = storage_->rowsByKey.find(key);
     VELOX_CHECK_NOT_NULL(
         cell, "Key must be prepared before adding row references");
-    const auto refWord = RowRef(blockNo, static_cast<uint32_t>(rowNo)).encode();
+    const auto refWord =
+        RowRef(blockNo, static_cast<uint32_t>(rowNo)).encode();
     cell->getMapped().insert(refWord, storage_->arena);
   });
 }
@@ -178,17 +180,7 @@ void ChHashBuild::addInput(RowVectorPtr input) {
   FixedKeyDecoder decoder(input, keyChannels_, rows);
   VELOX_CHECK(decoder.width() == storage_->rowsByKey.width());
   const auto prepare = [&]<typename Key>() {
-    const bool usePrefetch = FixedKeyDecoder::hasCheapKeyCalculation &&
-        storage_->rowsByKey.getBufferSizeInBytes() > minTableBytesForPrefetch();
-    auto prefetcher =
-        makeJoinPrefetcher(usePrefetch, input->size(), [&](size_t prefetchRow) {
-          Key prefetchKey;
-          if (decoder.pack(prefetchRow, prefetchKey)) {
-            storage_->rowsByKey.prefetch(prefetchKey);
-          }
-        });
     rows.applyToSelected([&](vector_size_t rowNo) {
-      prefetcher.prefetchAt(rowNo);
       Key key;
       if (decoder.pack(rowNo, key)) {
         storage_->rowsByKey.emplace(key);
