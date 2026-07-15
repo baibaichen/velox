@@ -91,65 +91,6 @@ TEST_F(FixedKeyTest, decodesDictionaryAndConstantAndSkipsNull) {
   EXPECT_FALSE(decoder.pack(2, key));
 }
 
-TEST_F(FixedKeyTest, rawPointerFastPathMatchesPackedBytes) {
-  auto bigintInput =
-      makeRowVector({makeFlatVector<int64_t>({11, -1, 33})});
-  SelectivityVector bigintRows(bigintInput->size());
-  FixedKeyDecoder bigintDecoder(bigintInput, {0}, bigintRows);
-
-  uint64_t bigintKey = 0;
-  ASSERT_TRUE(bigintDecoder.packFast(1, bigintKey));
-  EXPECT_EQ(bigintKey, std::numeric_limits<uint64_t>::max());
-  uint64_t scalarBigintKey = 0;
-  ASSERT_TRUE(bigintDecoder.pack(1, scalarBigintKey));
-  EXPECT_EQ(bigintKey, scalarBigintKey);
-
-  auto tinyintInput =
-      makeRowVector({makeFlatVector<int8_t>({1, -1, 3})});
-  SelectivityVector tinyintRows(tinyintInput->size());
-  FixedKeyDecoder tinyintDecoder(tinyintInput, {0}, tinyintRows);
-
-  uint64_t tinyintKey = 0;
-  ASSERT_TRUE(tinyintDecoder.packFast(1, tinyintKey));
-  EXPECT_EQ(tinyintKey, 0xff);
-  uint64_t scalarTinyintKey = 0;
-  ASSERT_TRUE(tinyintDecoder.pack(1, scalarTinyintKey));
-  EXPECT_EQ(tinyintKey, scalarTinyintKey);
-}
-
-TEST_F(FixedKeyTest, rawPointerFastPathRejectsFallbackInputs) {
-  auto base = makeFlatVector<int64_t>({11, 22, 33});
-  auto dictionary = BaseVector::wrapInDictionary(
-      nullptr, makeIndices({2, 0, 1}), 3, base);
-  auto dictionaryInput = makeRowVector({dictionary});
-  SelectivityVector dictionaryRows(dictionaryInput->size());
-  FixedKeyDecoder dictionaryDecoder(
-      dictionaryInput, {0}, dictionaryRows);
-  uint64_t key = 0;
-  EXPECT_FALSE(dictionaryDecoder.packFast(0, key));
-  ASSERT_TRUE(dictionaryDecoder.pack(0, key));
-  EXPECT_EQ(key, 33);
-
-  auto nullableInput = makeRowVector(
-      {makeNullableFlatVector<int64_t>({11, std::nullopt, 33})});
-  SelectivityVector nullableRows(nullableInput->size());
-  FixedKeyDecoder nullableDecoder(nullableInput, {0}, nullableRows);
-  EXPECT_FALSE(nullableDecoder.packFast(0, key));
-  EXPECT_FALSE(nullableDecoder.pack(1, key));
-
-  auto compositeInput = makeRowVector({
-      makeFlatVector<int64_t>({0x0102030405060708}),
-      makeFlatVector<int32_t>({0x11121314}),
-  });
-  SelectivityVector compositeRows(compositeInput->size());
-  FixedKeyDecoder compositeDecoder(compositeInput, {0, 1}, compositeRows);
-  UInt128 compositeKey;
-  EXPECT_FALSE(compositeDecoder.packFast(0, compositeKey));
-  ASSERT_TRUE(compositeDecoder.pack(0, compositeKey));
-  EXPECT_EQ(compositeKey.words[0], 0x0102030405060708);
-  EXPECT_EQ(compositeKey.words[1], 0x11121314);
-}
-
 TEST_F(FixedKeyTest, batchPackingMatchesScalarPackingAndMarksNulls) {
   auto first = makeNullableFlatVector<int64_t>(
       {0x0102030405060708, 11, std::nullopt, 33});
