@@ -29,6 +29,7 @@ add_executable(
   HashMapTest.cpp
   HashTableTest.cpp
   Main.cpp
+  PrefetchingTest.cpp
   RetainedVectorsIndexTest.cpp
   RowRefTest.cpp
   RowRefListTest.cpp

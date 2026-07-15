@@ -21,6 +21,7 @@ velox_add_library(
   ChHashProbe.cpp
   ChHashProbeOperator.cpp
   EmitGather.cpp
+  Prefetching.cpp
   RetainedVectorsIndex.cpp
   RowRefList.cpp
   HEADERS
@@ -39,6 +40,7 @@ velox_add_library(
     FixedKeyMap.h
     SerializedKey.h
     HashTableAllocatorAdapter.h
+    Prefetching.h
     RetainedVectorsIndex.h
     RowRef.h
     RowRefList.h

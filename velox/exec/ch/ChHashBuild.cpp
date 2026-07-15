@@ -18,17 +18,11 @@
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/exec/ch/HashedKey.h"
+#include "velox/exec/ch/Prefetching.h"
 #include "velox/exec/ch/RowRef.h"
 #include "velox/exec/ch/SerializedKey.h"
 
 namespace facebook::velox::exec::ch {
-
-namespace {
-// Mirror the probe-side prefetch tuning (ChHashProbe.cpp): look ahead 16 rows
-// and only prefetch once the table outgrows the last-level cache.
-constexpr vector_size_t kPrefetchLookAhead = 16;
-constexpr size_t kMinTableBytesForPrefetch = 8UL << 20;
-} // namespace
 
 ChHashBuild::ChHashBuild(
     uint32_t driverNo,
@@ -131,18 +125,19 @@ void ChHashBuild::addInput(RowVectorPtr input) {
     const uint32_t batchNo = retainedIndex_->add(input);
     const uint32_t blockNo = packBlockNo(driverNo_, batchNo);
     const bool usePrefetch =
-        storage_->rowsByKey.getBufferSizeInBytes() > kMinTableBytesForPrefetch;
+        storage_->rowsByKey.getBufferSizeInBytes() > minTableBytesForPrefetch();
+    auto prefetcher =
+        makeJoinPrefetcher(usePrefetch, rows.size(), [&](size_t prefetchRow) {
+          StringRef prefetchKey;
+          // atForPrefetch() uses a separate inline buffer, so it does not
+          // clobber the current row's key held below.
+          if (decoder.atForPrefetch(prefetchRow, prefetchKey)) {
+            storage_->rowsByKey.prefetchString(
+                storage_->rowsByKey.hashString(prefetchKey));
+          }
+        });
     rows.applyToSelected([&](vector_size_t rowNo) {
-      const auto prefetchRow = rowNo + kPrefetchLookAhead;
-      if (usePrefetch && prefetchRow < rows.size()) {
-        StringRef prefetchKey;
-        // atForPrefetch() uses a separate inline buffer, so it does not clobber
-        // the current row's key held below.
-        if (decoder.atForPrefetch(prefetchRow, prefetchKey)) {
-          storage_->rowsByKey.prefetchString(
-              storage_->rowsByKey.hashString(prefetchKey));
-        }
-      }
+      prefetcher.prefetchAt(rowNo);
 
       StringRef key;
       // Each iteration holds a single key; at() reuses the decoder's inline
@@ -177,28 +172,30 @@ void ChHashBuild::addInput(RowVectorPtr input) {
   VELOX_CHECK(decoder.width() == storage_->rowsByKey.width());
   const auto prepare = [&]<typename Key>() {
     const bool usePrefetch = FixedKeyDecoder::hasCheapKeyCalculation &&
-        storage_->rowsByKey.getBufferSizeInBytes() > kMinTableBytesForPrefetch;
+        storage_->rowsByKey.getBufferSizeInBytes() > minTableBytesForPrefetch();
     // CH batch-packs keys <= 16 bytes with no nullable column
     // (usePreparedKeys); wider or nullable keys pack per row.
     if (decoder.usePreparedKeys<Key>()) {
       decoder.packAll<Key>();
+      auto prefetcher = makeJoinPrefetcher(
+          usePrefetch, rows.size(), [&](size_t prefetchRow) {
+            storage_->rowsByKey.prefetch(decoder.packedAt<Key>(prefetchRow));
+          });
       rows.applyToSelected([&](vector_size_t rowNo) {
-        const auto prefetchRow = rowNo + kPrefetchLookAhead;
-        if (usePrefetch && prefetchRow < rows.size()) {
-          storage_->rowsByKey.prefetch(decoder.packedAt<Key>(prefetchRow));
-        }
+        prefetcher.prefetchAt(rowNo);
         storage_->rowsByKey.emplace(decoder.packedAt<Key>(rowNo));
       });
       return;
     }
+    auto prefetcher =
+        makeJoinPrefetcher(usePrefetch, rows.size(), [&](size_t prefetchRow) {
+          Key prefetchKey;
+          if (decoder.pack(prefetchRow, prefetchKey)) {
+            storage_->rowsByKey.prefetch(prefetchKey);
+          }
+        });
     rows.applyToSelected([&](vector_size_t rowNo) {
-      const auto prefetchRow = rowNo + kPrefetchLookAhead;
-      if (usePrefetch && prefetchRow < rows.size()) {
-        Key prefetchKey;
-        if (decoder.pack(prefetchRow, prefetchKey)) {
-          storage_->rowsByKey.prefetch(prefetchKey);
-        }
-      }
+      prefetcher.prefetchAt(rowNo);
 
       Key key;
       if (decoder.pack(rowNo, key)) {
@@ -232,14 +229,15 @@ void ChHashBuild::addInput(RowVectorPtr input) {
   const uint32_t blockNo = packBlockNo(driverNo_, batchNo);
   const auto attach = [&]<typename Key>() {
     const bool usePrefetch = FixedKeyDecoder::hasCheapKeyCalculation &&
-        storage_->rowsByKey.getBufferSizeInBytes() > kMinTableBytesForPrefetch;
+        storage_->rowsByKey.getBufferSizeInBytes() > minTableBytesForPrefetch();
     if (decoder.usePreparedKeys<Key>()) {
       decoder.packAll<Key>();
+      auto prefetcher = makeJoinPrefetcher(
+          usePrefetch, rows.size(), [&](size_t prefetchRow) {
+            storage_->rowsByKey.prefetch(decoder.packedAt<Key>(prefetchRow));
+          });
       rows.applyToSelected([&](vector_size_t rowNo) {
-        const auto prefetchRow = rowNo + kPrefetchLookAhead;
-        if (usePrefetch && prefetchRow < rows.size()) {
-          storage_->rowsByKey.prefetch(decoder.packedAt<Key>(prefetchRow));
-        }
+        prefetcher.prefetchAt(rowNo);
         auto* cell = storage_->rowsByKey.find(decoder.packedAt<Key>(rowNo));
         VELOX_CHECK_NOT_NULL(cell);
         cell->getMapped().insert(
@@ -248,14 +246,15 @@ void ChHashBuild::addInput(RowVectorPtr input) {
       });
       return;
     }
+    auto prefetcher =
+        makeJoinPrefetcher(usePrefetch, rows.size(), [&](size_t prefetchRow) {
+          Key prefetchKey;
+          if (decoder.pack(prefetchRow, prefetchKey)) {
+            storage_->rowsByKey.prefetch(prefetchKey);
+          }
+        });
     rows.applyToSelected([&](vector_size_t rowNo) {
-      const auto prefetchRow = rowNo + kPrefetchLookAhead;
-      if (usePrefetch && prefetchRow < rows.size()) {
-        Key prefetchKey;
-        if (decoder.pack(prefetchRow, prefetchKey)) {
-          storage_->rowsByKey.prefetch(prefetchKey);
-        }
-      }
+      prefetcher.prefetchAt(rowNo);
 
       Key key;
       if (!decoder.pack(rowNo, key)) {
