@@ -92,21 +92,39 @@ void probeLoop(
   VELOX_CHECK(decoder.width() == map.width());
 
   const auto probeKeys = [&]<typename Key>() {
-    decoder.packAll<Key>();
     const bool usePrefetch = FixedKeyDecoder::hasCheapKeyCalculation &&
         map.getBufferSizeInBytes() > kMinTableBytesForPrefetch;
+    // CH batch-packs keys that fit in 16 bytes with no nullable column
+    // (usePreparedKeys), then indexes prepared_keys[row]; wider or nullable
+    // keys pack per row. Mirror both here.
+    if (decoder.usePreparedKeys<Key>()) {
+      decoder.packAll<Key>();
+      for (vector_size_t probeRow = 0; probeRow < probe->size(); ++probeRow) {
+        const auto prefetchRow = probeRow + kPrefetchLookAhead;
+        if (usePrefetch && prefetchRow < probe->size()) {
+          map.prefetch(decoder.packedAt<Key>(prefetchRow));
+        }
+        const auto* cell = map.find(decoder.packedAt<Key>(probeRow));
+        if (cell != nullptr) {
+          onHit(probeRow, cell);
+        }
+      }
+      return;
+    }
     for (vector_size_t probeRow = 0; probeRow < probe->size(); ++probeRow) {
       const auto prefetchRow = probeRow + kPrefetchLookAhead;
       if (usePrefetch && prefetchRow < probe->size()) {
-        if (!decoder.mayHaveNulls() || decoder.hasPackedKeyAt(prefetchRow)) {
-          map.prefetch(decoder.packedAt<Key>(prefetchRow));
+        Key prefetchKey;
+        if (decoder.pack(prefetchRow, prefetchKey)) {
+          map.prefetch(prefetchKey);
         }
       }
 
-      if (decoder.mayHaveNulls() && !decoder.hasPackedKeyAt(probeRow)) {
+      Key key;
+      if (!decoder.pack(probeRow, key)) {
         continue;
       }
-      const auto* cell = map.find(decoder.packedAt<Key>(probeRow));
+      const auto* cell = map.find(key);
       if (cell != nullptr) {
         onHit(probeRow, cell);
       }

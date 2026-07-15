@@ -176,19 +176,33 @@ void ChHashBuild::addInput(RowVectorPtr input) {
   FixedKeyDecoder decoder(input, keyChannels_, rows);
   VELOX_CHECK(decoder.width() == storage_->rowsByKey.width());
   const auto prepare = [&]<typename Key>() {
-    decoder.packAll<Key>();
     const bool usePrefetch = FixedKeyDecoder::hasCheapKeyCalculation &&
         storage_->rowsByKey.getBufferSizeInBytes() > kMinTableBytesForPrefetch;
+    // CH batch-packs keys <= 16 bytes with no nullable column
+    // (usePreparedKeys); wider or nullable keys pack per row.
+    if (decoder.usePreparedKeys<Key>()) {
+      decoder.packAll<Key>();
+      rows.applyToSelected([&](vector_size_t rowNo) {
+        const auto prefetchRow = rowNo + kPrefetchLookAhead;
+        if (usePrefetch && prefetchRow < rows.size()) {
+          storage_->rowsByKey.prefetch(decoder.packedAt<Key>(prefetchRow));
+        }
+        storage_->rowsByKey.emplace(decoder.packedAt<Key>(rowNo));
+      });
+      return;
+    }
     rows.applyToSelected([&](vector_size_t rowNo) {
       const auto prefetchRow = rowNo + kPrefetchLookAhead;
       if (usePrefetch && prefetchRow < rows.size()) {
-        if (!decoder.mayHaveNulls() || decoder.hasPackedKeyAt(prefetchRow)) {
-          storage_->rowsByKey.prefetch(decoder.packedAt<Key>(prefetchRow));
+        Key prefetchKey;
+        if (decoder.pack(prefetchRow, prefetchKey)) {
+          storage_->rowsByKey.prefetch(prefetchKey);
         }
       }
 
-      if (!decoder.mayHaveNulls() || decoder.hasPackedKeyAt(rowNo)) {
-        storage_->rowsByKey.emplace(decoder.packedAt<Key>(rowNo));
+      Key key;
+      if (decoder.pack(rowNo, key)) {
+        storage_->rowsByKey.emplace(key);
       }
     });
   };
@@ -219,18 +233,35 @@ void ChHashBuild::addInput(RowVectorPtr input) {
   const auto attach = [&]<typename Key>() {
     const bool usePrefetch = FixedKeyDecoder::hasCheapKeyCalculation &&
         storage_->rowsByKey.getBufferSizeInBytes() > kMinTableBytesForPrefetch;
+    if (decoder.usePreparedKeys<Key>()) {
+      decoder.packAll<Key>();
+      rows.applyToSelected([&](vector_size_t rowNo) {
+        const auto prefetchRow = rowNo + kPrefetchLookAhead;
+        if (usePrefetch && prefetchRow < rows.size()) {
+          storage_->rowsByKey.prefetch(decoder.packedAt<Key>(prefetchRow));
+        }
+        auto* cell = storage_->rowsByKey.find(decoder.packedAt<Key>(rowNo));
+        VELOX_CHECK_NOT_NULL(cell);
+        cell->getMapped().insert(
+            RowRef(blockNo, static_cast<uint32_t>(rowNo)).encode(),
+            storage_->arena);
+      });
+      return;
+    }
     rows.applyToSelected([&](vector_size_t rowNo) {
       const auto prefetchRow = rowNo + kPrefetchLookAhead;
       if (usePrefetch && prefetchRow < rows.size()) {
-        if (!decoder.mayHaveNulls() || decoder.hasPackedKeyAt(prefetchRow)) {
-          storage_->rowsByKey.prefetch(decoder.packedAt<Key>(prefetchRow));
+        Key prefetchKey;
+        if (decoder.pack(prefetchRow, prefetchKey)) {
+          storage_->rowsByKey.prefetch(prefetchKey);
         }
       }
 
-      if (decoder.mayHaveNulls() && !decoder.hasPackedKeyAt(rowNo)) {
+      Key key;
+      if (!decoder.pack(rowNo, key)) {
         return;
       }
-      auto* cell = storage_->rowsByKey.find(decoder.packedAt<Key>(rowNo));
+      auto* cell = storage_->rowsByKey.find(key);
       VELOX_CHECK_NOT_NULL(cell);
       cell->getMapped().insert(
           RowRef(blockNo, static_cast<uint32_t>(rowNo)).encode(),
