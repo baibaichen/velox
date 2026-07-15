@@ -126,6 +126,11 @@ def fmt(value, digits=1):
     return "-" if value is None else f"{value:.{digits}f}"
 
 
+def ratio(value):
+    # Format a Port/other speed ratio; > 1 means CH Port is faster.
+    return "-" if value is None else f"{value:.2f}x"
+
+
 def ch_port_ms(cell, field):
     # CH Port = the single migrated ch arm's value for this metric.
     if "ch" in cell:
@@ -150,8 +155,11 @@ def render(cells):
     lines = []
     lines.append("## Probe wall-clock (ms, one full-table probe; lower = faster)")
     lines.append("")
-    lines.append("| dist | rows | key | CH map | Velox mode | CH Port | Velox | CH native | Port/Velox |")
-    lines.append("|---|---:|---|---|---|---:|---:|---:|---:|")
+    lines.append(
+        "| dist | rows | key | CH map | Velox mode | CH Port | Velox | "
+        "CH native | Port/Velox | Port/native |"
+    )
+    lines.append("|---|---:|---|---|---|---:|---:|---:|---:|---:|")
     for config in configs:
         dist, rows, key_layout = config
         cell = cells[config]
@@ -159,26 +167,34 @@ def render(cells):
         port = ch_port_ms(cell, "probe_ms")
         velox = cell["velox"]["probe_ms"] if "velox" in cell else None
         native = cell.get("ch_probe_ms")
-        ratio = (velox / port) if (port and velox) else None
+        vsVelox = (velox / port) if (port and velox) else None
+        vsNative = (native / port) if (port and native) else None
         lines.append(
             f"| {dist} | {rows} | {key_layout} | {ch_map_type(cell)} | {mode} | "
-            f"{fmt(port)} | {fmt(velox)} | {fmt(native)} | {fmt(ratio, 2)}x |"
+            f"{fmt(port)} | {fmt(velox)} | {fmt(native)} | "
+            f"{ratio(vsVelox)} | {ratio(vsNative)} |"
         )
 
     lines.append("")
     lines.append("## Build wall-clock (ms, one full build; lower = faster)")
     lines.append("")
-    lines.append("| dist | rows | key | CH map | CH Port | Velox | CH native |")
-    lines.append("|---|---:|---|---|---:|---:|---:|")
+    lines.append(
+        "| dist | rows | key | CH map | CH Port | Velox | CH native | "
+        "Port/Velox | Port/native |"
+    )
+    lines.append("|---|---:|---|---|---:|---:|---:|---:|---:|")
     for config in configs:
         dist, rows, key_layout = config
         cell = cells[config]
         port = ch_port_ms(cell, "build_ms")
         velox = cell["velox"]["build_ms"] if "velox" in cell else None
         native = cell.get("ch_build_ms")
+        vsVelox = (velox / port) if (port and velox) else None
+        vsNative = (native / port) if (port and native) else None
         lines.append(
             f"| {dist} | {rows} | {key_layout} | {ch_map_type(cell)} | "
-            f"{fmt(port)} | {fmt(velox)} | {fmt(native)} |"
+            f"{fmt(port)} | {fmt(velox)} | {fmt(native)} | "
+            f"{ratio(vsVelox)} | {ratio(vsNative)} |"
         )
 
     lines.append("")
