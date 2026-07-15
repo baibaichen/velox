@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>CH 坐标式 Hash Join → Velox (exec/ch) 移植文件对照 (commit 235a13b45)</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 32px; color: #1a1a1a; line-height: 1.5; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .sub { color: #666; font-size: 13px; margin-bottom: 20px; }
+  .summary { background: #f4f7fb; border-left: 4px solid #3b6ea5; padding: 12px 16px;
+             margin: 16px 0 24px; font-size: 14px; }
+  .summary b { color: #2c4a6e; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border: 1px solid #d5dde5; padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: #2c4a6e; color: #fff; font-weight: 600; }
+  tr:nth-child(even) td { background: #f7f9fb; }
+  code { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 3px; font-size: 11px; font-weight: 600; }
+  .tag-algo { background: #e3f0e3; color: #2e6b2e; }
+  .tag-concept { background: #fbeede; color: #96591a; }
+  .tag-new { background: #e6e9f0; color: #3a4a6b; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .ratio-less { color: #2e6b2e; }
+  .ratio-more { color: #b3541e; }
+  .sec { margin-top: 28px; font-size: 16px; color: #2c4a6e; }
+  .note { font-size: 12px; color: #666; margin-top: 6px; }
+  ul { font-size: 13px; }
+</style>
+</head>
+<body>
+
+<h1>ClickHouse 坐标式 Hash Join → Velox (exec/ch) 移植文件对照</h1>
+<div class="sub">commit <code>235a13b45</code> · 分支 <code>ch-hashjoin</code> · Port 行数为 .h + .cpp 合计，<code>wc -l</code> 实测 · CH 源在 <code>ClickHouse/src/</code></div>
+
+<div class="summary">
+<b>结论：核心算法文件全部「算法对齐 / 概念对齐」，无逐行源码搬运；4 个 velox 算子适配层无 CH 对应。</b><br>
+Port 把 CH 专有依赖（ProfileEvents、Block/Chunk、Arena=Common/Allocator、logger 等）剥离，
+算法骨架用 velox 原语（VELOX_CHECK / MemoryPool / DecodedVector / RowVector / simd）重写。
+坐标式 = 命中不拷贝 build 行，只存 64-bit RowRef 坐标（driver/batch/row），输出阶段再解引用物化，
+对应 CH 的 RowRef/RowRefList + LazyOutput。Port 侧另有一层 velox 算子适配（Operator/JoinBridge/PlanNode），
+这层是 velox 执行框架要求、CH 无对应。
+</div>
+
+<table>
+<thead>
+<tr><th>Port 文件 (velox/exec/ch/)</th><th>对应 CH 源文件</th><th>对齐类型</th><th class="num">Port 行</th><th class="num">CH 行</th></tr>
+</thead>
+<tbody>
+<tr><td><code>HashTable.h</code></td><td><code>Common/HashTable/HashTable.h</code></td><td><span class="tag tag-algo">算法对齐</span></td><td class="num">596</td><td class="num">1512</td></tr>
+<tr><td><code>HashMap.h</code></td><td><code>Common/HashTable/HashMap.h</code></td><td><span class="tag tag-algo">算法对齐</span></td><td class="num">281</td><td class="num">403</td></tr>
+<tr><td><code>FixedHashMap.h</code></td><td><code>Common/HashTable/FixedHashMap.h</code></td><td><span class="tag tag-algo">算法对齐</span></td><td class="num">219</td><td class="num">230</td></tr>
+<tr><td><code>HashTableAllocatorAdapter.h</code></td><td><code>Common/HashTable/HashTableAllocator.h</code> → <code>Common/Allocator.h</code></td><td><span class="tag tag-concept">概念对齐</span></td><td class="num">107</td><td class="num">14</td></tr>
+<tr><td><code>Prefetching.{h,cpp}</code></td><td><code>Common/HashTable/Prefetching.h</code> + <code>Interpreters/HashJoin/HashJoin.cpp</code>(getMinBytesForPrefetchInJoin)</td><td><span class="tag tag-algo">算法对齐</span></td><td class="num">235</td><td class="num">55+</td></tr>
+<tr><td><code>FixedKey.h</code> / <code>FixedKeyMap.h</code></td><td><code>HashJoin.cpp</code>(chooseMethod) + <code>Common/ColumnsHashing/HashMethod.h</code>(HashMethodKeysFixed) + <code>Interpreters/AggregationCommon.h</code>(packFixed)</td><td><span class="tag tag-algo">算法对齐</span></td><td class="num">824</td><td class="num">770+</td></tr>
+<tr><td><code>HashedKey.h</code></td><td><code>Common/ColumnsHashing/HashMethod.h</code>(HashMethodHashed / hash128)</td><td><span class="tag tag-algo">算法对齐</span></td><td class="num">153</td><td class="num">497*</td></tr>
+<tr><td><code>SerializedKey.h</code></td><td><code>Common/ColumnsHashing.h</code>(HashMethodSerialized)</td><td><span class="tag tag-algo">算法对齐</span></td><td class="num">264</td><td class="num">572</td></tr>
+<tr><td><code>RowRef.h</code> / <code>RowRefList.{h,cpp}</code></td><td><code>Interpreters/RowRefs.h</code></td><td><span class="tag tag-algo">算法对齐</span></td><td class="num">415</td><td class="num">520</td></tr>
+<tr><td><code>Arena.{h,cpp}</code></td><td><code>Common/Arena.h</code></td><td><span class="tag tag-algo">算法对齐</span></td><td class="num">358</td><td class="num">345</td></tr>
+<tr><td><code>ChHashBuild.{h,cpp}</code></td><td><code>Interpreters/HashJoin/HashJoinMethodsImpl.h</code>(insertFromBlockImpl / insertAll)</td><td><span class="tag tag-algo">算法对齐</span></td><td class="num">425</td><td class="num">1261*</td></tr>
+<tr><td><code>ChHashProbe.{h,cpp}</code></td><td><code>Interpreters/HashJoin/HashJoinMethods.h</code> + <code>HashJoinMethodsImpl.h</code>(joinBlockImpl)</td><td><span class="tag tag-algo">算法对齐</span></td><td class="num">355</td><td class="num">1534*</td></tr>
+<tr><td><code>EmitGather.{h,cpp}</code></td><td><code>Interpreters/HashJoin/AddedColumns.h</code>(LazyOutput) + <code>HashJoinResult.{h,cpp}</code></td><td><span class="tag tag-algo">算法对齐</span></td><td class="num">214</td><td class="num">1319*</td></tr>
+<tr><td><code>RetainedVectorsIndex.{h,cpp}</code></td><td><code>Interpreters/HashJoin/AddedColumns.h</code>(StoredColumnsIndex / StoredBlock)</td><td><span class="tag tag-concept">概念对齐</span></td><td class="num">143</td><td class="num">340*</td></tr>
+<tr><td><code>ChHashBuildOperator.{h,cpp}</code></td><td>—</td><td><span class="tag tag-new">velox 新增</span></td><td class="num">154</td><td class="num">—</td></tr>
+<tr><td><code>ChHashProbeOperator.{h,cpp}</code></td><td>—</td><td><span class="tag tag-new">velox 新增</span></td><td class="num">253</td><td class="num">—</td></tr>
+<tr><td><code>ChHashJoinBridge.{h,cpp}</code></td><td>—</td><td><span class="tag tag-new">velox 新增</span></td><td class="num">160</td><td class="num">—</td></tr>
+<tr><td><code>ChHashJoinNode.h</code></td><td>—</td><td><span class="tag tag-new">velox 新增</span></td><td class="num">94</td><td class="num">—</td></tr>
+</tbody>
+</table>
+<div class="note">
+※ <b>算法对齐</b> = 照 CH 算法逻辑重写，剥掉 CH 专有依赖、换 velox 原语。<br>
+※ <b>概念对齐</b> = 对应 CH 某抽象但接口形态不同：<code>HashTableAllocatorAdapter</code> 把 CH <code>HashTableAllocator</code>
+的 alloc/realloc/free 接口改走 velox <code>MemoryPool</code>；<code>RetainedVectorsIndex</code> 对应 CH 保活 build
+<code>Block</code> 的 <code>StoredColumnsIndex</code>，velox 侧改为保活 <code>RowVector</code>。<br>
+※ <b>velox 新增</b> = velox 执行框架适配层（<code>Operator</code> / <code>JoinBridge</code> / <code>core::PlanNode</code>），CH 无对应。<br>
+※ CH 行数带 <code>*</code> = 该 CH 文件不止服务这一个 Port 文件（如 <code>HashMethod.h</code> 同时是 FixedKey/HashedKey 的源，
+<code>HashJoinMethodsImpl.h</code> 同时是 build/probe 的源），行数非一对一，仅作规模参考；带 <code>+</code> = 对应多个 CH 文件的合计起点。
+</div>
+
+<div class="sec">数据准确性说明</div>
+<ul>
+<li>Port 行数为 <code>wc -l</code> 实测的 .h + .cpp 合计（commit <code>235a13b45</code>）。</li>
+<li>CH 行数为对应 CH 源文件实测；多对多处（HashMethod / HashJoinMethods / AddedColumns）不做百分比对比，因一个 CH 文件服务多个 Port 文件、无法一对一归属。</li>
+<li>对齐类型由实际读两边代码判定（非文件名猜测）：EmitGather 确认对应 CH LazyOutput + HashJoinResult 的输出物化；RetainedVectorsIndex 是 CH StoredColumnsIndex 的概念对齐而非纯 velox 新增。</li>
+</ul>
+
+<div class="sec">Port 侧新增（无 CH 对应：算子框架 / 测试 / benchmark）</div>
+<ul>
+<li>4 个算子适配层：<code>ChHashBuildOperator</code> / <code>ChHashProbeOperator</code> / <code>ChHashJoinBridge</code> / <code>ChHashJoinNode</code>——velox <code>Operator</code>/<code>JoinBridge</code>/<code>PlanNode</code> 要求，CH 无对应。</li>
+<li>20 个 <code>tests/*.cpp</code>：velox 侧新写单测，不对应 CH 测试。</li>
+<li>2 个 benchmark：<code>ChHashJoinBenchmark.cpp</code>（端到端）、<code>ChHashTableLayerBenchmark.cpp</code>（第 1 层公平三方对比）+ <code>analyze_layer1_results.py</code>。</li>
+</ul>
+
+<div class="sec">对齐缺口 / CH 有本次未移植</div>
+<ul>
+<li><b>hashed digest 生成未对齐</b>：Port <code>HashedKey.h</code> 用 <code>XXH3-128</code>，CH <code>hash128</code> 用 <code>SipHash128</code>。哈希函子（<code>UInt128TrivialHash</code> 取低 64 位）已对齐，但 digest 算法未对齐。完整对齐需 SipHash + saved_hash 缓存成套改（见 <code>HANDOFF_rebase_todo.md</code> TODO 1b）。</li>
+<li><b>two_level / TwoLevelHashMap</b>：CH 大表分级哈希表，本次未移植。</li>
+<li><b>ASOF / 多 join 类型分派</b>：CH <code>Inner/Left/Right/Full × All/Any/Semi/Anti/Asof</code> 的 40+ 实例化，本次只做 inner-all 单路径。</li>
+<li><b>low_cardinality / nullable KeyGetter 特化</b>：CH <code>HashMethodKeysFixed</code> 的低基数/可空特化，本次未搬。</li>
+</ul>
+
+<div class="sec">逐类 / typedef 对齐（class-level）</div>
+<div class="note">
+下表把每个 Port 类/结构/枚举/typedef 对到 CH 的对应符号，由子代理读两边代码核实。<b>注</b>：CH 源树已随本移植共演化——<code>RowRefs.h</code> 中已含 <code>EmitColumn</code> / <code>StoredColumnsIndex</code> / <code>ColumnReplicated</code>，故 Emit / RetainedVectors 侧在 CH 亦有对应实现，非纯 velox 新增。
+</div>
+<table>
+<thead>
+<tr><th>Port 文件</th><th>Port 符号</th><th>CH 对应符号（文件）</th><th>对齐类型</th></tr>
+</thead>
+<tbody>
+<tr><td rowspan="4"><code>HashTable.h</code></td><td><code>HashTableNoState</code></td><td><code>HashTableNoState</code> (HashTable.h)</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+<tr><td><code>HashTableGrower&lt;&gt;</code></td><td><code>HashTableGrower</code> (HashTable.h)</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+<tr><td><code>ZeroValueStorage&lt;&gt;</code></td><td><code>ZeroValueStorage</code> (HashTable.h)</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+<tr><td><code>HashTable&lt;&gt;</code></td><td><code>HashTable</code> (HashTable.h)</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+
+<tr><td rowspan="9"><code>HashMap.h</code></td><td><code>HashCRC32&lt;&gt;</code></td><td><code>HashCRC32</code> (Hash.h)</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+<tr><td><code>HashWide&lt;&gt;</code></td><td><code>UInt128HashCRC32</code>/<code>UInt256HashCRC32</code> (Hash.h)</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+<tr><td><code>UInt128TrivialHash</code></td><td><code>UInt128TrivialHash</code> (Hash.h)</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+<tr><td><code>PairNoInit&lt;&gt;</code></td><td><code>PairNoInit</code> (HashMap.h)</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+<tr><td><code>HashMapCell&lt;&gt;</code></td><td><code>HashMapCell</code> (HashMap.h)</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+<tr><td><code>HashMapCellWithSavedHash&lt;&gt;</code></td><td><code>HashMapCellWithSavedHash</code> (HashMap.h)</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+<tr><td><code>HashMapTable&lt;&gt;</code></td><td><code>HashMapTable</code> (HashMap.h)</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+<tr><td><code>HashMapAll</code> (using)</td><td><code>HashMap</code> / <code>HashMapWithSavedHash</code> (HashMap.h)</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+<tr><td><code>HashMapAll_key32/key64/keys128/keys256/key_string/hashed</code></td><td>HashJoin.h 各具体 map 实例</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+
+<tr><td rowspan="3"><code>FixedHashMap.h</code></td><td><code>FixedDirectMapCell&lt;&gt;</code></td><td><code>FixedHashMapCell</code>/<code>FixedHashMapImplicitZeroCell</code> (FixedHashMap.h)</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+<tr><td><code>FixedDirectMap&lt;&gt;</code></td><td><code>FixedHashMap</code> / <code>FixedHashTable</code></td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+<tr><td><code>FixedDirectMap_key8/key16</code></td><td>HashJoin.h key8/key16 map</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+
+<tr><td><code>HashTableAllocatorAdapter.h</code></td><td><code>HashTableAllocatorAdapter</code></td><td><code>HashTableAllocator</code> (HashTableAllocator.h)</td><td><span class="tag tag-concept">概念对齐</span></td></tr>
+
+<tr><td rowspan="2"><code>Prefetching.h</code></td><td><code>PrefetchingHelper</code></td><td><code>PrefetchingHelper</code> (Prefetching.h)</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+<tr><td><code>JoinPrefetcher&lt;&gt;</code> / <code>makeJoinPrefetcher</code></td><td>无（CH 内联在 join 循环）</td><td><span class="tag tag-new">velox 新增</span></td></tr>
+
+<tr><td rowspan="3"><code>FixedKey.h</code></td><td><code>UInt128</code> / <code>UInt256</code></td><td><code>DB::UInt128</code>/<code>UInt256</code> (base)</td><td><span class="tag tag-concept">概念对齐</span></td></tr>
+<tr><td><code>FixedKeyWidth</code> (enum)</td><td>无（隐含在 Type 分派）</td><td><span class="tag tag-new">velox 新增</span></td></tr>
+<tr><td><code>FixedKeyDecoder</code></td><td><code>HashMethodKeysFixed</code> (HashMethod.h)</td><td><span class="tag tag-concept">概念对齐</span></td></tr>
+
+<tr><td rowspan="3"><code>FixedKeyMap.h</code></td><td><code>FixedKeyMap</code> (整体)</td><td><code>HashJoin::MapsTemplate</code> + Type 分派</td><td><span class="tag tag-concept">概念对齐</span></td></tr>
+<tr><td><code>Type::</code> key8/key16/key32/key64/keys128/keys256/key_string/hashed</td><td>HashJoin.h <code>Type</code> 同名值</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+<tr><td><code>Type::</code> keys32/keys64</td><td>CH 无独立值（归入 key32/64）</td><td><span class="tag tag-new">velox 细分</span></td></tr>
+
+<tr><td><code>HashedKey.h</code></td><td><code>HashedKeyDecoder</code></td><td><code>HashMethodHashed</code> + <code>hash128</code> (HashMethod.h)</td><td><span class="tag tag-concept">概念对齐</span></td></tr>
+
+<tr><td rowspan="4"><code>SerializedKey.h</code></td><td><code>StringRef</code></td><td><code>StringRef</code> (Common/StringRef.h)</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+<tr><td><code>StringRefHash</code></td><td><code>StringRefHash</code> (StringRef.h)</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+<tr><td><code>SerializedKeyDecoder</code></td><td><code>HashMethodSerialized</code> (ColumnsHashing.h)</td><td><span class="tag tag-concept">概念对齐</span></td></tr>
+<tr><td><code>StringViewKeyDecoder</code></td><td><code>HashMethodString</code> (HashMethod.h)</td><td><span class="tag tag-concept">概念对齐</span></td></tr>
+
+<tr><td><code>RowRef.h</code></td><td><code>RowRef</code></td><td><code>RowRef</code> (RowRefs.h)</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+<tr><td><code>RowRefList.h</code></td><td><code>RowRefList</code> + <code>Batch</code></td><td><code>RowRefList</code> + <code>Batch</code> (RowRefs.h)</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+
+<tr><td><code>Arena.h</code></td><td><code>Arena</code> / <code>ArenaPtr</code> / <code>Arenas</code></td><td><code>Arena</code> (Common/Arena.h)；Ptr/Arenas 为 velox 便捷别名</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+
+<tr><td><code>ChHashBuild.h</code></td><td><code>ChHashBuild</code></td><td><code>HashJoinMethods::insertFromBlockImpl</code> (HashJoinMethodsImpl.h)</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+<tr><td rowspan="3"><code>ChHashProbe.h</code></td><td><code>joinProbe</code> / <code>probeHashBuild</code></td><td><code>HashJoinMethods::joinBlockImpl</code> / <code>joinRightColumns</code></td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+<tr><td><code>ProbeHit</code> {probeRow, matched}</td><td>CH probe 内联中间态，无命名结构</td><td><span class="tag tag-new">velox 新增</span></td></tr>
+<tr><td><code>ProbeMatch</code> {probeRow, blockNo, rowNo}</td><td>同上（CH 内联展开 RowRef）</td><td><span class="tag tag-new">velox 新增</span></td></tr>
+
+<tr><td><code>EmitGather.h</code></td><td><code>EmitGather</code></td><td><code>AddedColumns::fillFromRowRefs</code> (AddedColumns.h)</td><td><span class="tag tag-concept">概念对齐</span></td></tr>
+<tr><td rowspan="2"><code>RetainedVectorsIndex.h</code></td><td><code>EmitColumns</code></td><td><code>StoredColumnsIndex::EmitColumn</code> (RowRefs.h)</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+<tr><td><code>RetainedVectorsIndex</code></td><td><code>StoredColumnsIndex</code> (RowRefs.h)</td><td><span class="tag tag-algo">算法对齐</span></td></tr>
+
+<tr><td><code>ChHashBuildOperator.h</code></td><td><code>ChHashBuildOperator</code></td><td>无（CH 非 pull-operator 模型）</td><td><span class="tag tag-new">velox 新增</span></td></tr>
+<tr><td><code>ChHashProbeOperator.h</code></td><td><code>ChHashProbeOperator</code></td><td>无</td><td><span class="tag tag-new">velox 新增</span></td></tr>
+<tr><td rowspan="2"><code>ChHashJoinBridge.h</code></td><td><code>ChHashJoinBridge</code></td><td>无（build→probe 交接）</td><td><span class="tag tag-new">velox 新增</span></td></tr>
+<tr><td><code>ChHashJoinTranslator</code></td><td>无（PlanNode→Operator 映射）</td><td><span class="tag tag-new">velox 新增</span></td></tr>
+<tr><td><code>ChHashJoinNode.h</code></td><td><code>ChHashJoinNode</code></td><td>无（core::PlanNode）</td><td><span class="tag tag-new">velox 新增</span></td></tr>
+</tbody>
+</table>
+
+</body>
+</html>
