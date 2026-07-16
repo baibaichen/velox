@@ -264,6 +264,7 @@ if(${VELOX_ENABLE_BENCHMARKS})
 endif()
 
 add_subdirectory(ch)
+add_subdirectory(ch2)
 add_subdirectory(prefixsort)
 add_subdirectory(rpc)
 add_subdirectory(trace)
