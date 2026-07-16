@@ -18,6 +18,8 @@
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/exec/ch2/Common/ColumnsHashing/ColumnsHashingImpl.h"
+#include "velox/exec/ch2/Interpreters/AggregationCommon.h"
+#include "velox/exec/ch/Common/ColumnsHashing/FixedKey.h" // ch::UInt128 / ch::UInt256
 #include "velox/exec/ch2/Common/SipHash.h"
 #include "velox/vector/FlatVector.h"
 
@@ -222,5 +224,222 @@ struct HashMethodString : public columns_hashing_impl::HashMethodBase<
   friend class columns_hashing_impl::
       HashMethodBase<Self, Value, Mapped, use_cache, need_offset, nullable>;
 };
+
+
+// ============================================================================
+// LowCardinalityKeys - CH HashMethod.h:272-287。照抄保留(task8 low_cardinality
+// 用),has_low_cardinality=false 时是空壳。
+// ============================================================================
+template <bool has_low_cardinality>
+struct LowCardinalityKeys {
+  ColumnRawData nested_columns;
+  ColumnRawData positions;
+  Sizes position_sizes;
+};
+
+template <>
+struct LowCardinalityKeys<false> {};
+
+// ============================================================================
+// HashMethodKeysFixed - exactly 搬自 CH src/Common/ColumnsHashing/HashMethod.h:
+// 288-472。多列定长 key pack 进宽 Key(UInt128/UInt256)。
+// 铁律:pack 分派算法(usePreparedKeys / prepared vs 逐行 packFixed)逐字搬 CH,
+// 只换 infra 边界(列裸数据承载 + prepared_keys 承载)。
+//
+// 本 task 模板实例:has_nullable_keys_=false, has_low_cardinality_=false。
+//   - SSSE3 shuffle 分支(packFixedShuffle)= task7:照抄保留、编译期折走(用
+//     一个恒 false 的 constexpr 开关,不引入 <immintrin.h>)。
+//   - low_cardinality 分支 = task8:照抄保留、has_low_cardinality=false 折走。
+//   - nullable 分支:照抄保留、has_nullable_keys=false 折走。
+//
+// infra 边界:
+//   CH 构造 `Base(key_columns)` + `getActualColumns()[i]->getRawData().data()`
+//     取列裸基址;ch2 从 Velox flat 列取 rawValues() 装成 ColumnRawData 喂给
+//     Base(BaseStateKeysFixed)与 pack。
+//   CH `PaddedPODArray<Key> prepared_keys` -> `std::vector<Key>`。
+//   getKeyHolder / usePreparedKeys / packFixedBatch 分派逐字。
+// ============================================================================
+
+// task7 SSSE3 开关:照抄保留 shuffle 分支的位置,本 task 恒关(不引入 SSSE3)。
+static constexpr bool kKeysFixedUseSsse3 = false;
+
+template <
+    typename Value,
+    typename Key,
+    typename Mapped,
+    bool has_nullable_keys_ = false,
+    bool has_low_cardinality_ = false,
+    bool use_cache = true,
+    bool need_offset = false>
+struct HashMethodKeysFixed
+    : private columns_hashing_impl::BaseStateKeysFixed<Key, has_nullable_keys_>,
+      public columns_hashing_impl::HashMethodBase<
+          HashMethodKeysFixed<
+              Value,
+              Key,
+              Mapped,
+              has_nullable_keys_,
+              has_low_cardinality_,
+              use_cache,
+              need_offset>,
+          Value,
+          Mapped,
+          use_cache,
+          need_offset> {
+  using Self = HashMethodKeysFixed<
+      Value,
+      Key,
+      Mapped,
+      has_nullable_keys_,
+      has_low_cardinality_,
+      use_cache,
+      need_offset>;
+  using BaseHashed = columns_hashing_impl::
+      HashMethodBase<Self, Value, Mapped, use_cache, need_offset>;
+  using Base = columns_hashing_impl::BaseStateKeysFixed<Key, has_nullable_keys_>;
+
+  static constexpr bool has_nullable_keys = has_nullable_keys_;
+  static constexpr bool has_low_cardinality = has_low_cardinality_;
+
+  static constexpr bool has_cheap_key_calculation = true;
+  static constexpr bool has_pre_computed_hashes = false;
+
+  LowCardinalityKeys<has_low_cardinality> low_cardinality_keys;
+  Sizes key_sizes;
+  size_t keys_size;
+
+  // CH: PaddedPODArray<Key> prepared_keys; -> std::vector<Key>(infra 边界)。
+  std::vector<Key> prepared_keys;
+
+  // CH 原文 (HashMethod.h:322-334) 逐字。
+  static bool usePreparedKeys(const Sizes& key_sizes) {
+    if (has_low_cardinality || has_nullable_keys || sizeof(Key) > 16) {
+      return false;
+    }
+
+    for (auto size : key_sizes) {
+      if (size != 1 && size != 2 && size != 4 && size != 8 && size != 16) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  // CH 原文构造 (HashMethod.h:336-421)。infra 边界:key_columns 从
+  // ColumnRawPtrs(Velox VectorPtr)取 flat rawValues() 装成 ColumnRawData 喂
+  // Base;num_rows 显式传给 packFixedBatch。
+  HashMethodKeysFixed(
+      const ColumnRawPtrs& key_columns,
+      const Sizes& key_sizes_,
+      const HashMethodContextPtr&)
+      : Base(extractColumnData(key_columns)),
+        key_sizes(key_sizes_),
+        keys_size(key_columns.size()),
+        num_rows_(key_columns.empty() ? 0 : key_columns[0]->size()) {
+    if constexpr (has_low_cardinality) {
+      // CH low_cardinality 初始化(HashMethod.h:338-355)。照抄保留、task8 启用。
+      VELOX_NYI("has_low_cardinality HashMethodKeysFixed is task8");
+    }
+
+    if (usePreparedKeys(key_sizes)) {
+      // CH: packFixedBatch(keys_size, Base::getActualColumns(), key_sizes,
+      //                    prepared_keys);
+      // infra 边界:多传 num_rows(整块行数)。
+      packFixedBatch<Key>(
+          keys_size,
+          Base::getActualColumns(),
+          key_sizes,
+          num_rows_,
+          prepared_keys);
+    } else if constexpr (kKeysFixedUseSsse3) {
+      // CH SSSE3 masks / columns_data 初始化 (HashMethod.h:365-405)。task7 启用。
+      // 照抄保留:恒 false 折走,不引入 <immintrin.h>。
+      VELOX_UNREACHABLE("SSSE3 packFixedShuffle init is task7");
+    }
+  }
+
+  // CH 原文 getKeyHolder (HashMethod.h:410-437)。pack 分派逐字。
+  Key getKeyHolder(size_t row, ch::Arena&) const {
+    if constexpr (has_nullable_keys) {
+      // CH: auto bitmap = Base::createBitmap(row);
+      //     return packFixed<Key>(row, keys_size, Base::getActualColumns(),
+      //                           key_sizes, bitmap);
+      // nullable 照抄保留、本 task 折走(has_nullable_keys=false)。
+      VELOX_NYI("nullable getKeyHolder is not supported in task3");
+    } else {
+      if constexpr (has_low_cardinality) {
+        // CH: return packFixed<Key, true>(row, keys_size,
+        //         low_cardinality_keys.nested_columns, key_sizes,
+        //         &low_cardinality_keys.positions,
+        //         &low_cardinality_keys.position_sizes);
+        // 照抄保留、task8 启用。
+        VELOX_NYI("has_low_cardinality getKeyHolder is task8");
+      }
+
+      if (!prepared_keys.empty()) {
+        return prepared_keys[row];
+      }
+
+      if constexpr (kKeysFixedUseSsse3) {
+        // CH: if constexpr (sizeof(Key) <= 16)
+        //       return packFixedShuffle<Key>(columns_data.get(), keys_size,
+        //                                    key_sizes.data(), row, masks.get());
+        // task7 照抄保留、恒 false 折走。
+        VELOX_UNREACHABLE("packFixedShuffle is task7");
+      }
+
+      return packFixed<Key>(
+          row, keys_size, Base::getActualColumns(), key_sizes);
+    }
+  }
+
+ private:
+  // infra 边界的唯一实现:把 Velox flat 定长列的 rawValues() 基址取成
+  // ColumnRawData(const char* 列表),对应 CH 的
+  // `getActualColumns()[i]->getRawData().data()`。flat / non-null 限制
+  // VELOX_CHECK + TODO(同 task1/2)。
+  static ColumnRawData extractColumnData(const ColumnRawPtrs& key_columns) {
+    VELOX_CHECK(!key_columns.empty(), "HashMethodKeysFixed requires >=1 key");
+    ColumnRawData data;
+    data.reserve(key_columns.size());
+    for (const auto& vp : key_columns) {
+      const auto column = vp->loadedVector();
+      VELOX_CHECK(
+          column->isFlatEncoding(),
+          "HashMethodKeysFixed task3 requires flat key vectors (non-flat TODO)");
+      VELOX_CHECK(
+          !column->mayHaveNulls(),
+          "HashMethodKeysFixed task3 requires non-null keys (nullable TODO)");
+      // infra 边界:取该列定长值区基址(= CH getRawDataBegin<N>() 的等价承载)。
+      const char* base = rawValuesOf(column);
+      data.push_back(base);
+    }
+    return data;
+  }
+
+  static const char* rawValuesOf(const BaseVector* column) {
+    switch (column->typeKind()) {
+      case TypeKind::TINYINT:
+        return reinterpret_cast<const char*>(
+            column->asFlatVector<int8_t>()->rawValues());
+      case TypeKind::SMALLINT:
+        return reinterpret_cast<const char*>(
+            column->asFlatVector<int16_t>()->rawValues());
+      case TypeKind::INTEGER:
+        return reinterpret_cast<const char*>(
+            column->asFlatVector<int32_t>()->rawValues());
+      case TypeKind::BIGINT:
+        return reinterpret_cast<const char*>(
+            column->asFlatVector<int64_t>()->rawValues());
+      default:
+        VELOX_UNSUPPORTED(
+            "HashMethodKeysFixed task3 supports only fixed-width integer keys");
+    }
+  }
+
+  size_t num_rows_{0};
+};
+
 
 } // namespace facebook::velox::exec::ch2

@@ -27,11 +27,19 @@
 #include <memory>
 #include <new>
 #include <type_traits>
+#include <vector>
 
 namespace facebook::velox::exec::ch2 {
 
 using UInt8 = uint8_t;
+using UInt16 = uint16_t;
+using UInt32 = uint32_t;
 using UInt64 = uint64_t;
+
+// infra 承载:CH key_columns[i]->getRawData().data()(定长列裸数据
+// 基址)逐列换成一个 const char*。整批就是 std::vector<const char*>。
+using ColumnRawData = std::vector<const char*>;
+using Sizes = std::vector<size_t>;
 
 struct HashMethodContextSettings {
   size_t max_threads{};
@@ -49,6 +57,71 @@ class HashMethodContext {
 using HashMethodContextPtr = std::shared_ptr<HashMethodContext>;
 
 namespace columns_hashing_impl {
+
+// ============================================================================
+// BaseStateKeysFixed - exactly 搬自 CH src/Common/ColumnsHashingImpl.h:525-608.
+// 支撑 HashMethodKeysFixed 的 nullable。铁律:算法搬 CH,只换 infra 承载。
+//
+// infra 边界:CH getActualColumns() 返回 ColumnRawPtrs(nullable 取 nested,否则
+//   列本身);ch2 pack 从 Velox flat 列取好 rawValues() 基址装成 ColumnRawData
+//   (std::vector<const char*>),actual_columns 承载换成 ColumnRawData。
+//
+// nullable 分支照抄保留、本 task flat non-null 不走(has_nullable_keys=false;
+// createBitmap VELOX_NYI/TODO,承载待后续 task 补)。
+// ============================================================================
+template <typename Key>
+using KeysNullMap = std::vector<UInt8>;
+
+template <typename Key, bool has_nullable_keys>
+class BaseStateKeysFixed;
+
+/// Case where nullable keys are supported.
+// CH 原文 (ColumnsHashingImpl.h:531-589)。infra:actual_columns/null_maps 承载换
+// ColumnRawData。本 task 不实例化,照抄保留 + VELOX_NYI 折走。
+template <typename Key>
+class BaseStateKeysFixed<Key, true> {
+ protected:
+  explicit BaseStateKeysFixed(const ColumnRawData& key_columns)
+      : actual_columns(key_columns) {
+    VELOX_NYI(
+        "nullable BaseStateKeysFixed<Key,true> is not supported in task3");
+  }
+
+  const ColumnRawData& getActualColumns() const {
+    return actual_columns;
+  }
+
+  KeysNullMap<Key> createBitmap(size_t /*row*/) const {
+    VELOX_NYI("createBitmap for nullable keys is not supported in task3");
+  }
+
+ private:
+  ColumnRawData actual_columns;
+  ColumnRawData null_maps;
+};
+
+/// Case where nullable keys are not supported.
+// CH 原文 (ColumnsHashingImpl.h:592-608) 逐字。infra:actual_columns 承载换
+// ColumnRawData。
+template <typename Key>
+class BaseStateKeysFixed<Key, false> {
+ protected:
+  explicit BaseStateKeysFixed(const ColumnRawData& columns)
+      : actual_columns(columns) {}
+
+  const ColumnRawData& getActualColumns() const {
+    return actual_columns;
+  }
+
+  KeysNullMap<Key> createBitmap(size_t) const {
+    VELOX_FAIL(
+        "Internal error: calling createBitmap() for non-nullable keys is "
+        "forbidden");
+  }
+
+ private:
+  ColumnRawData actual_columns;
+};
 
 struct LastElementCacheBase {
   bool empty = true;
