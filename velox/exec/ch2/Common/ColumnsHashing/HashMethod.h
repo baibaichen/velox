@@ -26,6 +26,7 @@
 #include <folly/Portability.h>
 
 #include <cstddef>
+#include <optional>
 #include <cstring>
 #include <string_view>
 #include <vector>
@@ -110,6 +111,207 @@ struct HashMethodOneNumber : public columns_hashing_impl::HashMethodBase<
     return reinterpret_cast<const FieldType*>(vec);
   }
 };
+
+
+// ============================================================================
+// HashMethodOneNumberInRange — exactly 搬自 CH ColumnsHashing/HashMethod.h:
+// 99-149 (O2 hash join fixed-range 优化)。像 HashMethodOneNumber,但每个 key
+// 减 min_key 平移到 [0, range_size),并做范围校验。铁律 + O2 头号红线:
+// range 平移+范围校验定位算法逐字搬 CH,**绝不接 Velox kArray/VectorHasher
+// 的 range 模式顶替**。Velox 只允许出现在"扫列算 min/max 喂进
+// min_key/range_size"这个值域接入 infra 边界(见 computeKeyRange)。
+//
+// infra 边界:
+//   CH `vec = column->getRawData().data()`(IColumn 裸指针)→ Velox flat
+//     rawValues()(同 HashMethodOneNumber)。
+//   CH min_key/range_size 是成员,由 hash join build 侧扫 key 列算好 min/max
+//     后 set(Interpreters/HashJoin/HashJoinMethodsImpl.h:275-276
+//     `getter.min_key = key_range.min_key; getter.range_size = key_range.size`,
+//     key_range 由 HashJoin.cpp:2216-2262 扫 build key 列算 min/max、
+//     range = max-min+1 得到)。ch2 值域接入用 Velox flat 列扫 min/max 拿
+//     两个数(computeKeyRange),再 set 进成员——**只是拿到两个数,不接 kArray
+//     寻址**。
+//
+// range map 承载:CH range 场景下 hash 表存的是平移后 key ∈ [0, range_size)
+//   (HashJoin.cpp:2257 `range_map->emplace(getKey() - min_key, ...)`),走的
+//   仍是普通定长 map 寻址(平移后 key 当普通 key)。"直接当索引"的直查数组
+//   fastpath(probeFixedHashMap)是另一条独立优化路径,不在 HashMethod 这条
+//   路上。所以 range map 承载 = 复用已有定长 map,平移算法在 HashMethod 侧。
+// ============================================================================
+template <
+    typename Value,
+    typename Mapped,
+    typename FieldType,
+    bool use_cache = true,
+    bool need_offset = false,
+    bool nullable = false>
+struct HashMethodOneNumberInRange
+    : public columns_hashing_impl::HashMethodBase<
+          HashMethodOneNumberInRange<
+              Value,
+              Mapped,
+              FieldType,
+              use_cache,
+              need_offset,
+              nullable>,
+          Value,
+          Mapped,
+          use_cache,
+          need_offset,
+          nullable> {
+  using Self = HashMethodOneNumberInRange<
+      Value,
+      Mapped,
+      FieldType,
+      use_cache,
+      need_offset,
+      nullable>;
+  using Base = columns_hashing_impl::
+      HashMethodBase<Self, Value, Mapped, use_cache, need_offset, nullable>;
+
+  // CH: static constexpr bool has_range_check = true;(本 task 启用
+  // HashMethodBase 的 has_range_check 分支:findKey 走 getKeyHolderInRange、
+  // 范围外 miss)。
+  static constexpr bool has_range_check = true;
+  static constexpr bool has_cheap_key_calculation = true;
+  static constexpr bool has_pre_computed_hashes = false;
+
+  // CH: const char * vec; FieldType min_key{}; FieldType range_size{};
+  const char* vec;
+  FieldType min_key{};
+  FieldType range_size{};
+
+  HashMethodOneNumberInRange(
+      const ColumnRawPtrs& key_columns,
+      const Sizes&,
+      const HashMethodContextPtr&)
+      : Base(key_columns.empty() ? nullptr : key_columns[0]) {
+    // CH: explicit HashMethodOneNumberInRange(const IColumn * column):Base(column)
+    //     vec = column->getRawData().data();(nullable 取 nested,照抄保留 TODO)
+    VELOX_CHECK_EQ(key_columns.size(), 1);
+    const auto column = key_columns[0]->loadedVector();
+    // flat + non-null 限制(同 task1)。非-flat/nullable 留 TODO。
+    VELOX_CHECK(
+        column->isFlatEncoding(),
+        "HashMethodOneNumberInRange task5 requires a flat key vector (non-flat TODO)");
+    VELOX_CHECK(
+        !column->mayHaveNulls(),
+        "HashMethodOneNumberInRange task5 requires non-null keys (nullable TODO)");
+    if constexpr (nullable) {
+      VELOX_NYI("nullable HashMethodOneNumberInRange is not supported in task5");
+    }
+    const auto* flat = column->template asFlatVector<FieldType>();
+    VELOX_CHECK_NOT_NULL(
+        flat, "HashMethodOneNumberInRange key type does not match FieldType");
+    // infra 边界:CH IColumn 裸指针 → Velox flat rawValues()(同 OneNumber)。
+    vec = reinterpret_cast<const char*>(flat->rawValues());
+  }
+
+  using Base::createContext;
+  using Base::emplaceKey;
+  using Base::findKey;
+  using Base::getHash;
+
+  // CH 原文 (HashMethod.h:138-141) 逐字:直读 + 减 min_key 平移。
+  //   FieldType getKeyHolder(size_t row, Arena &) const {
+  //     return unalignedLoad<FieldType>(vec + row*sizeof(FieldType)) - min_key;
+  //   }
+  FieldType getKeyHolder(size_t row, ch::Arena&) const {
+    return unalignedLoad<FieldType>(vec + row * sizeof(FieldType)) - min_key;
+  }
+
+  // CH 原文 (HashMethod.h:143-147) 逐字:平移 + 范围校验 (shifted < range_size)。
+  //   std::pair<FieldType,bool> getKeyHolderInRange(size_t row, Arena &) const {
+  //     FieldType shifted_key =
+  //         unalignedLoad<FieldType>(vec + row*sizeof(FieldType)) - min_key;
+  //     return {shifted_key, shifted_key < range_size};
+  //   }
+  std::pair<FieldType, bool> getKeyHolderInRange(size_t row, ch::Arena&) const {
+    FieldType shifted_key =
+        unalignedLoad<FieldType>(vec + row * sizeof(FieldType)) - min_key;
+    return {shifted_key, shifted_key < range_size};
+  }
+};
+
+// ============================================================================
+// computeKeyRange — 值域接入 infra 边界(唯一允许 Velox 参与的地方,且只是
+// "拿到两个数")。对应 CH HashJoin.cpp:2216-2262 扫 build key 列算 min/max、
+// range = max-min+1。ch2 用 Velox flat 列扫 min/max 拿两个数,填 min_key/
+// range_size 成员。**不接 kArray 寻址,只算两个数。**
+//
+// 返回 {min_key, range_size},range_size = max - min + 1(与 CH 一致)。
+//
+// ---- 两层溢出防护,逐字对齐 CH HashJoin.cpp:2198/2242/2246 ----
+// CH 有两层防护,ch2 都补上:
+//   1. static constexpr size_t MAX_RANGE = (1ULL << 18); (HashJoin.cpp:2198)。
+//      扫描时 if (static_cast<size_t>(max_key - min_key) >= MAX_RANGE) return;
+//      (HashJoin.cpp:2242)——超限**不启用 range 优化**,CH 直接 return 不建
+//      range_map、回退普通 key32/key64 map。ch2 computeKeyRange 返回
+//      std::optional<KeyRange>,空 optional = "这批 key 不适合 range 优化",
+//      调用方据此回退普通定长 map(对齐 CH 的 return)。
+//   2. size_t range = static_cast<size_t>(max_key - min_key) + 1;
+//      (HashJoin.cpp:2246)——差值**提升到 size_t 无符号域**再 +1,wraparound
+//      defined,不是有符号 FieldType 溢出 UB。ch2 同样在无符号域算。
+//
+// range_size 成员类型仍是 FieldType(与 CH HashMethodOneNumberInRange 一致):
+// 因为只有 max-min < MAX_RANGE = 2^18 才会启用,range = max-min+1 <= 2^18 必然
+// 落在 FieldType(>=int32)可表示范围内,收窄回 FieldType 无损失,与
+// getKeyHolderInRange 里 shifted_key < range_size(FieldType 比较)语义不变。
+// ============================================================================
+template <typename FieldType>
+struct KeyRange {
+  FieldType min_key{};
+  FieldType range_size{};
+};
+
+// CH: static constexpr size_t MAX_RANGE = (1ULL << 18); (HashJoin.cpp:2198)。
+static constexpr size_t kComputeKeyRangeMaxRange = (1ULL << 18);
+
+template <typename FieldType>
+std::optional<KeyRange<FieldType>> computeKeyRange(const VectorPtr& keyColumn) {
+  const auto column = keyColumn->loadedVector();
+  VELOX_CHECK(
+      column->isFlatEncoding(),
+      "computeKeyRange task5 requires a flat key vector");
+  VELOX_CHECK(
+      !column->mayHaveNulls(),
+      "computeKeyRange task5 requires non-null keys");
+  const auto* flat = column->template asFlatVector<FieldType>();
+  VELOX_CHECK_NOT_NULL(flat, "computeKeyRange key type does not match FieldType");
+  const auto rows = flat->size();
+  VELOX_CHECK_GT(rows, 0, "computeKeyRange requires >=1 row");
+  const FieldType* data = flat->rawValues();
+  using UnsignedField = std::make_unsigned_t<FieldType>;
+  // CH: Key min_key = it->getKey(); ... 扫全部 key 取 min/max。
+  FieldType minKey = data[0];
+  FieldType maxKey = data[0];
+  for (vector_size_t i = 1; i < rows; ++i) {
+    if (data[i] < minKey) {
+      minKey = data[i];
+    }
+    if (data[i] > maxKey) {
+      maxKey = data[i];
+    }
+    // CH HashJoin.cpp:2242 逐字:超 MAX_RANGE 不启用 range 优化(CH return)。
+    // 差值在 size_t 无符号域比较,避免有符号 FieldType 溢出 UB。
+    if (static_cast<size_t>(
+            static_cast<UnsignedField>(maxKey) -
+            static_cast<UnsignedField>(minKey)) >= kComputeKeyRangeMaxRange) {
+      return std::nullopt;
+    }
+  }
+  // CH HashJoin.cpp:2246 逐字:size_t range = static_cast<size_t>(max - min) + 1;
+  // 无符号域算(wraparound defined,非有符号 UB)。此处 range <= MAX_RANGE = 2^18,
+  // 收窄回 FieldType 无损失。
+  const size_t range = static_cast<size_t>(
+                           static_cast<UnsignedField>(maxKey) -
+                           static_cast<UnsignedField>(minKey)) +
+      1;
+  KeyRange<FieldType> r;
+  r.min_key = minKey;
+  r.range_size = static_cast<FieldType>(range);
+  return r;
+}
 
 
 // ============================================================================
