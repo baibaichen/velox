@@ -20,6 +20,8 @@ velox_add_library(
     Common/ColumnsHashing/ColumnsHashingImpl.h
     Common/ColumnsHashing/HashMethod.h
     Common/HashTable/HashTableKeyHolder.h
+    Common/HashTable/StringHashMapAdapter.h
+    Interpreters/HashJoin/ChHashMethodDispatch.h
 )
 velox_link_libraries(
   velox_exec_ch2
