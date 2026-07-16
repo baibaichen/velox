@@ -269,6 +269,34 @@ class FixedKeyMap {
     keyStringMap().prefetchByHash(hashValue);
   }
 
+  // ch2-task9c1: public accessors to the concrete coordinate map, so the ch2
+  // HashMethod route (ChHashRoute.h) can drive emplaceKey/findKey directly over
+  // the chosen variant alternative. The old ch decoder path does not use these.
+  Map8& rawMap8() {
+    return map8();
+  }
+  Map16& rawMap16() {
+    return map16();
+  }
+  Map32& rawMap32() {
+    return map32();
+  }
+  Map64& rawMap64() {
+    return map64();
+  }
+  Map128& rawMap128() {
+    return map128();
+  }
+  Map256& rawMap256() {
+    return map256();
+  }
+  KeyStringMap& rawKeyStringMap() {
+    return keyStringMap();
+  }
+  HashedMap& rawHashedMap() {
+    return hashedMap();
+  }
+
  private:
   using Maps = std::variant<
       Map8,

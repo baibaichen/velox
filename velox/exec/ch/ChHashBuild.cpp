@@ -21,8 +21,19 @@
 #include "velox/exec/ch/Common/HashTable/Prefetching.h"
 #include "velox/exec/ch/Interpreters/RowRef.h"
 #include "velox/exec/ch/Common/ColumnsHashing/SerializedKey.h"
+#include "velox/exec/ch2/Interpreters/HashJoin/ChHashRoute.h"
+
+#include <cstdlib>
 
 namespace facebook::velox::exec::ch {
+
+namespace ch2Route {
+// Default = drive ch2. CH_USE_CH2=0 reverts to the old ch decoder path.
+bool useCh2Default() {
+  const char* env = std::getenv("CH_USE_CH2");
+  return !(env != nullptr && env[0] == '0');
+}
+} // namespace ch2Route
 
 ChHashBuild::ChHashBuild(
     uint32_t driverNo,
@@ -103,6 +114,23 @@ void ChHashBuild::addInput(RowVectorPtr input) {
   SelectivityVector rows(input->size());
   for (size_t i = 0; i < keyChannels_.size(); ++i) {
     VELOX_CHECK_EQ(input->childAt(keyChannels_[i])->type(), keyTypes_[i]);
+  }
+
+  if (useCh2_) {
+    // ch2-task9c1: default path. Drive the ch2 six-HashMethod route over the
+    // FixedKeyMap coordinate variant; the compacted-flat-null-free adaptation
+    // and ORIGINAL-row remapping live in ChHashRoute.h. Retains the ORIGINAL
+    // input (route calls retainedIndex_->add), matching the old paths.
+    ch2::route::buildViaCh2(
+        storage_->rowsByKey,
+        *retainedIndex_,
+        storage_->arena,
+        driverNo_,
+        input,
+        keyChannels_,
+        keyTypes_,
+        storage_->pool);
+    return;
   }
 
   if (storage_->rowsByKey.type() == FixedKeyMap::Type::hashed) {

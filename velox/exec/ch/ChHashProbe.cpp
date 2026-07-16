@@ -23,6 +23,9 @@
 #include "velox/exec/ch/Common/ColumnsHashing/SerializedKey.h"
 #include "velox/vector/DecodedVector.h"
 #include "velox/vector/SelectivityVector.h"
+#include "velox/exec/ch2/Interpreters/HashJoin/ChHashRoute.h"
+
+#include <cstdlib>
 
 namespace facebook::velox::exec::ch {
 
@@ -178,8 +181,24 @@ std::vector<ProbeHit> joinProbe(
     const ChHashBuild::JoinMap& map,
     const RowVectorPtr& probe,
     const std::vector<column_index_t>& probeKeyChannels) {
-  std::vector<ProbeHit> hits;
   VELOX_CHECK_NOT_NULL(probe);
+  // ch2-task9c1: default-drive the ch2 six-HashMethod route. Reversible via
+  // env CH_USE_CH2=0 (old decoder probeLoop below). findKey needs a mutable map
+  // ref (it only reads cells, never mutates the shared build table), so we
+  // const_cast the bridge-owned map at the route boundary. A per-call Arena
+  // backs any transient key holders; probe never persists into it.
+  {
+    const char* env = std::getenv("CH_USE_CH2");
+    const bool useCh2 = !(env != nullptr && env[0] == '0');
+    if (useCh2) {
+      Arena arena(probe->pool());
+      auto& mutableMap = const_cast<ChHashBuild::JoinMap&>(map);
+      return ch2::route::probeViaCh2(
+          mutableMap, arena, probe, probeKeyChannels, map.keyTypes(),
+          probe->pool());
+    }
+  }
+  std::vector<ProbeHit> hits;
   hits.reserve(probe->size());
   probeLoop(
       map,

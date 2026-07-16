@@ -25,6 +25,11 @@
 
 namespace facebook::velox::exec::ch {
 
+// ch2-task9c1: reads the CH_USE_CH2 env switch (default = drive ch2).
+namespace ch2Route {
+bool useCh2Default();
+} // namespace ch2Route
+
 class ChHashBuild {
  public:
   using JoinMap = FixedKeyMap;
@@ -99,8 +104,9 @@ class ChHashBuild {
     BuildStorage(
         memory::MemoryPool* pool,
         const std::vector<TypePtr>& keyTypes)
-        : arena(pool), rowsByKey(pool, keyTypes) {}
+        : pool(pool), arena(pool), rowsByKey(pool, keyTypes) {}
 
+    memory::MemoryPool* pool;
     Arena arena;
     JoinMap rowsByKey;
   };
@@ -111,6 +117,10 @@ class ChHashBuild {
   std::shared_ptr<RetainedVectorsIndex> retainedIndex_;
   std::shared_ptr<BuildStorage> storage_;
   bool needsInput_{true};
+  // ch2-task9c1: default-drive the ch2 six HashMethod route (ChHashRoute.h).
+  // Reversible: set env CH_USE_CH2=0 to fall back to the old ch decoder path
+  // (retained below for task 9c-2). Decided once at construction.
+  bool useCh2_{ch2Route::useCh2Default()};
 };
 
 } // namespace facebook::velox::exec::ch
