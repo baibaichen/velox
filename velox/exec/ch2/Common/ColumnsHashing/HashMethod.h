@@ -442,4 +442,149 @@ struct HashMethodKeysFixed
 };
 
 
+// ============================================================================
+// hash128 + HashMethodHashed — exactly 搬自 CH ColumnsHashing/HashMethod.h:
+//   hash128         : CH HashMethod.h:19-29
+//   HashMethodHashed: CH HashMethod.h:474-495
+// 宽/多列 key → 128 位 SipHash digest。铁律 + O6:digest 算法用 CH SipHash
+// (task1 已搬进 ch2、逐字节对拍过 CH),绝不用 Velox XXH3 顶替。只有"从列取
+// 第 i 行值喂进 hash"这个承载边界换 Velox。
+//
+// ---- O6 关键:updateHashWithValue 的字节喂法必须逐类对齐 CH ----
+// CH `hash128` 靠 `IColumn::updateHashWithValue(i, hash)`(IColumn 虚方法,按
+// 列类型把第 i 行值喂进 SipHash)。Velox 无此虚方法,ch2 写等价 dispatch:
+//   数值列 (ColumnVector<T>::updateHashWithValue, ColumnVector.cpp:70):
+//     `hash.update(data[n])` —— 喂第 n 行值的 sizeof(T) 字节。
+//     ch2: flat->rawValues()[row] 取值,hash.update(value)(SipHash 的
+//          `update(const T&)` 同样喂 sizeof(T) 字节,与 CH 逐字节一致)。
+//   字符串列 (ColumnString::updateHashWithValue, ColumnString.cpp:834):
+//     size_t size_used_in_hash = string_size + 1;
+//     hash.update(&size_used_in_hash, sizeof(size_used_in_hash)); // 8 字节 size
+//     hash.update(&chars[offset], string_size);                   // 原始字节
+//     hash.update(UInt8(0));                                      // 尾部兼容 0
+//     ch2: 从 FlatVector<StringView> 取第 row 行 sv(ptr+size),按同样三段喂:
+//          size+1(size_t 8 字节)→ sv 原始字节 → UInt8(0)。逐字节对齐 CH。
+// ============================================================================
+
+// ch2 版 IColumn::updateHashWithValue 等价:按 Velox 列类型把第 row 行值喂进
+// ch2::SipHash,字节喂法逐类对齐 CH(见上)。infra 边界 = 从列取值;算法(喂哪
+// 些字节、喂进 SipHash)搬 CH。
+inline void updateHashWithValue(
+    const BaseVector* column,
+    size_t row,
+    SipHash& hash) {
+  switch (column->typeKind()) {
+    // ---- 数值列:CH ColumnVector<T>::updateHashWithValue = hash.update(data[n]) ----
+    case TypeKind::TINYINT:
+      hash.update(column->asFlatVector<int8_t>()->rawValues()[row]);
+      return;
+    case TypeKind::SMALLINT:
+      hash.update(column->asFlatVector<int16_t>()->rawValues()[row]);
+      return;
+    case TypeKind::INTEGER:
+      hash.update(column->asFlatVector<int32_t>()->rawValues()[row]);
+      return;
+    case TypeKind::BIGINT:
+      hash.update(column->asFlatVector<int64_t>()->rawValues()[row]);
+      return;
+    case TypeKind::REAL:
+      hash.update(column->asFlatVector<float>()->rawValues()[row]);
+      return;
+    case TypeKind::DOUBLE:
+      hash.update(column->asFlatVector<double>()->rawValues()[row]);
+      return;
+    // ---- 字符串列:CH ColumnString::updateHashWithValue(size+1, bytes, 0) ----
+    case TypeKind::VARCHAR:
+    case TypeKind::VARBINARY: {
+      const StringView& sv = column->asFlatVector<StringView>()->rawValues()[row];
+      const size_t string_size = sv.size();
+      // CH: size_used_in_hash = string_size + 1(兼容聚合状态),喂 size_t 字节。
+      const size_t size_used_in_hash = string_size + 1;
+      hash.update(
+          reinterpret_cast<const char*>(&size_used_in_hash),
+          sizeof(size_used_in_hash));
+      hash.update(sv.data(), string_size);
+      // CH: 尾部兼容 0。
+      hash.update(UInt8(0));
+      return;
+    }
+    default:
+      VELOX_UNSUPPORTED(
+          "hash128 updateHashWithValue supports only fixed-width numeric and string keys");
+  }
+}
+
+// CH 原文 (HashMethod.h:19-29) 逐字:SipHash hash; 逐列 updateHashWithValue;
+// get128()。algorithm 逐字搬(SipHash + get128),只有 updateHashWithValue 的
+// 取值承载换 Velox(见上)。
+static inline UInt128 hash128(
+    size_t i,
+    size_t keys_size,
+    const ColumnRawPtrs& key_columns) {
+  SipHash hash;
+  for (size_t j = 0; j < keys_size; ++j)
+    updateHashWithValue(key_columns[j]->loadedVector(), i, hash);
+
+  return hash.get128();
+}
+
+// ============================================================================
+// HashMethodHashed — exactly 搬自 CH HashMethod.h:474-495。Key=UInt128,
+// getKeyHolder = hash128(row, key_columns.size(), key_columns)。算法逐字;
+// infra 边界 = key_columns 承载换 Velox VectorPtr(构造存下,getKeyHolder 逐列
+// 取值喂 hash128)。
+// ============================================================================
+template <
+    typename Value,
+    typename Mapped,
+    bool use_cache = true,
+    bool need_offset = false>
+struct HashMethodHashed : public columns_hashing_impl::HashMethodBase<
+                              HashMethodHashed<Value, Mapped, use_cache, need_offset>,
+                              Value,
+                              Mapped,
+                              use_cache,
+                              need_offset> {
+  using Key = UInt128;
+  using Self = HashMethodHashed<Value, Mapped, use_cache, need_offset>;
+  using Base = columns_hashing_impl::
+      HashMethodBase<Self, Value, Mapped, use_cache, need_offset>;
+
+  static constexpr bool has_cheap_key_calculation = false;
+  static constexpr bool has_pre_computed_hashes = false;
+
+  // CH: ColumnRawPtrs key_columns; infra 边界 = Velox VectorPtr 承载。
+  ColumnRawPtrs key_columns;
+
+  // CH 原文构造 (HashMethod.h:489-490):key_columns(std::move(key_columns_))。
+  HashMethodHashed(
+      ColumnRawPtrs key_columns_,
+      const Sizes&,
+      const HashMethodContextPtr&)
+      : Base(key_columns_.empty() ? nullptr : key_columns_[0]),
+        key_columns(std::move(key_columns_)) {
+    // flat/non-null 限制(同 task1-3):非-flat / nullable 留 TODO。
+    for (const auto& vp : key_columns) {
+      const auto column = vp->loadedVector();
+      VELOX_CHECK(
+          column->isFlatEncoding(),
+          "HashMethodHashed task4 requires flat key vectors (non-flat TODO)");
+      VELOX_CHECK(
+          !column->mayHaveNulls(),
+          "HashMethodHashed task4 requires non-null keys (nullable TODO)");
+    }
+  }
+
+  using Base::createContext;
+  using Base::emplaceKey;
+  using Base::findKey;
+  using Base::getHash;
+
+  // CH 原文 getKeyHolder (HashMethod.h:492-495) 逐字。
+  FOLLY_ALWAYS_INLINE Key getKeyHolder(size_t row, ch::Arena&) const {
+    return hash128(row, key_columns.size(), key_columns);
+  }
+};
+
+
 } // namespace facebook::velox::exec::ch2

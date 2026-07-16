@@ -14,6 +14,7 @@
 
 add_executable(
   velox_exec_ch2_test
+  HashMethodHashedTest.cpp
   HashMethodKeysFixedTest.cpp
   HashMethodOneNumberTest.cpp
   HashMethodStringTest.cpp
