@@ -27,6 +27,9 @@
 #include <folly/Portability.h>
 
 #include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <memory>
 #include <optional>
 #include <cstring>
 #include <string_view>
@@ -605,8 +608,11 @@ struct LowCardinalityKeys<false> {};
 // 只换 infra 边界(列裸数据承载 + prepared_keys 承载)。
 //
 // 本 task 模板实例:has_nullable_keys_=false, has_low_cardinality_=false。
-//   - SSSE3 shuffle 分支(packFixedShuffle)= task7:照抄保留、编译期折走(用
-//     一个恒 false 的 constexpr 开关,不引入 <immintrin.h>)。
+//   - SSSE3 shuffle 分支(packFixedShuffle)= task7(O5):启用。x86 有 SSSE3
+//     (`#if defined(__SSSE3__)`)时编进 masks/columns_data + shuffle 分支;
+//     **运行时 A/B 可切换**(useSsse3_ 成员,env CH2_KEYSFIXED_USE_SSSE3),
+//     同一二进制能切 SSSE3 vs 标量 packFixed 供多机 benchmark。SSSE3 输出
+//     必须 == 标量输出(逐字节对拍硬关卡)。ARM/无 SSSE3 编译期只剩标量。
 //   - low_cardinality 分支 = task8:照抄保留、has_low_cardinality=false 折走。
 //   - nullable 分支:照抄保留、has_nullable_keys=false 折走。
 //
@@ -618,8 +624,29 @@ struct LowCardinalityKeys<false> {};
 //   getKeyHolder / usePreparedKeys / packFixedBatch 分派逐字。
 // ============================================================================
 
-// task7 SSSE3 开关:照抄保留 shuffle 分支的位置,本 task 恒关(不引入 SSSE3)。
-static constexpr bool kKeysFixedUseSsse3 = false;
+// task7 (O5) SSSE3 编译期能力:x86 有 SSSE3(且非 MSan)才把 packFixedShuffle
+// 编进来。ARM / 无 SSSE3 / MSan 下恒 false,只剩标量 packFixed 兜底。
+#if defined(__SSSE3__) && !defined(MEMORY_SANITIZER)
+static constexpr bool kKeysFixedHasSsse3 = true;
+#else
+static constexpr bool kKeysFixedHasSsse3 = false;
+#endif
+
+// 运行时 A/B 开关默认值:有 SSSE3 编译进来时默认走 SSSE3 快路径,可用
+// 环境变量 CH2_KEYSFIXED_USE_SSSE3=0/1 强制标量/SSSE3(同一二进制切两路径,
+// 供多机 benchmark)。无 SSSE3 编译能力时恒 false。
+inline bool keysFixedSsse3DefaultEnabled() {
+  if constexpr (!kKeysFixedHasSsse3) {
+    return false;
+  } else {
+    const char* env = std::getenv("CH2_KEYSFIXED_USE_SSSE3");
+    if (env == nullptr || env[0] == 0) {
+      return true; // 默认按平台:有 SSSE3 用快路径。
+    }
+    // "0" -> 标量;其它非空 -> SSSE3。
+    return !(env[0] == '0' && env[1] == 0);
+  }
+}
 
 template <
     typename Value,
@@ -669,6 +696,18 @@ struct HashMethodKeysFixed
   // CH: PaddedPODArray<Key> prepared_keys; -> std::vector<Key>(infra 边界)。
   std::vector<Key> prepared_keys;
 
+  // task7 (O5) SSSE3 洗牌:masks / columns_data —— CH 原文
+  //   std::unique_ptr<uint8_t[]> masks;
+  //   std::unique_ptr<const char*[]> columns_data;
+  // 逐字保留(承载不变)。只在 kKeysFixedHasSsse3 且 !usePreparedKeys 且
+  // sizeof(Key)<=16 时构造(与 CH 同条件)。
+  std::unique_ptr<uint8_t[]> masks;
+  std::unique_ptr<const char*[]> columns_data;
+
+  // 运行时 A/B 开关:同一二进制切 SSSE3 vs 标量。仅当 masks 已构造(SSSE3
+  // 路径可用)且 useSsse3_ 为真时走 packFixedShuffle,否则标量 packFixed。
+  bool useSsse3_ = false;
+
   // CH 原文 (HashMethod.h:322-334) 逐字。
   static bool usePreparedKeys(const Sizes& key_sizes) {
     if (has_low_cardinality || has_nullable_keys || sizeof(Key) > 16) {
@@ -710,10 +749,35 @@ struct HashMethodKeysFixed
           key_sizes,
           num_rows_,
           prepared_keys);
-    } else if constexpr (kKeysFixedUseSsse3) {
-      // CH SSSE3 masks / columns_data 初始化 (HashMethod.h:365-405)。task7 启用。
-      // 照抄保留:恒 false 折走,不引入 <immintrin.h>。
-      VELOX_UNREACHABLE("SSSE3 packFixedShuffle init is task7");
+    } else if constexpr (
+        kKeysFixedHasSsse3 && !has_low_cardinality && !has_nullable_keys &&
+        sizeof(Key) <= 16) {
+      // CH SSSE3 masks / columns_data 初始化 (CH HashMethod.h:365-405) 逐字。
+      // 每个 GROUP BY 元素一张 16B mask(只用前 sizeof(Key) 字节),0xFF=置零,
+      // 0..15=从源寄存器该下标取字节。infra 边界:columns_data 换成 Velox flat
+      // 的 rawValues() 基址(= CH getRawData().data())。
+      // 运行时 A/B:masks 始终构造好,getKeyHolder 按 useSsse3_ 选路径。
+      size_t total_masks_size = sizeof(Key) * keys_size + (16 - sizeof(Key));
+      masks.reset(new uint8_t[total_masks_size]);
+      memset(masks.get(), 0xFF, total_masks_size);
+
+      size_t offset = 0;
+      for (size_t i = 0; i < keys_size; ++i) {
+        for (size_t j = 0; j < key_sizes[i]; ++j) {
+          masks[i * sizeof(Key) + offset] = static_cast<uint8_t>(j);
+          ++offset;
+        }
+      }
+
+      columns_data.reset(new const char*[keys_size]);
+      for (size_t i = 0; i < keys_size; ++i) {
+        // infra 边界:CH getActualColumns()[i]->getRawData().data();ch2 的
+        // getActualColumns() 已是预取的 const char* 裸基址。
+        columns_data[i] = Base::getActualColumns()[i];
+      }
+
+      // 运行时 A/B 默认(env CH2_KEYSFIXED_USE_SSSE3 可覆写)。
+      useSsse3_ = keysFixedSsse3DefaultEnabled();
     }
   }
 
@@ -739,20 +803,86 @@ struct HashMethodKeysFixed
         return prepared_keys[row];
       }
 
-      if constexpr (kKeysFixedUseSsse3) {
-        // CH: if constexpr (sizeof(Key) <= 16)
-        //       return packFixedShuffle<Key>(columns_data.get(), keys_size,
-        //                                    key_sizes.data(), row, masks.get());
-        // task7 照抄保留、恒 false 折走。
-        VELOX_UNREACHABLE("packFixedShuffle is task7");
+#if defined(__SSSE3__) && !defined(MEMORY_SANITIZER)
+      // CH 原文 (HashMethod.h:428-432):
+      //   if constexpr (sizeof(Key) <= 16)
+      //     return packFixedShuffle<Key>(columns_data.get(), keys_size,
+      //                                  key_sizes.data(), row, masks.get());
+      // 运行时 A/B:masks 已构造(SSSE3 路径可用)且 useSsse3_ 才走 shuffle,
+      // 否则落到下面的标量 packFixed(A/B 强制标量 / 无 masks 时)。
+      if constexpr (sizeof(Key) <= 16) {
+        if (masks && useSsse3_) {
+          VELOX_DCHECK(!has_low_cardinality && !has_nullable_keys);
+          return packFixedShuffle<Key>(
+              columns_data.get(), keys_size, key_sizes.data(), row, masks.get());
+        }
       }
+#endif
 
       return packFixed<Key>(
           row, keys_size, Base::getActualColumns(), key_sizes);
     }
   }
 
+  // ------------------------------------------------------------------------
+  // 多机 A/B 设施(task7 O5)。让同一二进制在 benchmark 里对同一批 key 显式跑
+  // 标量 packFixed 与 SSSE3 packFixedShuffle 两条路径,对比吞吐 + 逐字节验相等。
+  // 与 CH 的 getKeyHolder 分派(prepared 优先)正交:这两个是显式 A/B 入口,
+  // 绕开 prepared,直接压测两种 pack 算法本身。
+  //
+  // 怎么在别的机器跑 A/B:同一 velox_exec_ch2 二进制,
+  //   - 设 CH2_KEYSFIXED_USE_SSSE3=1(默认,x86 有 SSSE3)-> getKeyHolder 自然
+  //     走 SSSE3(非 prepared 档);=0 强制标量。
+  //   - benchmark 直接调 packRowScalar / packRowSsse3 对比两算法(见 ch2 bench)。
+  // ------------------------------------------------------------------------
+
+  // A/B:标量路径(始终可用,ARM/无 SSSE3 也走这)。
+  Key packRowScalar(size_t row) const {
+    return packFixed<Key>(
+        row, keys_size, Base::getActualColumns(), key_sizes);
+  }
+
+  // A/B:SSSE3 路径。需 masks/columns_data;若构造时未建(prepared 档)则
+  // 惰性建一次。仅 kKeysFixedHasSsse3 且 sizeof(Key)<=16 有效,否则回退标量。
+  Key packRowSsse3(size_t row) {
+#if defined(__SSSE3__) && !defined(MEMORY_SANITIZER)
+    if constexpr (sizeof(Key) <= 16) {
+      if (!masks) {
+        buildSsse3Masks();
+      }
+      return packFixedShuffle<Key>(
+          columns_data.get(), keys_size, key_sizes.data(), row, masks.get());
+    }
+#endif
+    return packRowScalar(row);
+  }
+
+  // A/B 是否真能走 SSSE3(编译能力 + Key 宽度)。ARM/无 SSSE3 返回 false。
+  static constexpr bool ssse3Available() {
+    return kKeysFixedHasSsse3 && sizeof(Key) <= 16;
+  }
+
  private:
+#if defined(__SSSE3__) && !defined(MEMORY_SANITIZER)
+  // SSSE3 masks/columns_data 构造(与构造函数里 CH HashMethod.h:365-405 同算法),
+  // 抽出来供 A/B packRowSsse3 惰性建(prepared 档构造时没建)。
+  void buildSsse3Masks() {
+    size_t total_masks_size = sizeof(Key) * keys_size + (16 - sizeof(Key));
+    masks.reset(new uint8_t[total_masks_size]);
+    memset(masks.get(), 0xFF, total_masks_size);
+    size_t offset = 0;
+    for (size_t i = 0; i < keys_size; ++i) {
+      for (size_t j = 0; j < key_sizes[i]; ++j) {
+        masks[i * sizeof(Key) + offset] = static_cast<uint8_t>(j);
+        ++offset;
+      }
+    }
+    columns_data.reset(new const char*[keys_size]);
+    for (size_t i = 0; i < keys_size; ++i) {
+      columns_data[i] = Base::getActualColumns()[i];
+    }
+  }
+#endif
   // infra 边界的唯一实现:把 Velox flat 定长列的 rawValues() 基址取成
   // ColumnRawData(const char* 列表),对应 CH 的
   // `getActualColumns()[i]->getRawData().data()`。flat / non-null 限制

@@ -16,6 +16,7 @@ add_executable(
   velox_exec_ch2_test
   HashMethodHashedTest.cpp
   HashMethodKeysFixedTest.cpp
+  HashMethodKeysFixedSsse3Test.cpp
   HashMethodOneNumberInRangeTest.cpp
   HashMethodOneNumberTest.cpp
   HashMethodFixedStringTest.cpp

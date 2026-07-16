@@ -12,29 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-velox_add_library(
-  velox_exec_ch2
-  INTERFACE
-  HEADERS
-    Common/SipHash.h
-    Common/ColumnsHashing/ColumnsHashingImpl.h
-    DataTypes/FixedStringType.h
-    Common/ColumnsHashing/HashMethod.h
-    Common/HashTable/HashTableKeyHolder.h
-    Common/HashTable/StringHashMapAdapter.h
-    Interpreters/AggregationCommon.h
-    Interpreters/HashJoin/ChHashMethodDispatch.h
-)
-velox_link_libraries(
-  velox_exec_ch2
-  INTERFACE
-    velox_exec_ch
-    velox_vector
-)
+# ch2-task7 (O5) multi-machine A/B micro-bench: SSSE3 packFixedShuffle vs scalar
+# packFixed, same binary switches both paths.
+add_executable(
+  velox_exec_ch2_keysfixed_ssse3_benchmark ChKeysFixedSsse3Benchmark.cpp)
 
-if(${VELOX_BUILD_TESTING})
-  add_subdirectory(tests)
-  add_subdirectory(benchmarks)
-endif()
-
-velox_install_library_headers()
+target_link_libraries(
+  velox_exec_ch2_keysfixed_ssse3_benchmark
+  velox_exec_ch2
+  velox_exec_ch
+  velox_vector
+  velox_vector_test_lib
+  Folly::follybenchmark)
