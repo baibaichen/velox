@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "velox/exec/ch2/Common/ColumnsHashing/HashMethod.h"
+#include "velox/exec/ch/Common/ColumnsHashing/HashMethod.h"
 
 #include "velox/common/memory/Memory.h"
 #include "velox/exec/ch/Common/Arena.h"
@@ -27,7 +27,7 @@
 #include <limits>
 #include <vector>
 
-namespace facebook::velox::exec::ch2 {
+namespace facebook::velox::exec::ch {
 namespace {
 
 using Hash = std::hash<int64_t>;
@@ -48,8 +48,8 @@ class HashMethodOneNumberInRangeTest : public testing::Test,
   }
 
   void SetUp() override {
-    mapPool_ = memory::memoryManager()->addLeafPool("ch2-inrange-map");
-    arenaPool_ = memory::memoryManager()->addLeafPool("ch2-inrange-arena");
+    mapPool_ = memory::memoryManager()->addLeafPool("ch-inrange-map");
+    arenaPool_ = memory::memoryManager()->addLeafPool("ch-inrange-arena");
   }
 
   std::shared_ptr<memory::MemoryPool> mapPool_;
@@ -206,4 +206,4 @@ TEST_F(HashMethodOneNumberInRangeTest, sparseSmallSpanEnabled) {
 }
 
 } // namespace
-} // namespace facebook::velox::exec::ch2
+} // namespace facebook::velox::exec::ch

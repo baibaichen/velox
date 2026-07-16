@@ -35,7 +35,6 @@ velox_add_library(
     EmitGather.h
     Common/HashTable/HashMap.h
     Common/ColumnsHashing/FixedKey.h
-    Common/ColumnsHashing/HashedKey.h
     Common/HashTable/HashTable.h
     Interpreters/HashJoin/FixedKeyMap.h
     Common/ColumnsHashing/SerializedKey.h
@@ -44,6 +43,17 @@ velox_add_library(
     RetainedVectorsIndex.h
     Interpreters/RowRef.h
     Interpreters/RowRefList.h
+    Common/SipHash.h
+    Common/ColumnsHashing/ColumnsHashingImpl.h
+    Common/ColumnsHashing/HashMethod.h
+    Common/HashTable/HashTableKeyHolder.h
+    Common/HashTable/StringHashMapAdapter.h
+    DataTypes/FixedStringType.h
+    Interpreters/AggregationCommon.h
+    Interpreters/HashJoin/ChHashRoute.h
+    Interpreters/HashJoin/ChHashMethodDispatch.h
+    Interpreters/HashJoin/ChHashJoinCh2Pipeline.h
+    Interpreters/HashJoin/LowCardinalityKeyGetterForJoin.h
 )
 velox_link_libraries(velox_exec_ch PUBLIC velox_exec velox_memory velox_vector)
 

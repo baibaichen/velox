@@ -18,7 +18,7 @@
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/exec/ch/Common/Arena.h"
-#include "velox/exec/ch2/Common/HashTable/HashTableKeyHolder.h"
+#include "velox/exec/ch/Common/HashTable/HashTableKeyHolder.h"
 #include "velox/vector/BaseVector.h"
 
 #include <folly/Portability.h>
@@ -29,7 +29,7 @@
 #include <type_traits>
 #include <vector>
 
-namespace facebook::velox::exec::ch2 {
+namespace facebook::velox::exec::ch {
 
 using UInt8 = uint8_t;
 using UInt16 = uint16_t;
@@ -63,7 +63,7 @@ namespace columns_hashing_impl {
 // 支撑 HashMethodKeysFixed 的 nullable。铁律:算法搬 CH,只换 infra 承载。
 //
 // infra 边界:CH getActualColumns() 返回 ColumnRawPtrs(nullable 取 nested,否则
-//   列本身);ch2 pack 从 Velox flat 列取好 rawValues() 基址装成 ColumnRawData
+//   列本身);ch pack 从 Velox flat 列取好 rawValues() 基址装成 ColumnRawData
 //   (std::vector<const char*>),actual_columns 承载换成 ColumnRawData。
 //
 // nullable 分支照抄保留、本 task flat non-null 不走(has_nullable_keys=false;
@@ -563,4 +563,4 @@ class HashMethodBase {
 };
 
 } // namespace columns_hashing_impl
-} // namespace facebook::velox::exec::ch2
+} // namespace facebook::velox::exec::ch

@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "velox/exec/ch2/Common/SipHash.h"
+#include "velox/exec/ch/Common/SipHash.h"
 
 #include <gtest/gtest.h>
 
@@ -23,7 +23,7 @@
 #include <cstring>
 #include <string_view>
 
-namespace facebook::velox::exec::ch2 {
+namespace facebook::velox::exec::ch {
 namespace {
 
 TEST(SipHashTest, matchesClickHouseKnownVectorsByteForByte) {
@@ -96,4 +96,4 @@ TEST(SipHashTest, preservesClickHouseTransformTemplateApi) {
 }
 
 } // namespace
-} // namespace facebook::velox::exec::ch2
+} // namespace facebook::velox::exec::ch

@@ -16,9 +16,9 @@
 
 #include "velox/exec/ch/Common/ColumnsHashing/FixedKey.h" // ch::UInt128 / ch::UInt256
 #include "velox/exec/ch/Common/HashTable/HashMap.h" // ch::HashMapAll_keys128/256
-#include "velox/exec/ch2/Common/ColumnsHashing/HashMethod.h"
-#include "velox/exec/ch2/Interpreters/AggregationCommon.h" // packFixedBatch (order size premise test)
-#include "velox/exec/ch2/Interpreters/HashJoin/ChHashMethodDispatch.h"
+#include "velox/exec/ch/Common/ColumnsHashing/HashMethod.h"
+#include "velox/exec/ch/Interpreters/AggregationCommon.h" // packFixedBatch (order size premise test)
+#include "velox/exec/ch/Interpreters/HashJoin/ChHashMethodDispatch.h"
 
 #include "velox/common/memory/Memory.h"
 #include "velox/exec/ch/Common/Arena.h"
@@ -29,7 +29,7 @@
 #include <cstring>
 #include <vector>
 
-namespace facebook::velox::exec::ch2 {
+namespace facebook::velox::exec::ch {
 namespace {
 
 using ch::UInt128;
@@ -68,15 +68,15 @@ class HashMethodKeysFixedTest : public testing::Test,
   }
 
   void SetUp() override {
-    mapPool_ = memory::memoryManager()->addLeafPool("ch2-hmkf-map");
-    arenaPool_ = memory::memoryManager()->addLeafPool("ch2-hmkf-arena");
+    mapPool_ = memory::memoryManager()->addLeafPool("ch-hmkf-map");
+    arenaPool_ = memory::memoryManager()->addLeafPool("ch-hmkf-arena");
   }
 
   std::shared_ptr<memory::MemoryPool> mapPool_;
   std::shared_ptr<memory::MemoryPool> arenaPool_;
 
   // 独立参考 pack:逐列按 column 顺序把 value 字节 memcpy 拼进宽 key。
-  // 对应 CH 逐行 packFixed(consecutive 布局)。用来跟 ch2 pack 逐字节对拍。
+  // 对应 CH 逐行 packFixed(consecutive 布局)。用来跟 ch pack 逐字节对拍。
   template <typename Key>
   static Key
   refPack(const std::vector<std::pair<const char*, size_t>>& cols, size_t row) {
@@ -110,7 +110,7 @@ TEST_F(HashMethodKeysFixedTest, keys128PreparedTwoBigint) {
   Map128 map(mapPool_.get());
   ch::Arena arena(arenaPool_.get());
 
-  // 逐字节对拍:ch2 getKeyHolder(prepared 路径)== 独立参考 pack。
+  // 逐字节对拍:ch getKeyHolder(prepared 路径)== 独立参考 pack。
   std::vector<std::pair<const char*, size_t>> cols{
       {reinterpret_cast<const char*>(v0->rawValues()), 8},
       {reinterpret_cast<const char*>(v1->rawValues()), 8}};
@@ -280,4 +280,4 @@ TEST_F(HashMethodKeysFixedTest, packFixedBatchDescendingGroupingPremise) {
 }
 
 } // namespace
-} // namespace facebook::velox::exec::ch2
+} // namespace facebook::velox::exec::ch

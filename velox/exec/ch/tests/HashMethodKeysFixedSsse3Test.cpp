@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// ch2-task7 (O5): packFixedShuffle SSSE3 == 标量 packFixed 逐字节对拍 +
+// ch-task7 (O5): packFixedShuffle SSSE3 == 标量 packFixed 逐字节对拍 +
 // SSSE3 路径 emplace/find + 运行时 A/B 开关能切两条路径。
 //
 // 硬关卡:同一批多列定长 key,SSSE3 packFixedShuffle 出的宽 key 跟标量
@@ -22,8 +22,8 @@
 
 #include "velox/exec/ch/Common/ColumnsHashing/FixedKey.h" // ch::UInt128
 #include "velox/exec/ch/Common/HashTable/HashMap.h"
-#include "velox/exec/ch2/Common/ColumnsHashing/HashMethod.h"
-#include "velox/exec/ch2/Interpreters/HashJoin/ChHashMethodDispatch.h"
+#include "velox/exec/ch/Common/ColumnsHashing/HashMethod.h"
+#include "velox/exec/ch/Interpreters/HashJoin/ChHashMethodDispatch.h"
 
 #include "velox/common/memory/Memory.h"
 #include "velox/exec/ch/Common/Arena.h"
@@ -35,7 +35,7 @@
 #include <cstring>
 #include <vector>
 
-namespace facebook::velox::exec::ch2 {
+namespace facebook::velox::exec::ch {
 namespace {
 
 using ch::UInt128;
@@ -62,8 +62,8 @@ class HashMethodKeysFixedSsse3Test : public testing::Test,
   }
 
   void SetUp() override {
-    mapPool_ = memory::memoryManager()->addLeafPool("ch2-ssse3-map");
-    arenaPool_ = memory::memoryManager()->addLeafPool("ch2-ssse3-arena");
+    mapPool_ = memory::memoryManager()->addLeafPool("ch-ssse3-map");
+    arenaPool_ = memory::memoryManager()->addLeafPool("ch-ssse3-arena");
   }
 
   std::shared_ptr<memory::MemoryPool> mapPool_;
@@ -193,4 +193,4 @@ TEST_F(HashMethodKeysFixedSsse3Test, runtimeAbSwitch) {
 }
 
 } // namespace
-} // namespace facebook::velox::exec::ch2
+} // namespace facebook::velox::exec::ch

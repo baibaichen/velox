@@ -37,3 +37,15 @@ target_link_libraries(
   Folly::follybenchmark
   duckdb_static
 )
+
+# O5 multi-machine A/B micro-bench: SSSE3 packFixedShuffle vs scalar packFixed,
+# same binary switches both paths (moved from ch in task9c-2).
+add_executable(
+  velox_exec_ch_keysfixed_ssse3_benchmark ChKeysFixedSsse3Benchmark.cpp)
+
+target_link_libraries(
+  velox_exec_ch_keysfixed_ssse3_benchmark
+  velox_exec_ch
+  velox_vector
+  velox_vector_test_lib
+  Folly::follybenchmark)

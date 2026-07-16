@@ -29,7 +29,7 @@
 #include <string_view>
 #include <type_traits>
 
-namespace facebook::velox::exec::ch2 {
+namespace facebook::velox::exec::ch {
 
 using UInt8 = uint8_t;
 using UInt64 = uint64_t;
@@ -285,4 +285,4 @@ class SipHash {
 #undef SIPROUND
 #undef CURRENT_BYTES_IDX
 
-} // namespace facebook::velox::exec::ch2
+} // namespace facebook::velox::exec::ch

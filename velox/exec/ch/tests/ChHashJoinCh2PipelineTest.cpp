@@ -15,22 +15,22 @@
  */
 
 // ============================================================================
-// ch2-task9a 端到端验证:走 ch2 路径 (ch2 HashMethod 驱动坐标模型) 的 inner
+// ch-task9a 端到端验证:走 ch 路径 (ch HashMethod 驱动坐标模型) 的 inner
 // join 结果 == Velox 原生 hashJoin。覆盖 fixed(int64) / string(varchar) /
 // hashed(多列 SipHash) 三类 key。
 //
-// 与旧路径的关系:本测试**只调 ch2 pipeline glue** (ChHashJoinCh2Pipeline.h) +
+// 与旧路径的关系:本测试**只调 ch pipeline glue** (ChHashJoinCh2Pipeline.h) +
 // 复用 ch 的 RowRefList/RetainedVectorsIndex/EmitGather (坐标输出，与旧路径同
 // 一套)。ch 库源码一个字没改，旧 decoder 路径与 113 gtest 不受影响。
 //
-// 比对方式:ch2 pipeline 产出 output RowVector (build 投影 + probe 投影)，与
+// 比对方式:ch pipeline 产出 output RowVector (build 投影 + probe 投影)，与
 // Velox 原生 PlanBuilder().hashJoin(...) 的结果用 assertEqualResults 无序比对。
 // ============================================================================
 
-#include "velox/exec/ch2/Interpreters/HashJoin/ChHashJoinCh2Pipeline.h"
-#include "velox/exec/ch2/Common/HashTable/StringHashMapAdapter.h"
-#include "velox/exec/ch2/DataTypes/FixedStringType.h"
-#include "velox/exec/ch2/Interpreters/HashJoin/LowCardinalityKeyGetterForJoin.h"
+#include "velox/exec/ch/Interpreters/HashJoin/ChHashJoinCh2Pipeline.h"
+#include "velox/exec/ch/Common/HashTable/StringHashMapAdapter.h"
+#include "velox/exec/ch/DataTypes/FixedStringType.h"
+#include "velox/exec/ch/Interpreters/HashJoin/LowCardinalityKeyGetterForJoin.h"
 #include "velox/exec/ch/Common/ColumnsHashing/FixedKey.h"
 
 #include "velox/common/memory/Memory.h"
@@ -49,7 +49,7 @@
 
 #include <vector>
 
-namespace facebook::velox::exec::ch2 {
+namespace facebook::velox::exec::ch {
 namespace {
 
 using exec::test::AssertQueryBuilder;
@@ -70,7 +70,7 @@ class ChHashJoinCh2PipelineTest : public testing::Test,
     parse::registerTypeResolver();
   }
 
-  // Runs the ch2 coordinate pipeline (build+probe+EmitGather) over one build
+  // Runs the ch coordinate pipeline (build+probe+EmitGather) over one build
   // batch and one probe batch, returning the concatenated output. Output
   // columns are [buildProjections..., probeProjections...].
   template <typename HashMethod, typename CoordinateMap>
@@ -86,10 +86,10 @@ class ChHashJoinCh2PipelineTest : public testing::Test,
     ch::Arena arena(pool());
     ch::RetainedVectorsIndex retained(kDriverNo);
 
-    ch2BuildCoordinates(
+    chBuildCoordinates(
         buildMethod, map, retained, arena, kDriverNo, buildInput);
 
-    auto hits = ch2ProbeCoordinates(probeMethod, map, arena, probeInput);
+    auto hits = chProbeCoordinates(probeMethod, map, arena, probeInput);
     auto matches = ch::listJoinResults(hits, retained);
 
     ch::EmitGather gather(
@@ -153,7 +153,7 @@ TEST_F(ChHashJoinCh2PipelineTest, fixedInt64KeyMatchesNative) {
   auto outputType = ROW(
       {"b_key", "b_val", "p_key", "p_val"},
       {BIGINT(), BIGINT(), BIGINT(), BIGINT()});
-  auto ch2Out = runCh2(
+  auto chOut = runCh2(
       buildMethod, probeMethod, map, buildInput, probeInput, {0, 1}, {0, 1},
       outputType);
 
@@ -170,7 +170,7 @@ TEST_F(ChHashJoinCh2PipelineTest, fixedInt64KeyMatchesNative) {
           .planNode();
   auto expected = AssertQueryBuilder(nativePlan).copyResults(pool());
 
-  EXPECT_TRUE(exec::test::assertEqualResults({ch2Out}, {expected}));
+  EXPECT_TRUE(exec::test::assertEqualResults({chOut}, {expected}));
 }
 
 // ---- string key: varchar key via HashMethodString + HashMapAll_key_string ----
@@ -198,7 +198,7 @@ TEST_F(ChHashJoinCh2PipelineTest, stringKeyMatchesNative) {
   auto outputType = ROW(
       {"b_key", "b_val", "p_key", "p_val"},
       {VARCHAR(), BIGINT(), VARCHAR(), BIGINT()});
-  auto ch2Out = runCh2(
+  auto chOut = runCh2(
       buildMethod, probeMethod, map, buildInput, probeInput, {0, 1}, {0, 1},
       outputType);
 
@@ -215,7 +215,7 @@ TEST_F(ChHashJoinCh2PipelineTest, stringKeyMatchesNative) {
           .planNode();
   auto expected = AssertQueryBuilder(nativePlan).copyResults(pool());
 
-  EXPECT_TRUE(exec::test::assertEqualResults({ch2Out}, {expected}));
+  EXPECT_TRUE(exec::test::assertEqualResults({chOut}, {expected}));
 }
 
 // ---- hashed key: two int64 keys via HashMethodHashed + HashMapAll_hashed ------
@@ -244,7 +244,7 @@ TEST_F(ChHashJoinCh2PipelineTest, hashedMultiKeyMatchesNative) {
   auto outputType = ROW(
       {"b_k1", "b_k2", "b_val", "p_k1", "p_k2", "p_val"},
       {BIGINT(), BIGINT(), BIGINT(), BIGINT(), BIGINT(), BIGINT()});
-  auto ch2Out = runCh2(
+  auto chOut = runCh2(
       buildMethod, probeMethod, map, buildInput, probeInput, {0, 1, 2},
       {0, 1, 2}, outputType);
 
@@ -261,12 +261,12 @@ TEST_F(ChHashJoinCh2PipelineTest, hashedMultiKeyMatchesNative) {
           .planNode();
   auto expected = AssertQueryBuilder(nativePlan).copyResults(pool());
 
-  EXPECT_TRUE(exec::test::assertEqualResults({ch2Out}, {expected}));
+  EXPECT_TRUE(exec::test::assertEqualResults({chOut}, {expected}));
 }
 
 
 // ===========================================================================
-// ch2-task9b: 扩端到端覆盖剩余 key 类型 (ch2 路径 == Velox 原生 hashJoin)。
+// ch-task9b: 扩端到端覆盖剩余 key 类型 (ch 路径 == Velox 原生 hashJoin)。
 // 每类型含重复 build key (RowRefList 链)。use_cache=false 硬约束沿用。
 // ===========================================================================
 
@@ -301,7 +301,7 @@ TEST_F(ChHashJoinCh2PipelineTest, keys128TwoBigintMatchesNative) {
   auto outputType = ROW(
       {"b_k1", "b_k2", "b_val", "p_k1", "p_k2", "p_val"},
       {BIGINT(), BIGINT(), BIGINT(), BIGINT(), BIGINT(), BIGINT()});
-  auto ch2Out = runCh2(
+  auto chOut = runCh2(
       buildMethod, probeMethod, map, buildInput, probeInput, {0, 1, 2},
       {0, 1, 2}, outputType);
 
@@ -317,7 +317,7 @@ TEST_F(ChHashJoinCh2PipelineTest, keys128TwoBigintMatchesNative) {
               {"b_k1", "b_k2", "b_val", "p_k1", "p_k2", "p_val"})
           .planNode();
   auto expected = AssertQueryBuilder(nativePlan).copyResults(pool());
-  EXPECT_TRUE(exec::test::assertEqualResults({ch2Out}, {expected}));
+  EXPECT_TRUE(exec::test::assertEqualResults({chOut}, {expected}));
 }
 
 // ---- 多宽度 fixed: keys256 (3x bigint, 逐行 packFixed) via Map256 -----------
@@ -356,7 +356,7 @@ TEST_F(ChHashJoinCh2PipelineTest, keys256ThreeBigintMatchesNative) {
       {"b_k1", "b_k2", "b_k3", "b_val", "p_k1", "p_k2", "p_k3", "p_val"},
       {BIGINT(), BIGINT(), BIGINT(), BIGINT(), BIGINT(), BIGINT(), BIGINT(),
        BIGINT()});
-  auto ch2Out = runCh2(
+  auto chOut = runCh2(
       buildMethod, probeMethod, map, buildInput, probeInput, {0, 1, 2, 3},
       {0, 1, 2, 3}, outputType);
 
@@ -373,7 +373,7 @@ TEST_F(ChHashJoinCh2PipelineTest, keys256ThreeBigintMatchesNative) {
                "p_val"})
           .planNode();
   auto expected = AssertQueryBuilder(nativePlan).copyResults(pool());
-  EXPECT_TRUE(exec::test::assertEqualResults({ch2Out}, {expected}));
+  EXPECT_TRUE(exec::test::assertEqualResults({chOut}, {expected}));
 }
 
 // ---- O2 InRange: 密集 int64 key 走 range 优化 (平移 key 存 range map) --------
@@ -415,7 +415,7 @@ TEST_F(ChHashJoinCh2PipelineTest, inRangeMatchesNative) {
   auto outputType = ROW(
       {"b_key", "b_val", "p_key", "p_val"},
       {BIGINT(), BIGINT(), BIGINT(), BIGINT()});
-  auto ch2Out = runCh2(
+  auto chOut = runCh2(
       buildMethod, probeMethod, map, buildInput, probeInput, {0, 1}, {0, 1},
       outputType);
 
@@ -431,7 +431,7 @@ TEST_F(ChHashJoinCh2PipelineTest, inRangeMatchesNative) {
               {"b_key", "b_val", "p_key", "p_val"})
           .planNode();
   auto expected = AssertQueryBuilder(nativePlan).copyResults(pool());
-  EXPECT_TRUE(exec::test::assertEqualResults({ch2Out}, {expected}));
+  EXPECT_TRUE(exec::test::assertEqualResults({chOut}, {expected}));
 }
 
 // ---- O3 FixedString: FixedStringType(N) 定长 key 端到端 == 原生 -------------
@@ -476,7 +476,7 @@ TEST_F(ChHashJoinCh2PipelineTest, fixedStringMatchesNative) {
   auto outputType = ROW(
       {"b_key", "b_val", "p_key", "p_val"},
       {FIXED_STRING(kN), BIGINT(), FIXED_STRING(kN), BIGINT()});
-  auto ch2Out = runCh2(
+  auto chOut = runCh2(
       buildMethod, probeMethod, map, buildInput, probeInput, {0, 1}, {0, 1},
       outputType);
 
@@ -492,7 +492,7 @@ TEST_F(ChHashJoinCh2PipelineTest, fixedStringMatchesNative) {
               {"b_key", "b_val", "p_key", "p_val"})
           .planNode();
   auto expected = AssertQueryBuilder(nativePlan).copyResults(pool());
-  EXPECT_TRUE(exec::test::assertEqualResults({ch2Out}, {expected}));
+  EXPECT_TRUE(exec::test::assertEqualResults({chOut}, {expected}));
 }
 
 // ---- O4 低基数: DictionaryVector probe 走 LowCardinalityKeyGetter -----------
@@ -557,7 +557,7 @@ TEST_F(ChHashJoinCh2PipelineTest, lowCardinalityMatchesNative) {
   auto outputType = ROW(
       {"b_key", "b_val", "p_key", "p_val"},
       {VARCHAR(), BIGINT(), VARCHAR(), BIGINT()});
-  auto ch2Out = runCh2(
+  auto chOut = runCh2(
       buildMethod, probeMethod, map, buildInput, probeInput, {0, 1}, {0, 1},
       outputType);
 
@@ -573,8 +573,8 @@ TEST_F(ChHashJoinCh2PipelineTest, lowCardinalityMatchesNative) {
               {"b_key", "b_val", "p_key", "p_val"})
           .planNode();
   auto expected = AssertQueryBuilder(nativePlan).copyResults(pool());
-  EXPECT_TRUE(exec::test::assertEqualResults({ch2Out}, {expected}));
+  EXPECT_TRUE(exec::test::assertEqualResults({chOut}, {expected}));
 }
 
 } // namespace
-} // namespace facebook::velox::exec::ch2
+} // namespace facebook::velox::exec::ch

@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-#include "velox/exec/ch2/Common/ColumnsHashing/HashMethod.h"
-#include "velox/exec/ch2/Common/HashTable/StringHashMapAdapter.h"
-#include "velox/exec/ch2/Interpreters/HashJoin/ChHashMethodDispatch.h"
-#include "velox/exec/ch2/Interpreters/HashJoin/LowCardinalityKeyGetterForJoin.h"
+#include "velox/exec/ch/Common/ColumnsHashing/HashMethod.h"
+#include "velox/exec/ch/Common/HashTable/StringHashMapAdapter.h"
+#include "velox/exec/ch/Interpreters/HashJoin/ChHashMethodDispatch.h"
+#include "velox/exec/ch/Interpreters/HashJoin/LowCardinalityKeyGetterForJoin.h"
 
 #include "velox/common/memory/Memory.h"
 #include "velox/exec/ch/Common/Arena.h"
@@ -29,7 +29,7 @@
 #include <string>
 #include <vector>
 
-namespace facebook::velox::exec::ch2 {
+namespace facebook::velox::exec::ch {
 namespace {
 
 using Map = StringHashMapAdapter;
@@ -56,8 +56,8 @@ class LowCardinalityKeyGetterTest : public testing::Test,
   }
 
   void SetUp() override {
-    mapPool_ = memory::memoryManager()->addLeafPool("ch2-lc-map");
-    arenaPool_ = memory::memoryManager()->addLeafPool("ch2-lc-arena");
+    mapPool_ = memory::memoryManager()->addLeafPool("ch-lc-map");
+    arenaPool_ = memory::memoryManager()->addLeafPool("ch-lc-arena");
   }
 
   // 建一个 DictionaryVector<StringView>:base(distinct 值)+ indices(row→index)。
@@ -254,4 +254,4 @@ TEST_F(LowCardinalityKeyGetterTest, savedHashStubIsNullptrCurrentHashFallback) {
 }
 
 } // namespace
-} // namespace facebook::velox::exec::ch2
+} // namespace facebook::velox::exec::ch

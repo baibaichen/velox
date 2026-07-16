@@ -20,14 +20,14 @@
 
 #include <cstddef>
 
-namespace facebook::velox::exec::ch2 {
+namespace facebook::velox::exec::ch {
 
 // ============================================================================
 // ChHashMethodDispatch — task3-8 复用的最小 build/probe 驱动壳。
 //
 // 这是 CH `Inserter::insertOne/insertAll`(HashJoinMethods.h:25-48)与
 // `HashJoinMethodsImpl.h` probe 循环(:640+ 的 `key_getter.findKey`)驱动形状
-// 的 ch2 最小版(路 B):对一批 row,用 `hashMethod.emplaceKey(map,row,pool)` /
+// 的 ch 最小版(路 B):对一批 row,用 `hashMethod.emplaceKey(map,row,pool)` /
 // `hashMethod.findKey(map,row,pool)` 逐行驱动。设计成模板挂任意 HashMethod
 // (task3-8 换 HashMethod / Map 即可复用),本 task 先让 HashMethodString 走通。
 //
@@ -79,4 +79,4 @@ struct ChHashMethodDispatch {
   }
 };
 
-} // namespace facebook::velox::exec::ch2
+} // namespace facebook::velox::exec::ch

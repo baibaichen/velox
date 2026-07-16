@@ -22,7 +22,7 @@
 #include <string_view>
 #include <utility>
 
-namespace facebook::velox::exec::ch2 {
+namespace facebook::velox::exec::ch {
 
 template <typename Key>
 FOLLY_ALWAYS_INLINE Key& keyHolderGetKey(Key&& key) {
@@ -69,4 +69,4 @@ inline void keyPrefetch(std::string_view key) {
   }
 }
 
-} // namespace facebook::velox::exec::ch2
+} // namespace facebook::velox::exec::ch

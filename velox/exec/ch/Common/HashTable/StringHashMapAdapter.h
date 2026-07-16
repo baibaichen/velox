@@ -18,16 +18,16 @@
 
 #include "velox/exec/ch/Common/ColumnsHashing/SerializedKey.h" // ch::StringRef / StringRefHash
 #include "velox/exec/ch/Common/HashTable/HashMap.h" // ch::HashMapAll_key_string
-#include "velox/exec/ch2/Common/HashTable/HashTableKeyHolder.h"
+#include "velox/exec/ch/Common/HashTable/HashTableKeyHolder.h"
 
 #include <folly/Portability.h>
 
 #include <string_view>
 
-namespace facebook::velox::exec::ch2 {
+namespace facebook::velox::exec::ch {
 
 // ============================================================================
-// StringHashMapAdapter — ch2 变长字符串 key 的 `Data`(HashMethodBase 看到的
+// StringHashMapAdapter — ch 变长字符串 key 的 `Data`(HashMethodBase 看到的
 // map 抽象)。它包住 port 的 `ch::HashMapAll_key_string`(StringRef key +
 // HashMapCellWithSavedHash + StringRefHash + CRC32),只在这一层把 CH 的
 // **ArenaKeyHolder persist 协议**逐字搬进来。
@@ -39,7 +39,7 @@ namespace facebook::velox::exec::ch2 {
 //   port 的 `ch::HashTable::emplace` 走 `const Key& key = keyHolder;` —— 它
 //   **不**跑 keyHolder persist 协议(port 采用"先插非持久 key,再由 caller
 //   setKey 换成 arena 副本"的模型)。铁律要求算法搬 CH,而 ch/ 不许动,所以
-//   把 CH 的 persist 协议原样搬到这个 ch2 适配层里驱动 port map:
+//   把 CH 的 persist 协议原样搬到这个 ch 适配层里驱动 port map:
 //     插入成功 → keyHolderPersistKey(拷进 ch::Arena)→ cell->setKey(持久 view)
 //     命中既有 → keyHolderDiscardKey
 //   —— 与 CH emplaceNonZeroImpl 逐字对应,只把底层 map 换成 port 的 infra。
@@ -111,4 +111,4 @@ class StringHashMapAdapter {
   Impl impl_;
 };
 
-} // namespace facebook::velox::exec::ch2
+} // namespace facebook::velox::exec::ch

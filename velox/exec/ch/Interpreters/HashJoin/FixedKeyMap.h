@@ -18,7 +18,8 @@
 
 #include "velox/exec/ch/Common/HashTable/FixedHashMap.h"
 #include "velox/exec/ch/Common/HashTable/HashMap.h"
-#include "velox/exec/ch/Common/ColumnsHashing/HashedKey.h"
+#include "velox/exec/ch/Common/ColumnsHashing/FixedKey.h"
+#include "velox/exec/ch/Common/ColumnsHashing/SerializedKey.h"
 
 #include <algorithm>
 #include <variant>
@@ -72,7 +73,7 @@ class FixedKeyMap {
 
   /// Returns the packed-key width for a fixed-width integer map. Only valid
   /// when type() is one of the packed integer families; used by the
-  /// FixedKeyDecoder pack path to size the packed key.
+  /// fixed-key pack path to size the packed key.
   FixedKeyWidth width() const {
     switch (type_) {
       case Type::key8:
@@ -269,7 +270,7 @@ class FixedKeyMap {
     keyStringMap().prefetchByHash(hashValue);
   }
 
-  // ch2-task9c1: public accessors to the concrete coordinate map, so the ch2
+  // ch-task9c1: public accessors to the concrete coordinate map, so the ch
   // HashMethod route (ChHashRoute.h) can drive emplaceKey/findKey directly over
   // the chosen variant alternative. The old ch decoder path does not use these.
   Map8& rawMap8() {
@@ -316,7 +317,7 @@ class FixedKeyMap {
       case Type::key16:
         return Maps(std::in_place_type<Map16>, pool);
       // Single 4-byte or packs totaling <= 4 bytes use the 32-bit Map32; packs
-      // totaling <= 8 bytes use the 64-bit map. The FixedKeyDecoder packs into
+      // totaling <= 8 bytes use the 64-bit map. The fixed-key pack path packs into
       // uint32_t or uint64_t respectively.
       case Type::key32:
       case Type::keys32:

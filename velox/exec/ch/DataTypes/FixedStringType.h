@@ -21,7 +21,7 @@
 #include <map>
 #include <mutex>
 
-namespace facebook::velox::exec::ch2 {
+namespace facebook::velox::exec::ch {
 
 // ============================================================================
 // FixedStringType(N) — O3 的 infra 承载逻辑类型。
@@ -123,4 +123,4 @@ inline bool isFixedStringType(const TypePtr& type) {
   return dynamic_cast<const FixedStringType*>(type.get()) != nullptr;
 }
 
-} // namespace facebook::velox::exec::ch2
+} // namespace facebook::velox::exec::ch

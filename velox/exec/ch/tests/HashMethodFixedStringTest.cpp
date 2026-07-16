@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-#include "velox/exec/ch2/Common/ColumnsHashing/HashMethod.h"
-#include "velox/exec/ch2/Common/HashTable/StringHashMapAdapter.h"
-#include "velox/exec/ch2/DataTypes/FixedStringType.h"
-#include "velox/exec/ch2/Interpreters/HashJoin/ChHashMethodDispatch.h"
+#include "velox/exec/ch/Common/ColumnsHashing/HashMethod.h"
+#include "velox/exec/ch/Common/HashTable/StringHashMapAdapter.h"
+#include "velox/exec/ch/DataTypes/FixedStringType.h"
+#include "velox/exec/ch/Interpreters/HashJoin/ChHashMethodDispatch.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/memory/Memory.h"
@@ -29,7 +29,7 @@
 #include <string>
 #include <vector>
 
-namespace facebook::velox::exec::ch2 {
+namespace facebook::velox::exec::ch {
 namespace {
 
 using Map = StringHashMapAdapter;
@@ -55,8 +55,8 @@ class HashMethodFixedStringTest : public testing::Test,
   }
 
   void SetUp() override {
-    mapPool_ = memory::memoryManager()->addLeafPool("ch2-hmfs-map");
-    arenaPool_ = memory::memoryManager()->addLeafPool("ch2-hmfs-arena");
+    mapPool_ = memory::memoryManager()->addLeafPool("ch-hmfs-map");
+    arenaPool_ = memory::memoryManager()->addLeafPool("ch-hmfs-arena");
   }
 
   // 构造一个 FixedStringType(kN) 承载的 flat vector:每行正好 kN 字节。
@@ -240,4 +240,4 @@ TEST_F(HashMethodFixedStringTest, rejectsRowInlineShorterThanN) {
 }
 
 } // namespace
-} // namespace facebook::velox::exec::ch2
+} // namespace facebook::velox::exec::ch

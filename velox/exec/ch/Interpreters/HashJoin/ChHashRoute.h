@@ -17,10 +17,10 @@
 #pragma once
 
 // ============================================================================
-// ch2-task9c1: ch2-side runtime dispatch (switch spike).
+// ch-task9c1: ch-side runtime dispatch (switch spike).
 //
 // Given the bridge-owned ch::FixedKeyMap (a std::variant already routed by
-// FixedKeyMap::chooseType), drive the SIX ch2 HashMethod classes over the
+// FixedKeyMap::chooseType), drive the SIX ch HashMethod classes over the
 // concrete coordinate map. This EXACTLY mirrors FixedKeyMap::chooseType because
 // the variant alternative IS the chooseType result: single narrow int ->
 // FixedHashMap_key8/16 direct addressing; single 4/8-byte int ->
@@ -32,11 +32,11 @@
 // All HashMethod instances use_cache=false, mapped=ch::RowRefList (coordinate
 // model correctness, see ChHashJoinCh2Pipeline.h header).
 //
-// NULL / NON-FLAT ADAPTATION (infra boundary): ch2 HashMethods require FLAT
+// NULL / NON-FLAT ADAPTATION (infra boundary): ch HashMethods require FLAT
 // NON-NULL key columns. Existing ch end-to-end tests feed NULLABLE keys via
 // Values nodes. So for each batch we build a compacted flat null-free key
 // projection over the survivors (rows non-null in ALL key columns) plus a
-// survivorRows mapping compacted-index -> ORIGINAL row. ch2 drives over the
+// survivorRows mapping compacted-index -> ORIGINAL row. ch drives over the
 // compacted columns, but build RowRefs use RowRef(blockNo, survivorRows[i])
 // (ORIGINAL row into the ORIGINAL retained batch) and probe hits report
 // survivorRows[i] as the probeRow. The retained index keeps the ORIGINAL
@@ -49,9 +49,9 @@
 #include "velox/exec/ch/Interpreters/HashJoin/FixedKeyMap.h"
 #include "velox/exec/ch/Interpreters/RowRef.h"
 #include "velox/exec/ch/RetainedVectorsIndex.h"
-#include "velox/exec/ch2/Common/ColumnsHashing/HashMethod.h"
-#include "velox/exec/ch2/Common/HashTable/StringHashMapAdapter.h"
-#include "velox/exec/ch2/Interpreters/HashJoin/ChHashJoinCh2Pipeline.h"
+#include "velox/exec/ch/Common/ColumnsHashing/HashMethod.h"
+#include "velox/exec/ch/Common/HashTable/StringHashMapAdapter.h"
+#include "velox/exec/ch/Interpreters/HashJoin/ChHashJoinCh2Pipeline.h"
 
 #include "velox/vector/BaseVector.h"
 #include "velox/vector/DecodedVector.h"
@@ -60,10 +60,10 @@
 #include <memory>
 #include <vector>
 
-namespace facebook::velox::exec::ch2 {
+namespace facebook::velox::exec::ch {
 namespace route {
 
-// Non-owning ch2 string-map adapter over a bridge-owned raw
+// Non-owning ch string-map adapter over a bridge-owned raw
 // ch::HashMapAll_key_string. Mirrors StringHashMapAdapter ArenaKeyHolder
 // persist protocol (glue, not the HashMethod algorithm) so the operators can
 // drive their FixedKeyMap variant string map through HashMethodString without
@@ -166,7 +166,7 @@ inline CompactedKeys compactKeys(
       flat->copy(child.get(), i, out.survivorRows[i], 1);
     }
     // Survivors are non-null in every key column; drop the null buffer so the
-    // ch2 HashMethods (which hard-require !mayHaveNulls) accept the column.
+    // ch HashMethods (which hard-require !mayHaveNulls) accept the column.
     flat->resetNulls();
     out.columns.push_back(std::move(flat));
   }
@@ -184,7 +184,7 @@ inline Sizes fixedKeySizes(const std::vector<TypePtr>& keyTypes) {
 
 // ---- build ----------------------------------------------------------------
 
-// Inserts coordinates for one batch over the ch2-driven map, remapping
+// Inserts coordinates for one batch over the ch-driven map, remapping
 // compacted-index -> ORIGINAL row via survivorRows. Retains the ORIGINAL input.
 inline void buildViaCh2(
     ch::FixedKeyMap& map,
@@ -465,4 +465,4 @@ inline std::vector<ch::ProbeHit> probeViaCh2(
 }
 
 } // namespace route
-} // namespace facebook::velox::exec::ch2
+} // namespace facebook::velox::exec::ch

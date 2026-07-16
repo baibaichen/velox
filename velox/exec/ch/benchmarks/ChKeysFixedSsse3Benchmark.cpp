@@ -15,7 +15,7 @@
  */
 
 // ============================================================================
-// ch2-task7 (O5) 多机 A/B micro-benchmark:同一二进制切 SSSE3 packFixedShuffle
+// ch-task7 (O5) 多机 A/B micro-benchmark:同一二进制切 SSSE3 packFixedShuffle
 // vs 标量 packFixed 两条路径,压测复合定长 key 的宽 key pack 吞吐。
 //
 // 用途:SSSE3 收益跟微架构强相关,单机结论不通用 —— 把这个二进制拷到不同机器
@@ -24,9 +24,9 @@
 //
 // 怎么跑(同一二进制):
 //   源 env:  source /root/oss/velox-help/env.sh
-//   编:      /root/oss/velox-help/build.sh velox_exec_ch2_keysfixed_ssse3_benchmark
-//   跑:      cd _build/debug/velox/exec/ch2/benchmarks
-//            ./velox_exec_ch2_keysfixed_ssse3_benchmark
+//   编:      /root/oss/velox-help/build.sh velox_exec_ch_keysfixed_ssse3_benchmark
+//   跑:      cd _build/debug/velox/exec/ch/benchmarks
+//            ./velox_exec_ch_keysfixed_ssse3_benchmark
 //   两条 folly benchmark(scalar / ssse3)在同一次运行里都跑,直接看相对时间。
 //   ARM / 无 SSSE3 编译:ssse3 路径自动回退标量(packRowSsse3 内 #if 守卫),
 //   两条曲线会一样 —— 说明该机器无 SSSE3 加速。
@@ -35,7 +35,7 @@
 #include "velox/exec/ch/Common/Arena.h"
 #include "velox/exec/ch/Common/ColumnsHashing/FixedKey.h"
 #include "velox/exec/ch/Common/HashTable/HashMap.h"
-#include "velox/exec/ch2/Common/ColumnsHashing/HashMethod.h"
+#include "velox/exec/ch/Common/ColumnsHashing/HashMethod.h"
 
 #include "velox/common/memory/Memory.h"
 #include "velox/vector/FlatVector.h"
@@ -47,7 +47,7 @@
 #include <random>
 #include <vector>
 
-namespace facebook::velox::exec::ch2 {
+namespace facebook::velox::exec::ch {
 namespace {
 
 using ch::UInt128;
@@ -73,7 +73,7 @@ struct Fixture {
       memory::MemoryManager::Options o;
       memory::MemoryManager::initialize(o);
     }
-    pool = memory::memoryManager()->addLeafPool("ch2-ssse3-bench");
+    pool = memory::memoryManager()->addLeafPool("ch-ssse3-bench");
 
     std::mt19937_64 rng(12345);
     std::vector<int64_t> c0(kRows);
@@ -141,13 +141,13 @@ bool ssse3AvailableForBench() {
 }
 
 } // namespace
-} // namespace facebook::velox::exec::ch2
+} // namespace facebook::velox::exec::ch
 
 int main(int argc, char** argv) {
   folly::Init init(&argc, &argv);
   const bool ssse3 =
-      facebook::velox::exec::ch2::ssse3AvailableForBench();
-  LOG(INFO) << "ch2 KeysFixed SSSE3 A/B benchmark: ssse3Available="
+      facebook::velox::exec::ch::ssse3AvailableForBench();
+  LOG(INFO) << "ch KeysFixed SSSE3 A/B benchmark: ssse3Available="
             << (ssse3 ? "true" : "false (ARM/no-SSSE3 -> ssse3 path falls back "
                                  "to scalar)");
   folly::runBenchmarks();

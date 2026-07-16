@@ -23,17 +23,25 @@ add_executable(
   ChHashProbeOperatorTest.cpp
   EmitGatherTest.cpp
   FixedHashMapTest.cpp
-  FixedKeyTest.cpp
   FixedKeyMapTypeTest.cpp
-  HashedKeyTest.cpp
   HashMapTest.cpp
   HashTableTest.cpp
+  StringRefHashTest.cpp
+  HashMethodHashedTest.cpp
+  HashMethodKeysFixedTest.cpp
+  HashMethodKeysFixedSsse3Test.cpp
+  HashMethodOneNumberInRangeTest.cpp
+  HashMethodOneNumberTest.cpp
+  HashMethodFixedStringTest.cpp
+  HashMethodStringTest.cpp
+  ChHashJoinCh2PipelineTest.cpp
+  LowCardinalityKeyGetterTest.cpp
+  SipHashTest.cpp
   Main.cpp
   PrefetchingTest.cpp
   RetainedVectorsIndexTest.cpp
   RowRefTest.cpp
   RowRefListTest.cpp
-  SerializedKeyTest.cpp
 )
 
 target_link_libraries(

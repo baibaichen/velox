@@ -17,7 +17,7 @@
 #pragma once
 
 #include "velox/common/base/Exceptions.h"
-#include "velox/exec/ch2/Common/ColumnsHashing/ColumnsHashingImpl.h"
+#include "velox/exec/ch/Common/ColumnsHashing/ColumnsHashingImpl.h"
 #include "velox/exec/ch/Common/ColumnsHashing/FixedKey.h" // ch::UInt128
 
 #include <folly/Portability.h>
@@ -42,7 +42,7 @@
 // infra 边界(唯一换点):
 //   CH pack 从列拿裸数据用
 //     `static_cast<const ColumnFixedSizeHelper *>(column)->getRawDataBegin<N>()`
-//   —— 返回该定长列数据区首字节 `const char *`。ch2 这里换成:调用方(HashMethod)
+//   —— 返回该定长列数据区首字节 `const char *`。ch 这里换成:调用方(HashMethod)
 //   预先从 Velox flat 列取好的 `rawValues()` 基址(`const char*`),按列装进
 //   `std::vector<const char*>`(承载 = CH 的 ColumnRawPtrs 里"裸数据指针"那一维)。
 //   packFixedBatch 的 `PaddedPODArray<Key>` out → `std::vector<Key>`。
@@ -52,7 +52,7 @@
 //   `#if defined(__SSSE3__)` 守卫内 intrinsics 逐字搬 CH)。packFixed 的
 //   low_cardinality 重载参数照抄保留但本 task 不走(has_low_cardinality=false)。
 // ============================================================================
-namespace facebook::velox::exec::ch2 {
+namespace facebook::velox::exec::ch {
 
 // UInt8/16/32/64 + ColumnRawData + Sizes 定义在 ColumnsHashingImpl.h。
 // UInt128(宽 16B 首级 pack)——CH 原文 packFixedBatch 首级用 UInt128,
@@ -83,7 +83,7 @@ void fillFixedBatch(size_t num_rows, const T* source, T* dest) {
 //
 // CH 原文 (AggregationCommon.h:57-75)。infra 边界:CH 的
 //   `key_columns[i]` + `getRawDataBegin<sizeof(T)>()` + `column->size()`
-// 换成 ch2 预取的 `column_data[i]`(裸基址)+ 显式 `num_rows`。byte 搬运
+// 换成 ch 预取的 `column_data[i]`(裸基址)+ 显式 `num_rows`。byte 搬运
 // (fillFixedBatch<T, sizeof(Key)/sizeof(T)>)与 CH 逐字一致。
 template <typename T, typename Key>
 void fillFixedBatch(
@@ -104,7 +104,7 @@ void fillFixedBatch(
       /// Note: here we violate strict aliasing.
       /// It should be ok as long as we do not refer to any value from `out`
       /// before filling.
-      // infra 边界: CH 用 getRawDataBegin<sizeof(T)>() 取列裸基址;ch2 用
+      // infra 边界: CH 用 getRawDataBegin<sizeof(T)>() 取列裸基址;ch 用
       // 预取的 column_data[i]。
       const char* source = column_data[i];
       T* dest = reinterpret_cast<T*>(
@@ -142,7 +142,7 @@ void packFixedBatch(
 //
 // CH 原文 (AggregationCommon.h:92-159)。infra 边界:CH 的
 //   `static_cast<const ColumnFixedSizeHelper *>(column)->getRawDataBegin<N>() + index * N`
-// 换成 ch2 预取基址 `column_data[j] + index * N`。switch/offset/memcpy 的 byte
+// 换成 ch 预取基址 `column_data[j] + index * N`。switch/offset/memcpy 的 byte
 // 拼接算法逐字一致。
 //
 // low_cardinality 重载参数(low_cardinality_positions / _sizes)照抄保留,本
@@ -166,7 +166,7 @@ static T FOLLY_ALWAYS_INLINE packFixed(
     const char* column = column_data[j];
     if constexpr (has_low_cardinality) {
       // 照抄保留(task8):low_cardinality index 解引用。本 task 不走。
-      // ch2 承载待 task8 补;此处保留结构、false 折走。
+      // ch 承载待 task8 补;此处保留结构、false 折走。
       VELOX_UNREACHABLE(
           "packFixed low_cardinality path is not enabled in task3 (task8)");
       (void)low_cardinality_positions;
@@ -260,4 +260,4 @@ static T inline packFixedShuffle(
 }
 #endif
 
-} // namespace facebook::velox::exec::ch2
+} // namespace facebook::velox::exec::ch

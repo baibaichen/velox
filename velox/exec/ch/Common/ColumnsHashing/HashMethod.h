@@ -17,12 +17,12 @@
 #pragma once
 
 #include "velox/common/base/Exceptions.h"
-#include "velox/exec/ch2/Common/ColumnsHashing/ColumnsHashingImpl.h"
-#include "velox/exec/ch2/Interpreters/AggregationCommon.h"
+#include "velox/exec/ch/Common/ColumnsHashing/ColumnsHashingImpl.h"
+#include "velox/exec/ch/Interpreters/AggregationCommon.h"
 #include "velox/exec/ch/Common/ColumnsHashing/FixedKey.h" // ch::UInt128 / ch::UInt256
-#include "velox/exec/ch2/Common/SipHash.h"
+#include "velox/exec/ch/Common/SipHash.h"
 #include "velox/vector/FlatVector.h"
-#include "velox/exec/ch2/DataTypes/FixedStringType.h"
+#include "velox/exec/ch/DataTypes/FixedStringType.h"
 
 #include <folly/Portability.h>
 
@@ -35,7 +35,7 @@
 #include <string_view>
 #include <vector>
 
-namespace facebook::velox::exec::ch2 {
+namespace facebook::velox::exec::ch {
 
 using Sizes = std::vector<size_t>;
 using ColumnRawPtrs = std::vector<VectorPtr>;
@@ -132,7 +132,7 @@ struct HashMethodOneNumber : public columns_hashing_impl::HashMethodBase<
 //     后 set(Interpreters/HashJoin/HashJoinMethodsImpl.h:275-276
 //     `getter.min_key = key_range.min_key; getter.range_size = key_range.size`,
 //     key_range 由 HashJoin.cpp:2216-2262 扫 build key 列算 min/max、
-//     range = max-min+1 得到)。ch2 值域接入用 Velox flat 列扫 min/max 拿
+//     range = max-min+1 得到)。ch 值域接入用 Velox flat 列扫 min/max 拿
 //     两个数(computeKeyRange),再 set 进成员——**只是拿到两个数,不接 kArray
 //     寻址**。
 //
@@ -240,22 +240,22 @@ struct HashMethodOneNumberInRange
 // ============================================================================
 // computeKeyRange — 值域接入 infra 边界(唯一允许 Velox 参与的地方,且只是
 // "拿到两个数")。对应 CH HashJoin.cpp:2216-2262 扫 build key 列算 min/max、
-// range = max-min+1。ch2 用 Velox flat 列扫 min/max 拿两个数,填 min_key/
+// range = max-min+1。ch 用 Velox flat 列扫 min/max 拿两个数,填 min_key/
 // range_size 成员。**不接 kArray 寻址,只算两个数。**
 //
 // 返回 {min_key, range_size},range_size = max - min + 1(与 CH 一致)。
 //
 // ---- 两层溢出防护,逐字对齐 CH HashJoin.cpp:2198/2242/2246 ----
-// CH 有两层防护,ch2 都补上:
+// CH 有两层防护,ch 都补上:
 //   1. static constexpr size_t MAX_RANGE = (1ULL << 18); (HashJoin.cpp:2198)。
 //      扫描时 if (static_cast<size_t>(max_key - min_key) >= MAX_RANGE) return;
 //      (HashJoin.cpp:2242)——超限**不启用 range 优化**,CH 直接 return 不建
-//      range_map、回退普通 key32/key64 map。ch2 computeKeyRange 返回
+//      range_map、回退普通 key32/key64 map。ch computeKeyRange 返回
 //      std::optional<KeyRange>,空 optional = "这批 key 不适合 range 优化",
 //      调用方据此回退普通定长 map(对齐 CH 的 return)。
 //   2. size_t range = static_cast<size_t>(max_key - min_key) + 1;
 //      (HashJoin.cpp:2246)——差值**提升到 size_t 无符号域**再 +1,wraparound
-//      defined,不是有符号 FieldType 溢出 UB。ch2 同样在无符号域算。
+//      defined,不是有符号 FieldType 溢出 UB。ch 同样在无符号域算。
 //
 // range_size 成员类型仍是 FieldType(与 CH HashMethodOneNumberInRange 一致):
 // 因为只有 max-min < MAX_RANGE = 2^18 才会启用,range = max-min+1 <= 2^18 必然
@@ -373,7 +373,7 @@ struct HashMethodString : public columns_hashing_impl::HashMethodBase<
       const HashMethodContextPtr&)
       : Base(key_columns.empty() ? nullptr : key_columns[0]) {
     // CH: if constexpr (nullable) 取 ColumnNullable 的 nested;else 直接列。
-    // ch2 task2: nullable 留 VELOX_CHECK + TODO(同 task1)。照抄保留结构。
+    // ch task2: nullable 留 VELOX_CHECK + TODO(同 task1)。照抄保留结构。
     VELOX_CHECK_EQ(key_columns.size(), 1);
     const auto column = key_columns[0]->loadedVector();
     // flat + non-null 限制(同 task1)。非-flat/nullable 留 TODO。
@@ -410,7 +410,7 @@ struct HashMethodString : public columns_hashing_impl::HashMethodBase<
   //         return key;
   //   }
   //
-  // ch2: 算法(取 string_view → 包 ArenaKeyHolder)逐字不变;只有
+  // ch: 算法(取 string_view → 包 ArenaKeyHolder)逐字不变;只有
   //   "怎么从列拿到这行字节 view" 这个 infra 边界换成 Velox StringView。
   auto getKeyHolder(size_t row, ch::Arena& pool) const {
     // infra 边界: CH 用 chars+offsets 差值算出这行字节区间;Velox 直接
@@ -441,7 +441,7 @@ struct HashMethodString : public columns_hashing_impl::HashMethodBase<
 //   CH `ColumnFixedString`:`getN()` 拿定长 N,`getChars()` 是连续 UInt8
 //     buffer,第 row 行 key = chars[row*n .. row*n+n](CH getKeyHolder:
 //     `string_view(&(*chars)[row*n], n)`)。
-//   Velox 无 FixedString 物理类型 → 用 ch2::FixedStringType(N) 逻辑类型承载:
+//   Velox 无 FixedString 物理类型 → 用 ch::FixedStringType(N) 逻辑类型承载:
 //     * N 从 key 列的 FixedStringType 拿(= CH column_string.getN() 的等价)。
 //     * 数据装在 FlatVector<StringView>(物理 VARBINARY),每行 StringView 约定
 //       正好 N 字节 → 直接取第 row 行 StringView(sv.data(), sv.size()==n)。
@@ -489,7 +489,7 @@ struct HashMethodFixedString : public columns_hashing_impl::HashMethodBase<
   //   size_t n;
   //   const ColumnFixedString::Chars * chars;
   // infra 边界:CH `n` 从 ColumnFixedString::getN() 拿;`chars` 是连续 UInt8
-  // buffer。ch2:`n` 从 key 列的 FixedStringType 逻辑类型拿;数据承载换成 Velox
+  // buffer。ch:`n` 从 key 列的 FixedStringType 逻辑类型拿;数据承载换成 Velox
   // 每行自包含的 StringView 数组指针(约定每行正好 n 字节)。
   size_t n;
   const StringView* values;
@@ -502,7 +502,7 @@ struct HashMethodFixedString : public columns_hashing_impl::HashMethodBase<
     // CH 原文 (HashMethod.h:243-256):if constexpr (nullable) 取 ColumnNullable
     // 的 nested;else 直接列;assert_cast<ColumnFixedString>;n = getN();
     // chars = &getChars();
-    // ch2 task6: nullable 留 VELOX_NYI + TODO(同 task2)。照抄保留结构。
+    // ch task6: nullable 留 VELOX_NYI + TODO(同 task2)。照抄保留结构。
     VELOX_CHECK_EQ(key_columns.size(), 1);
     const auto column = key_columns[0]->loadedVector();
     // flat + non-null 限制(同 task2)。非-flat/nullable 留 TODO。
@@ -515,13 +515,13 @@ struct HashMethodFixedString : public columns_hashing_impl::HashMethodBase<
     if constexpr (nullable) {
       VELOX_NYI("nullable HashMethodFixedString is not supported in task6");
     }
-    // infra 边界:CH `n = column_string.getN();` → ch2 从 key 列的
+    // infra 边界:CH `n = column_string.getN();` → ch 从 key 列的
     // FixedStringType(N) 逻辑类型拿 N(= CH ColumnFixedString::getN() 等价)。
     const auto* fixedType =
         dynamic_cast<const FixedStringType*>(column->type().get());
     VELOX_CHECK_NOT_NULL(
         fixedType,
-        "HashMethodFixedString key column must carry ch2::FixedStringType(N)");
+        "HashMethodFixedString key column must carry ch::FixedStringType(N)");
     n = fixedType->fixedLength();
     // infra 边界:CH `chars = &column_string.getChars();`(连续 UInt8 buffer)→
     // Velox StringView 数组基址(每行自带 ptr+size,约定 size == n)。
@@ -563,7 +563,7 @@ struct HashMethodFixedString : public columns_hashing_impl::HashMethodBase<
   //         return key;
   //   }
   //
-  // ch2: 算法(取 n 字节 slice → 包 ArenaKeyHolder)逐字不变;只有「怎么从列
+  // ch: 算法(取 n 字节 slice → 包 ArenaKeyHolder)逐字不变;只有「怎么从列
   //   拿到这行 n 字节 view」这个 infra 边界换成 Velox StringView。CH 用
   //   chars+row*n 定位定长 n 字节;Velox 直接取第 row 行 StringView(约定正好
   //   n 字节),两者取到的 std::string_view 语义一致(&chars[row*n], n)。
@@ -618,7 +618,7 @@ struct LowCardinalityKeys<false> {};
 //
 // infra 边界:
 //   CH 构造 `Base(key_columns)` + `getActualColumns()[i]->getRawData().data()`
-//     取列裸基址;ch2 从 Velox flat 列取 rawValues() 装成 ColumnRawData 喂给
+//     取列裸基址;ch 从 Velox flat 列取 rawValues() 装成 ColumnRawData 喂给
 //     Base(BaseStateKeysFixed)与 pack。
 //   CH `PaddedPODArray<Key> prepared_keys` -> `std::vector<Key>`。
 //   getKeyHolder / usePreparedKeys / packFixedBatch 分派逐字。
@@ -771,7 +771,7 @@ struct HashMethodKeysFixed
 
       columns_data.reset(new const char*[keys_size]);
       for (size_t i = 0; i < keys_size; ++i) {
-        // infra 边界:CH getActualColumns()[i]->getRawData().data();ch2 的
+        // infra 边界:CH getActualColumns()[i]->getRawData().data();ch 的
         // getActualColumns() 已是预取的 const char* 裸基址。
         columns_data[i] = Base::getActualColumns()[i];
       }
@@ -830,10 +830,10 @@ struct HashMethodKeysFixed
   // 与 CH 的 getKeyHolder 分派(prepared 优先)正交:这两个是显式 A/B 入口,
   // 绕开 prepared,直接压测两种 pack 算法本身。
   //
-  // 怎么在别的机器跑 A/B:同一 velox_exec_ch2 二进制,
+  // 怎么在别的机器跑 A/B:同一 velox_exec_ch 二进制,
   //   - 设 CH2_KEYSFIXED_USE_SSSE3=1(默认,x86 有 SSSE3)-> getKeyHolder 自然
   //     走 SSSE3(非 prepared 档);=0 强制标量。
-  //   - benchmark 直接调 packRowScalar / packRowSsse3 对比两算法(见 ch2 bench)。
+  //   - benchmark 直接调 packRowScalar / packRowSsse3 对比两算法(见 ch bench)。
   // ------------------------------------------------------------------------
 
   // A/B:标量路径(始终可用,ARM/无 SSSE3 也走这)。
@@ -935,27 +935,27 @@ struct HashMethodKeysFixed
 //   hash128         : CH HashMethod.h:19-29
 //   HashMethodHashed: CH HashMethod.h:474-495
 // 宽/多列 key → 128 位 SipHash digest。铁律 + O6:digest 算法用 CH SipHash
-// (task1 已搬进 ch2、逐字节对拍过 CH),绝不用 Velox XXH3 顶替。只有"从列取
+// (task1 已搬进 ch、逐字节对拍过 CH),绝不用 Velox XXH3 顶替。只有"从列取
 // 第 i 行值喂进 hash"这个承载边界换 Velox。
 //
 // ---- O6 关键:updateHashWithValue 的字节喂法必须逐类对齐 CH ----
 // CH `hash128` 靠 `IColumn::updateHashWithValue(i, hash)`(IColumn 虚方法,按
-// 列类型把第 i 行值喂进 SipHash)。Velox 无此虚方法,ch2 写等价 dispatch:
+// 列类型把第 i 行值喂进 SipHash)。Velox 无此虚方法,ch 写等价 dispatch:
 //   数值列 (ColumnVector<T>::updateHashWithValue, ColumnVector.cpp:70):
 //     `hash.update(data[n])` —— 喂第 n 行值的 sizeof(T) 字节。
-//     ch2: flat->rawValues()[row] 取值,hash.update(value)(SipHash 的
+//     ch: flat->rawValues()[row] 取值,hash.update(value)(SipHash 的
 //          `update(const T&)` 同样喂 sizeof(T) 字节,与 CH 逐字节一致)。
 //   字符串列 (ColumnString::updateHashWithValue, ColumnString.cpp:834):
 //     size_t size_used_in_hash = string_size + 1;
 //     hash.update(&size_used_in_hash, sizeof(size_used_in_hash)); // 8 字节 size
 //     hash.update(&chars[offset], string_size);                   // 原始字节
 //     hash.update(UInt8(0));                                      // 尾部兼容 0
-//     ch2: 从 FlatVector<StringView> 取第 row 行 sv(ptr+size),按同样三段喂:
+//     ch: 从 FlatVector<StringView> 取第 row 行 sv(ptr+size),按同样三段喂:
 //          size+1(size_t 8 字节)→ sv 原始字节 → UInt8(0)。逐字节对齐 CH。
 // ============================================================================
 
-// ch2 版 IColumn::updateHashWithValue 等价:按 Velox 列类型把第 row 行值喂进
-// ch2::SipHash,字节喂法逐类对齐 CH(见上)。infra 边界 = 从列取值;算法(喂哪
+// ch 版 IColumn::updateHashWithValue 等价:按 Velox 列类型把第 row 行值喂进
+// ch::SipHash,字节喂法逐类对齐 CH(见上)。infra 边界 = 从列取值;算法(喂哪
 // 些字节、喂进 SipHash)搬 CH。
 inline void updateHashWithValue(
     const BaseVector* column,
@@ -1075,4 +1075,4 @@ struct HashMethodHashed : public columns_hashing_impl::HashMethodBase<
 };
 
 
-} // namespace facebook::velox::exec::ch2
+} // namespace facebook::velox::exec::ch

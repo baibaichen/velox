@@ -17,143 +17,14 @@
 #include "velox/exec/ch/ChHashProbe.h"
 
 #include "velox/common/base/Exceptions.h"
-#include "velox/exec/ch/Common/ColumnsHashing/HashedKey.h"
-#include "velox/exec/ch/Common/HashTable/Prefetching.h"
 #include "velox/exec/ch/Interpreters/RowRef.h"
-#include "velox/exec/ch/Common/ColumnsHashing/SerializedKey.h"
 #include "velox/vector/DecodedVector.h"
 #include "velox/vector/SelectivityVector.h"
-#include "velox/exec/ch2/Interpreters/HashJoin/ChHashRoute.h"
+#include "velox/exec/ch/Interpreters/HashJoin/ChHashRoute.h"
 
-#include <cstdlib>
 
 namespace facebook::velox::exec::ch {
 
-namespace {
-
-// Probes the layer-1 hash table for every row of `probe`, invoking
-// `onHit(probeRow, cell)` for each matched row. Dispatches by map type
-// (hashed / key_string / fixed-integer) and, for the fixed-integer case, a
-// second time by packed key width. Probe-side rolling prefetch (adaptive
-// look-ahead via JoinPrefetcher, gated on table size vs L2) lives here so both
-// the vector-collecting and count-only entry points share one copy. `onHit` is
-// a compile-time-known callable (generic lambda), so the call fully inlines and
-// the count-only path pays no ProbeHit collection cost.
-template <typename OnHit>
-void probeLoop(
-    const ChHashBuild::JoinMap& map,
-    const RowVectorPtr& probe,
-    const std::vector<column_index_t>& probeKeyChannels,
-    OnHit&& onHit) {
-  VELOX_CHECK_NOT_NULL(probe);
-  SelectivityVector rows(probe->size());
-
-  if (map.type() == FixedKeyMap::Type::hashed) {
-    HashedKeyDecoder decoder(probe, probeKeyChannels, map.keyTypes(), rows);
-    for (vector_size_t probeRow = 0; probeRow < probe->size(); ++probeRow) {
-      UInt128 digest;
-      if (!decoder.hash(probeRow, digest)) {
-        continue;
-      }
-      const auto* cell = map.findHashed(digest);
-      if (cell != nullptr) {
-        onHit(probeRow, cell);
-      }
-    }
-    return;
-  }
-  if (map.type() == FixedKeyMap::Type::key_string) {
-    StringViewKeyDecoder decoder(probe, probeKeyChannels, map.keyTypes(), rows);
-    const bool usePrefetch =
-        map.getBufferSizeInBytes() > minTableBytesForPrefetch();
-    auto prefetcher =
-        makeJoinPrefetcher(usePrefetch, probe->size(), [&](size_t prefetchRow) {
-          StringRef prefetchKey;
-          // at() reuses the decoder's inline storage across calls, so
-          // prefetchKey must be consumed (hashed) before the at(probeRow) call
-          // below reads the next row into the same storage.
-          if (decoder.at(prefetchRow, prefetchKey)) {
-            map.prefetchString(map.hashString(prefetchKey));
-          }
-        });
-    for (vector_size_t probeRow = 0; probeRow < probe->size(); ++probeRow) {
-      prefetcher.prefetchAt(probeRow);
-
-      StringRef key;
-      if (!decoder.at(probeRow, key)) {
-        continue;
-      }
-      const auto* cell = map.find(key, map.hashString(key));
-      if (cell != nullptr) {
-        onHit(probeRow, cell);
-      }
-    }
-    return;
-  }
-
-  FixedKeyDecoder decoder(probe, probeKeyChannels, rows);
-  VELOX_CHECK(decoder.width() == map.width());
-
-  const auto probeKeys = [&]<typename Key>() {
-    const bool usePrefetch = FixedKeyDecoder::hasCheapKeyCalculation &&
-        map.getBufferSizeInBytes() > minTableBytesForPrefetch();
-    // CH batch-packs keys that fit in 16 bytes with no nullable column
-    // (usePreparedKeys), then indexes prepared_keys[row]; wider or nullable
-    // keys pack per row. Mirror both here.
-    if (decoder.usePreparedKeys<Key>()) {
-      decoder.packAll<Key>();
-      auto prefetcher = makeJoinPrefetcher(
-          usePrefetch, probe->size(), [&](size_t prefetchRow) {
-            map.prefetch(decoder.packedAt<Key>(prefetchRow));
-          });
-      for (vector_size_t probeRow = 0; probeRow < probe->size(); ++probeRow) {
-        prefetcher.prefetchAt(probeRow);
-        const auto* cell = map.find(decoder.packedAt<Key>(probeRow));
-        if (cell != nullptr) {
-          onHit(probeRow, cell);
-        }
-      }
-      return;
-    }
-    auto prefetcher =
-        makeJoinPrefetcher(usePrefetch, probe->size(), [&](size_t prefetchRow) {
-          Key prefetchKey;
-          if (decoder.pack(prefetchRow, prefetchKey)) {
-            map.prefetch(prefetchKey);
-          }
-        });
-    for (vector_size_t probeRow = 0; probeRow < probe->size(); ++probeRow) {
-      prefetcher.prefetchAt(probeRow);
-
-      Key key;
-      if (!decoder.pack(probeRow, key)) {
-        continue;
-      }
-      const auto* cell = map.find(key);
-      if (cell != nullptr) {
-        onHit(probeRow, cell);
-      }
-    }
-  };
-
-  // Fixed-integer variants dispatch a second time by packed key width.
-  switch (map.width()) {
-    case FixedKeyWidth::k8:
-      return probeKeys.template operator()<uint8_t>();
-    case FixedKeyWidth::k16:
-      return probeKeys.template operator()<uint16_t>();
-    case FixedKeyWidth::k32:
-      return probeKeys.template operator()<uint32_t>();
-    case FixedKeyWidth::k64:
-      return probeKeys.template operator()<uint64_t>();
-    case FixedKeyWidth::k128:
-      return probeKeys.template operator()<UInt128>();
-    case FixedKeyWidth::k256:
-      return probeKeys.template operator()<UInt256>();
-  }
-  VELOX_UNREACHABLE();
-}
-} // namespace
 
 std::vector<ProbeHit> joinProbe(
     const ChHashBuild& build,
@@ -182,43 +53,21 @@ std::vector<ProbeHit> joinProbe(
     const RowVectorPtr& probe,
     const std::vector<column_index_t>& probeKeyChannels) {
   VELOX_CHECK_NOT_NULL(probe);
-  // ch2-task9c1: default-drive the ch2 six-HashMethod route. Reversible via
-  // env CH_USE_CH2=0 (old decoder probeLoop below). findKey needs a mutable map
-  // ref (it only reads cells, never mutates the shared build table), so we
-  // const_cast the bridge-owned map at the route boundary. A per-call Arena
-  // backs any transient key holders; probe never persists into it.
-  {
-    const char* env = std::getenv("CH_USE_CH2");
-    const bool useCh2 = !(env != nullptr && env[0] == '0');
-    if (useCh2) {
-      Arena arena(probe->pool());
-      auto& mutableMap = const_cast<ChHashBuild::JoinMap&>(map);
-      return ch2::route::probeViaCh2(
-          mutableMap, arena, probe, probeKeyChannels, map.keyTypes(),
-          probe->pool());
-    }
-  }
-  std::vector<ProbeHit> hits;
-  hits.reserve(probe->size());
-  probeLoop(
-      map,
-      probe,
-      probeKeyChannels,
-      [&](vector_size_t probeRow, const auto* cell) {
-        hits.push_back({probeRow, &cell->getMapped()});
-      });
-  return hits;
+  // Drive the six-HashMethod route. findKey needs a mutable map ref (it only
+  // reads cells, never mutates the shared build table), so we const_cast the
+  // bridge-owned map at the route boundary. A per-call Arena backs any
+  // transient key holders; probe never persists into it.
+  Arena arena(probe->pool());
+  auto& mutableMap = const_cast<ChHashBuild::JoinMap&>(map);
+  return ch::route::probeViaCh2(
+      mutableMap, arena, probe, probeKeyChannels, map.keyTypes(), probe->pool());
 }
 
 size_t joinProbeCount(
     const ChHashBuild::JoinMap& map,
     const RowVectorPtr& probe,
     const std::vector<column_index_t>& probeKeyChannels) {
-  size_t count = 0;
-  probeLoop(map, probe, probeKeyChannels, [&](vector_size_t, const auto*) {
-    ++count;
-  });
-  return count;
+  return joinProbe(map, probe, probeKeyChannels).size();
 }
 
 size_t joinProbeCount(

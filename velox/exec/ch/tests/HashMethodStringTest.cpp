@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-#include "velox/exec/ch2/Common/ColumnsHashing/HashMethod.h"
-#include "velox/exec/ch2/Common/HashTable/StringHashMapAdapter.h"
-#include "velox/exec/ch2/Interpreters/HashJoin/ChHashMethodDispatch.h"
+#include "velox/exec/ch/Common/ColumnsHashing/HashMethod.h"
+#include "velox/exec/ch/Common/HashTable/StringHashMapAdapter.h"
+#include "velox/exec/ch/Interpreters/HashJoin/ChHashMethodDispatch.h"
 
 #include "velox/common/memory/Memory.h"
 #include "velox/exec/ch/Common/Arena.h"
@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-namespace facebook::velox::exec::ch2 {
+namespace facebook::velox::exec::ch {
 namespace {
 
 using Map = StringHashMapAdapter;
@@ -52,8 +52,8 @@ class HashMethodStringTest : public testing::Test,
   }
 
   void SetUp() override {
-    mapPool_ = memory::memoryManager()->addLeafPool("ch2-hms-map");
-    arenaPool_ = memory::memoryManager()->addLeafPool("ch2-hms-arena");
+    mapPool_ = memory::memoryManager()->addLeafPool("ch-hms-map");
+    arenaPool_ = memory::memoryManager()->addLeafPool("ch-hms-arena");
   }
 
   std::shared_ptr<memory::MemoryPool> mapPool_;
@@ -154,4 +154,4 @@ TEST_F(HashMethodStringTest, persistKeepsKeysAliveAfterInputMutated) {
 }
 
 } // namespace
-} // namespace facebook::velox::exec::ch2
+} // namespace facebook::velox::exec::ch

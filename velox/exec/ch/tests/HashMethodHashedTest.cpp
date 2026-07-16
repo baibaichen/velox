@@ -16,9 +16,9 @@
 
 #include "velox/exec/ch/Common/ColumnsHashing/FixedKey.h" // ch::UInt128
 #include "velox/exec/ch/Common/HashTable/HashMap.h" // ch::HashMapAll_hashed
-#include "velox/exec/ch2/Common/ColumnsHashing/HashMethod.h"
-#include "velox/exec/ch2/Common/SipHash.h"
-#include "velox/exec/ch2/Interpreters/HashJoin/ChHashMethodDispatch.h"
+#include "velox/exec/ch/Common/ColumnsHashing/HashMethod.h"
+#include "velox/exec/ch/Common/SipHash.h"
+#include "velox/exec/ch/Interpreters/HashJoin/ChHashMethodDispatch.h"
 
 #include "velox/common/memory/Memory.h"
 #include "velox/exec/ch/Common/Arena.h"
@@ -30,7 +30,7 @@
 #include <string>
 #include <vector>
 
-namespace facebook::velox::exec::ch2 {
+namespace facebook::velox::exec::ch {
 namespace {
 
 using ch::UInt128;
@@ -57,14 +57,14 @@ class HashMethodHashedTest : public testing::Test,
   }
 
   void SetUp() override {
-    mapPool_ = memory::memoryManager()->addLeafPool("ch2-hmh-map");
-    arenaPool_ = memory::memoryManager()->addLeafPool("ch2-hmh-arena");
+    mapPool_ = memory::memoryManager()->addLeafPool("ch-hmh-map");
+    arenaPool_ = memory::memoryManager()->addLeafPool("ch-hmh-arena");
   }
 
   std::shared_ptr<memory::MemoryPool> mapPool_;
   std::shared_ptr<memory::MemoryPool> arenaPool_;
 
-  // Independent reference digest: explicitly feed bytes into ch2::SipHash the
+  // Independent reference digest: explicitly feed bytes into ch::SipHash the
   // exact way CH IColumn::updateHashWithValue does (numeric: sizeof value
   // bytes; string: size+1 as size_t, then bytes, then UInt8(0)), then get128().
   // This is a separate code path from hash128; byte-for-byte equality proves
@@ -94,9 +94,9 @@ class HashMethodHashedTest : public testing::Test,
   }
 };
 
-// hash128 cross-check (numeric multi-column): ch2 HashMethodHashed::getKeyHolder
+// hash128 cross-check (numeric multi-column): ch HashMethodHashed::getKeyHolder
 // digest == independent reference (explicit CH updateHashWithValue byte feed
-// into ch2::SipHash). Byte-for-byte equality proves byte feeding matches CH.
+// into ch::SipHash). Byte-for-byte equality proves byte feeding matches CH.
 TEST_F(HashMethodHashedTest, digestNumericMatchesChByteFeed) {
   const std::vector<int64_t> c0{10, 20, 10, 30, 20};
   const std::vector<int64_t> c1{100, 200, 100, 300, 999};
@@ -225,4 +225,4 @@ TEST_F(HashMethodHashedTest, emplaceFindStringKey) {
 }
 
 } // namespace
-} // namespace facebook::velox::exec::ch2
+} // namespace facebook::velox::exec::ch

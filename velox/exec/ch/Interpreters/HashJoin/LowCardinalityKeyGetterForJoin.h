@@ -17,7 +17,7 @@
 #pragma once
 
 #include "velox/exec/ch/Common/Arena.h"
-#include "velox/exec/ch2/Common/ColumnsHashing/ColumnsHashingImpl.h"
+#include "velox/exec/ch/Common/ColumnsHashing/ColumnsHashingImpl.h"
 #include "velox/vector/BaseVector.h"
 
 #include <folly/Portability.h>
@@ -25,7 +25,7 @@
 #include <cstddef>
 #include <vector>
 
-namespace facebook::velox::exec::ch2 {
+namespace facebook::velox::exec::ch {
 
 // ============================================================================
 // LowCardinalityKeyGetterForJoin — exactly 搬自 CH
@@ -73,7 +73,7 @@ struct LowCardinalityKeyGetterForJoin {
 
   // CH 原文 (KeyGetter.h:59):has_cheap_key_calculation = false —— 解析 key 要
   // 查字典 index,不当"便宜",从而关掉 probe-loop 软件预取(会跟 per-dict 缓存
-  // 打架)。ch2 照抄保留。
+  // 打架)。ch 照抄保留。
   static constexpr bool has_cheap_key_calculation = false;
 
   // CH 原文 (KeyGetter.h:62-66)。
@@ -248,7 +248,7 @@ struct LowCardinalityKeyGetterForJoin {
     const bool found = it;
     Mapped* mapped = found ? &it->getMapped() : nullptr;
     // O4(b) stub:offset 相关(need_offset)本 task 不启用,置 0。CH 走
-    // data.offsetInternal(it)(JoinUsedFlags 按 offset 索引),ch2 最小版 map
+    // data.offsetInternal(it)(JoinUsedFlags 按 offset 索引),ch 最小版 map
     // 不带 offsetInternal,need_offset=false 时 FindResult 忽略此值。
     const size_t offset = 0;
 
@@ -259,4 +259,4 @@ struct LowCardinalityKeyGetterForJoin {
   }
 };
 
-} // namespace facebook::velox::exec::ch2
+} // namespace facebook::velox::exec::ch
