@@ -21,6 +21,7 @@ add_executable(
   HashMethodOneNumberTest.cpp
   HashMethodFixedStringTest.cpp
   HashMethodStringTest.cpp
+  ChHashJoinCh2PipelineTest.cpp
   LowCardinalityKeyGetterTest.cpp
   Main.cpp
   SipHashTest.cpp

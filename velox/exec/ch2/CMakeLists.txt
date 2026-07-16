@@ -24,6 +24,7 @@ velox_add_library(
     Common/HashTable/StringHashMapAdapter.h
     Interpreters/AggregationCommon.h
     Interpreters/HashJoin/ChHashMethodDispatch.h
+    Interpreters/HashJoin/ChHashJoinCh2Pipeline.h
 )
 velox_link_libraries(
   velox_exec_ch2
