@@ -16,7 +16,7 @@
 
 #include "velox/exec/ch/ChHashBuildOperator.h"
 #include "velox/exec/ch/ChHashJoinBridge.h"
-#include "velox/exec/ch/RowRef.h"
+#include "velox/exec/ch/Interpreters/RowRef.h"
 
 #include "velox/common/memory/Memory.h"
 #include "velox/exec/Task.h"

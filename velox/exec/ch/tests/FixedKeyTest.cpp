@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "velox/exec/ch/FixedKey.h"
+#include "velox/exec/ch/Common/ColumnsHashing/FixedKey.h"
 
 #include "velox/common/memory/Memory.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"

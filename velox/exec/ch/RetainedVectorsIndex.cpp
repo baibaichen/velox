@@ -17,7 +17,7 @@
 #include "velox/exec/ch/RetainedVectorsIndex.h"
 
 #include "velox/common/base/Exceptions.h"
-#include "velox/exec/ch/RowRef.h"
+#include "velox/exec/ch/Interpreters/RowRef.h"
 
 #include <utility>
 

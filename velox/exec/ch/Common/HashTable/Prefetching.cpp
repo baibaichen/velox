@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "velox/exec/ch/Prefetching.h"
+#include "velox/exec/ch/Common/HashTable/Prefetching.h"
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <cpuid.h>

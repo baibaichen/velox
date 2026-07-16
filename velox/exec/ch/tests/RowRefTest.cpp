@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "velox/exec/ch/RowRef.h"
+#include "velox/exec/ch/Interpreters/RowRef.h"
 
 #include <array>
 #include <limits>

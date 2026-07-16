@@ -16,8 +16,8 @@
 
 #pragma once
 
-#include "velox/exec/ch/HashTableAllocatorAdapter.h"
-#include "velox/exec/ch/RowRefList.h"
+#include "velox/exec/ch/Common/HashTable/HashTableAllocatorAdapter.h"
+#include "velox/exec/ch/Interpreters/RowRefList.h"
 
 #include <cstddef>
 #include <cstdint>

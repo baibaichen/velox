@@ -17,7 +17,7 @@
 #include "velox/exec/ch/ChHashBuild.h"
 
 #include "velox/common/memory/Memory.h"
-#include "velox/exec/ch/RowRef.h"
+#include "velox/exec/ch/Interpreters/RowRef.h"
 #include "velox/vector/DecodedVector.h"
 #include "velox/vector/SelectivityVector.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"

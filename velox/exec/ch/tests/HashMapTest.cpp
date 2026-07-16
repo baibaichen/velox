@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 
-#include "velox/exec/ch/HashMap.h"
+#include "velox/exec/ch/Common/HashTable/HashMap.h"
 
 #include "velox/common/memory/Memory.h"
-#include "velox/exec/ch/Arena.h"
-#include "velox/exec/ch/RowRef.h"
+#include "velox/exec/ch/Common/Arena.h"
+#include "velox/exec/ch/Interpreters/RowRef.h"
 
 #include <algorithm>
 #include <array>

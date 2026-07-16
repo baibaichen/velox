@@ -18,7 +18,7 @@
 // which is header-only). This translation unit exists so the class is part of
 // the velox_exec_ch library's source list and so the header is verified to
 // compile stand-alone.
-#include "velox/exec/ch/RowRefList.h"
+#include "velox/exec/ch/Interpreters/RowRefList.h"
 
 namespace facebook::velox::exec::ch {
 

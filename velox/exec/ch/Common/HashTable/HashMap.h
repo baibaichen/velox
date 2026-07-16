@@ -17,11 +17,11 @@
 #pragma once
 
 #include "velox/common/base/SimdUtil.h"
-#include "velox/exec/ch/FixedKey.h"
-#include "velox/exec/ch/HashTable.h"
-#include "velox/exec/ch/HashTableAllocatorAdapter.h"
-#include "velox/exec/ch/RowRefList.h"
-#include "velox/exec/ch/SerializedKey.h"
+#include "velox/exec/ch/Common/ColumnsHashing/FixedKey.h"
+#include "velox/exec/ch/Common/HashTable/HashTable.h"
+#include "velox/exec/ch/Common/HashTable/HashTableAllocatorAdapter.h"
+#include "velox/exec/ch/Interpreters/RowRefList.h"
+#include "velox/exec/ch/Common/ColumnsHashing/SerializedKey.h"
 
 #include <cstddef>
 #include <cstdint>

@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-#include "velox/exec/ch/HashedKey.h"
+#include "velox/exec/ch/Common/ColumnsHashing/HashedKey.h"
 
 #include "velox/common/memory/Memory.h"
-#include "velox/exec/ch/HashMap.h"
+#include "velox/exec/ch/Common/HashTable/HashMap.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
 #include <gtest/gtest.h>

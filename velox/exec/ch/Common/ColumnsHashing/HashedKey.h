@@ -17,8 +17,8 @@
 #pragma once
 
 #include "velox/common/base/Exceptions.h"
-#include "velox/exec/ch/FixedKey.h"
-#include "velox/exec/ch/SerializedKey.h"
+#include "velox/exec/ch/Common/ColumnsHashing/FixedKey.h"
+#include "velox/exec/ch/Common/ColumnsHashing/SerializedKey.h"
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/DecodedVector.h"
 #include "velox/vector/SelectivityVector.h"

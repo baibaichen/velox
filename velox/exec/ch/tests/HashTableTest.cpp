@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#include "velox/exec/ch/HashTable.h"
-#include "velox/exec/ch/HashTableAllocatorAdapter.h"
+#include "velox/exec/ch/Common/HashTable/HashTable.h"
+#include "velox/exec/ch/Common/HashTable/HashTableAllocatorAdapter.h"
 
 #include "velox/common/memory/Memory.h"
 

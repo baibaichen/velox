@@ -17,10 +17,10 @@
 #include "velox/exec/ch/ChHashBuild.h"
 
 #include "velox/common/base/Exceptions.h"
-#include "velox/exec/ch/HashedKey.h"
-#include "velox/exec/ch/Prefetching.h"
-#include "velox/exec/ch/RowRef.h"
-#include "velox/exec/ch/SerializedKey.h"
+#include "velox/exec/ch/Common/ColumnsHashing/HashedKey.h"
+#include "velox/exec/ch/Common/HashTable/Prefetching.h"
+#include "velox/exec/ch/Interpreters/RowRef.h"
+#include "velox/exec/ch/Common/ColumnsHashing/SerializedKey.h"
 
 namespace facebook::velox::exec::ch {
 

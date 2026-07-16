@@ -19,7 +19,7 @@
 #include "velox/common/memory/Memory.h"
 #include "velox/exec/ch/ChHashBuild.h"
 #include "velox/exec/ch/ChHashProbe.h"
-#include "velox/exec/ch/RowRef.h"
+#include "velox/exec/ch/Interpreters/RowRef.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
 #include <gtest/gtest.h>

@@ -21,8 +21,8 @@
 #include <cstdint>
 #include <iterator>
 
-#include "velox/exec/ch/Arena.h"
-#include "velox/exec/ch/RowRef.h"
+#include "velox/exec/ch/Common/Arena.h"
+#include "velox/exec/ch/Interpreters/RowRef.h"
 
 namespace facebook::velox::exec::ch {
 

@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "velox/exec/ch/Prefetching.h"
+#include "velox/exec/ch/Common/HashTable/Prefetching.h"
 
 #include <gtest/gtest.h>
 

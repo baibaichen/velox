@@ -17,8 +17,8 @@
 #pragma once
 
 #include "velox/common/memory/MemoryPool.h"
-#include "velox/exec/ch/Arena.h"
-#include "velox/exec/ch/FixedKeyMap.h"
+#include "velox/exec/ch/Common/Arena.h"
+#include "velox/exec/ch/Interpreters/HashJoin/FixedKeyMap.h"
 #include "velox/exec/ch/RetainedVectorsIndex.h"
 #include "velox/vector/DecodedVector.h"
 #include "velox/vector/SelectivityVector.h"

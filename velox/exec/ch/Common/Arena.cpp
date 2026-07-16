@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "velox/exec/ch/Arena.h"
+#include "velox/exec/ch/Common/Arena.h"
 
 #include "velox/common/base/Exceptions.h"
 

@@ -14,18 +14,18 @@
 
 velox_add_library(
   velox_exec_ch
-  Arena.cpp
+  Common/Arena.cpp
   ChHashBuild.cpp
   ChHashBuildOperator.cpp
   ChHashJoinBridge.cpp
   ChHashProbe.cpp
   ChHashProbeOperator.cpp
   EmitGather.cpp
-  Prefetching.cpp
+  Common/HashTable/Prefetching.cpp
   RetainedVectorsIndex.cpp
-  RowRefList.cpp
+  Interpreters/RowRefList.cpp
   HEADERS
-    Arena.h
+    Common/Arena.h
     ChHashBuild.h
     ChHashBuildOperator.h
     ChHashJoinBridge.h
@@ -33,17 +33,17 @@ velox_add_library(
     ChHashProbe.h
     ChHashProbeOperator.h
     EmitGather.h
-    HashMap.h
-    FixedKey.h
-    HashedKey.h
-    HashTable.h
-    FixedKeyMap.h
-    SerializedKey.h
-    HashTableAllocatorAdapter.h
-    Prefetching.h
+    Common/HashTable/HashMap.h
+    Common/ColumnsHashing/FixedKey.h
+    Common/ColumnsHashing/HashedKey.h
+    Common/HashTable/HashTable.h
+    Interpreters/HashJoin/FixedKeyMap.h
+    Common/ColumnsHashing/SerializedKey.h
+    Common/HashTable/HashTableAllocatorAdapter.h
+    Common/HashTable/Prefetching.h
     RetainedVectorsIndex.h
-    RowRef.h
-    RowRefList.h
+    Interpreters/RowRef.h
+    Interpreters/RowRefList.h
 )
 velox_link_libraries(velox_exec_ch PUBLIC velox_exec velox_memory velox_vector)
 

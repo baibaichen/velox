@@ -16,9 +16,9 @@
 
 #pragma once
 
-#include "velox/exec/ch/FixedHashMap.h"
-#include "velox/exec/ch/HashMap.h"
-#include "velox/exec/ch/HashedKey.h"
+#include "velox/exec/ch/Common/HashTable/FixedHashMap.h"
+#include "velox/exec/ch/Common/HashTable/HashMap.h"
+#include "velox/exec/ch/Common/ColumnsHashing/HashedKey.h"
 
 #include <algorithm>
 #include <variant>

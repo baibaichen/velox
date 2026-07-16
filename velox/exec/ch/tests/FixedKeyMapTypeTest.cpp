@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "velox/exec/ch/FixedKeyMap.h"
+#include "velox/exec/ch/Interpreters/HashJoin/FixedKeyMap.h"
 
 #include <gtest/gtest.h>
 

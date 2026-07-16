@@ -18,7 +18,7 @@
 
 #include "velox/buffer/Buffer.h"
 #include "velox/common/base/Exceptions.h"
-#include "velox/exec/ch/RowRef.h"
+#include "velox/exec/ch/Interpreters/RowRef.h"
 
 #include <map>
 #include <utility>
