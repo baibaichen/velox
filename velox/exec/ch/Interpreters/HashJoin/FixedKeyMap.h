@@ -50,8 +50,8 @@ class FixedKeyMap {
   /// supported set (integer fixed-width and VARCHAR).
   static Type chooseType(const std::vector<TypePtr>& keyTypes);
 
-  using Map8 = FixedDirectMap_key8;
-  using Map16 = FixedDirectMap_key16;
+  using Map8 = FixedHashMap_key8;
+  using Map16 = FixedHashMap_key16;
   using Map32 = HashMapAll_key32;
   using Map64 = HashMapAll_key64;
   using Map128 = HashMapAll_keys128;

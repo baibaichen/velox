@@ -32,6 +32,16 @@ namespace facebook::velox::exec::ch {
 
 struct HashTableNoState {};
 
+/// Ports ClickHouse VoidKey/VoidMapped: placeholder key/value types used by the
+/// Set-variant cells (e.g. FixedHashTableCell) that carry no real mapped value.
+struct VoidKey {};
+struct VoidMapped {
+  template <typename T>
+  auto& operator=(const T&) {
+    return *this;
+  }
+};
+
 template <typename T>
 inline bool bitEquals(T lhs, T rhs) {
   if constexpr (std::is_floating_point_v<T>) {

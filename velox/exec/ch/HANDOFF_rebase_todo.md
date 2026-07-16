@@ -101,7 +101,7 @@ review 已确认这 3 个是"对齐 CH"方向、但与本地改动硬冲突，�
 - key_string 哈希 `bits::hashBytes` → CRC32（`simd::crc32U64`）：对齐 CH 的 key_string CRC32。
 - key_string build 双 find → 单次 emplace：对齐 CH `insertAll`（emplaceKey 一次查或插）。
 - build 加软件预取：对齐 CH build 有预取（但门控是固定 8MiB，见 TODO 2，应被远程自适应取代）。
-- `FixedDirectMap`（key8/key16 直接寻址）：对齐 CH `FixedHashMap`。
+- `FixedHashMap`（key8/key16 直接寻址，继承 `FixedHashTable` 基类层，含 min/max 值域优化）：对齐 CH `FixedHashMap.h`+`FixedHashTable.h`。
 - `Map32`（key32/keys32 用 UInt32 表）：对齐 CH `key32`。
 - `FixedKeyMap::Type` enum + chooseType：对齐 CH `chooseMethod` 的显式 Type 派发。
 
