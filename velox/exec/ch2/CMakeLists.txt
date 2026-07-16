@@ -18,6 +18,7 @@ velox_add_library(
   HEADERS
     Common/SipHash.h
     Common/ColumnsHashing/ColumnsHashingImpl.h
+    DataTypes/FixedStringType.h
     Common/ColumnsHashing/HashMethod.h
     Common/HashTable/HashTableKeyHolder.h
     Common/HashTable/StringHashMapAdapter.h

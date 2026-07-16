@@ -18,6 +18,7 @@ add_executable(
   HashMethodKeysFixedTest.cpp
   HashMethodOneNumberInRangeTest.cpp
   HashMethodOneNumberTest.cpp
+  HashMethodFixedStringTest.cpp
   HashMethodStringTest.cpp
   Main.cpp
   SipHashTest.cpp

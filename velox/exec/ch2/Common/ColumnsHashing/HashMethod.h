@@ -22,6 +22,7 @@
 #include "velox/exec/ch/Common/ColumnsHashing/FixedKey.h" // ch::UInt128 / ch::UInt256
 #include "velox/exec/ch2/Common/SipHash.h"
 #include "velox/vector/FlatVector.h"
+#include "velox/exec/ch2/DataTypes/FixedStringType.h"
 
 #include <folly/Portability.h>
 
@@ -414,6 +415,161 @@ struct HashMethodString : public columns_hashing_impl::HashMethodBase<
     // 语义与 CH 完全一致。
     const StringView& sv = values[row];
     std::string_view key(sv.data(), sv.size());
+
+    if constexpr (place_string_to_arena) {
+      return ArenaKeyHolder{key, pool};
+    } else {
+      return key;
+    }
+  }
+
+ protected:
+  friend class columns_hashing_impl::
+      HashMethodBase<Self, Value, Mapped, use_cache, need_offset, nullable>;
+};
+
+
+// ============================================================================
+// HashMethodFixedString — exactly搬自 CH ColumnsHashing/HashMethod.h:219-276
+// (定长 N 字节字符串 key)。铁律 + O3:取 n 字节 slice + 包 ArenaKeyHolder 的
+// persist 算法逐字搬 CH;只把 infra 边界(数据怎么装、N 从哪拿)换成 Velox。
+//
+// infra 边界(O3 主坎):
+//   CH `ColumnFixedString`:`getN()` 拿定长 N,`getChars()` 是连续 UInt8
+//     buffer,第 row 行 key = chars[row*n .. row*n+n](CH getKeyHolder:
+//     `string_view(&(*chars)[row*n], n)`)。
+//   Velox 无 FixedString 物理类型 → 用 ch2::FixedStringType(N) 逻辑类型承载:
+//     * N 从 key 列的 FixedStringType 拿(= CH column_string.getN() 的等价)。
+//     * 数据装在 FlatVector<StringView>(物理 VARBINARY),每行 StringView 约定
+//       正好 N 字节 → 直接取第 row 行 StringView(sv.data(), sv.size()==n)。
+//   取到 view 之后 —— 包 ArenaKeyHolder{key, pool} 的算法(persist 协议 task2
+//   StringHashMapAdapter 已建,复用)逐字不变,与 HashMethodString 完全一致,
+//   唯一区别是「怎么定位这行字节」:定长 n 字节 vs 变长 offsets 差值。
+// ============================================================================
+template <
+    typename Value,
+    typename Mapped,
+    bool place_string_to_arena = true,
+    bool use_cache = true,
+    bool need_offset = false,
+    bool nullable = false>
+struct HashMethodFixedString : public columns_hashing_impl::HashMethodBase<
+                                   HashMethodFixedString<
+                                       Value,
+                                       Mapped,
+                                       place_string_to_arena,
+                                       use_cache,
+                                       need_offset,
+                                       nullable>,
+                                   Value,
+                                   Mapped,
+                                   use_cache,
+                                   need_offset,
+                                   nullable> {
+  using Self = HashMethodFixedString<
+      Value,
+      Mapped,
+      place_string_to_arena,
+      use_cache,
+      need_offset,
+      nullable>;
+  using Base = columns_hashing_impl::
+      HashMethodBase<Self, Value, Mapped, use_cache, need_offset, nullable>;
+
+  // CH 原文 (HashMethod.h:237-238):
+  //   static constexpr bool has_cheap_key_calculation = false;
+  //   static constexpr bool has_pre_computed_hashes = false;
+  static constexpr bool has_cheap_key_calculation = false;
+  static constexpr bool has_pre_computed_hashes = false;
+
+  // CH 原文 (HashMethod.h:240-241):
+  //   size_t n;
+  //   const ColumnFixedString::Chars * chars;
+  // infra 边界:CH `n` 从 ColumnFixedString::getN() 拿;`chars` 是连续 UInt8
+  // buffer。ch2:`n` 从 key 列的 FixedStringType 逻辑类型拿;数据承载换成 Velox
+  // 每行自包含的 StringView 数组指针(约定每行正好 n 字节)。
+  size_t n;
+  const StringView* values;
+
+  HashMethodFixedString(
+      const ColumnRawPtrs& key_columns,
+      const Sizes& /*key_sizes*/,
+      const HashMethodContextPtr&)
+      : Base(key_columns.empty() ? nullptr : key_columns[0]) {
+    // CH 原文 (HashMethod.h:243-256):if constexpr (nullable) 取 ColumnNullable
+    // 的 nested;else 直接列;assert_cast<ColumnFixedString>;n = getN();
+    // chars = &getChars();
+    // ch2 task6: nullable 留 VELOX_NYI + TODO(同 task2)。照抄保留结构。
+    VELOX_CHECK_EQ(key_columns.size(), 1);
+    const auto column = key_columns[0]->loadedVector();
+    // flat + non-null 限制(同 task2)。非-flat/nullable 留 TODO。
+    VELOX_CHECK(
+        column->isFlatEncoding(),
+        "HashMethodFixedString task6 requires a flat key vector (non-flat TODO)");
+    VELOX_CHECK(
+        !column->mayHaveNulls(),
+        "HashMethodFixedString task6 requires non-null keys (nullable TODO)");
+    if constexpr (nullable) {
+      VELOX_NYI("nullable HashMethodFixedString is not supported in task6");
+    }
+    // infra 边界:CH `n = column_string.getN();` → ch2 从 key 列的
+    // FixedStringType(N) 逻辑类型拿 N(= CH ColumnFixedString::getN() 等价)。
+    const auto* fixedType =
+        dynamic_cast<const FixedStringType*>(column->type().get());
+    VELOX_CHECK_NOT_NULL(
+        fixedType,
+        "HashMethodFixedString key column must carry ch2::FixedStringType(N)");
+    n = fixedType->fixedLength();
+    // infra 边界:CH `chars = &column_string.getChars();`(连续 UInt8 buffer)→
+    // Velox StringView 数组基址(每行自带 ptr+size,约定 size == n)。
+    const auto* flat = column->template asFlatVector<StringView>();
+    VELOX_CHECK_NOT_NULL(
+        flat, "HashMethodFixedString key column is not FlatVector<StringView>");
+    values = flat->rawValues();
+    // 越界守卫:FixedStringType(N) 承载约定「每行 StringView 正好 n 字节」在
+    // Velox 变长 VARBINARY 上无物理保证(不像 CH ColumnFixedString 天生定长)。
+    // 若某行 size != n,getKeyHolder 的 std::string_view(sv.data(), n) 会越界
+    // (< n:external 读越界;inline≤12:读进 StringView 结构体尾部垃圾)。
+    // 构造时一次性扫全列校验(而非 per-row check),把约定显式化又不拖热路径
+    // getKeyHolder。CH 无此 check(ColumnFixedString 天生 N 字节)。
+    const vector_size_t numRows = flat->size();
+    for (vector_size_t i = 0; i < numRows; ++i) {
+      VELOX_CHECK_EQ(
+          values[i].size(),
+          n,
+          "HashMethodFixedString: row {} StringView size {} != FixedStringType({}); "
+          "FixedStringType 承载约定每行正好 N 字节",
+          i,
+          values[i].size(),
+          n);
+    }
+  }
+
+  using Base::createContext;
+  using Base::emplaceKey;
+  using Base::findKey;
+  using Base::getHash;
+
+  // CH 原文 (HashMethod.h:259-270) 逐字:
+  //   auto getKeyHolder(size_t row, Arena & pool) const {
+  //     std::string_view key(
+  //         reinterpret_cast<const char *>(&(*chars)[row * n]), n);
+  //     if constexpr (place_string_to_arena)
+  //         return ArenaKeyHolder{key, pool};
+  //     else
+  //         return key;
+  //   }
+  //
+  // ch2: 算法(取 n 字节 slice → 包 ArenaKeyHolder)逐字不变;只有「怎么从列
+  //   拿到这行 n 字节 view」这个 infra 边界换成 Velox StringView。CH 用
+  //   chars+row*n 定位定长 n 字节;Velox 直接取第 row 行 StringView(约定正好
+  //   n 字节),两者取到的 std::string_view 语义一致(&chars[row*n], n)。
+  auto getKeyHolder(size_t row, [[maybe_unused]] ch::Arena& pool) const {
+    // infra 边界:CH `&(*chars)[row*n]` 定长定位 → Velox 第 row 行 StringView。
+    // StringView 约定每行正好 n 字节(FixedStringType(N) 承载),等价于
+    // CH string_view(&chars[row*n], n)。
+    const StringView& sv = values[row];
+    std::string_view key(sv.data(), n);
 
     if constexpr (place_string_to_arena) {
       return ArenaKeyHolder{key, pool};
