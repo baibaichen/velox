@@ -15,6 +15,7 @@
 velox_add_library(
   velox_ch_filecache
   StatusFile.cpp
+  ThreadPool.cpp
   HEADERS
     ClickHouseAliases.h
     CurrentMetrics.h
@@ -29,6 +30,7 @@ velox_add_library(
     QueryStatus.h
     SharedMutex.h
     StatusFile.h
+    ThreadPool.h
 )
 
 # In non-mono builds velox_ch_filecache is a real library; link its direct deps.
