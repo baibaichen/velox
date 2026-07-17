@@ -26,3 +26,18 @@ target_link_libraries(
     GTest::gtest
     GTest::gtest_main
 )
+
+add_executable(velox_ch_threadpool_test ThreadPoolTest.cpp)
+add_test(velox_ch_threadpool_test velox_ch_threadpool_test)
+
+target_link_libraries(
+  velox_ch_threadpool_test
+  PRIVATE
+    velox_ch_filecache
+    velox_test_util
+    velox_exception
+    Folly::folly
+    fmt::fmt
+    GTest::gtest
+    GTest::gtest_main
+)
