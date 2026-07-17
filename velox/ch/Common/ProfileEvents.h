@@ -20,6 +20,9 @@ enum Event {
   FileSegmentCompleteMicroseconds,
   FilesystemCacheCheckCorrectness,
   FilesystemCacheCheckCorrectnessMicroseconds,
+  FilesystemCacheStateLockMicroseconds,
+  FilesystemCachePriorityWriteLockMicroseconds,
+  FilesystemCachePriorityReadLockMicroseconds,
 };
 
 inline void increment(Event, uint64_t = 1) {}
