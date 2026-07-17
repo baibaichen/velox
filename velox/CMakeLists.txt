@@ -16,6 +16,7 @@
 include_directories(external/xxhash)
 add_subdirectory(buffer)
 add_subdirectory(common)
+add_subdirectory(ch)
 add_subdirectory(core)
 add_subdirectory(serializers)
 add_subdirectory(type)
