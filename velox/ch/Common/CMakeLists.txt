@@ -1,0 +1,11 @@
+velox_add_library(
+  velox_ch_filecache
+  INTERFACE
+  HEADERS
+    CurrentMetrics.h
+    FailPoint.h
+    FilesystemCacheLog.h
+    OpenTelemetryTraceContext.h
+    ProfileEvents.h
+    QueryStatus.h
+)
