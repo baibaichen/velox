@@ -16,6 +16,8 @@ velox_add_library(
   velox_ch_filecache
   StatusFile.cpp
   ThreadPool.cpp
+  FileCacheQueryIdScope.cpp
+  FileCacheScheduler.cpp
   HEADERS
     ClickHouseAliases.h
     CurrentMetrics.h
@@ -23,6 +25,8 @@ velox_add_library(
     FileCacheBoundedQueue.h
     FileCacheException.h
     FileCacheFilesystem.h
+    FileCacheQueryIdScope.h
+    FileCacheScheduler.h
     FilesystemCacheLog.h
     logger_useful.h
     OpenTelemetryTraceContext.h
