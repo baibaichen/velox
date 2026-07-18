@@ -12,6 +12,65 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+set(
+  VELOX_BUILD_REVISION
+  ""
+  CACHE STRING
+  "Full Velox source revision embedded in StatusFile diagnostics"
+)
+
+set(VELOX_BUILD_REVISION_VALUE "${VELOX_BUILD_REVISION}")
+string(STRIP "${VELOX_BUILD_REVISION_VALUE}" VELOX_BUILD_REVISION_VALUE)
+
+if(VELOX_BUILD_REVISION_VALUE STREQUAL "")
+  find_package(Git QUIET)
+  if(NOT Git_FOUND OR NOT GIT_EXECUTABLE)
+    message(
+      FATAL_ERROR
+      "Cannot determine the full Velox source revision. Configure with -DVELOX_BUILD_REVISION=<full-source-revision>."
+    )
+  endif()
+
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" rev-parse HEAD
+    WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+    RESULT_VARIABLE VELOX_BUILD_REVISION_GIT_RESULT
+    OUTPUT_VARIABLE VELOX_BUILD_REVISION_VALUE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+  )
+
+  if(
+    NOT VELOX_BUILD_REVISION_GIT_RESULT EQUAL 0
+    OR VELOX_BUILD_REVISION_VALUE STREQUAL ""
+  )
+    message(
+      FATAL_ERROR
+      "Cannot determine the full Velox source revision. Configure with -DVELOX_BUILD_REVISION=<full-source-revision>."
+    )
+  endif()
+endif()
+
+string(LENGTH "${VELOX_BUILD_REVISION_VALUE}" VELOX_BUILD_REVISION_LENGTH)
+if(
+  NOT "${VELOX_BUILD_REVISION_VALUE}" MATCHES "^[0-9A-Fa-f]+$"
+  OR (
+    NOT VELOX_BUILD_REVISION_LENGTH EQUAL 40
+    AND NOT VELOX_BUILD_REVISION_LENGTH EQUAL 64
+  )
+)
+  message(
+    FATAL_ERROR
+    "VELOX_BUILD_REVISION must be a full source revision containing exactly 40 or 64 hexadecimal characters."
+  )
+endif()
+
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/VeloxBuildRevision.h.in
+  ${CMAKE_CURRENT_BINARY_DIR}/VeloxBuildRevision.h
+  @ONLY
+)
+
 velox_add_library(
   velox_ch_filecache
   StatusFile.cpp
@@ -38,6 +97,12 @@ velox_add_library(
     SipHash128.h
     StatusFile.h
     ThreadPool.h
+)
+
+velox_include_directories(
+  velox_ch_filecache
+  PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}
 )
 
 # In non-mono builds velox_ch_filecache is a real library; link its direct deps.

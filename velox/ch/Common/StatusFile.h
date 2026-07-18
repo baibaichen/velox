@@ -54,6 +54,8 @@ public:
     /// Returns a FillFunction that writes the current PID as a decimal string.
     static FillFunction writePid();
 
+    static FillFunction writeFullInfo();
+
 private:
     const std::string path_;
     folly::File file_;
