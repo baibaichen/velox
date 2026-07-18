@@ -15,6 +15,12 @@
 add_executable(velox_ch_guards_test StatusFileAndGuardsTest.cpp)
 add_test(velox_ch_guards_test velox_ch_guards_test)
 
+target_include_directories(
+  velox_ch_guards_test
+  PRIVATE
+    ${PROJECT_BINARY_DIR}/velox/ch/Common
+)
+
 target_link_libraries(
   velox_ch_guards_test
   PRIVATE

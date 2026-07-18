@@ -16,23 +16,77 @@
 
 #include "velox/ch/Common/StatusFile.h"
 #include "velox/ch/Common/FileCacheException.h"
+#include "VeloxBuildRevision.h"
+
+#include <folly/FileUtil.h>
 
 #include <fcntl.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
+#include <ctime>
 #include <string>
+#include <string_view>
 
 namespace facebook::velox::ch
 {
+namespace
+{
+
+void writeAll(int fd, std::string_view contents)
+{
+    if (folly::writeFull(fd, contents.data(), contents.size()) == -1)
+    {
+        const int error = errno;
+        VELOX_FAIL(
+            "Cannot write StatusFile contents: error code {} ({})",
+            error,
+            std::strerror(error));
+    }
+}
+
+std::string localTimestamp()
+{
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t time = std::chrono::system_clock::to_time_t(now);
+    std::tm localTime{};
+    if (::localtime_r(&time, &localTime) == nullptr)
+        VELOX_FAIL("Cannot format StatusFile timestamp: localtime_r failed");
+
+    char buffer[20];
+    if (std::strftime(
+            buffer,
+            sizeof(buffer),
+            "%Y-%m-%d %H:%M:%S",
+            &localTime)
+        == 0)
+        VELOX_FAIL("Cannot format StatusFile timestamp: strftime failed");
+
+    return buffer;
+}
+
+}
 
 StatusFile::FillFunction StatusFile::writePid()
 {
     return [](int fd)
     {
         const std::string pid = std::to_string(static_cast<long>(::getpid()));
-        (void)::write(fd, pid.data(), pid.size());
+        writeAll(fd, pid);
+    };
+}
+
+StatusFile::FillFunction StatusFile::writeFullInfo()
+{
+    return [](int fd)
+    {
+        const std::string contents =
+            "PID: " + std::to_string(static_cast<long>(::getpid())) + "\n"
+            + "Started at: " + localTimestamp() + "\n"
+            + "Revision: " + std::string(detail::kVeloxBuildRevision) + "\n";
+        writeAll(fd, contents);
     };
 }
 

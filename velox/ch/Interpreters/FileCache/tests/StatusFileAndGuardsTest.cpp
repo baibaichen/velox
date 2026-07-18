@@ -18,16 +18,26 @@
 #include "velox/ch/Interpreters/FileCache/Guards.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
+#include "VeloxBuildRevision.h"
 
 #include <gtest/gtest.h>
 
+#include <sys/wait.h>
+#include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
+#include <exception>
+#include <fstream>
 #include <future>
+#include <iterator>
 #include <memory>
 #include <mutex>
+#include <regex>
 #include <shared_mutex>
+#include <sstream>
+#include <string>
 #include <type_traits>
 
 namespace facebook::velox::ch
@@ -37,6 +47,29 @@ namespace
 
 using common::testutil::TempDirectoryPath;
 using namespace std::chrono_literals;
+
+void invokeFillAfterClosingFd(
+    int fd,
+    const StatusFile::FillFunction & fill)
+{
+    const int replacementFd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    ASSERT_NE(replacementFd, -1);
+    ASSERT_EQ(::close(fd), 0);
+
+    try
+    {
+        fill(fd);
+    }
+    catch (const VeloxRuntimeError &)
+    {
+        ASSERT_EQ(::dup2(replacementFd, fd), fd);
+        ASSERT_EQ(::close(replacementFd), 0);
+        throw;
+    }
+
+    ASSERT_EQ(::dup2(replacementFd, fd), fd);
+    ASSERT_EQ(::close(replacementFd), 0);
+}
 
 // ---------------------------------------------------------------------------
 // StatusFile tests
@@ -49,6 +82,73 @@ TEST(StatusFileTest, WritePidFillFunctionDoesNotThrow)
     EXPECT_NO_THROW(StatusFile file(path, StatusFile::writePid()));
     // After destruction the path is removed.
     EXPECT_FALSE(fs::exists(path));
+}
+
+TEST(StatusFileTest, WriteFullInfoHasExactThreeLineContract)
+{
+    auto directory = TempDirectoryPath::create();
+    const std::string path = directory->getPath() + "/status";
+
+    StatusFile file(path, StatusFile::writeFullInfo());
+
+    std::ifstream input(path);
+    ASSERT_TRUE(input.is_open());
+    const std::string contents{
+        std::istreambuf_iterator<char>(input),
+        std::istreambuf_iterator<char>()};
+
+    ASSERT_FALSE(contents.empty());
+    EXPECT_EQ(contents.back(), '\n');
+    EXPECT_EQ(std::count(contents.begin(), contents.end(), '\n'), 3);
+
+    std::istringstream lines(contents);
+    std::string pidLine;
+    std::string startedAtLine;
+    std::string revisionLine;
+    std::string extraLine;
+    ASSERT_TRUE(static_cast<bool>(std::getline(lines, pidLine)));
+    ASSERT_TRUE(static_cast<bool>(std::getline(lines, startedAtLine)));
+    ASSERT_TRUE(static_cast<bool>(std::getline(lines, revisionLine)));
+    EXPECT_FALSE(static_cast<bool>(std::getline(lines, extraLine)));
+
+    EXPECT_EQ(
+        pidLine,
+        "PID: " + std::to_string(static_cast<long>(::getpid())));
+    EXPECT_TRUE(std::regex_match(
+        startedAtLine,
+        std::regex(
+            R"(Started at: [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})")));
+    EXPECT_EQ(
+        revisionLine,
+        "Revision: " + std::string(detail::kVeloxBuildRevision));
+}
+
+TEST(StatusFileTest, WritePidPropagatesWriteFailure)
+{
+    auto directory = TempDirectoryPath::create();
+    const std::string path = directory->getPath() + "/status";
+
+    auto closeThenWritePid = [](int fd)
+    {
+        invokeFillAfterClosingFd(fd, StatusFile::writePid());
+    };
+
+    EXPECT_THROW(StatusFile file(path, closeThenWritePid), VeloxRuntimeError);
+}
+
+TEST(StatusFileTest, WriteFullInfoPropagatesWriteFailure)
+{
+    auto directory = TempDirectoryPath::create();
+    const std::string path = directory->getPath() + "/status";
+
+    auto closeThenWriteFullInfo = [](int fd)
+    {
+        invokeFillAfterClosingFd(fd, StatusFile::writeFullInfo());
+    };
+
+    EXPECT_THROW(
+        StatusFile file(path, closeThenWriteFullInfo),
+        VeloxRuntimeError);
 }
 
 TEST(StatusFileTest, EmptyFillFunctionDoesNotThrow)
@@ -69,6 +169,39 @@ TEST(StatusFileTest, SecondInstanceOnSamePathThrows)
     // A second StatusFile on the same path must fail because the first
     // holds the exclusive flock.
     EXPECT_THROW(StatusFile second(path, StatusFile::writePid()), VeloxRuntimeError);
+}
+
+TEST(StatusFileTest, SecondProcessOnSamePathThrows)
+{
+    auto directory = TempDirectoryPath::create();
+    const std::string path = directory->getPath() + "/status";
+
+    StatusFile first(path, StatusFile::writePid());
+    const pid_t childPid = ::fork();
+    ASSERT_NE(childPid, -1);
+
+    if (childPid == 0)
+    {
+        std::set_terminate([]
+        {
+            ::_exit(2);
+        });
+
+        try
+        {
+            StatusFile second(path, StatusFile::writePid());
+        }
+        catch (const VeloxRuntimeError &)
+        {
+            ::_exit(0);
+        }
+        ::_exit(1);
+    }
+
+    int status = 0;
+    ASSERT_EQ(::waitpid(childPid, &status, 0), childPid);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
 TEST(StatusFileTest, DestructorUnlinksPath)
