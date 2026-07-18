@@ -18,22 +18,39 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace facebook::velox::ch
 {
 
-struct FileCacheLogger
+// First-phase, name-only logger shim. FileCache.cpp directly calls
+// log->name(), so getLogger() must return a non-null object that remembers
+// the name it was constructed with. Actual logging is deferred to Task 017.
+class FileCacheLogger
 {
+public:
+    explicit FileCacheLogger(std::string name)
+        : name_(std::move(name))
+    {
+    }
+
+    const std::string & name() const
+    {
+        return name_;
+    }
+
+private:
+    std::string name_;
 };
 
 using LoggerPtr = std::shared_ptr<FileCacheLogger>;
 
-inline LoggerPtr getLogger(std::string_view)
+inline LoggerPtr getLogger(std::string_view name)
 {
-    return {};
+    return std::make_shared<FileCacheLogger>(std::string(name));
 }
 
-inline std::string getCurrentExceptionMessage(bool = false)
+inline std::string getCurrentExceptionMessage(bool /*withStackTrace*/ = false)
 {
     return {};
 }

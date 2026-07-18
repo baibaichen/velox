@@ -21,6 +21,7 @@ velox_add_library(
   SipHash128.cpp
   HEADERS
     ClickHouseAliases.h
+    ClickHouseAssert.h
     CurrentMetrics.h
     FailPoint.h
     FileCacheBoundedQueue.h

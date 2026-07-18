@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/ch/Common/ClickHouseAliases.h"
+#include "velox/ch/Common/ClickHouseAssert.h"
 #include "velox/ch/Common/FileCacheBoundedQueue.h"
 #include "velox/ch/Common/FileCacheException.h"
 #include "velox/ch/Common/FileCacheFilesystem.h"
@@ -28,9 +29,11 @@
 #include <future>
 #include <mutex>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <type_traits>
+#include <utility>
 
 namespace facebook::velox::ch
 {
@@ -55,11 +58,75 @@ TEST(LoggerUsefulTest, ArgumentsAreNotEvaluated)
     EXPECT_EQ(evaluated, 0);
 }
 
+TEST(LoggerUsefulTest, AllLogMacrosDoNotEvaluateArguments)
+{
+    int evaluated = 0;
+    auto logger = getLogger("test");
+    LOG_TEST(logger, "value {}", ++evaluated);
+    LOG_TRACE(logger, "value {}", ++evaluated);
+    LOG_DEBUG(logger, "value {}", ++evaluated);
+    LOG_INFO(logger, "value {}", ++evaluated);
+    LOG_WARNING(logger, "value {}", ++evaluated);
+    LOG_ERROR(logger, "value {}", ++evaluated);
+    EXPECT_EQ(evaluated, 0);
+}
+
+TEST(LoggerUsefulTest, GetLoggerReturnsNonNullWithNameIdentity)
+{
+    auto logger = getLogger("FileCache(test)");
+    ASSERT_NE(logger, nullptr);
+    EXPECT_EQ(logger->name(), "FileCache(test)");
+}
+
+TEST(LoggerUsefulTest, CurrentExceptionMessageRemainsEmptyFirstPhase)
+{
+    try
+    {
+        throw std::runtime_error("boom");
+    }
+    catch (...)
+    {
+        EXPECT_TRUE(getCurrentExceptionMessage().empty());
+        EXPECT_TRUE(getCurrentExceptionMessage(/*withStackTrace=*/true).empty());
+    }
+}
+
+TEST(LoggerUsefulTest, TryLogCurrentExceptionIsNoOpFirstPhase)
+{
+    try
+    {
+        throw std::runtime_error("boom");
+    }
+    catch (...)
+    {
+        EXPECT_NO_THROW(tryLogCurrentException(__PRETTY_FUNCTION__));
+        EXPECT_NO_THROW(tryLogCurrentException(getLogger("test"), "context"));
+    }
+}
+
 TEST(FileCacheExceptionTest, ThrowsVeloxRuntimeError)
 {
     EXPECT_THROW(
         throwFileCacheException("invalid value {}", 42),
         VeloxRuntimeError);
+}
+
+TEST(FileCacheExceptionTest, NeverThrowsVeloxUserError)
+{
+    try
+    {
+        throwFileCacheException("invalid value {}", 42);
+        FAIL() << "Expected VeloxRuntimeError";
+    }
+    catch (const VeloxUserError &)
+    {
+        FAIL() << "throwFileCacheException must never throw VeloxUserError";
+    }
+    catch (const VeloxRuntimeError & exception)
+    {
+        EXPECT_FALSE(exception.isUserError());
+        EXPECT_EQ(exception.errorCode(), "INVALID_STATE");
+    }
 }
 
 TEST(SharedMutexTest, SupportsExclusiveAndSharedLocks)
@@ -95,12 +162,41 @@ TEST(FileCacheFilesystemTest, FilesystemErrorKeepsContext)
         throwFileCacheExceptionFromFilesystemError(error, "loading cache");
         FAIL() << "Expected VeloxRuntimeError";
     }
+    catch (const VeloxUserError &)
+    {
+        FAIL()
+            << "Filesystem failures must never throw VeloxUserError";
+    }
     catch (const VeloxRuntimeError & exception)
     {
+        const std::string message(exception.what());
+        EXPECT_NE(message.find("loading cache"), std::string::npos);
+        EXPECT_NE(message.find("/cache/file"), std::string::npos);
         EXPECT_NE(
-            std::string(exception.what()).find("loading cache"),
+            message.find(std::to_string(error.code().value())),
             std::string::npos);
+        EXPECT_NE(message.find(error.code().message()), std::string::npos);
+        EXPECT_FALSE(exception.isUserError());
     }
+}
+
+TEST(ClickHouseAssertTest, DebugDefaultDiagnosticIncludesExpressionText)
+{
+    EXPECT_DEATH(chassert(1 == 2), "1 == 2");
+}
+
+TEST(ClickHouseAssertTest, DebugCustomDiagnosticIncluded)
+{
+    EXPECT_DEATH(
+        chassert(1 == 2, "custom diagnostic message"),
+        "custom diagnostic message");
+}
+
+TEST(ClickHouseAssertTest, DebugTrueExpressionEvaluatedExactlyOnce)
+{
+    int evaluated = 0;
+    chassert(++evaluated == 1);
+    EXPECT_EQ(evaluated, 1);
 }
 
 TEST(FileCacheBoundedQueueTest, CapacityZeroTryPushFails)
@@ -160,6 +256,303 @@ TEST(FileCacheBoundedQueueTest, FinishReleasesBlockedProducer)
     queue.finish();
     ASSERT_EQ(result.wait_for(1s), std::future_status::ready);
     EXPECT_FALSE(result.get());
+}
+
+TEST(FileCacheBoundedQueueTest, Task012CallShapesCompile)
+{
+    FileCacheBoundedQueue<int> queue(2);
+    int batch = 5;
+    ASSERT_TRUE(queue.tryPush(batch, 10));
+
+    int poppedBatch = 0;
+    ASSERT_TRUE(queue.tryPop(poppedBatch));
+    EXPECT_EQ(poppedBatch, batch);
+}
+
+TEST(FileCacheBoundedQueueTest, NonBlockingEmptyTryPopReturnsImmediately)
+{
+    FileCacheBoundedQueue<int> queue(1);
+    int value = 0;
+    EXPECT_FALSE(queue.tryPop(value));
+}
+
+TEST(FileCacheBoundedQueueTest, TimedTryPushRemainsPendingWhileFullAndSucceedsAfterPop)
+{
+    FileCacheBoundedQueue<int> queue(1);
+    ASSERT_TRUE(queue.push(1));
+
+    auto result = std::async(std::launch::async, [&]
+    {
+        return queue.tryPush(2, 5000);
+    });
+
+    EXPECT_EQ(result.wait_for(20ms), std::future_status::timeout);
+
+    int value = 0;
+    ASSERT_TRUE(queue.pop(value));
+    EXPECT_EQ(value, 1);
+
+    ASSERT_EQ(result.wait_for(1s), std::future_status::ready);
+    EXPECT_TRUE(result.get());
+}
+
+TEST(FileCacheBoundedQueueTest, TimedTryPushOnFullQueueTimesOutRatherThanReturningImmediately)
+{
+    FileCacheBoundedQueue<int> queue(1);
+    ASSERT_TRUE(queue.push(1));
+
+    auto result = std::async(std::launch::async, [&]
+    {
+        return queue.tryPush(2, 200);
+    });
+
+    EXPECT_EQ(result.wait_for(20ms), std::future_status::timeout);
+    ASSERT_EQ(result.wait_for(1s), std::future_status::ready);
+    EXPECT_FALSE(result.get());
+}
+
+TEST(FileCacheBoundedQueueTest, TimedTryPopWakesOnPush)
+{
+    FileCacheBoundedQueue<int> queue(1);
+
+    auto result = std::async(std::launch::async, [&]
+    {
+        int value = 0;
+        const bool popped = queue.tryPop(value, 5000);
+        return std::make_pair(popped, value);
+    });
+
+    EXPECT_EQ(result.wait_for(20ms), std::future_status::timeout);
+    ASSERT_TRUE(queue.push(42));
+    ASSERT_EQ(result.wait_for(1s), std::future_status::ready);
+
+    const auto [popped, value] = result.get();
+    EXPECT_TRUE(popped);
+    EXPECT_EQ(value, 42);
+}
+
+TEST(FileCacheBoundedQueueTest, TimedTryPopWakesOnFinish)
+{
+    FileCacheBoundedQueue<int> queue(1);
+
+    auto result = std::async(std::launch::async, [&]
+    {
+        int value = 0;
+        return queue.tryPop(value, 5000);
+    });
+
+    EXPECT_EQ(result.wait_for(20ms), std::future_status::timeout);
+    queue.finish();
+    ASSERT_EQ(result.wait_for(1s), std::future_status::ready);
+    EXPECT_FALSE(result.get());
+}
+
+TEST(FileCacheBoundedQueueTest, CapacityZeroBlockedProducerReleasedByFinish)
+{
+    FileCacheBoundedQueue<int> queue(0);
+    EXPECT_FALSE(queue.tryPush(1));
+
+    auto result = std::async(std::launch::async, [&]
+    {
+        return queue.push(2);
+    });
+
+    EXPECT_EQ(result.wait_for(20ms), std::future_status::timeout);
+    queue.finish();
+    ASSERT_EQ(result.wait_for(1s), std::future_status::ready);
+    EXPECT_FALSE(result.get());
+}
+
+TEST(FileCacheBoundedQueueTest, CapacityZeroTimedProducerReleasedByFinish)
+{
+    FileCacheBoundedQueue<int> queue(0);
+
+    auto result = std::async(std::launch::async, [&]
+    {
+        return queue.tryPush(2, 5000);
+    });
+
+    EXPECT_EQ(result.wait_for(20ms), std::future_status::timeout);
+    queue.finish();
+    ASSERT_EQ(result.wait_for(1s), std::future_status::ready);
+    EXPECT_FALSE(result.get());
+}
+
+TEST(FileCacheBoundedQueueTest, AllPushFormsRejectAfterFinish)
+{
+    FileCacheBoundedQueue<int> queue(2);
+    queue.finish();
+
+    int lvalue = 1;
+    EXPECT_FALSE(queue.push(1));
+    EXPECT_FALSE(queue.tryPush(lvalue));
+    EXPECT_FALSE(queue.tryPush(2));
+    EXPECT_FALSE(queue.tryPush(lvalue, 10));
+    EXPECT_FALSE(queue.tryPush(3, 10));
+}
+
+namespace
+{
+
+// Move assignment is noexcept, so the queue must move rather than copy.
+struct NoexceptMoveAssignable
+{
+    int value = 0;
+    bool movedInto = false;
+
+    NoexceptMoveAssignable() = default;
+    explicit NoexceptMoveAssignable(int initialValue)
+        : value(initialValue)
+    {
+    }
+
+    NoexceptMoveAssignable(const NoexceptMoveAssignable &) = default;
+    NoexceptMoveAssignable(NoexceptMoveAssignable &&) noexcept = default;
+    NoexceptMoveAssignable & operator=(const NoexceptMoveAssignable &) = default;
+
+    NoexceptMoveAssignable & operator=(NoexceptMoveAssignable && other) noexcept
+    {
+        value = other.value;
+        movedInto = true;
+        return *this;
+    }
+};
+
+static_assert(std::is_nothrow_move_assignable_v<NoexceptMoveAssignable>);
+
+// Move assignment is not noexcept, so the queue must copy. Copy assignment
+// can be made to throw to prove a failed copy leaves the source recoverable.
+struct ThrowingMoveAssignable
+{
+    int value = 0;
+    bool copyAssignCalled = false;
+    static inline bool throwOnCopy = false;
+
+    ThrowingMoveAssignable() = default;
+    explicit ThrowingMoveAssignable(int initialValue)
+        : value(initialValue)
+    {
+    }
+
+    ThrowingMoveAssignable(const ThrowingMoveAssignable &) = default;
+    ThrowingMoveAssignable(ThrowingMoveAssignable &&) = default;
+
+    ThrowingMoveAssignable & operator=(const ThrowingMoveAssignable & other)
+    {
+        if (throwOnCopy)
+            throw std::runtime_error("copy assignment failed");
+        value = other.value;
+        copyAssignCalled = true;
+        return *this;
+    }
+
+    ThrowingMoveAssignable & operator=(ThrowingMoveAssignable && other)
+    {
+        value = other.value;
+        return *this;
+    }
+};
+
+static_assert(!std::is_nothrow_move_assignable_v<ThrowingMoveAssignable>);
+static_assert(std::is_copy_assignable_v<ThrowingMoveAssignable>);
+
+}
+
+TEST(FileCacheBoundedQueueTest, NoexceptMoveAssignableTypeUsesMove)
+{
+    FileCacheBoundedQueue<NoexceptMoveAssignable> queue(1);
+    ASSERT_TRUE(queue.push(NoexceptMoveAssignable(7)));
+
+    NoexceptMoveAssignable out;
+    ASSERT_TRUE(queue.pop(out));
+    EXPECT_TRUE(out.movedInto);
+    EXPECT_EQ(out.value, 7);
+}
+
+TEST(FileCacheBoundedQueueTest, ThrowingMoveAssignableTypeUsesCopy)
+{
+    ThrowingMoveAssignable::throwOnCopy = false;
+    FileCacheBoundedQueue<ThrowingMoveAssignable> queue(1);
+    ASSERT_TRUE(queue.push(ThrowingMoveAssignable(9)));
+
+    ThrowingMoveAssignable out;
+    ASSERT_TRUE(queue.pop(out));
+    EXPECT_TRUE(out.copyAssignCalled);
+    EXPECT_EQ(out.value, 9);
+}
+
+TEST(FileCacheBoundedQueueTest, ThrowingCopyLeavesElementQueuedAndRecoverable)
+{
+    ThrowingMoveAssignable::throwOnCopy = true;
+    FileCacheBoundedQueue<ThrowingMoveAssignable> queue(1);
+    ASSERT_TRUE(queue.push(ThrowingMoveAssignable(11)));
+
+    ThrowingMoveAssignable out;
+    EXPECT_THROW(queue.pop(out), std::runtime_error);
+
+    ThrowingMoveAssignable::throwOnCopy = false;
+    ASSERT_TRUE(queue.pop(out));
+    EXPECT_EQ(out.value, 11);
+}
+
+namespace
+{
+
+// Tracks whether it was moved-from and how many times it was copied, so
+// tests can prove a failed tryPush leaves the caller's argument untouched.
+// Mirrors CH's ConcurrentBoundedQueue::emplaceImpl(Args &&...), which only
+// forwards into the deque after the wait and is_finished checks succeed, so
+// a failed/full push must not move-from or copy the caller's value at all.
+struct MoveTrackingProbe
+{
+    int value = 0;
+    bool movedFrom = false;
+    static inline int copyCount = 0;
+
+    MoveTrackingProbe() = default;
+    explicit MoveTrackingProbe(int initialValue)
+        : value(initialValue)
+    {
+    }
+
+    MoveTrackingProbe(const MoveTrackingProbe & other)
+        : value(other.value)
+    {
+        ++copyCount;
+    }
+
+    MoveTrackingProbe(MoveTrackingProbe && other) noexcept
+        : value(other.value)
+    {
+        other.movedFrom = true;
+    }
+
+    MoveTrackingProbe & operator=(const MoveTrackingProbe &) = default;
+    MoveTrackingProbe & operator=(MoveTrackingProbe &&) noexcept = default;
+};
+
+}
+
+TEST(FileCacheBoundedQueueTest, FailedFullTryPushMoveDoesNotConsumeCallerValue)
+{
+    FileCacheBoundedQueue<MoveTrackingProbe> queue(1);
+    ASSERT_TRUE(queue.push(MoveTrackingProbe(1)));
+
+    MoveTrackingProbe value(42);
+    EXPECT_FALSE(queue.tryPush(std::move(value), 0));
+    EXPECT_FALSE(value.movedFrom);
+    EXPECT_EQ(value.value, 42);
+}
+
+TEST(FileCacheBoundedQueueTest, FailedFullTryPushConstRefDoesNotCopyCallerValue)
+{
+    FileCacheBoundedQueue<MoveTrackingProbe> queue(1);
+    ASSERT_TRUE(queue.push(MoveTrackingProbe(1)));
+
+    MoveTrackingProbe::copyCount = 0;
+    const MoveTrackingProbe value(42);
+    EXPECT_FALSE(queue.tryPush(value, 0));
+    EXPECT_EQ(MoveTrackingProbe::copyCount, 0);
 }
 
 }
