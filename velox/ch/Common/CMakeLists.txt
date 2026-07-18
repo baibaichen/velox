@@ -18,6 +18,7 @@ velox_add_library(
   ThreadPool.cpp
   FileCacheQueryIdScope.cpp
   FileCacheScheduler.cpp
+  SipHash128.cpp
   HEADERS
     ClickHouseAliases.h
     CurrentMetrics.h
@@ -33,13 +34,23 @@ velox_add_library(
     ProfileEvents.h
     QueryStatus.h
     SharedMutex.h
+    SipHash128.h
     StatusFile.h
     ThreadPool.h
 )
 
 # In non-mono builds velox_ch_filecache is a real library; link its direct deps.
+# FileCacheKey.cpp uses fmt::format and the VELOX_FAIL-based exception helper, and
+# the public headers include fmt and Folly F14 containers, so carry all three as
+# PUBLIC to propagate their compile usage requirements to consumers of the headers.
 if(NOT VELOX_MONO_LIBRARY)
-  target_link_libraries(velox_ch_filecache PRIVATE Folly::folly)
+  target_link_libraries(
+    velox_ch_filecache
+    PUBLIC
+      velox_exception
+      Folly::folly
+      fmt::fmt
+  )
 endif()
 
 if(${VELOX_BUILD_TESTING} OR ${VELOX_BUILD_TEST_UTILS})

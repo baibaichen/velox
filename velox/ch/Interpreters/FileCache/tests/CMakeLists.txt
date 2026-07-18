@@ -26,3 +26,14 @@ target_link_libraries(
     GTest::gtest
     GTest::gtest_main
 )
+
+add_executable(velox_ch_leaf_types_test LeafTypesTest.cpp)
+add_test(velox_ch_leaf_types_test velox_ch_leaf_types_test)
+
+target_link_libraries(
+  velox_ch_leaf_types_test
+  PRIVATE
+    velox_ch_filecache
+    GTest::gtest
+    GTest::gtest_main
+)
