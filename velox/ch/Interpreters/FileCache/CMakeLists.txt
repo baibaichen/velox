@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Compiled sources for velox_ch_filecache. In the default mono build
+# velox_ch_filecache is an alias to the velox target and cannot be passed to
+# target_sources() directly, so route through the velox_sources() helper which
+# targets the real underlying library in both mono and non-mono builds.
+velox_sources(
+  velox_ch_filecache
+  PRIVATE
+  FileSegmentKeyType.cpp
+  FileCacheKey.cpp
+)
+
 # Guards.h is a header-only addition to velox_ch_filecache.
 # With VELOX_MONO_LIBRARY=ON the global include_directories(.) from the root
 # CMakeLists already makes it findable; we register the FILE_SET only in
@@ -21,14 +32,21 @@
 # was already registered with PUBLIC scope by velox_add_library() in
 # Common/CMakeLists.txt; a FILE_SET name must keep one consistent scope across
 # all target_sources() calls on the same target, so this call must also use
-# PUBLIC (not INTERFACE).
+# PUBLIC (not INTERFACE). Task 008 adds its public headers to the same set.
 if(NOT VELOX_MONO_LIBRARY)
   target_sources(
     velox_ch_filecache
     PUBLIC
     FILE_SET HEADERS
     BASE_DIRS ${PROJECT_SOURCE_DIR}
-    FILES ${CMAKE_CURRENT_SOURCE_DIR}/Guards.h
+    FILES
+      ${CMAKE_CURRENT_SOURCE_DIR}/Guards.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/FileSegmentKeyType.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/FileCacheOriginInfo.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/FileCache_fwd.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/FileCache_fwd_internal.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/FileCacheKey.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/FileCacheUtils.h
   )
 endif()
 
