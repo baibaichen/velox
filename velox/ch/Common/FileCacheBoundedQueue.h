@@ -17,14 +17,21 @@
 
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
+#include <chrono>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <type_traits>
 #include <utility>
 
 namespace facebook::velox::ch
 {
 
+// Mirrors ClickHouse's src/Common/ConcurrentBoundedQueue.h: a fixed-capacity,
+// thread-safe queue that can be permanently "finished". Producers block until
+// capacity is available or the queue is finished; consumers block until data
+// is available or the queue is finished and drained.
 template <typename T>
 class FileCacheBoundedQueue
 {
@@ -37,57 +44,42 @@ public:
     FileCacheBoundedQueue(const FileCacheBoundedQueue &) = delete;
     FileCacheBoundedQueue & operator=(const FileCacheBoundedQueue &) = delete;
 
+    // Blocks until capacity is available or the queue is finished. Returns
+    // false if the queue was (or becomes) finished before capacity frees up.
     bool push(T value)
     {
-        {
-            std::unique_lock lock(mutex_);
-            producerCv_.wait(lock, [&]
-            {
-                return finished_ || queue_.size() < capacity_;
-            });
-
-            if (finished_)
-                return false;
-
-            queue_.emplace_back(std::move(value));
-        }
-
-        consumerCv_.notify_one();
-        return true;
+        return emplaceImpl(std::nullopt, std::move(value));
     }
 
-    bool tryPush(T value)
+    // Never blocks longer than timeoutMilliseconds (0 means non-blocking).
+    // Returns false if the queue is full, finished, or the timeout elapses.
+    bool tryPush(const T & value, uint64_t timeoutMilliseconds = 0)
+    {
+        return emplaceImpl(timeoutMilliseconds, value);
+    }
+
+    bool tryPush(T && value, uint64_t timeoutMilliseconds = 0)
+    {
+        return emplaceImpl(timeoutMilliseconds, std::move(value));
+    }
+
+    // Blocks until data is available or the queue is finished. After finish,
+    // still returns queued values in FIFO order before finally returning
+    // false once the queue is empty.
+    bool pop(T & value)
+    {
+        return popImpl(value, std::nullopt);
+    }
+
+    // Never blocks. Returns false if the queue is currently empty.
+    bool tryPop(T & value)
     {
         {
             std::lock_guard lock(mutex_);
-            if (finished_ || queue_.size() >= capacity_)
-                return false;
-            queue_.emplace_back(std::move(value));
-        }
-
-        consumerCv_.notify_one();
-        return true;
-    }
-
-    bool pop(T & value)
-    {
-        {
-            std::unique_lock lock(mutex_);
-            consumerCv_.wait(lock, [&]
-            {
-                return finished_ || !queue_.empty();
-            });
-
-            if (finished_ && queue_.empty())
+            if (queue_.empty())
                 return false;
 
-            if constexpr (
-                std::is_nothrow_move_assignable_v<T>
-                || !std::is_copy_assignable_v<T>)
-                value = std::move(queue_.front());
-            else
-                value = queue_.front();
-
+            assignFront(value);
             queue_.pop_front();
         }
 
@@ -95,6 +87,15 @@ public:
         return true;
     }
 
+    // Never blocks longer than timeoutMilliseconds. Returns false if the
+    // queue stays empty for the whole timeout, or is finished and drained.
+    bool tryPop(T & value, uint64_t timeoutMilliseconds)
+    {
+        return popImpl(value, timeoutMilliseconds);
+    }
+
+    // Idempotently marks the queue as finished: subsequent pushes fail, and
+    // every blocked producer and consumer wakes up.
     void finish()
     {
         {
@@ -106,19 +107,85 @@ public:
         consumerCv_.notify_all();
     }
 
-    bool isFinished() const
-    {
-        std::lock_guard lock(mutex_);
-        return finished_;
-    }
-
-    size_t size() const
-    {
-        std::lock_guard lock(mutex_);
-        return queue_.size();
-    }
-
 private:
+    template <typename U>
+    bool emplaceImpl(std::optional<uint64_t> timeoutMilliseconds, U && value)
+    {
+        {
+            std::unique_lock lock(mutex_);
+            auto predicate = [&]
+            {
+                return finished_ || queue_.size() < capacity_;
+            };
+
+            if (timeoutMilliseconds.has_value())
+            {
+                if (!producerCv_.wait_for(
+                        lock,
+                        std::chrono::milliseconds(*timeoutMilliseconds),
+                        predicate))
+                    return false;
+            }
+            else
+            {
+                producerCv_.wait(lock, predicate);
+            }
+
+            if (finished_)
+                return false;
+
+            queue_.emplace_back(std::forward<U>(value));
+        }
+
+        consumerCv_.notify_one();
+        return true;
+    }
+
+    bool popImpl(T & value, std::optional<uint64_t> timeoutMilliseconds)
+    {
+        {
+            std::unique_lock lock(mutex_);
+            auto predicate = [&]
+            {
+                return finished_ || !queue_.empty();
+            };
+
+            if (timeoutMilliseconds.has_value())
+            {
+                if (!consumerCv_.wait_for(
+                        lock,
+                        std::chrono::milliseconds(*timeoutMilliseconds),
+                        predicate))
+                    return false;
+            }
+            else
+            {
+                consumerCv_.wait(lock, predicate);
+            }
+
+            if (finished_ && queue_.empty())
+                return false;
+
+            assignFront(value);
+            queue_.pop_front();
+        }
+
+        producerCv_.notify_one();
+        return true;
+    }
+
+    // Moves the front element into value only when the move-assignment
+    // cannot throw; otherwise copies, so that a throwing copy leaves the
+    // front element queued and recoverable (popped again later) rather than
+    // losing it to a partially-completed, potentially-throwing move.
+    void assignFront(T & value)
+    {
+        if constexpr (std::is_nothrow_move_assignable_v<T>)
+            value = std::move(queue_.front());
+        else
+            value = queue_.front();
+    }
+
     mutable std::mutex mutex_;
     std::condition_variable producerCv_;
     std::condition_variable consumerCv_;

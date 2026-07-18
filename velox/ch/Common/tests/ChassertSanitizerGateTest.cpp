@@ -13,28 +13,22 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#pragma once
+#include "velox/ch/Common/ClickHouseAssert.h"
 
-#include "velox/common/base/Exceptions.h"
-
-#include <filesystem>
-#include <string_view>
+#include <gtest/gtest.h>
 
 namespace facebook::velox::ch
 {
-
-namespace fs = std::filesystem;
-
-[[noreturn]] inline void throwFileCacheExceptionFromFilesystemError(
-    const fs::filesystem_error & error,
-    std::string_view context)
+namespace
 {
-    VELOX_FAIL(
-        "{}: path '{}', error code {} ({})",
-        context,
-        error.path1().string(),
-        error.code().value(),
-        error.code().message());
+
+// This target is compiled with NDEBUG and FOLLY_SANITIZE=1, simulating a
+// sanitizer build without requiring an actual sanitizer-instrumented binary.
+// chassert() must still abort under these compile definitions.
+TEST(ClickHouseAssertSanitizerGateTest, AbortsEvenWithNdebugWhenSanitizerActive)
+{
+    EXPECT_DEATH(chassert(false), "");
 }
 
+}
 }

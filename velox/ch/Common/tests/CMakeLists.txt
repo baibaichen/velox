@@ -56,3 +56,41 @@ target_link_libraries(
     GTest::gtest
     GTest::gtest_main
 )
+
+# Plain executable (no gtest): the process exit status is the proof. It is
+# compiled with NDEBUG only, so ClickHouseAssert.h must take the ordinary
+# Release path and evaluate neither the asserted expression nor the
+# diagnostic message. A zero exit status is the passing result.
+add_executable(velox_ch_chassert_release_probe ChassertReleaseProbe.cpp)
+add_test(velox_ch_chassert_release_probe velox_ch_chassert_release_probe)
+
+target_compile_definitions(velox_ch_chassert_release_probe PRIVATE NDEBUG)
+
+target_link_libraries(
+  velox_ch_chassert_release_probe
+  PRIVATE
+    velox_ch_filecache
+    Folly::folly
+)
+
+# Compiled with NDEBUG and FOLLY_SANITIZE=1 to simulate a sanitizer build:
+# chassert() must still abort, unlike ordinary Release.
+add_executable(velox_ch_chassert_sanitizer_gate_test ChassertSanitizerGateTest.cpp)
+add_test(velox_ch_chassert_sanitizer_gate_test velox_ch_chassert_sanitizer_gate_test)
+
+target_compile_definitions(
+  velox_ch_chassert_sanitizer_gate_test
+  PRIVATE
+    NDEBUG
+    FOLLY_SANITIZE=1
+)
+
+target_link_libraries(
+  velox_ch_chassert_sanitizer_gate_test
+  PRIVATE
+    velox_ch_filecache
+    velox_test_util
+    Folly::folly
+    GTest::gtest
+    GTest::gtest_main
+)
