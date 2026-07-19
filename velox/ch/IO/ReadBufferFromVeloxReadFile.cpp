@@ -19,141 +19,242 @@
 #include "velox/ch/Common/FileCacheException.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <limits>
 
 namespace facebook::velox::ch
 {
 
-ReadBufferFromVeloxReadFile::ReadBufferFromVeloxReadFile(
-    std::shared_ptr<velox::ReadFile> readFile,
-    size_t bufferSize)
-    : ownedReadFile_(std::move(readFile))
-{
-    readFile_ = ownedReadFile_.get();
-    VELOX_CHECK_NOT_NULL(readFile_);
-    VELOX_CHECK_GT(bufferSize, 0u, "ReadBuffer size must be > 0");
-    initBuffer(bufferSize);
-    readUntil_ = readFile_->size();
-}
+// ---------------------------------------------------------------------------
+// FileCacheBufferState
+// ---------------------------------------------------------------------------
 
-ReadBufferFromVeloxReadFile::ReadBufferFromVeloxReadFile(
-    velox::ReadFile * readFile,
-    size_t bufferSize)
-    : readFile_(readFile)
+void FileCacheBufferState::allocateOwned(
+    velox::memory::MemoryPool * pool,
+    size_t size,
+    size_t alignment)
 {
-    VELOX_CHECK_NOT_NULL(readFile_);
-    VELOX_CHECK_GT(bufferSize, 0u, "ReadBuffer size must be > 0");
-    initBuffer(bufferSize);
-    readUntil_ = readFile_->size();
-}
+    VELOX_CHECK_NOT_NULL(pool);
+    VELOX_CHECK_GT(size, 0u, "Owned buffer size must be > 0");
+    ownedPool_ = pool;
 
-void ReadBufferFromVeloxReadFile::initBuffer(size_t bufferSize)
-{
-    internalBuffer_.resize(bufferSize);
-    bufData_ = internalBuffer_.data();
-    bufCapacity_ = bufferSize;
-    pos_ = bufData_;
-    bufEnd_ = bufData_;
-    externalBuffer_ = false;
-}
-
-bool ReadBufferFromVeloxReadFile::next()
-{
-    if (atEof_)
+    if (alignment <= 1)
     {
-        resetToInternalWindow();
-        return false;
+        ownedBuffer_ = AlignedBuffer::allocate<char>(size, pool);
+        ownedBegin_ = ownedBuffer_->asMutable<char>();
+        ownedCapacity_ = size;
     }
-    if (currentOffset_ >= readUntil_)
+    else
     {
-        atEof_ = true;
-        resetToInternalWindow();
-        return false;
+        // Direct IO needs the address and the length aligned, but a pool
+        // allocation only guarantees its own (smaller) alignment. Over-allocate
+        // so the usable range can be aligned up and its length rounded up to a
+        // multiple of `alignment`.
+        const size_t rounded = ((size + alignment - 1) / alignment) * alignment;
+        const size_t allocSize = rounded + alignment;
+        ownedBuffer_ = AlignedBuffer::allocate<char>(allocSize, pool);
+        auto * raw = ownedBuffer_->asMutable<char>();
+        const auto addr = reinterpret_cast<uintptr_t>(raw);
+        const auto alignedAddr =
+            (addr + alignment - 1) & ~(static_cast<uintptr_t>(alignment) - 1);
+        ownedBegin_ = reinterpret_cast<char *>(alignedAddr);
+        ownedCapacity_ = rounded;
     }
 
-    // Select the destination for this read cycle without committing it yet: the
-    // caller-owned buffer installed by set() (used exactly once) or the internal
-    // allocation. Only a successful read publishes it as the active window, so
-    // every non-success path can restore a coherent internal window below.
-    char * const dest = externalBuffer_ ? bufData_ : internalBuffer_.data();
-    const size_t destCapacity =
-        externalBuffer_ ? bufCapacity_ : internalBuffer_.size();
+    // Install the full owned range as both the internal and working buffer with
+    // the cursor at the start, mirroring BufferBase(ptr, size, 0). Read adapters
+    // then empty the working view; write adapters keep it full to write into.
+    internal_ = CacheBuffer(ownedBegin_, ownedBegin_ + ownedCapacity_);
+    working_ = CacheBuffer(ownedBegin_, ownedBegin_ + ownedCapacity_);
+    position_ = ownedBegin_;
+}
 
-    const size_t startOffset = currentOffset_;
-    // The capacity bounds the read so pread always stays within dest.
-    const size_t toRead = std::min(destCapacity, readUntil_ - currentOffset_);
+void FileCacheBufferState::set(char * ptr, size_t size, size_t offset)
+{
+    if (ptr == nullptr)
+    {
+        // A null buffer is only the detach signal; it never carries a nonzero
+        // extent or cursor. Represent it as a coherent empty state without any
+        // null-pointer arithmetic.
+        VELOX_CHECK_EQ(size, 0u, "A null buffer requires size 0");
+        VELOX_CHECK_EQ(offset, 0u, "A null buffer requires offset 0");
+        internal_ = CacheBuffer();
+        working_ = CacheBuffer();
+        position_ = nullptr;
+        return;
+    }
 
-    std::string_view chunk;
+    // Reject an out-of-range cursor before computing `ptr + offset`.
+    VELOX_CHECK_LE(offset, size, "set() offset exceeds the buffer size");
+    internal_ = CacheBuffer(ptr, ptr + size);
+    working_ = CacheBuffer(ptr, ptr + size);
+    position_ = ptr + offset;
+}
+
+void FileCacheBufferState::restoreOwnedWindow()
+{
+    if (ownedBuffer_ != nullptr)
+    {
+        internal_ = CacheBuffer(ownedBegin_, ownedBegin_ + ownedCapacity_);
+        working_ = CacheBuffer(ownedBegin_, ownedBegin_);
+        position_ = ownedBegin_;
+    }
+    else
+    {
+        internal_ = CacheBuffer();
+        working_ = CacheBuffer();
+        position_ = nullptr;
+    }
+}
+
+void FileCacheBufferState::detach()
+{
+    // Drop every working/internal view and cursor into a coherent empty state
+    // that references no caller memory. The owned BufferPtr, if any, stays
+    // charged to the pool until this state is destroyed, but is no longer
+    // exposed through the working view.
+    internal_ = CacheBuffer();
+    working_ = CacheBuffer();
+    position_ = nullptr;
+}
+
+void FileCacheBufferState::resetWorkingView()
+{
+    working_ = CacheBuffer(internal_.begin(), internal_.begin());
+    position_ = internal_.begin();
+}
+
+// ---------------------------------------------------------------------------
+// ReadBufferFromFileBase
+// ---------------------------------------------------------------------------
+
+bool ReadBufferFromFileBase::next()
+{
+    VELOX_CHECK(!hasPendingData(), "next() called while the buffer still has pending data");
+    VELOX_CHECK(!canceled_, "Cannot read from a canceled ReadBuffer");
+
+    // Settle the bytes consumed from the previous working buffer before loading
+    // the next chunk, mirroring ReadBuffer::next (bytes += offset()).
+    state_.settleConsumed();
+
+    bool res = false;
     try
     {
-        chunk = readFile_->pread(startOffset, toRead, dest);
+        res = nextImpl();
     }
     catch (...)
     {
-        // A failed read ends the external-buffer lifetime like any other next()
-        // attempt. Restore a coherent internal window before rethrowing so a
-        // retry never reads into caller memory that may already be released.
-        resetToInternalWindow();
+        // A read failure cancels the reader; the canceled state is terminal so a
+        // second next() is rejected above rather than silently retried. The
+        // original exception propagates unchanged.
+        cancel();
         throw;
     }
 
-    if (chunk.empty())
+    if (!res)
     {
-        atEof_ = true;
-        resetToInternalWindow();
-        return false;
+        // Publish an empty working view at the current position.
+        char * const p = position();
+        buffer() = CacheBuffer(p, p);
     }
+    else
+    {
+        position() = buffer().begin();
+        VELOX_CHECK(
+            position() < buffer().end(),
+            "nextImpl reported success but published an empty working buffer");
+    }
+    return res;
+}
 
-    // Success: publish dest as the active window.
-    bufData_ = dest;
-    bufCapacity_ = destCapacity;
-    bufStartOffset_ = startOffset;
-    pos_ = dest;
-    bufEnd_ = dest + chunk.size();
-    // The external buffer, if any, has now been consumed by this read cycle.
-    externalBuffer_ = false;
+bool ReadBufferFromFileBase::nextImpl()
+{
+    char * const dest = internalBuffer().begin();
+    const size_t destCapacity = internalBuffer().size();
+    if (dest == nullptr || destCapacity == 0)
+        // The reader is detached (no read target); there is nothing to load.
+        return false;
+
+    const size_t startOffset = fileOffsetOfBufferEnd_;
+    if (startOffset >= readUntil_)
+        // The right boundary has been reached.
+        return false;
+
+    const size_t toRead = std::min(destCapacity, readUntil_ - startOffset);
+    // Fail closed before issuing an actual pread when direct IO is required.
+    checkDirectIoRead(dest, startOffset, toRead);
+    const size_t bytesRead = readInto(startOffset, dest, toRead);
+    if (bytesRead == 0)
+        // Physical end of input.
+        return false;
+
+    fileOffsetOfBufferEnd_ = startOffset + bytesRead;
+    buffer() = CacheBuffer(dest, dest + bytesRead);
     return true;
 }
 
-void ReadBufferFromVeloxReadFile::resetToInternalWindow()
+void ReadBufferFromFileBase::checkDirectIoRead(
+    const char * dest,
+    size_t startOffset,
+    size_t length) const
 {
-    // Disarm any external buffer and present a coherent empty internal window at
-    // the current offset. currentOffset_ is preserved so the next successful
-    // next() reloads from the same position.
-    bufData_ = internalBuffer_.data();
-    bufCapacity_ = internalBuffer_.size();
-    pos_ = bufData_;
-    bufEnd_ = bufData_;
-    bufStartOffset_ = currentOffset_;
-    externalBuffer_ = false;
+    if (directIoAlignment_ <= 1)
+        return;
+
+    const size_t alignment = directIoAlignment_;
+    VELOX_CHECK_EQ(
+        reinterpret_cast<uintptr_t>(dest) % alignment,
+        0u,
+        "Direct-IO read destination address violates the required alignment");
+    VELOX_CHECK_EQ(
+        startOffset % alignment,
+        0u,
+        "Direct-IO read offset violates the required alignment");
+    VELOX_CHECK_EQ(
+        length % alignment,
+        0u,
+        "Direct-IO read length violates the required alignment "
+        "(unaligned file tail or right bound)");
 }
 
-void ReadBufferFromVeloxReadFile::advance(ptrdiff_t n)
+void ReadBufferFromFileBase::set(char * ptr, size_t size)
 {
-    VELOX_CHECK_GE(n, 0, "Cannot advance by a negative amount");
-    // Compare the signed count against the remaining window before forming
-    // pos_ + n, so an oversized or extreme count never builds an out-of-range
-    // pointer.
-    const ptrdiff_t available = bufEnd_ - pos_;
-    VELOX_CHECK_LE(n, available, "advance past buffer end");
-    pos_ += n;
-    currentOffset_ = bufStartOffset_ + static_cast<size_t>(pos_ - bufData_);
+    if (ptr == nullptr)
+    {
+        VELOX_CHECK_EQ(size, 0u, "Detaching set() requires a size of 0");
+        // Detach every caller pointer and restore a coherent empty window over
+        // the owned buffer, preserving the current file offset.
+        state_.restoreOwnedWindow();
+        return;
+    }
+
+    if (directIoAlignment_ > 1)
+    {
+        VELOX_CHECK_EQ(
+            reinterpret_cast<uintptr_t>(ptr) % directIoAlignment_,
+            0u,
+            "External buffer address violates the direct-IO alignment");
+        VELOX_CHECK_EQ(
+            size % directIoAlignment_,
+            0u,
+            "External buffer length violates the direct-IO alignment");
+        // Validate the offset the next read will actually use (the buffer end),
+        // which equals getPosition() once the working view is drained.
+        VELOX_CHECK_EQ(
+            fileOffsetOfBufferEnd_ % directIoAlignment_,
+            0u,
+            "Read offset violates the direct-IO alignment");
+    }
+
+    // Install caller memory as both the internal and (empty) working buffer so
+    // the next read fills it directly. The target persists until another set().
+    state_.set(ptr, size, 0);
+    state_.workingBuffer().resize(0);
 }
 
-off_t ReadBufferFromVeloxReadFile::getPosition() const
+off_t ReadBufferFromFileBase::seek(off_t offset, int whence)
 {
-    return static_cast<off_t>(currentOffset_);
-}
-
-off_t ReadBufferFromVeloxReadFile::getFileOffsetOfBufferEnd() const
-{
-    return static_cast<off_t>(
-        bufStartOffset_ + static_cast<size_t>(bufEnd_ - bufData_));
-}
-
-void ReadBufferFromVeloxReadFile::seek(off_t offset, int whence)
-{
-    off_t newPosition{0};
+    off_t newPosition = 0;
     if (whence == SEEK_SET)
     {
         VELOX_CHECK_GE(offset, 0, "Cannot seek to a negative offset");
@@ -171,64 +272,111 @@ void ReadBufferFromVeloxReadFile::seek(off_t offset, int whence)
                 std::numeric_limits<off_t>::max() - current,
                 "Seek offset overflows the maximum file position");
         newPosition = current + offset;
-        VELOX_CHECK_GE(
-            newPosition, 0, "Cannot seek before the start of the file");
+        VELOX_CHECK_GE(newPosition, 0, "Cannot seek before the start of the file");
     }
     else
+    {
         throwFileCacheException("Unsupported seek whence: {}", whence);
+    }
 
-    currentOffset_ = static_cast<size_t>(newPosition);
-    // A seek ends any armed external-buffer cycle (see set()'s contract): revert
-    // to the internal buffer so the next next() never reads into caller-owned
-    // storage the caller may already have released.
-    bufData_ = internalBuffer_.data();
-    bufCapacity_ = internalBuffer_.size();
-    externalBuffer_ = false;
-    // Invalidate the buffer so the next next() reads from currentOffset_.
-    pos_ = bufData_;
-    bufEnd_ = bufData_;
-    bufStartOffset_ = currentOffset_;
-    atEof_ = false;
+    // Fail closed on an unaligned direct-IO target before mutating any reader
+    // state, so a rejected seek leaves the position and loaded window untouched.
+    if (directIoAlignment_ > 1)
+        VELOX_CHECK_EQ(
+            static_cast<size_t>(newPosition) % directIoAlignment_,
+            0u,
+            "Direct-IO seek offset violates the required alignment");
+
+    fileOffsetOfBufferEnd_ = static_cast<size_t>(newPosition);
+    // Discard the loaded window but keep the current read target so a set()
+    // target persists across a seek, then the next read starts from here.
+    state_.resetWorkingView();
+    return newPosition;
 }
 
-void ReadBufferFromVeloxReadFile::setReadUntilPosition(size_t filePos)
+void ReadBufferFromFileBase::setReadUntilPosition(size_t position)
 {
-    readUntil_ = filePos;
-    // Update EOF in both directions: shrinking the boundary to at or below the
-    // current offset marks EOF, while extending it beyond the current offset
-    // clears EOF so next() can resume from currentOffset_.
-    atEof_ = currentOffset_ >= readUntil_;
+    readUntil_ = position;
 
-    // Constrain an already-loaded window so bufferEnd never exposes bytes at or
-    // beyond the new exclusive boundary. Work in file-offset space to avoid
-    // forming out-of-range pointers.
-    const size_t windowEndOffset =
-        bufStartOffset_ + static_cast<size_t>(bufEnd_ - bufData_);
-    if (atEof_)
-        // Boundary at or behind the current position: expose an empty window at
-        // the current offset (pos_ already tracks currentOffset_).
-        bufEnd_ = pos_;
-    else if (readUntil_ < windowEndOffset)
-        // Boundary inside the loaded window: clamp bufEnd_ to it.
-        bufEnd_ = bufData_ + (readUntil_ - bufStartOffset_);
+    // File offset that corresponds to the cursor.
+    const size_t currentPosition = fileOffsetOfBufferEnd_ - available();
+
+    if (readUntil_ <= currentPosition)
+    {
+        // Boundary at or behind the cursor: expose an empty window at the cursor
+        // and drop everything from the cursor onwards.
+        buffer().resize(offset());
+        fileOffsetOfBufferEnd_ = currentPosition;
+    }
+    else if (readUntil_ < fileOffsetOfBufferEnd_)
+    {
+        // Boundary inside the loaded window past the cursor: clamp the window
+        // end so it never exposes bytes at or beyond the boundary.
+        const size_t shrink = fileOffsetOfBufferEnd_ - readUntil_;
+        buffer().resize(buffer().size() - shrink);
+        fileOffsetOfBufferEnd_ = readUntil_;
+    }
+    // Otherwise the boundary is at or beyond the loaded window; extending it
+    // lets a later next() resume, and nextImpl re-derives the real end of input.
 }
 
-void ReadBufferFromVeloxReadFile::set(char * data, size_t size)
+// ---------------------------------------------------------------------------
+// ReadBufferFromVeloxReadFile
+// ---------------------------------------------------------------------------
+
+ReadBufferFromVeloxReadFile::ReadBufferFromVeloxReadFile(
+    std::shared_ptr<velox::ReadFile> readFile,
+    velox::memory::MemoryPool * pool,
+    size_t bufferSize)
+    : ownedReadFile_(std::move(readFile))
 {
-    VELOX_CHECK_NOT_NULL(data, "External buffer must not be null");
-    VELOX_CHECK_GT(size, 0u, "External buffer capacity must be > 0");
-    bufData_ = data;
-    bufCapacity_ = size;
-    pos_ = data;
-    // Not yet filled; the next next() fills the external buffer.
-    bufEnd_ = data;
-    bufStartOffset_ = currentOffset_;
-    externalBuffer_ = true;
+    readFile_ = ownedReadFile_.get();
+    initialize(pool, bufferSize);
 }
 
-std::string ReadBufferFromVeloxReadFile::getFileName() const
+ReadBufferFromVeloxReadFile::ReadBufferFromVeloxReadFile(
+    velox::ReadFile * readFile,
+    velox::memory::MemoryPool * pool,
+    size_t bufferSize)
+    : readFile_(readFile)
 {
-    return readFile_ ? readFile_->getName() : std::string{};
+    initialize(pool, bufferSize);
+}
+
+void ReadBufferFromVeloxReadFile::initialize(
+    velox::memory::MemoryPool * pool,
+    size_t bufferSize)
+{
+    VELOX_CHECK_NOT_NULL(readFile_);
+    VELOX_CHECK_NOT_NULL(pool, "A MemoryPool is required for the owned buffer");
+    VELOX_CHECK_GT(bufferSize, 0u, "ReadBuffer size must be > 0");
+
+    uint64_t alignment = 1;
+    readFile_->directIo(alignment);
+    VELOX_CHECK_GT(alignment, 0u, "Direct-IO alignment must be positive");
+    VELOX_CHECK_EQ(
+        alignment & (alignment - 1),
+        0u,
+        "Direct-IO alignment must be a power of two");
+    directIoAlignment_ = alignment;
+
+    fileSize_ = readFile_->size();
+    readUntil_ = fileSize_;
+    fileOffsetOfBufferEnd_ = 0;
+
+    state_.allocateOwned(pool, bufferSize, directIoAlignment_);
+    // ReadBuffer convention: start with an empty working view so the first
+    // next() loads data.
+    state_.workingBuffer().resize(0);
+}
+
+size_t ReadBufferFromVeloxReadFile::readInto(
+    size_t startOffset,
+    char * dest,
+    size_t destCapacity)
+{
+    const std::string_view chunk = readFile_->pread(startOffset, destCapacity, dest);
+    return chunk.size();
 }
 
 } // namespace facebook::velox::ch

@@ -24,97 +24,167 @@
 namespace facebook::velox::ch
 {
 
+// ---------------------------------------------------------------------------
+// WriteBufferFromFileBase
+// ---------------------------------------------------------------------------
+
+void WriteBufferFromFileBase::write(const char * from, size_t n)
+{
+    VELOX_CHECK(!finalized_, "Cannot write to a finalized buffer");
+    VELOX_CHECK(!canceled_, "Cannot write to a canceled buffer");
+    VELOX_CHECK(
+        !buffer().empty(),
+        "Cannot write through an empty (external-only) buffer");
+
+    size_t copied = 0;
+    while (copied < n)
+    {
+        if (!hasPendingData())
+            next();
+        const size_t toCopy = std::min(available(), n - copied);
+        std::memcpy(position(), from + copied, toCopy);
+        position() += toCopy;
+        copied += toCopy;
+    }
+}
+
+void WriteBufferFromFileBase::set(char * ptr, size_t size, size_t offset)
+{
+    // A pure state operation: install a non-owning working view. It never
+    // touches the underlying file, so it stays safe even after cancel() (the
+    // detaching set(nullptr, 0) runs on the write path's cleanup even when a
+    // preceding next() failed).
+    state_.set(ptr, size, offset);
+}
+
+void WriteBufferFromFileBase::advance(size_t n)
+{
+    VELOX_CHECK(!finalized_, "Cannot advance a finalized buffer");
+    VELOX_CHECK(!canceled_, "Cannot advance a canceled buffer");
+    VELOX_CHECK_LE(n, available(), "advance past the buffer capacity");
+    position() += n;
+}
+
+void WriteBufferFromFileBase::next()
+{
+    if (canceled_ || finalized_)
+        return;
+    if (offset() == 0)
+        return;
+
+    const size_t bytesInBuffer = offset();
+    try
+    {
+        nextImpl();
+    }
+    catch (...)
+    {
+        // CH WriteBuffer::next settles bytes += bytes_in_buffer before
+        // cancel/rethrow (WriteBuffer.h:69). Settle here so count()/getPosition()
+        // report the prior committed total plus the attempted chunk, allowing the
+        // caller to reconcile from the physical file size.
+        state_.addBytes(bytesInBuffer);
+        cancel();
+        throw;
+    }
+    state_.addBytes(bytesInBuffer);
+    position() = buffer().begin();
+}
+
+void WriteBufferFromFileBase::sync()
+{
+    if (canceled_ || finalized_)
+        return;
+    next();
+    syncImpl();
+}
+
+void WriteBufferFromFileBase::finalize()
+{
+    if (finalized_)
+        return;
+    if (canceled_)
+        throwFileCacheException("Cannot finalize a canceled writer");
+
+    try
+    {
+        finalizeImpl();
+        finalized_ = true;
+    }
+    catch (...)
+    {
+        // A failed finalize is terminal, exactly like a failed next().
+        cancel();
+        throw;
+    }
+}
+
+void WriteBufferFromFileBase::cancel() noexcept
+{
+    if (canceled_ || finalized_)
+        return;
+    // Append nothing and release the underlying file through its non-throwing
+    // destruction path...
+    cancelImpl();
+    // ...then discard the pending cursor and detach caller memory so no caller
+    // pointer is retained and offset() becomes 0.
+    state_.detach();
+    canceled_ = true;
+}
+
+// ---------------------------------------------------------------------------
+// WriteBufferFromVeloxWriteFile
+// ---------------------------------------------------------------------------
+
 WriteBufferFromVeloxWriteFile::WriteBufferFromVeloxWriteFile(
-    std::shared_ptr<velox::WriteFile> writeFile,
+    std::unique_ptr<velox::WriteFile> writeFile,
+    velox::memory::MemoryPool * pool,
     size_t bufferSize)
     : writeFile_(std::move(writeFile))
-    , buffer_(bufferSize)
 {
     VELOX_CHECK_NOT_NULL(writeFile_);
-    VELOX_CHECK_GT(bufferSize, 0u, "WriteBuffer size must be > 0");
-}
+    fileName_ = writeFile_->getName();
 
-void WriteBufferFromVeloxWriteFile::write(const char * buf, size_t len)
-{
-    VELOX_CHECK(!finalized_, "write after finalize");
-    VELOX_CHECK(!cancelled_, "write after cancel");
-
-    size_t written = 0;
-    while (written < len)
+    if (bufferSize > 0)
     {
-        const size_t capacity = buffer_.size();
-        if (writePos_ == capacity)
-            flushInternal();
-
-        const size_t available = capacity - writePos_;
-        const size_t chunk = std::min(available, len - written);
-        std::memcpy(buffer_.data() + writePos_, buf + written, chunk);
-        writePos_ += chunk;
-        written += chunk;
+        VELOX_CHECK_NOT_NULL(
+            pool, "A MemoryPool is required for a non-zero owned buffer");
+        // Owned staging buffer; the working view stays full so write() can copy
+        // into it. Writers do not use direct-IO alignment (WriteFile does not
+        // expose it), so the default 64-byte pool alignment is sufficient.
+        state_.allocateOwned(pool, bufferSize, 1);
     }
-    totalWritten_ += len;
+    // bufferSize == 0: external-only writer, no owned BufferPtr; the working
+    // view stays empty and the caller drives it with set(from, size, offset).
 }
 
-void WriteBufferFromVeloxWriteFile::next(char *& data, int64_t & size)
+void WriteBufferFromVeloxWriteFile::nextImpl()
 {
-    VELOX_CHECK(!finalized_, "next after finalize");
-    VELOX_CHECK(!cancelled_, "next after cancel");
-
-    if (writePos_ == buffer_.size())
-        flushInternal();
-
-    data = buffer_.data() + writePos_;
-    size = static_cast<int64_t>(buffer_.size() - writePos_);
+    // Append exactly the pending bytes directly from the working view; for an
+    // external buffer this is the caller's own memory (application-level zero
+    // copy). Do not flush here.
+    writeFile_->append(std::string_view(buffer().begin(), offset()));
 }
 
-void WriteBufferFromVeloxWriteFile::advance(size_t n)
+void WriteBufferFromVeloxWriteFile::finalizeImpl()
 {
-    // advance stages bytes into the buffer just like write()/next(); reject it
-    // after a terminal transition so no later flush can commit orphaned bytes.
-    VELOX_CHECK(!finalized_, "advance after finalize");
-    VELOX_CHECK(!cancelled_, "advance after cancel");
-    // Compare against the remaining capacity so the validation itself cannot
-    // overflow (writePos_ <= buffer_.size() always holds).
-    VELOX_CHECK_LE(
-        n,
-        buffer_.size() - writePos_,
-        "advance past buffer capacity");
-    writePos_ += n;
-    totalWritten_ += n;
-}
-
-void WriteBufferFromVeloxWriteFile::flush()
-{
-    if (!finalized_ && !cancelled_)
-    {
-        flushInternal();
-        writeFile_->flush();
-    }
-}
-
-void WriteBufferFromVeloxWriteFile::finalize()
-{
-    VELOX_CHECK(!finalized_, "finalize called twice");
-    VELOX_CHECK(!cancelled_, "finalize after cancel");
-    flushInternal();
-    writeFile_->flush();
+    // Append any pending bytes, then close. No extra flush so a normal close is
+    // not turned into a per-segment fsync.
+    next();
     writeFile_->close();
-    finalized_ = true;
 }
 
-void WriteBufferFromVeloxWriteFile::cancel()
+void WriteBufferFromVeloxWriteFile::syncImpl()
 {
-    VELOX_CHECK(!finalized_, "cancel after finalize");
-    writePos_ = 0;
-    cancelled_ = true;
+    writeFile_->flush();
 }
 
-void WriteBufferFromVeloxWriteFile::flushInternal()
+void WriteBufferFromVeloxWriteFile::cancelImpl() noexcept
 {
-    if (writePos_ == 0)
-        return;
-    writeFile_->append(std::string_view(buffer_.data(), writePos_));
-    writePos_ = 0;
+    // Append nothing; release the file so its non-throwing destructor closes the
+    // handle. Any bytes already appended stay on disk for the caller to
+    // reconcile; buffered-but-unappended bytes are discarded.
+    writeFile_.reset();
 }
 
 } // namespace facebook::velox::ch

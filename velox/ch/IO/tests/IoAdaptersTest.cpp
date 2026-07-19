@@ -16,17 +16,18 @@
 
 #include "velox/ch/IO/ReadBufferFromVeloxReadFile.h"
 #include "velox/ch/IO/WriteBufferFromVeloxWriteFile.h"
+
+#include "velox/buffer/Buffer.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/file/File.h"
+#include "velox/common/memory/Memory.h"
 
 #include <gtest/gtest.h>
 
-#include <atomic>
+#include <cstdint>
 #include <cstring>
-#include <limits>
 #include <memory>
 #include <string>
-#include <vector>
 
 namespace facebook::velox::ch
 {
@@ -34,13 +35,16 @@ namespace
 {
 
 // ---------------------------------------------------------------------------
-// In-memory mock ReadFile
+// Mock ReadFile: serves in-memory data, counts preads, records the read
+// destination, and can report a direct-IO alignment.
 // ---------------------------------------------------------------------------
-
 class MockReadFile : public velox::ReadFile
 {
 public:
-    explicit MockReadFile(std::string data) : data_(std::move(data)) {}
+    explicit MockReadFile(std::string data, uint64_t directIoAlignment = 1)
+        : data_(std::move(data)), directIoAlignment_(directIoAlignment)
+    {
+    }
 
     std::string_view pread(
         uint64_t offset,
@@ -48,6 +52,23 @@ public:
         void * buf,
         const velox::FileIoContext &) const override
     {
+        ++preadCalls_;
+        lastPreadDest_ = buf;
+        lastPreadOffset_ = offset;
+        lastPreadLength_ = length;
+        // Enforce O_DIRECT-style alignment on the actual read the adapter issues.
+        // The call count is recorded above *first*, so a test can prove the
+        // adapter fails closed before pread (call count unchanged) rather than
+        // relying on this backstop to reject a misaligned read.
+        if (directIoAlignment_ > 1)
+        {
+            VELOX_CHECK_EQ(offset % directIoAlignment_, 0u, "mock pread: unaligned offset");
+            VELOX_CHECK_EQ(length % directIoAlignment_, 0u, "mock pread: unaligned length");
+            VELOX_CHECK_EQ(
+                reinterpret_cast<uintptr_t>(buf) % directIoAlignment_,
+                0u,
+                "mock pread: unaligned destination");
+        }
         const uint64_t available =
             offset < data_.size() ? data_.size() - offset : 0;
         const uint64_t toRead = std::min(length, available);
@@ -57,23 +78,38 @@ public:
         return {static_cast<const char *>(buf), toRead};
     }
 
+    bool directIo(uint64_t & alignment) const override
+    {
+        alignment = directIoAlignment_;
+        return directIoAlignment_ > 1;
+    }
+
     bool shouldCoalesce() const override { return false; }
     uint64_t size() const override { return data_.size(); }
     uint64_t memoryUsage() const override { return data_.size(); }
     std::string getName() const override { return "MockReadFile"; }
     uint64_t getNaturalReadSize() const override { return 4096; }
 
+    int preadCalls() const { return preadCalls_; }
+    const void * lastPreadDest() const { return lastPreadDest_; }
+    uint64_t lastPreadOffset() const { return lastPreadOffset_; }
+    uint64_t lastPreadLength() const { return lastPreadLength_; }
+
 private:
     std::string data_;
+    uint64_t directIoAlignment_;
+    mutable int preadCalls_{0};
+    mutable const void * lastPreadDest_{nullptr};
+    mutable uint64_t lastPreadOffset_{0};
+    mutable uint64_t lastPreadLength_{0};
 };
 
-// A ReadFile whose pread throws on demand, used to exercise next()'s exception
-// path and prove the external-buffer lifetime ends even when a physical read
-// fails.
-class ThrowingReadFile : public velox::ReadFile
+// A ReadFile whose pread throws on the first call and counts invocations, used
+// to prove the reader's exception state is terminal.
+class CountingThrowReadFile : public velox::ReadFile
 {
 public:
-    explicit ThrowingReadFile(std::string data) : data_(std::move(data)) {}
+    explicit CountingThrowReadFile(std::string data) : data_(std::move(data)) {}
 
     std::string_view pread(
         uint64_t offset,
@@ -81,11 +117,9 @@ public:
         void * buf,
         const velox::FileIoContext &) const override
     {
-        if (throwOnNextPread_)
-        {
-            throwOnNextPread_ = false;
+        ++preadCalls_;
+        if (preadCalls_ == 1)
             VELOX_FAIL("simulated pread failure");
-        }
         const uint64_t available =
             offset < data_.size() ? data_.size() - offset : 0;
         const uint64_t toRead = std::min(length, available);
@@ -94,627 +128,771 @@ public:
         return {static_cast<const char *>(buf), toRead};
     }
 
-    // Arms the next pread call to throw exactly once.
-    void throwOnNextPread() { throwOnNextPread_ = true; }
+    int preadCalls() const { return preadCalls_; }
 
     bool shouldCoalesce() const override { return false; }
     uint64_t size() const override { return data_.size(); }
     uint64_t memoryUsage() const override { return data_.size(); }
-    std::string getName() const override { return "ThrowingReadFile"; }
+    std::string getName() const override { return "CountingThrowReadFile"; }
     uint64_t getNaturalReadSize() const override { return 4096; }
 
 private:
     std::string data_;
-    mutable bool throwOnNextPread_{false};
+    mutable int preadCalls_{0};
 };
 
 // ---------------------------------------------------------------------------
-// In-memory mock WriteFile
+// Mock WriteFile: reports every observable event to an external observer so the
+// state survives the WriteFile being released by cancel().
 // ---------------------------------------------------------------------------
+struct WriteFileObserver
+{
+    std::string content;
+    const char * lastAppendData{nullptr};
+    size_t lastAppendSize{0};
+    int appendCalls{0};
+    int flushCalls{0};
+    int closeCalls{0};
+    size_t contentSizeAtLastFlush{0};
+    bool closed{false};
+    bool destroyed{false};
+    // When >= 0, the append whose 0-based index equals this value throws.
+    int throwOnAppendIndex{-1};
+    // On the throwing append, physically commit this many bytes (a strict prefix
+    // of the requested data) before failing, so a caller can observe a partial
+    // physical write.
+    size_t partialPrefixBytes{0};
+    std::string name{"ObservableWriteFile"};
+};
 
-class MockWriteFile : public velox::WriteFile
+class ObservableWriteFile : public velox::WriteFile
 {
 public:
+    explicit ObservableWriteFile(WriteFileObserver * observer) : observer_(observer)
+    {
+    }
+
+    ~ObservableWriteFile() override { observer_->destroyed = true; }
+
     void append(std::string_view data) override
     {
-        VELOX_CHECK(!closed_, "WriteFile already closed");
-        VELOX_CHECK(!cancelled_, "WriteFile already cancelled");
-        content_.append(data);
+        VELOX_CHECK(!observer_->closed, "append after close");
+        if (observer_->throwOnAppendIndex == observer_->appendCalls)
+        {
+            observer_->throwOnAppendIndex = -1;
+            // Physically commit a strict prefix (possibly empty) before failing,
+            // so a caller can later observe the partial physical write. The
+            // append itself does not complete: appendCalls is not incremented.
+            const size_t prefix =
+                std::min(observer_->partialPrefixBytes, data.size());
+            if (prefix > 0)
+                observer_->content.append(data.substr(0, prefix));
+            observer_->lastAppendData = data.data();
+            observer_->lastAppendSize = data.size();
+            VELOX_FAIL("simulated append failure");
+        }
+        observer_->lastAppendData = data.data();
+        observer_->lastAppendSize = data.size();
+        ++observer_->appendCalls;
+        observer_->content.append(data);
     }
 
     void flush() override
     {
-        flushed_ = true;
+        ++observer_->flushCalls;
+        observer_->contentSizeAtLastFlush = observer_->content.size();
     }
 
     void close() override
     {
-        closed_ = true;
+        ++observer_->closeCalls;
+        observer_->closed = true;
     }
 
-    uint64_t size() const override { return content_.size(); }
-
-    const std::string getName() const override
-    {
-        return "MockWriteFile";
-    }
-
-    const std::string & content() const { return content_; }
-    bool isClosed() const { return closed_; }
-    bool isFlushed() const { return flushed_; }
-    bool isCancelled() const { return cancelled_; }
-
-    void setCancelled() { cancelled_ = true; }
+    uint64_t size() const override { return observer_->content.size(); }
+    const std::string getName() const override { return observer_->name; }
 
 private:
-    std::string content_;
-    bool closed_{false};
-    bool flushed_{false};
-    bool cancelled_{false};
+    WriteFileObserver * observer_;
 };
 
 // ---------------------------------------------------------------------------
-// ReadBufferFromVeloxReadFile tests
+// Fixture providing a leaf MemoryPool for the owned buffers.
 // ---------------------------------------------------------------------------
+class IoAdaptersTest : public ::testing::Test
+{
+protected:
+    static void SetUpTestCase()
+    {
+        FLAGS_velox_enable_memory_usage_track_in_default_memory_pool = true;
+    }
 
-TEST(ReadBufferFromVeloxReadFileTest, NextReadsDataInChunks)
+    void SetUp() override
+    {
+        pool_ = memoryManager_.addLeafPool("io-adapters-test");
+    }
+
+    velox::memory::MemoryManager memoryManager_;
+    std::shared_ptr<velox::memory::MemoryPool> pool_;
+};
+
+std::string toString(const CacheBuffer & buffer)
+{
+    return std::string(buffer.begin(), buffer.size());
+}
+
+// ===========================================================================
+// ReadBufferFromVeloxReadFile
+// ===========================================================================
+
+// Basic streaming: read the whole file in chunks and track count()/position.
+TEST_F(IoAdaptersTest, ReaderReadsWholeFileInChunks)
 {
     const std::string data(8192, 'A');
     auto rf = std::make_shared<MockReadFile>(data);
-    ReadBufferFromVeloxReadFile reader(rf, /*bufferSize=*/4096);
+    ReadBufferFromVeloxReadFile reader(rf, pool_.get(), /*bufferSize=*/4096);
 
     std::string result;
-    while (reader.next())
+    while (!reader.eof())
     {
-        result.append(reader.position(), reader.bufferEnd() - reader.position());
-        reader.advance(reader.bufferEnd() - reader.position());
+        const size_t available = reader.available();
+        result.append(reader.position(), available);
+        reader.position() += available;
     }
     EXPECT_EQ(result, data);
-}
-
-TEST(ReadBufferFromVeloxReadFileTest, NextReturnsFalseAtEof)
-{
-    auto rf = std::make_shared<MockReadFile>("hello");
-    ReadBufferFromVeloxReadFile reader(rf);
-
-    ASSERT_TRUE(reader.next());
-    reader.advance(reader.bufferEnd() - reader.position());
-    EXPECT_FALSE(reader.next());
+    // "settle consumed offset before the next nextImpl": count() accumulates the
+    // consumed bytes across every next().
+    EXPECT_EQ(reader.count(), data.size());
+    EXPECT_EQ(reader.getPosition(), static_cast<off_t>(data.size()));
     EXPECT_TRUE(reader.eof());
 }
 
-TEST(ReadBufferFromVeloxReadFileTest, GetPositionTracksConsumption)
+// Reader 1: eof() fills an empty reader and reports false while bytes are
+// available.
+TEST_F(IoAdaptersTest, ReaderEofFillsBuffer)
+{
+    auto rf = std::make_shared<MockReadFile>("hello");
+    ReadBufferFromVeloxReadFile reader(rf, pool_.get());
+
+    EXPECT_FALSE(reader.hasPendingData());
+    EXPECT_FALSE(reader.eof());
+    EXPECT_TRUE(reader.hasPendingData());
+    EXPECT_EQ(reader.available(), 5u);
+    EXPECT_EQ(toString(reader.buffer()), "hello");
+}
+
+// Reader 2: next() settles the consumed offset (bytes) before the next read.
+TEST_F(IoAdaptersTest, ReaderNextSettlesConsumedOffset)
 {
     const std::string data(1024, 'B');
     auto rf = std::make_shared<MockReadFile>(data);
-    ReadBufferFromVeloxReadFile reader(rf, 512);
+    ReadBufferFromVeloxReadFile reader(rf, pool_.get(), /*bufferSize=*/512);
 
-    EXPECT_EQ(reader.getPosition(), 0);
     ASSERT_TRUE(reader.next());
-    EXPECT_EQ(reader.getFileOffsetOfBufferEnd(), 512);
+    EXPECT_EQ(reader.getFileOffsetOfBufferEnd(), 512u);
+    EXPECT_EQ(reader.count(), 0u); // nothing consumed yet
 
-    reader.advance(256);
+    reader.position() += 256; // consume half
+    EXPECT_EQ(reader.count(), 256u);
     EXPECT_EQ(reader.getPosition(), 256);
+
+    reader.position() += 256; // consume the rest
+    ASSERT_TRUE(reader.next()); // settles 512 -> bytes, then reads more
+    EXPECT_EQ(reader.count(), 512u);
+    EXPECT_EQ(reader.getFileOffsetOfBufferEnd(), 1024u);
 }
 
-TEST(ReadBufferFromVeloxReadFileTest, SetReadUntilPositionLimitsReads)
+// Reader 3: a pread exception cancels the reader; the state is terminal and a
+// second read is rejected without touching pread again.
+TEST_F(IoAdaptersTest, ReaderExceptionIsTerminal)
 {
-    const std::string data(4096, 'C');
-    auto rf = std::make_shared<MockReadFile>(data);
-    ReadBufferFromVeloxReadFile reader(rf, 4096);
+    auto rf = std::make_shared<CountingThrowReadFile>("abcdefgh");
+    ReadBufferFromVeloxReadFile reader(rf, pool_.get());
+
+    EXPECT_THROW(reader.next(), VeloxException);
+    EXPECT_TRUE(reader.isCanceled());
+    EXPECT_THROW(reader.next(), VeloxException);
+    EXPECT_EQ(rf->preadCalls(), 1)
+        << "a canceled reader must not retry the physical read";
+}
+
+// Reader 4: external memory remains the read target across reads until an
+// explicit detach.
+TEST_F(IoAdaptersTest, ReaderExternalBufferPersistsAcrossReads)
+{
+    auto rf = std::make_shared<MockReadFile>("AAAABBBB");
+    ReadBufferFromVeloxReadFile reader(rf, pool_.get());
+
+    char ext[4] = {0, 0, 0, 0};
+    reader.set(ext, sizeof(ext));
+
+    ASSERT_TRUE(reader.next());
+    EXPECT_EQ(reader.buffer().begin(), ext);
+    EXPECT_EQ(toString(reader.buffer()), "AAAA");
+
+    reader.position() = reader.buffer().end(); // consume
+    ASSERT_TRUE(reader.next());
+    EXPECT_EQ(reader.buffer().begin(), ext)
+        << "external buffer must remain the read target";
+    EXPECT_EQ(std::string(ext, sizeof(ext)), "BBBB");
+}
+
+// Reader 5: set(nullptr, 0) removes every reference to caller memory.
+TEST_F(IoAdaptersTest, ReaderSetNullDetaches)
+{
+    auto rf = std::make_shared<MockReadFile>("payload");
+    ReadBufferFromVeloxReadFile reader(rf, pool_.get());
+
+    char ext[4] = {0, 0, 0, 0};
+    reader.set(ext, sizeof(ext));
+    ASSERT_TRUE(reader.next());
+    ASSERT_EQ(reader.internalBuffer().begin(), ext);
+
+    EXPECT_NO_THROW(reader.set(nullptr, 0));
+    EXPECT_NE(reader.internalBuffer().begin(), ext);
+    EXPECT_NE(reader.position(), ext);
+    EXPECT_EQ(reader.available(), 0u);
+}
+
+// Reader 6: the attach/read/detach handoff satisfies both FileSegment
+// invariants (available()==0 and getFileOffsetOfBufferEnd()==currentWriteOffset,
+// with no pointer left referencing the caller buffer).
+TEST_F(IoAdaptersTest, ReaderHandoffSatisfiesFileSegmentInvariants)
+{
+    auto rf = std::make_shared<MockReadFile>(std::string(4096, 'Z'));
+    ReadBufferFromVeloxReadFile reader(rf, pool_.get());
+
+    char queryBuffer[1024];
+    reader.seek(0);
+    reader.set(queryBuffer, sizeof(queryBuffer));
+    ASSERT_TRUE(reader.next());
+    EXPECT_EQ(reader.buffer().begin(), queryBuffer); // remote bytes landed in B
+
+    // FileSegment writes B to cache; its currentWriteOffset advances to here.
+    const size_t currentWriteOffset = reader.getFileOffsetOfBufferEnd();
+
+    reader.set(nullptr, 0); // detach, then hand the reader to FileSegment
+    EXPECT_EQ(reader.available(), 0u);
+    EXPECT_EQ(reader.getFileOffsetOfBufferEnd(), currentWriteOffset);
+    EXPECT_NE(reader.internalBuffer().begin(), queryBuffer);
+    EXPECT_NE(reader.position(), queryBuffer);
+}
+
+// Reader 7a: setReadUntilPosition bounds a read and, when shrunk over an already
+// loaded window, clamps it; extending resumes.
+TEST_F(IoAdaptersTest, ReaderRightBoundShrinkAndExtend)
+{
+    auto rf = std::make_shared<MockReadFile>(std::string(4096, 'C'));
+    ReadBufferFromVeloxReadFile reader(rf, pool_.get(), /*bufferSize=*/4096);
 
     reader.setReadUntilPosition(512);
-
     ASSERT_TRUE(reader.next());
-    // Must not read past the readUntil boundary.
-    EXPECT_LE(
-        static_cast<size_t>(reader.bufferEnd() - reader.position()), 512u);
+    EXPECT_EQ(reader.buffer().size(), 512u);
+    EXPECT_EQ(reader.getFileOffsetOfBufferEnd(), 512u);
+
+    // Shrink below the loaded window: it must not expose bytes at/after 256.
+    reader.setReadUntilPosition(256);
+    EXPECT_EQ(reader.buffer().size(), 256u);
+    EXPECT_EQ(reader.getFileOffsetOfBufferEnd(), 256u);
+
+    // Extend and resume from where we stopped.
+    reader.setReadUntilPosition(1024);
+    reader.position() = reader.buffer().end();
+    ASSERT_TRUE(reader.next());
+    EXPECT_EQ(reader.getFileOffsetOfBufferEnd(), 1024u);
 }
 
-TEST(ReadBufferFromVeloxReadFileTest, SeekRepositionsToAbsoluteOffset)
+// Reader 7b: seek repositions and the buffer-end offset / pending-data track it.
+TEST_F(IoAdaptersTest, ReaderSeekAndPendingData)
 {
-    const std::string data = "0123456789";
-    auto rf = std::make_shared<MockReadFile>(data);
-    ReadBufferFromVeloxReadFile reader(rf);
+    auto rf = std::make_shared<MockReadFile>("0123456789");
+    ReadBufferFromVeloxReadFile reader(rf, pool_.get());
 
-    reader.seek(5);
+    EXPECT_EQ(reader.seek(5), 5);
+    EXPECT_FALSE(reader.hasPendingData());
+    ASSERT_TRUE(reader.next());
+    EXPECT_EQ(toString(reader.buffer()), "56789");
     EXPECT_EQ(reader.getPosition(), 5);
+    EXPECT_EQ(reader.getFileOffsetOfBufferEnd(), 10u);
+    EXPECT_TRUE(reader.hasPendingData());
 
-    ASSERT_TRUE(reader.next());
-    EXPECT_EQ(std::string(reader.position(), reader.bufferEnd()), "56789");
+    reader.position() += reader.available();
+    EXPECT_FALSE(reader.hasPendingData());
+    EXPECT_TRUE(reader.eof());
 }
 
-TEST(ReadBufferFromVeloxReadFileTest, ExternalBufferIsUsedForReads)
-{
-    const std::string data = "external-buffer-test";
-    auto rf = std::make_shared<MockReadFile>(data);
-    ReadBufferFromVeloxReadFile reader(rf);
-
-    // Provide an external buffer; next() should write into it directly.
-    std::vector<char> externalBuf(data.size());
-    reader.set(externalBuf.data(), externalBuf.size());
-
-    ASSERT_TRUE(reader.next());
-    EXPECT_EQ(
-        std::string(externalBuf.data(), data.size()),
-        data);
-}
-
-TEST(ReadBufferFromVeloxReadFileTest, ExternalBufferIsSingleUseThenRevertsToInternal)
-{
-    const std::string data = "ABCDEFGH";
-    auto rf = std::make_shared<MockReadFile>(data);
-    // Small internal buffer so the file is read in 4-byte chunks.
-    ReadBufferFromVeloxReadFile reader(rf, 4);
-
-    // Arm an external buffer for exactly one read cycle.
-    std::vector<char> externalBuf(4, '\0');
-    reader.set(externalBuf.data(), externalBuf.size());
-
-    // First next() reads directly into the external buffer.
-    ASSERT_TRUE(reader.next());
-    EXPECT_EQ(std::string(reader.position(), reader.bufferEnd()), "ABCD");
-    EXPECT_EQ(std::string(externalBuf.data(), externalBuf.size()), "ABCD");
-    reader.advance(reader.bufferEnd() - reader.position());
-
-    // The external buffer is single-use: the second next() must read into the
-    // reader's internal buffer and must NOT touch the caller's external buffer
-    // (which the caller is free to release once the first next() returned).
-    ASSERT_TRUE(reader.next());
-    EXPECT_EQ(std::string(reader.position(), reader.bufferEnd()), "EFGH");
-    EXPECT_EQ(std::string(externalBuf.data(), externalBuf.size()), "ABCD")
-        << "second next() must not write into the consumed external buffer";
-}
-
-TEST(ReadBufferFromVeloxReadFileTest, SeekCancelsArmedExternalBuffer)
-{
-    const std::string data = "ABCDEFGHIJ";
-    auto rf = std::make_shared<MockReadFile>(data);
-    ReadBufferFromVeloxReadFile reader(rf, 4);
-
-    // Arm an external buffer but seek before consuming it. Per set()'s contract
-    // a seek ends the external buffer's validity window, so the caller may
-    // release it; the next read must land in the internal buffer and must not
-    // write through the released external storage.
-    std::vector<char> externalBuf(4, '\0');
-    reader.set(externalBuf.data(), externalBuf.size());
-    reader.seek(4, SEEK_SET);
-
-    ASSERT_TRUE(reader.next());
-    EXPECT_EQ(std::string(reader.position(), reader.bufferEnd()), "EFGH");
-    EXPECT_EQ(
-        std::string(externalBuf.data(), externalBuf.size()),
-        std::string(4, '\0'))
-        << "next() after set()+seek() must not write into the released external "
-           "buffer";
-}
-
-TEST(ReadBufferFromVeloxReadFileTest, NonOwningConstructorDoesNotDelete)
-{
-    const std::string data = "non-owning";
-    MockReadFile rawFile(data);
-
-    {
-        ReadBufferFromVeloxReadFile reader(&rawFile);
-        ASSERT_TRUE(reader.next());
-    }
-    // rawFile must still be usable after reader is destroyed.
-    EXPECT_EQ(rawFile.size(), data.size());
-}
-
-TEST(ReadBufferFromVeloxReadFileTest, GetFileNameDelegates)
+// Reader 8: the owned buffer is charged to the injected pool and released when
+// the reader is destroyed.
+TEST_F(IoAdaptersTest, ReaderOwnedBufferChargedToPool)
 {
     auto rf = std::make_shared<MockReadFile>("x");
-    ReadBufferFromVeloxReadFile reader(rf);
+    auto pool = memoryManager_.addLeafPool("reader-pool");
+    ASSERT_EQ(pool->usedBytes(), 0);
+    {
+        ReadBufferFromVeloxReadFile reader(rf, pool.get(), /*bufferSize=*/64 * 1024);
+        EXPECT_GT(pool->usedBytes(), 0)
+            << "owned buffer must be allocated from the injected pool";
+    }
+    EXPECT_EQ(pool->usedBytes(), 0) << "owned buffer must be released";
+}
+
+// Reader 9: with direct IO enabled the owned buffer is aligned, aligned external
+// buffers are accepted, and misaligned ones are rejected.
+TEST_F(IoAdaptersTest, ReaderDirectIoAlignment)
+{
+    constexpr uint64_t kAlignment = 512;
+    auto rf = std::make_shared<MockReadFile>(std::string(4096, 'D'), kAlignment);
+    ReadBufferFromVeloxReadFile reader(rf, pool_.get(), /*bufferSize=*/4096);
+
+    // Owned buffer address is aligned.
+    EXPECT_EQ(
+        reinterpret_cast<uintptr_t>(reader.internalBuffer().begin()) % kAlignment,
+        0u);
+
+    alignas(kAlignment) char aligned[kAlignment];
+    EXPECT_NO_THROW(reader.set(aligned, kAlignment));
+    reader.set(nullptr, 0);
+
+    // Misaligned address and misaligned length are rejected (no silent
+    // buffered-IO fallback).
+    EXPECT_THROW(reader.set(aligned + 1, kAlignment), VeloxException);
+    EXPECT_THROW(reader.set(aligned, kAlignment - 1), VeloxException);
+}
+
+// Reader 9a (direct-IO): a fully aligned read succeeds and issues exactly one
+// aligned pread; an aligned seek target is accepted.
+TEST_F(IoAdaptersTest, ReaderDirectIoAlignedReadSucceeds)
+{
+    constexpr uint64_t kAlignment = 512;
+    // File size is a multiple of the alignment so every read stays aligned.
+    auto rf = std::make_shared<MockReadFile>(std::string(1024, 'D'), kAlignment);
+    ReadBufferFromVeloxReadFile reader(rf, pool_.get(), /*bufferSize=*/512);
+
+    // An aligned seek target is accepted and issues no read on its own.
+    EXPECT_EQ(reader.seek(512), 512);
+    EXPECT_EQ(rf->preadCalls(), 0);
+    EXPECT_EQ(reader.seek(0), 0);
+
+    ASSERT_TRUE(reader.next()); // aligned read of [0, 512)
+    EXPECT_EQ(reader.available(), 512u);
+    EXPECT_EQ(rf->preadCalls(), 1);
+    EXPECT_EQ(rf->lastPreadOffset() % kAlignment, 0u);
+    EXPECT_EQ(rf->lastPreadLength() % kAlignment, 0u);
+    EXPECT_EQ(
+        reinterpret_cast<uintptr_t>(rf->lastPreadDest()) % kAlignment, 0u);
+}
+
+// Reader 9b (direct-IO): an unaligned SEEK_SET target is rejected before it
+// mutates the reader position, and no read is issued.
+TEST_F(IoAdaptersTest, ReaderDirectIoUnalignedSeekRejected)
+{
+    constexpr uint64_t kAlignment = 512;
+    auto rf = std::make_shared<MockReadFile>(std::string(1024, 'D'), kAlignment);
+    ReadBufferFromVeloxReadFile reader(rf, pool_.get(), /*bufferSize=*/512);
+
+    EXPECT_THROW(reader.seek(100), VeloxException);
+    EXPECT_EQ(reader.getFileOffsetOfBufferEnd(), 0u)
+        << "a rejected unaligned seek must not move the reader position";
+    EXPECT_EQ(rf->preadCalls(), 0);
+}
+
+// Reader 9c (direct-IO): an unaligned file tail is rejected *before* pread, so
+// the mock's pread call count is unchanged (no over-read, no silent rounding).
+TEST_F(IoAdaptersTest, ReaderDirectIoUnalignedTailRejectedBeforePread)
+{
+    constexpr uint64_t kAlignment = 512;
+    // 512 aligned bytes followed by a 100-byte unaligned tail.
+    auto rf = std::make_shared<MockReadFile>(std::string(612, 'D'), kAlignment);
+    ReadBufferFromVeloxReadFile reader(rf, pool_.get(), /*bufferSize=*/512);
+
+    ASSERT_TRUE(reader.next()); // aligned read of [0, 512)
+    EXPECT_EQ(rf->preadCalls(), 1);
+    reader.position() = reader.buffer().end(); // consume the loaded window
+
+    EXPECT_THROW(reader.next(), VeloxException)
+        << "an unaligned file tail must fail closed";
+    EXPECT_EQ(rf->preadCalls(), 1)
+        << "the adapter must reject the unaligned tail before calling pread";
+}
+
+// Reader 9d (direct-IO): an unaligned right bound is rejected before pread.
+TEST_F(IoAdaptersTest, ReaderDirectIoUnalignedRightBoundRejectedBeforePread)
+{
+    constexpr uint64_t kAlignment = 512;
+    auto rf = std::make_shared<MockReadFile>(std::string(1024, 'D'), kAlignment);
+    ReadBufferFromVeloxReadFile reader(rf, pool_.get(), /*bufferSize=*/1024);
+
+    reader.setReadUntilPosition(600); // unaligned right bound
+    EXPECT_THROW(reader.next(), VeloxException)
+        << "an unaligned right bound must fail closed";
+    EXPECT_EQ(rf->preadCalls(), 0)
+        << "the adapter must reject the unaligned right bound before calling pread";
+}
+
+// The non-owning raw-pointer constructor does not take ownership of the file.
+TEST_F(IoAdaptersTest, ReaderNonOwningConstructor)
+{
+    MockReadFile rawFile("non-owning");
+    {
+        ReadBufferFromVeloxReadFile reader(&rawFile, pool_.get());
+        ASSERT_TRUE(reader.next());
+    }
+    EXPECT_EQ(rawFile.size(), std::string("non-owning").size());
+}
+
+// Capability and identity accessors.
+TEST_F(IoAdaptersTest, ReaderCapabilitiesAndIdentity)
+{
+    auto rf = std::make_shared<MockReadFile>("abcdef");
+    ReadBufferFromVeloxReadFile reader(rf, pool_.get());
+    EXPECT_TRUE(reader.supportsExternalBufferMode());
+    EXPECT_TRUE(reader.supportsRightBoundedReads());
     EXPECT_EQ(reader.getFileName(), "MockReadFile");
+    ASSERT_TRUE(reader.tryGetFileSize().has_value());
+    EXPECT_EQ(reader.tryGetFileSize().value(), 6u);
+
+    // The stored base type is what FileSegment::RemoteFileReaderPtr holds.
+    std::shared_ptr<ReadBufferFromFileBase> base =
+        std::make_shared<ReadBufferFromVeloxReadFile>(rf, pool_.get());
+    EXPECT_EQ(base->getFileName(), "MockReadFile");
 }
 
-// ---------------------------------------------------------------------------
-// ReadBufferFromVeloxReadFile: offset and boundary safety
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// WriteBufferFromVeloxWriteFile
+// ===========================================================================
 
-TEST(ReadBufferFromVeloxReadFileTest, AdvanceRejectsNegativeCount)
+// Writer 1: a buffer-size-0 external attach + no-arg next appends without a
+// staging copy; the address the WriteFile observes equals the caller buffer.
+TEST_F(IoAdaptersTest, WriterExternalZeroCopyAppend)
 {
-    auto rf = std::make_shared<MockReadFile>("hello");
-    ReadBufferFromVeloxReadFile reader(rf);
+    WriteFileObserver observer;
+    auto wf = std::make_unique<ObservableWriteFile>(&observer);
+    WriteBufferFromVeloxWriteFile writer(std::move(wf)); // bufferSize 0
 
-    ASSERT_TRUE(reader.next());
-    // A negative advance must be rejected before any pointer arithmetic.
-    EXPECT_THROW(reader.advance(-1), VeloxException);
-    // The rejected advance must not have moved the cursor.
-    EXPECT_EQ(reader.getPosition(), 0);
+    const std::string payload = "zero-copy-payload";
+    auto external = AlignedBuffer::allocate<char>(payload.size(), pool_.get());
+    char * externalData = external->asMutable<char>();
+    std::memcpy(externalData, payload.data(), payload.size());
+
+    writer.set(externalData, payload.size(), payload.size());
+    writer.next();
+    writer.set(nullptr, 0);
+
+    EXPECT_EQ(observer.lastAppendData, externalData)
+        << "append must receive the caller buffer directly (no staging copy)";
+    EXPECT_EQ(observer.content, payload);
+    EXPECT_EQ(observer.appendCalls, 1);
 }
 
-TEST(ReadBufferFromVeloxReadFileTest, AdvanceRejectsOversizedCount)
+// Writer 2: a non-zero owned buffer is a BufferPtr charged to the injected pool.
+TEST_F(IoAdaptersTest, WriterOwnedBufferChargedToPool)
 {
-    const std::string data = "ABCDEFGH";
-    auto rf = std::make_shared<MockReadFile>(data);
-    ReadBufferFromVeloxReadFile reader(rf, 4);
-
-    ASSERT_TRUE(reader.next());
-    const ptrdiff_t available = reader.bufferEnd() - reader.position();
-    // One byte past the loaded window must be rejected.
-    EXPECT_THROW(reader.advance(available + 1), VeloxException);
-    // An extreme count must be rejected without out-of-range pointer
-    // arithmetic.
-    EXPECT_THROW(
-        reader.advance(std::numeric_limits<ptrdiff_t>::max()), VeloxException);
-    // The rejected advances must not have moved the cursor.
-    EXPECT_EQ(reader.getPosition(), 0);
+    auto pool = memoryManager_.addLeafPool("writer-pool");
+    ASSERT_EQ(pool->usedBytes(), 0);
+    WriteFileObserver observer;
+    {
+        auto wf = std::make_unique<ObservableWriteFile>(&observer);
+        WriteBufferFromVeloxWriteFile writer(
+            std::move(wf), pool.get(), /*bufferSize=*/64 * 1024);
+        EXPECT_GT(pool->usedBytes(), 0);
+    }
+    EXPECT_EQ(pool->usedBytes(), 0);
 }
 
-TEST(ReadBufferFromVeloxReadFileTest, SeekSetRejectsNegativeOffset)
+// Writer 3: set(nullptr, 0) detaches and leaves no caller pointer.
+TEST_F(IoAdaptersTest, WriterSetNullDetaches)
 {
-    auto rf = std::make_shared<MockReadFile>("0123456789");
-    ReadBufferFromVeloxReadFile reader(rf);
+    WriteFileObserver observer;
+    auto wf = std::make_unique<ObservableWriteFile>(&observer);
+    WriteBufferFromVeloxWriteFile writer(std::move(wf));
 
-    EXPECT_THROW(reader.seek(-1, SEEK_SET), VeloxException);
+    char external[8] = {};
+    writer.set(external, sizeof(external), sizeof(external));
+    ASSERT_EQ(writer.buffer().begin(), external);
+
+    writer.set(nullptr, 0);
+    EXPECT_NE(writer.buffer().begin(), external);
+    EXPECT_EQ(writer.offset(), 0u);
 }
 
-TEST(ReadBufferFromVeloxReadFileTest, SeekCurSupportsValidNegativeOffset)
+// Buffer-state safety 1: set() rejects a null buffer with a nonzero size or
+// offset instead of performing null-pointer arithmetic; the canonical
+// set(nullptr, 0) detach is still accepted and leaves a coherent empty state.
+TEST_F(IoAdaptersTest, WriterSetRejectsNullWithNonzeroSizeOrOffset)
 {
-    const std::string data = "0123456789";
-    auto rf = std::make_shared<MockReadFile>(data);
-    ReadBufferFromVeloxReadFile reader(rf);
+    WriteFileObserver observer;
+    auto wf = std::make_unique<ObservableWriteFile>(&observer);
+    WriteBufferFromVeloxWriteFile writer(std::move(wf));
 
-    reader.seek(8, SEEK_SET);
-    reader.seek(-3, SEEK_CUR);
-    EXPECT_EQ(reader.getPosition(), 5);
+    EXPECT_THROW(writer.set(nullptr, 5), VeloxException);
+    EXPECT_THROW(writer.set(nullptr, 0, 3), VeloxException);
 
-    ASSERT_TRUE(reader.next());
-    EXPECT_EQ(std::string(reader.position(), reader.bufferEnd()), "56789");
+    EXPECT_NO_THROW(writer.set(nullptr, 0));
+    EXPECT_EQ(writer.buffer().begin(), nullptr);
+    EXPECT_EQ(writer.offset(), 0u);
+    EXPECT_EQ(writer.available(), 0u);
+    EXPECT_FALSE(writer.hasPendingData());
 }
 
-TEST(ReadBufferFromVeloxReadFileTest, SeekCurRejectsPositionBeforeStart)
+// Buffer-state safety 2: set() rejects an offset past the buffer size before it
+// forms an out-of-range cursor; an offset equal to the size (the FileSegment
+// write shape) is accepted.
+TEST_F(IoAdaptersTest, WriterSetRejectsOffsetPastSize)
 {
-    auto rf = std::make_shared<MockReadFile>("0123456789");
-    ReadBufferFromVeloxReadFile reader(rf);
+    WriteFileObserver observer;
+    auto wf = std::make_unique<ObservableWriteFile>(&observer);
+    WriteBufferFromVeloxWriteFile writer(std::move(wf));
 
-    reader.seek(4, SEEK_SET);
-    EXPECT_THROW(reader.seek(-10, SEEK_CUR), VeloxException);
+    char buf[4] = {};
+    EXPECT_THROW(writer.set(buf, sizeof(buf), sizeof(buf) + 1), VeloxException);
+
+    EXPECT_NO_THROW(writer.set(buf, sizeof(buf), sizeof(buf)));
+    EXPECT_EQ(writer.offset(), sizeof(buf));
 }
 
-TEST(ReadBufferFromVeloxReadFileTest, SeekCurRejectsPositiveOverflow)
+// Buffer-state safety 3: after a detach the accessors are a coherent empty
+// state and finalize appends nothing and closes cleanly (no dangling caller
+// pointer is dereferenced).
+TEST_F(IoAdaptersTest, WriterDetachAccessorsAndFinalizeAreCoherent)
 {
-    auto rf = std::make_shared<MockReadFile>("0123456789");
-    ReadBufferFromVeloxReadFile reader(rf);
+    WriteFileObserver observer;
+    auto wf = std::make_unique<ObservableWriteFile>(&observer);
+    WriteBufferFromVeloxWriteFile writer(std::move(wf));
 
-    reader.seek(std::numeric_limits<off_t>::max() - 4, SEEK_SET);
-    // Adding this offset would overflow off_t; it must be rejected before the
-    // addition rather than wrapping into a bogus position.
-    EXPECT_THROW(reader.seek(100, SEEK_CUR), VeloxException);
+    char external[8];
+    std::memset(external, 'X', sizeof(external));
+    writer.set(external, sizeof(external), sizeof(external));
+    writer.set(nullptr, 0); // detach without appending
+
+    EXPECT_EQ(writer.offset(), 0u);
+    EXPECT_EQ(writer.available(), 0u);
+    EXPECT_FALSE(writer.hasPendingData());
+    EXPECT_NE(writer.buffer().begin(), external);
+
+    EXPECT_NO_THROW(writer.finalize());
+    EXPECT_EQ(observer.appendCalls, 0) << "a detached finalize must append nothing";
+    EXPECT_TRUE(observer.closed);
 }
 
-TEST(ReadBufferFromVeloxReadFileTest, SetReadUntilPositionResumesAfterExtension)
+// Writer 4: next appends exactly offset bytes, settles count, and resets
+// position.
+TEST_F(IoAdaptersTest, WriterNextAppendsExactlyOffset)
 {
-    const std::string data = "ABCDEFGHIJ";
-    auto rf = std::make_shared<MockReadFile>(data);
-    ReadBufferFromVeloxReadFile reader(rf, 4);
+    WriteFileObserver observer;
+    auto wf = std::make_unique<ObservableWriteFile>(&observer);
+    WriteBufferFromVeloxWriteFile writer(std::move(wf));
 
-    reader.setReadUntilPosition(4);
-    ASSERT_TRUE(reader.next());
-    EXPECT_EQ(std::string(reader.position(), reader.bufferEnd()), "ABCD");
-    reader.advance(reader.bufferEnd() - reader.position());
+    char external[5];
+    std::memcpy(external, "abcde", 5);
+    writer.set(external, sizeof(external), sizeof(external));
+    EXPECT_EQ(writer.offset(), 5u);
 
-    // At the boundary next() reports EOF.
-    EXPECT_FALSE(reader.next());
-    EXPECT_TRUE(reader.eof());
-
-    // Extending the boundary beyond the current offset must clear EOF and let
-    // next() resume.
-    reader.setReadUntilPosition(8);
-    EXPECT_FALSE(reader.eof());
-    ASSERT_TRUE(reader.next());
-    EXPECT_EQ(std::string(reader.position(), reader.bufferEnd()), "EFGH");
+    writer.next();
+    EXPECT_EQ(observer.content, "abcde");
+    EXPECT_EQ(observer.appendCalls, 1);
+    EXPECT_EQ(writer.offset(), 0u) << "position must reset to the working begin";
+    EXPECT_EQ(writer.count(), 5u) << "settled bytes must include the appended chunk";
 }
 
-TEST(ReadBufferFromVeloxReadFileTest, SetRejectsNullExternalBuffer)
+// Writer 5: sync performs append then flush without close.
+TEST_F(IoAdaptersTest, WriterSyncAppendsThenFlushesWithoutClose)
 {
-    auto rf = std::make_shared<MockReadFile>("data");
-    ReadBufferFromVeloxReadFile reader(rf);
+    WriteFileObserver observer;
+    auto wf = std::make_unique<ObservableWriteFile>(&observer);
+    WriteBufferFromVeloxWriteFile writer(std::move(wf));
 
-    EXPECT_THROW(reader.set(nullptr, 16), VeloxException);
+    char external[4];
+    std::memcpy(external, "data", 4);
+    writer.set(external, sizeof(external), sizeof(external));
+    writer.sync();
+
+    EXPECT_EQ(observer.content, "data");
+    EXPECT_EQ(observer.flushCalls, 1);
+    EXPECT_EQ(observer.contentSizeAtLastFlush, 4u) << "append must precede flush";
+    EXPECT_FALSE(observer.closed);
+    // The writer stays active after sync.
+    EXPECT_FALSE(writer.isFinalized());
+    EXPECT_FALSE(writer.isCanceled());
 }
 
-TEST(ReadBufferFromVeloxReadFileTest, SetRejectsZeroCapacityExternalBuffer)
+// Writer 6: finalize appends then closes without an extra flush and is
+// idempotent.
+TEST_F(IoAdaptersTest, WriterFinalizeAppendsThenClosesIdempotent)
 {
-    auto rf = std::make_shared<MockReadFile>("data");
-    ReadBufferFromVeloxReadFile reader(rf);
+    WriteFileObserver observer;
+    auto wf = std::make_unique<ObservableWriteFile>(&observer);
+    WriteBufferFromVeloxWriteFile writer(std::move(wf));
 
-    std::vector<char> buf(4);
-    EXPECT_THROW(reader.set(buf.data(), 0), VeloxException);
+    char external[4];
+    std::memcpy(external, "data", 4);
+    writer.set(external, sizeof(external), sizeof(external));
+    writer.next();
+    writer.set(nullptr, 0);
+
+    writer.finalize();
+    EXPECT_EQ(observer.content, "data");
+    EXPECT_TRUE(observer.closed);
+    EXPECT_EQ(observer.closeCalls, 1);
+    EXPECT_EQ(observer.flushCalls, 0) << "finalize must not add an extra flush";
+
+    EXPECT_NO_THROW(writer.finalize());
+    EXPECT_EQ(observer.closeCalls, 1) << "repeated finalize must be a no-op";
 }
 
-// ---------------------------------------------------------------------------
-// ReadBufferFromVeloxReadFile: external-buffer lifetime on every next() exit
-// ---------------------------------------------------------------------------
-
-TEST(ReadBufferFromVeloxReadFileTest, ExternalBufferReleasedAtBoundaryThenNextUsesInternal)
+// Writer 7: cancel is noexcept and idempotent, appends nothing, releases the
+// file, and is a no-op after finalize.
+TEST_F(IoAdaptersTest, WriterCancelIsNoexceptIdempotent)
 {
-    const std::string data = "ABCDEFGH";
-    auto rf = std::make_shared<MockReadFile>(data);
-    ReadBufferFromVeloxReadFile reader(rf, 4);
+    WriteFileObserver observer;
+    {
+        auto wf = std::make_unique<ObservableWriteFile>(&observer);
+        WriteBufferFromVeloxWriteFile writer(std::move(wf));
 
-    // Consume up to a readUntil boundary so the reader sits exactly on it.
-    reader.setReadUntilPosition(4);
-    ASSERT_TRUE(reader.next());
-    EXPECT_EQ(std::string(reader.position(), reader.bufferEnd()), "ABCD");
-    reader.advance(reader.bufferEnd() - reader.position());
+        char external[7];
+        std::memcpy(external, "discard", 7);
+        writer.set(external, sizeof(external), sizeof(external));
 
-    // Arm an external buffer, then hit the boundary: next() returns false and
-    // must end the external buffer's lifetime so the caller may release it.
-    std::vector<char> externalBuf(4, '\0');
-    reader.set(externalBuf.data(), externalBuf.size());
-    EXPECT_FALSE(reader.next());
-    EXPECT_EQ(
-        std::string(externalBuf.data(), externalBuf.size()), std::string(4, '\0'))
-        << "a boundary next() must not fill the external buffer";
+        EXPECT_NO_THROW(writer.cancel());
+        EXPECT_TRUE(writer.isCanceled());
+        EXPECT_EQ(observer.appendCalls, 0) << "cancel must not append pending bytes";
+        EXPECT_TRUE(observer.destroyed) << "cancel must release the WriteFile";
+        // cancel must discard the pending cursor and detach the caller buffer.
+        EXPECT_EQ(writer.offset(), 0u) << "cancel must discard the pending cursor";
+        EXPECT_FALSE(writer.hasPendingData());
+        EXPECT_NE(writer.buffer().begin(), external)
+            << "cancel must leave no pointer into the caller buffer";
+        EXPECT_NO_THROW(writer.cancel()); // idempotent
+    }
 
-    // The window must be a coherent empty internal window at the current offset.
-    EXPECT_EQ(reader.position(), reader.bufferEnd());
-    EXPECT_EQ(reader.getPosition(), 4);
-    EXPECT_EQ(reader.getFileOffsetOfBufferEnd(), 4);
-
-    // Extending the boundary and reading again must use internal memory and
-    // leave the released external buffer untouched.
-    reader.setReadUntilPosition(8);
-    ASSERT_TRUE(reader.next());
-    EXPECT_EQ(std::string(reader.position(), reader.bufferEnd()), "EFGH");
-    EXPECT_EQ(
-        std::string(externalBuf.data(), externalBuf.size()), std::string(4, '\0'))
-        << "the resumed read must not write through the released external buffer";
+    // cancel after finalize is a no-op.
+    WriteFileObserver observer2;
+    auto wf2 = std::make_unique<ObservableWriteFile>(&observer2);
+    WriteBufferFromVeloxWriteFile writer2(std::move(wf2));
+    writer2.finalize();
+    EXPECT_NO_THROW(writer2.cancel());
+    EXPECT_TRUE(writer2.isFinalized());
+    EXPECT_FALSE(writer2.isCanceled());
 }
 
-TEST(ReadBufferFromVeloxReadFileTest, ExternalBufferPreadThrowsThenRetryUsesInternal)
+// Writer 8: a next() failure leaves the writer canceled and prevents a second
+// write; the original append exception propagates unchanged.
+TEST_F(IoAdaptersTest, WriterNextFailureCancelsAndPreventsWrite)
 {
-    const std::string data = "ABCDEFGH";
-    auto rf = std::make_shared<ThrowingReadFile>(data);
-    ReadBufferFromVeloxReadFile reader(rf, 4);
+    WriteFileObserver observer;
+    observer.throwOnAppendIndex = 0; // first append throws
+    auto wf = std::make_unique<ObservableWriteFile>(&observer);
+    WriteBufferFromVeloxWriteFile writer(
+        std::move(wf), pool_.get(), /*bufferSize=*/64);
 
-    std::vector<char> externalBuf(4, '\0');
-    reader.set(externalBuf.data(), externalBuf.size());
-
-    // A failed pread must propagate its original exception unchanged and end the
-    // external buffer's lifetime.
-    rf->throwOnNextPread();
+    writer.write("hello", 5); // staged into the owned buffer, not yet appended
     try
     {
-        reader.next();
-        FAIL() << "expected pread to throw";
+        writer.next();
+        FAIL() << "next() must rethrow the append failure";
     }
     catch (const VeloxException & e)
     {
-        EXPECT_NE(
-            std::string(e.what()).find("simulated pread failure"),
+        EXPECT_NE(std::string(e.what()).find("simulated append failure"),
             std::string::npos);
     }
-
-    EXPECT_EQ(
-        std::string(externalBuf.data(), externalBuf.size()), std::string(4, '\0'))
-        << "a failed read must not fill the external buffer";
-    // The window must be a coherent empty internal window preserving the offset.
-    EXPECT_EQ(reader.position(), reader.bufferEnd());
-    EXPECT_EQ(reader.getPosition(), 0);
-
-    // The retry must use internal memory and leave the released external buffer
-    // untouched.
-    ASSERT_TRUE(reader.next());
-    EXPECT_EQ(std::string(reader.position(), reader.bufferEnd()), "ABCD");
-    EXPECT_EQ(
-        std::string(externalBuf.data(), externalBuf.size()), std::string(4, '\0'))
-        << "the retry must not write through the released external buffer";
+    EXPECT_TRUE(writer.isCanceled());
+    // CH WriteBuffer::next settles bytes += bytes_in_buffer before cancel/rethrow
+    // (WriteBuffer.h:69); count()/getPosition() must equal prior settled count
+    // (0) + attempted bytes (5), matching the CH contract.
+    EXPECT_EQ(writer.count(), 5u)
+        << "writer must settle the attempted 5 bytes before cancel";
+    EXPECT_EQ(writer.getPosition(), 5u)
+        << "getPosition() must match settled count after failure";
+    EXPECT_EQ(observer.content, "") << "no bytes may be committed on a failed append";
+    // The pending cursor is discarded so no retry can re-append the abandoned bytes.
+    EXPECT_EQ(writer.offset(), 0u) << "a failed append must discard the pending cursor";
+    EXPECT_FALSE(writer.hasPendingData());
+    EXPECT_THROW(writer.write("more", 4), VeloxException);
 }
 
-TEST(ReadBufferFromVeloxReadFileTest, EmptyPreadAfterExternalReadKeepsCoherentInternalWindow)
+// Writer 9: getFileName delegates to the WriteFile.
+TEST_F(IoAdaptersTest, WriterGetFileNameDelegates)
 {
-    const std::string data = "ABCD";
-    auto rf = std::make_shared<MockReadFile>(data);
-    ReadBufferFromVeloxReadFile reader(rf, 4);
-
-    // Allow reads to run one buffer past physical EOF so the terminal next()
-    // takes the empty-pread path rather than the readUntil boundary path.
-    reader.setReadUntilPosition(8);
-
-    std::vector<char> externalBuf(4, '\0');
-    reader.set(externalBuf.data(), externalBuf.size());
-    ASSERT_TRUE(reader.next());
-    ASSERT_EQ(std::string(reader.position(), reader.bufferEnd()), "ABCD");
-    reader.advance(reader.bufferEnd() - reader.position());
-
-    // The next read hits physical EOF via an empty pread. It must restore a
-    // coherent empty internal window: no stale external pointers and no
-    // cross-allocation pointer arithmetic.
-    EXPECT_FALSE(reader.next());
-    EXPECT_TRUE(reader.eof());
-    EXPECT_EQ(reader.position(), reader.bufferEnd());
-    EXPECT_EQ(reader.getPosition(), 4);
-    EXPECT_EQ(reader.getFileOffsetOfBufferEnd(), reader.getPosition())
-        << "an empty read must leave bufferEnd coherent with position";
-    EXPECT_NO_THROW(reader.advance(0));
+    WriteFileObserver observer;
+    observer.name = "/cache/segment-42";
+    auto wf = std::make_unique<ObservableWriteFile>(&observer);
+    WriteBufferFromVeloxWriteFile writer(std::move(wf));
+    EXPECT_EQ(writer.getFileName(), "/cache/segment-42");
 }
 
-// ---------------------------------------------------------------------------
-// ReadBufferFromVeloxReadFile: dynamic readUntil boundary with buffered data
-// ---------------------------------------------------------------------------
-
-TEST(ReadBufferFromVeloxReadFileTest, ShrinkReadUntilConstrainsLoadedWindow)
+// Writer 10: given an already-open WriteFile that already contains a downloaded
+// prefix, appending through the adapter preserves that prefix. This proves the
+// adapter never truncates an already-open file; it does not claim to prove the
+// file-opening mode (append/no-truncate opening is FileSegment's responsibility,
+// Task 012).
+TEST_F(IoAdaptersTest, WriterResumeAppendsWithoutTruncatingPrefix)
 {
-    const std::string data = "ABCDEFGH";
-    auto rf = std::make_shared<MockReadFile>(data);
-    ReadBufferFromVeloxReadFile reader(rf, 8);
+    WriteFileObserver observer;
+    observer.content = "DOWNLOADED-PREFIX"; // an already-downloaded prefix
+    auto wf = std::make_unique<ObservableWriteFile>(&observer);
+    WriteBufferFromVeloxWriteFile writer(std::move(wf));
 
-    // Load a full 8-byte window.
-    ASSERT_TRUE(reader.next());
-    ASSERT_EQ(reader.bufferEnd() - reader.position(), 8);
+    char more[5];
+    std::memcpy(more, "-more", 5);
+    writer.set(more, sizeof(more), sizeof(more));
+    writer.next();
+    writer.set(nullptr, 0);
 
-    // Shrink the boundary below the loaded window: the window must be constrained
-    // so bufferEnd exposes no bytes at or beyond the new exclusive limit.
-    reader.setReadUntilPosition(4);
-    EXPECT_EQ(reader.getFileOffsetOfBufferEnd(), 4)
-        << "bufferEnd must not expose bytes at or beyond the new boundary";
-    EXPECT_LE(reader.bufferEnd() - reader.position(), 4);
-
-    // advance must reject consuming past the new exclusive boundary.
-    EXPECT_THROW(reader.advance(5), VeloxException);
+    EXPECT_EQ(observer.content, "DOWNLOADED-PREFIX-more")
+        << "the downloaded prefix must be preserved and the new bytes appended";
 }
 
-// ---------------------------------------------------------------------------
-// WriteBufferFromVeloxWriteFile tests
-// ---------------------------------------------------------------------------
-
-TEST(WriteBufferFromVeloxWriteFileTest, WriteAccumulatesAndFlushCommits)
+// Writer 11: a WriteFile double physically commits a strict prefix of the
+// requested append and then throws. The adapter must rethrow the original
+// exception unchanged, become canceled, detach the caller buffer, perform no
+// retry, and leave the committed physical prefix observable for a later
+// FileSegment reconciliation. This adapter test does not itself reconcile
+// filesystem size against downloaded/reserved sizes (that is FileSegment,
+// Task 012).
+TEST_F(IoAdaptersTest, WriterPartialWriteCommitsPrefixThenThrows)
 {
-    auto wf = std::make_shared<MockWriteFile>();
-    WriteBufferFromVeloxWriteFile writer(wf, 4096);
+    WriteFileObserver observer;
+    observer.content = "COMMITTED";  // already-downloaded bytes on disk
+    observer.throwOnAppendIndex = 0; // the first append fails mid-flight
+    observer.partialPrefixBytes = 6; // after physically writing 6 of 16 bytes
+    auto wf = std::make_unique<ObservableWriteFile>(&observer);
+    WriteBufferFromVeloxWriteFile writer(std::move(wf));
 
-    writer.write("hello", 5);
-    writer.write(" world", 6);
+    char reserved[16];
+    std::memset(reserved, 'R', sizeof(reserved));
+    writer.set(reserved, sizeof(reserved), sizeof(reserved));
 
-    EXPECT_TRUE(wf->content().empty()); // buffered, not yet flushed
-    writer.flush();
-    EXPECT_EQ(wf->content(), "hello world");
-    EXPECT_TRUE(wf->isFlushed());
-}
-
-TEST(WriteBufferFromVeloxWriteFileTest, FinalizeFlushesAndCloses)
-{
-    auto wf = std::make_shared<MockWriteFile>();
-    WriteBufferFromVeloxWriteFile writer(wf, 4096);
-
-    writer.write("data", 4);
-    writer.finalize();
-
-    EXPECT_EQ(wf->content(), "data");
-    EXPECT_TRUE(wf->isClosed());
-}
-
-TEST(WriteBufferFromVeloxWriteFileTest, CancelAbandonsBufferedData)
-{
-    auto wf = std::make_shared<MockWriteFile>();
-    WriteBufferFromVeloxWriteFile writer(wf, 4096);
-
-    writer.write("discard", 7);
-    writer.cancel();
-
-    EXPECT_TRUE(wf->content().empty());
-    EXPECT_FALSE(wf->isClosed());
-}
-
-TEST(WriteBufferFromVeloxWriteFileTest, NextGetWritableChunkAndShortWrite)
-{
-    auto wf = std::make_shared<MockWriteFile>();
-    WriteBufferFromVeloxWriteFile writer(wf, 64);
-
-    // next() provides a writable chunk.
-    char * data = nullptr;
-    int64_t size = 0;
-    writer.next(data, size);
-    ASSERT_NE(data, nullptr);
-    ASSERT_GT(size, 0);
-
-    // Write only 3 bytes (short write).
-    std::memcpy(data, "abc", 3);
-    writer.advance(3);
-
-    // Flush should commit only the 3 bytes actually written.
-    writer.flush();
-    EXPECT_EQ(wf->content(), "abc");
-}
-
-TEST(WriteBufferFromVeloxWriteFileTest, BufferAutoFlushesWhenFull)
-{
-    auto wf = std::make_shared<MockWriteFile>();
-    // Small buffer to force auto-flush.
-    WriteBufferFromVeloxWriteFile writer(wf, 8);
-
-    const std::string payload(16, 'Z');
-    writer.write(payload.data(), payload.size());
-
-    // At least the first 8 bytes must have been flushed already.
-    EXPECT_GE(wf->content().size(), 8u);
-}
-
-TEST(WriteBufferFromVeloxWriteFileTest, GetPositionTracksWrittenBytes)
-{
-    auto wf = std::make_shared<MockWriteFile>();
-    WriteBufferFromVeloxWriteFile writer(wf, 4096);
-
-    EXPECT_EQ(writer.getPosition(), 0u);
-    writer.write("abcde", 5);
-    EXPECT_EQ(writer.getPosition(), 5u);
-}
-
-TEST(WriteBufferFromVeloxWriteFileTest, OwnershipTransferSharedPtr)
-{
-    auto wf = std::make_shared<MockWriteFile>();
-    std::weak_ptr<MockWriteFile> weak = wf;
+    try
     {
-        // The writer copies the shared_ptr, so caller and writer both own it.
-        WriteBufferFromVeloxWriteFile writer(wf);
-        writer.write("x", 1);
-        writer.finalize();
+        writer.next();
+        FAIL() << "next() must rethrow the append failure";
     }
-    // Destroying the writer must not destroy the file while the caller still
-    // holds wf on the stack: ownership is shared, not transferred.
-    EXPECT_FALSE(weak.expired());
+    catch (const VeloxException & e)
+    {
+        EXPECT_NE(std::string(e.what()).find("simulated append failure"),
+            std::string::npos)
+            << "the original append exception must propagate unchanged";
+    }
 
-    // Once the caller drops its reference too, the file is released, proving
-    // the writer did not leak its shared_ptr.
-    wf.reset();
-    EXPECT_TRUE(weak.expired());
-}
-
-TEST(WriteBufferFromVeloxWriteFileTest, AdvanceRejectsOverflowingCount)
-{
-    auto wf = std::make_shared<MockWriteFile>();
-    WriteBufferFromVeloxWriteFile writer(wf, 16);
-
-    writer.write("01234567", 8); // writePos_ = 8, 8 bytes of spare capacity
-
-    // A normal oversized advance is rejected.
-    EXPECT_THROW(writer.advance(9), VeloxException);
-    // An advance whose addition would wrap past the buffer capacity must be
-    // rejected by the validation itself, not silently accepted.
-    EXPECT_THROW(
-        writer.advance(std::numeric_limits<size_t>::max() - 4), VeloxException);
-    // Position must be unchanged after the rejected advances.
-    EXPECT_EQ(writer.getPosition(), 8u);
-}
-
-TEST(WriteBufferFromVeloxWriteFileTest, AdvanceAfterFinalizeThrows)
-{
-    auto wf = std::make_shared<MockWriteFile>();
-    WriteBufferFromVeloxWriteFile writer(wf, 64);
-
-    // Stage a short write, then finalize the writer.
-    char * data = nullptr;
-    int64_t size = 0;
-    writer.next(data, size);
-    std::memcpy(data, "abc", 3);
-    writer.advance(3);
-    writer.finalize();
-
-    // advance is a write operation: after finalize it must throw without
-    // changing the write position, just like write() and next().
-    const size_t positionBefore = writer.getPosition();
-    EXPECT_THROW(writer.advance(1), VeloxException);
-    EXPECT_EQ(writer.getPosition(), positionBefore)
-        << "advance after finalize must not change the write position";
-}
-
-TEST(WriteBufferFromVeloxWriteFileTest, AdvanceAfterCancelThrows)
-{
-    auto wf = std::make_shared<MockWriteFile>();
-    WriteBufferFromVeloxWriteFile writer(wf, 64);
-
-    writer.write("abc", 3);
-    writer.cancel();
-
-    // advance after cancel must throw without changing the write position.
-    const size_t positionBefore = writer.getPosition();
-    EXPECT_THROW(writer.advance(1), VeloxException);
-    EXPECT_EQ(writer.getPosition(), positionBefore)
-        << "advance after cancel must not change the write position";
+    EXPECT_TRUE(writer.isCanceled());
+    // CH WriteBuffer::next settles bytes += bytes_in_buffer before cancel/rethrow;
+    // count()/getPosition() must equal prior settled count (0) + attempted (16),
+    // regardless of how many bytes were physically committed.
+    EXPECT_EQ(writer.count(), 16u)
+        << "writer must settle the full attempted 16 bytes before cancel";
+    EXPECT_EQ(writer.getPosition(), 16u)
+        << "getPosition() must match settled count after partial-write failure";
+    EXPECT_EQ(writer.offset(), 0u) << "the pending cursor must be discarded";
+    EXPECT_NE(writer.buffer().begin(), reserved)
+        << "a failed append must detach the caller buffer";
+    // The strict physical prefix stays on disk for FileSegment to reconcile from
+    // the filesystem size; the adapter adds neither the reserved-but-unwritten
+    // tail nor performs the reconciliation itself.
+    EXPECT_EQ(observer.content, "COMMITTEDRRRRRR")
+        << "only the strict physical prefix is observable after the failure";
+    EXPECT_EQ(observer.appendCalls, 0) << "the failed append did not complete";
+    EXPECT_THROW(writer.write("more", 4), VeloxException)
+        << "a canceled writer must not retry the write";
 }
 
 } // namespace
