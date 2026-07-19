@@ -13,6 +13,14 @@ enum Metric {
   FilesystemCacheDelayedCleanupElements,
   FilesystemCacheReserveThreads,
   FilesystemCacheSizeLimit,
+  // B2: hard-blocker enumerator names referenced via add/sub on the in-scope
+  // center-SCC path (Tasks 011/012). Real counters remain Task 017; add/sub
+  // stay no-op.
+  FilesystemCacheElements,
+  FilesystemCacheInvalidatedElements,
+  FilesystemCachePriorityQueueElements,
+  FilesystemCacheSize,
+  FilesystemCacheKeys,
 };
 
 inline void add(Metric, int64_t = 1) {}
