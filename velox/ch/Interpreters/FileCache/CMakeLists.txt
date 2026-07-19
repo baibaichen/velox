@@ -21,6 +21,7 @@ velox_sources(
   PRIVATE
   FileSegmentKeyType.cpp
   FileCacheKey.cpp
+  FileCacheSettings.cpp
 )
 
 # Guards.h is a header-only addition to velox_ch_filecache.
@@ -48,6 +49,8 @@ if(NOT VELOX_MONO_LIBRARY)
       ${CMAKE_CURRENT_SOURCE_DIR}/FileCacheKey.h
       ${CMAKE_CURRENT_SOURCE_DIR}/FileCacheUtils.h
       ${CMAKE_CURRENT_SOURCE_DIR}/ShardedMap.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/FileCacheSettings.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/FileCacheReadOptions.h
   )
 endif()
 
