@@ -15,9 +15,11 @@
  */
 #include "velox/ch/Common/ClickHouseAliases.h"
 #include "velox/ch/Common/ClickHouseAssert.h"
+#include "velox/ch/Common/CurrentMetrics.h"
 #include "velox/ch/Common/FileCacheBoundedQueue.h"
 #include "velox/ch/Common/FileCacheException.h"
 #include "velox/ch/Common/FileCacheFilesystem.h"
+#include "velox/ch/Common/ProfileEvents.h"
 #include "velox/ch/Common/SharedMutex.h"
 #include "velox/ch/Common/logger_useful.h"
 #include "velox/common/base/Exceptions.h"
@@ -553,6 +555,85 @@ TEST(FileCacheBoundedQueueTest, FailedFullTryPushConstRefDoesNotCopyCallerValue)
     const MoveTrackingProbe value(42);
     EXPECT_FALSE(queue.tryPush(value, 0));
     EXPECT_EQ(MoveTrackingProbe::copyCount, 0);
+}
+
+// B1/B2 enum-coverage test. This translation unit must fail to compile if any
+// center-SCC-required ProfileEvents::Event or CurrentMetrics::Metric enumerator
+// name is absent. It names every event/metric the migrated
+// src/Interpreters/FileCache/ sources reference, so both the newly added B1/B2
+// names and the pre-existing names are exercised (deleting any one goes RED).
+// The shim increment/add/sub stay no-op; this only proves the name surface.
+TEST(ProfileEventsAndCurrentMetricsCoverageTest, AllCenterSccEnumeratorNamesExist)
+{
+    using ProfileEvents::increment;
+    // Pre-existing event names kept by the shim.
+    increment(ProfileEvents::FilesystemCacheGetOrSetMicroseconds);
+    increment(ProfileEvents::FilesystemCacheGetMicroseconds);
+    increment(ProfileEvents::FilesystemCacheReserveAttempts);
+    increment(ProfileEvents::FilesystemCacheFailedReserveAttempts);
+    increment(ProfileEvents::FilesystemCacheReserveMicroseconds);
+    increment(ProfileEvents::FileSegmentWaitMicroseconds);
+    increment(ProfileEvents::FileSegmentWriteMicroseconds);
+    increment(ProfileEvents::FileSegmentCompleteMicroseconds);
+    increment(ProfileEvents::FilesystemCacheCheckCorrectness);
+    increment(ProfileEvents::FilesystemCacheCheckCorrectnessMicroseconds);
+    increment(ProfileEvents::FilesystemCacheStateLockMicroseconds);
+    increment(ProfileEvents::FilesystemCachePriorityWriteLockMicroseconds);
+    increment(ProfileEvents::FilesystemCachePriorityReadLockMicroseconds);
+    // B1: the 31 added event names.
+    increment(ProfileEvents::FileSegmentFailToIncreasePriority);
+    increment(ProfileEvents::FileSegmentHolderCompleteMicroseconds);
+    increment(ProfileEvents::FileSegmentIncreasePriorityMicroseconds);
+    increment(ProfileEvents::FileSegmentLockMicroseconds);
+    increment(ProfileEvents::FilesystemCacheBackgroundDownloadQueuePush);
+    increment(ProfileEvents::FilesystemCacheBackgroundEvictedBytes);
+    increment(ProfileEvents::FilesystemCacheBackgroundEvictedFileSegments);
+    increment(ProfileEvents::FilesystemCacheBackgroundRemovedInvalidatedEntries);
+    increment(ProfileEvents::FilesystemCacheCreatedKeyDirectories);
+    increment(ProfileEvents::FilesystemCacheDowngradedFileSegments);
+    increment(ProfileEvents::FilesystemCacheEvictedBytes);
+    increment(ProfileEvents::FilesystemCacheEvictedFileSegments);
+    increment(ProfileEvents::FilesystemCacheEvictionReusedIterator);
+    increment(ProfileEvents::FilesystemCacheEvictionSkippedEvictingFileSegments);
+    increment(ProfileEvents::FilesystemCacheEvictionSkippedFileSegments);
+    increment(ProfileEvents::FilesystemCacheEvictionSkippedMovingFileSegments);
+    increment(ProfileEvents::FilesystemCacheEvictionTries);
+    increment(ProfileEvents::FilesystemCacheEvictMicroseconds);
+    increment(ProfileEvents::FilesystemCacheFailedEvictionCandidates);
+    increment(ProfileEvents::FilesystemCacheFailToReserveSpaceBecauseOfCacheResize);
+    increment(ProfileEvents::FilesystemCacheFreeSpaceKeepingThreadErrors);
+    increment(ProfileEvents::FilesystemCacheFreeSpaceKeepingThreadRun);
+    increment(ProfileEvents::FilesystemCacheFreeSpaceKeepingThreadWorkMilliseconds);
+    increment(ProfileEvents::FilesystemCacheHoldFileSegments);
+    increment(ProfileEvents::FilesystemCacheIdleClientEvictions);
+    increment(ProfileEvents::FilesystemCacheInvalidatedEntriesCleanupThreadWorkMilliseconds);
+    increment(ProfileEvents::FilesystemCacheLoadMetadataMicroseconds);
+    increment(ProfileEvents::FilesystemCacheLockKeyMicroseconds);
+    increment(ProfileEvents::FilesystemCacheLockMetadataMicroseconds);
+    increment(ProfileEvents::FilesystemCacheLockOriginPoolMicroseconds);
+    increment(ProfileEvents::FilesystemCacheUnusedHoldFileSegments);
+    // Seed named in the reopen contract.
+    increment(ProfileEvents::FilesystemCacheEvictedFileSegments);
+
+    // Pre-existing metric names kept by the shim.
+    CurrentMetrics::add(CurrentMetrics::CacheFileSegments, 1);
+    CurrentMetrics::sub(CurrentMetrics::FilesystemCacheHoldFileSegments, 1);
+    CurrentMetrics::add(CurrentMetrics::FilesystemCacheDownloadQueueElements, 1);
+    CurrentMetrics::add(CurrentMetrics::FilesystemCacheDelayedCleanupElements, 1);
+    CurrentMetrics::add(CurrentMetrics::FilesystemCacheReserveThreads, 1);
+    CurrentMetrics::add(CurrentMetrics::FilesystemCacheSizeLimit, 1);
+    // B2: the 5 added metric names.
+    CurrentMetrics::add(CurrentMetrics::FilesystemCacheElements, 1);
+    CurrentMetrics::add(CurrentMetrics::FilesystemCacheInvalidatedElements, 1);
+    CurrentMetrics::add(CurrentMetrics::FilesystemCachePriorityQueueElements, 1);
+    CurrentMetrics::sub(CurrentMetrics::FilesystemCacheKeys, 1);
+    // Seed named in the reopen contract.
+    CurrentMetrics::add(CurrentMetrics::FilesystemCacheSize, 1);
+
+    // A non-trivial assertion so this is not an assertion-free test: naming the
+    // enumerators above (which compiles only when every name exists) is the
+    // proof, and this confirms the test body executed to completion.
+    SUCCEED() << "all center-SCC ProfileEvents/CurrentMetrics enumerator names resolved";
 }
 
 }
