@@ -109,10 +109,13 @@ velox_include_directories(
 # FileCacheKey.cpp uses fmt::format and the VELOX_FAIL-based exception helper, and
 # the public headers include fmt and Folly F14 containers, so carry all three as
 # PUBLIC to propagate their compile usage requirements to consumers of the headers.
+# FileCacheSettings.h publicly includes velox/common/config/Config.h, so
+# velox_common_config is likewise a PUBLIC dependency.
 if(NOT VELOX_MONO_LIBRARY)
   target_link_libraries(
     velox_ch_filecache
     PUBLIC
+      velox_common_config
       velox_exception
       Folly::folly
       fmt::fmt

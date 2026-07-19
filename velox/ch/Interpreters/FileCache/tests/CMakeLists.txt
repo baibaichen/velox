@@ -58,3 +58,20 @@ target_link_libraries(
     GTest::gtest
     GTest::gtest_main
 )
+
+# FileCacheSettings.h/.cpp and FileCacheReadOptions.h are part of
+# velox_ch_filecache. FileCacheSettings.h publicly includes
+# velox/common/config/Config.h, so velox_ch_filecache must PUBLIC-propagate
+# velox_common_config (and its exception/fmt/Folly deps). Link this focused test
+# directly only to velox_ch_filecache and GTest so any missing public-interface
+# dependency surfaces here instead of being masked by direct links.
+add_executable(velox_ch_settings_test FileCacheSettingsTest.cpp)
+add_test(velox_ch_settings_test velox_ch_settings_test)
+
+target_link_libraries(
+  velox_ch_settings_test
+  PRIVATE
+    velox_ch_filecache
+    GTest::gtest
+    GTest::gtest_main
+)
