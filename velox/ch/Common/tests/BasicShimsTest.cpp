@@ -15,9 +15,11 @@
  */
 #include "velox/ch/Common/ClickHouseAliases.h"
 #include "velox/ch/Common/ClickHouseAssert.h"
+#include "velox/ch/Common/CurrentMetrics.h"
 #include "velox/ch/Common/FileCacheBoundedQueue.h"
 #include "velox/ch/Common/FileCacheException.h"
 #include "velox/ch/Common/FileCacheFilesystem.h"
+#include "velox/ch/Common/ProfileEvents.h"
 #include "velox/ch/Common/SharedMutex.h"
 #include "velox/ch/Common/logger_useful.h"
 #include "velox/common/base/Exceptions.h"
@@ -26,7 +28,9 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstddef>
 #include <future>
+#include <iterator>
 #include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
@@ -553,6 +557,113 @@ TEST(FileCacheBoundedQueueTest, FailedFullTryPushConstRefDoesNotCopyCallerValue)
     const MoveTrackingProbe value(42);
     EXPECT_FALSE(queue.tryPush(value, 0));
     EXPECT_EQ(MoveTrackingProbe::copyCount, 0);
+}
+
+// Compile-coverage for the complete required `ProfileEvents::Event` name
+// surface: every pre-existing name plus the 34 approved B1 names (31
+// referenced by CH src/Interpreters/FileCache/* plus the 3 OpenedFileCache
+// names required by the Task-013 dependency mapping). Deleting any one name
+// from ProfileEvents.h makes this array fail to compile, not just fail a
+// runtime check.
+TEST(ProfileEventsCoverageTest, AllRequiredEventNamesCompile)
+{
+    constexpr ProfileEvents::Event kRequiredEvents[] = {
+        // Pre-existing names.
+        ProfileEvents::FilesystemCacheGetOrSetMicroseconds,
+        ProfileEvents::FilesystemCacheGetMicroseconds,
+        ProfileEvents::FilesystemCacheReserveAttempts,
+        ProfileEvents::FilesystemCacheFailedReserveAttempts,
+        ProfileEvents::FilesystemCacheReserveMicroseconds,
+        ProfileEvents::CachedReadBufferReadFromCacheBytes,
+        ProfileEvents::CachedReadBufferReadFromSourceBytes,
+        ProfileEvents::CachedReadBufferCacheWriteBytes,
+        ProfileEvents::FileSegmentWaitMicroseconds,
+        ProfileEvents::FileSegmentWriteMicroseconds,
+        ProfileEvents::FileSegmentCompleteMicroseconds,
+        ProfileEvents::FilesystemCacheCheckCorrectness,
+        ProfileEvents::FilesystemCacheCheckCorrectnessMicroseconds,
+        ProfileEvents::FilesystemCacheStateLockMicroseconds,
+        ProfileEvents::FilesystemCachePriorityWriteLockMicroseconds,
+        ProfileEvents::FilesystemCachePriorityReadLockMicroseconds,
+        // B1: 31 names referenced by CH src/Interpreters/FileCache/*.
+        ProfileEvents::FileSegmentFailToIncreasePriority,
+        ProfileEvents::FileSegmentHolderCompleteMicroseconds,
+        ProfileEvents::FileSegmentIncreasePriorityMicroseconds,
+        ProfileEvents::FileSegmentLockMicroseconds,
+        ProfileEvents::FilesystemCacheBackgroundDownloadQueuePush,
+        ProfileEvents::FilesystemCacheBackgroundEvictedBytes,
+        ProfileEvents::FilesystemCacheBackgroundEvictedFileSegments,
+        ProfileEvents::FilesystemCacheBackgroundRemovedInvalidatedEntries,
+        ProfileEvents::FilesystemCacheCreatedKeyDirectories,
+        ProfileEvents::FilesystemCacheDowngradedFileSegments,
+        ProfileEvents::FilesystemCacheEvictMicroseconds,
+        ProfileEvents::FilesystemCacheEvictedBytes,
+        ProfileEvents::FilesystemCacheEvictedFileSegments,
+        ProfileEvents::FilesystemCacheEvictionReusedIterator,
+        ProfileEvents::FilesystemCacheEvictionSkippedEvictingFileSegments,
+        ProfileEvents::FilesystemCacheEvictionSkippedFileSegments,
+        ProfileEvents::FilesystemCacheEvictionSkippedMovingFileSegments,
+        ProfileEvents::FilesystemCacheEvictionTries,
+        ProfileEvents::FilesystemCacheFailToReserveSpaceBecauseOfCacheResize,
+        ProfileEvents::FilesystemCacheFailedEvictionCandidates,
+        ProfileEvents::FilesystemCacheFreeSpaceKeepingThreadErrors,
+        ProfileEvents::FilesystemCacheFreeSpaceKeepingThreadRun,
+        ProfileEvents::FilesystemCacheFreeSpaceKeepingThreadWorkMilliseconds,
+        ProfileEvents::FilesystemCacheHoldFileSegments,
+        ProfileEvents::FilesystemCacheIdleClientEvictions,
+        ProfileEvents::FilesystemCacheInvalidatedEntriesCleanupThreadWorkMilliseconds,
+        ProfileEvents::FilesystemCacheLoadMetadataMicroseconds,
+        ProfileEvents::FilesystemCacheLockKeyMicroseconds,
+        ProfileEvents::FilesystemCacheLockMetadataMicroseconds,
+        ProfileEvents::FilesystemCacheLockOriginPoolMicroseconds,
+        ProfileEvents::FilesystemCacheUnusedHoldFileSegments,
+        // B1: 3 names referenced by CH src/IO/OpenedFileCache.h, required by
+        // the Task-013 OpenedFileCache dependency mapping.
+        ProfileEvents::OpenedFileCacheHits,
+        ProfileEvents::OpenedFileCacheMisses,
+        ProfileEvents::OpenedFileCacheMicroseconds,
+    };
+
+    constexpr std::size_t kExpectedCount = 16 + 34;
+    static_assert(std::size(kRequiredEvents) == kExpectedCount);
+
+    for (auto event : kRequiredEvents)
+    {
+        ProfileEvents::increment(event);
+    }
+    EXPECT_EQ(std::size(kRequiredEvents), kExpectedCount);
+}
+
+// Compile-coverage for the complete required `CurrentMetrics::Metric` name
+// surface: every pre-existing name plus the 5 approved B2 names. Deleting
+// any one name from CurrentMetrics.h makes this array fail to compile, not
+// just fail a runtime check.
+TEST(CurrentMetricsCoverageTest, AllRequiredMetricNamesCompile)
+{
+    constexpr CurrentMetrics::Metric kRequiredMetrics[] = {
+        // Pre-existing names.
+        CurrentMetrics::CacheFileSegments,
+        CurrentMetrics::FilesystemCacheHoldFileSegments,
+        CurrentMetrics::FilesystemCacheDownloadQueueElements,
+        CurrentMetrics::FilesystemCacheDelayedCleanupElements,
+        CurrentMetrics::FilesystemCacheReserveThreads,
+        CurrentMetrics::FilesystemCacheSizeLimit,
+        // B2: 5 approved names.
+        CurrentMetrics::FilesystemCacheElements,
+        CurrentMetrics::FilesystemCacheInvalidatedElements,
+        CurrentMetrics::FilesystemCachePriorityQueueElements,
+        CurrentMetrics::FilesystemCacheSize,
+        CurrentMetrics::FilesystemCacheKeys,
+    };
+
+    constexpr std::size_t kExpectedCount = 6 + 5;
+    static_assert(std::size(kRequiredMetrics) == kExpectedCount);
+
+    for (auto metric : kRequiredMetrics)
+    {
+        CurrentMetrics::add(metric);
+    }
+    EXPECT_EQ(std::size(kRequiredMetrics), kExpectedCount);
 }
 
 }

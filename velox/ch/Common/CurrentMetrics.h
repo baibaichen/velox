@@ -13,6 +13,11 @@ enum Metric {
   FilesystemCacheDelayedCleanupElements,
   FilesystemCacheReserveThreads,
   FilesystemCacheSizeLimit,
+  FilesystemCacheElements,
+  FilesystemCacheInvalidatedElements,
+  FilesystemCachePriorityQueueElements,
+  FilesystemCacheSize,
+  FilesystemCacheKeys,
 };
 
 inline void add(Metric, int64_t = 1) {}
