@@ -106,12 +106,60 @@ TEST(FileCacheKeyTest, FromKeyStringBadLength)
         FileCacheKey::fromKeyString(std::string(33, '0')), VeloxRuntimeError);
 }
 
-TEST(FileCacheKeyTest, FromKeyStringInvalidHexChar)
+TEST(FileCacheKeyTest, FromKeyStringMalformedCharCompatibility)
 {
-    // Correct 32-character length but contains a non-hex character 'g'.
-    EXPECT_THROW(
-        FileCacheKey::fromKeyString("g0000000000000000000000000000000"),
-        VeloxRuntimeError);
+    // CH FileCacheKey::fromKeyString delegates all 32-byte input to unhexUInt
+    // without per-character validation. Non-hex 'g' maps to nibble 0xFF via the
+    // lookup table; accumulation via addition (not OR) with natural uint64_t
+    // overflow: 0xFF after 15 left 4-bit shifts yields 0xF000000000000000 for
+    // the high word. So g0...0 must not throw and must stringify as f0...0.
+    FileCacheKey key;
+    ASSERT_NO_THROW(key = FileCacheKey::fromKeyString("g0000000000000000000000000000000"));
+    EXPECT_EQ(key.toString(), "f0000000000000000000000000000000");
+}
+
+TEST(FileCacheKeyTest, UppercaseParserRoundTrip)
+{
+    // CH unhexUInt accepts both upper- and lower-case hex via hex_char_to_digit_table.
+    // Parse the same 128-bit value as lowercase and uppercase; results must be equal.
+    // toString must emit the exact lowercase numeric form (fmt {:016x} format).
+    const std::string lower = "aabbccdd11223344aabbccdd11223344";
+    std::string upper = lower;
+    for (auto & c : upper)
+    {
+        if (c >= 'a' && c <= 'f')
+            c = static_cast<char>(c - 'a' + 'A');
+    }
+    // upper == "AABBCCDD11223344AABBCCDD11223344"
+    const auto fromLower = FileCacheKey::fromKeyString(lower);
+    FileCacheKey fromUpper;
+    ASSERT_NO_THROW(fromUpper = FileCacheKey::fromKeyString(upper));
+    EXPECT_EQ(fromUpper, fromLower);
+    EXPECT_EQ(fromUpper.toString(), lower); // toString always emits lowercase
+}
+
+TEST(FileCacheKeyTest, MalformedCarryHighWord)
+{
+    // 'f'=15, 'g'=0xFF (invalid). Using addition (not OR), the high word accumulates:
+    //   i=0: hi = 0x0F
+    //   i=1: hi = (0x0F << 4) + 0xFF = 0xF0 + 0xFF = 0x1EF
+    //   i=2..15: hi = hi << 4  (14 more shifts, each ×16)
+    // Final hi = 0x1EF << 56 (mod 2^64) = 0xEF00000000000000.
+    // With OR instead of +, i=1 gives 0xF0 | 0xFF = 0xFF, yielding 0xFF00000000000000
+    // (result "ff000000000000000000000000000000"), so this test distinguishes the two.
+    FileCacheKey key;
+    ASSERT_NO_THROW(key = FileCacheKey::fromKeyString("fg000000000000000000000000000000"));
+    EXPECT_EQ(key.toString(), "ef000000000000000000000000000000");
+}
+
+TEST(FileCacheKeyTest, MalformedCarryLowWord)
+{
+    // Same carry arithmetic as MalformedCarryHighWord but exercised in the low
+    // 64-bit accumulation loop (chars 16..31). High word is all '0' so hi = 0.
+    // With addition: lo = 0xEF00000000000000. With OR: lo = 0xFF00000000000000.
+    FileCacheKey key;
+    ASSERT_NO_THROW(key = FileCacheKey::fromKeyString("0000000000000000fg00000000000000"));
+    EXPECT_EQ(key.toString(), "0000000000000000ef00000000000000");
 }
 
 TEST(FileCacheKeyTest, OrderHighFirst)
@@ -301,6 +349,49 @@ TEST(FileCacheUtilsTest, RoundUpActualOverflow)
     EXPECT_THROW(
         FileCacheUtils::roundUpToMultiple(SIZE_MAX - 1, 4),
         std::overflow_error);
+}
+
+// ── FileCacheUtils::checkedAdd ────────────────────────────────────────────────
+
+TEST(FileCacheUtilsTest, CheckedAddZero)
+{
+    EXPECT_EQ(FileCacheUtils::checkedAdd(uint64_t{0}, uint64_t{0}, "zero_op"), uint64_t{0});
+    EXPECT_EQ(FileCacheUtils::checkedAdd(uint64_t{0}, uint64_t{5}, "zero_op"), uint64_t{5});
+    EXPECT_EQ(FileCacheUtils::checkedAdd(uint64_t{5}, uint64_t{0}, "zero_op"), uint64_t{5});
+}
+
+TEST(FileCacheUtilsTest, CheckedAddNormal)
+{
+    EXPECT_EQ(
+        FileCacheUtils::checkedAdd(uint64_t{3}, uint64_t{4}, "normal_op"),
+        uint64_t{7});
+}
+
+TEST(FileCacheUtilsTest, CheckedAddMaxNoOverflow)
+{
+    EXPECT_EQ(
+        FileCacheUtils::checkedAdd(UINT64_MAX, uint64_t{0}, "max_op"),
+        UINT64_MAX);
+}
+
+TEST(FileCacheUtilsTest, CheckedAddOverflow)
+{
+    EXPECT_THROW(
+        FileCacheUtils::checkedAdd(UINT64_MAX, uint64_t{1}, "overflow_op"),
+        VeloxRuntimeError);
+}
+
+TEST(FileCacheUtilsTest, CheckedAddOperationInMessage)
+{
+    try {
+        FileCacheUtils::checkedAdd(UINT64_MAX, uint64_t{1}, "budget_overflow_test");
+        FAIL() << "Expected VeloxRuntimeError to be thrown";
+    } catch (const VeloxRuntimeError & e) {
+        EXPECT_NE(
+            std::string(e.what()).find("budget_overflow_test"),
+            std::string::npos)
+            << "VeloxRuntimeError message must contain the operation name";
+    }
 }
 
 } // namespace
