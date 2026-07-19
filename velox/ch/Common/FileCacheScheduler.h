@@ -103,7 +103,10 @@ public:
     bool schedule();
 
     /// Dispatch for execution after `delayMs` milliseconds.
-    /// Returns false if already Deactivated or shut down.
+    /// Returns false if already Deactivated or shut down, or if an immediate
+    /// run is already pending while the callback is Running (immediate work has
+    /// priority and is never downgraded to a delayed run, matching CH
+    /// `BackgroundSchedulePoolTaskInfo::scheduleAfter`).
     bool scheduleAfter(uint64_t delayMs);
 
     /// Prevent all future executions; block until any running callback returns.
