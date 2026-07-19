@@ -142,11 +142,19 @@ bool FileCacheScheduledTask::scheduleAfter(uint64_t delayMs)
     if (state_ == State::Queued)
         return false; // already queued to run imminently; keep that request
 
-    // state_ == State::Running: remember/overwrite one delayed next-run
-    // request. A delayed request made after an immediate one supersedes it,
-    // matching schedule()'s Running branch, which does the reverse.
+    // state_ == State::Running.
+    // CH `BackgroundSchedulePoolTaskInfo::scheduleAfter` returns false and
+    // records no delayed run whenever an immediate run is already pending
+    // (`if (deactivated || scheduled) return false;`): immediate work has
+    // priority and must never be downgraded to a delayed run. schedule()'s
+    // Running branch does the reverse — an immediate request cancels a pending
+    // delayed one.
+    if (pendingImmediate_)
+        return false;
+
+    // No immediate run pending: record or overwrite the single delayed next-run
+    // (CH default `overwrite == true`).
     pendingDelayed_ = true;
-    pendingImmediate_ = false;
     pendingDelayMs_ = delayMs;
     return true;
 }

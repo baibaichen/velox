@@ -127,6 +127,86 @@ TEST(FileCacheSchedulerTest, ScheduleAdvancesDelayedTask)
     EXPECT_GE(count.load(), 1);
 }
 
+// Corrective Task 006 regression: while a callback is Running with an immediate
+// re-run already pending, scheduleAfter() must NOT downgrade that immediate
+// request to a delayed one. This mirrors CH
+// `BackgroundSchedulePoolTaskInfo::scheduleAfter`, which returns false and
+// records no delayed run whenever an immediate run is already scheduled
+// (`if (deactivated || scheduled) return false;`) — immediate work has priority.
+// Real callers depend on this: `FileCache::backgroundCleanupTaskFunc` ends by
+// calling `scheduleAfter(interval)` from inside the running callback, while the
+// invalidated-entries notifier and `applySettingsChanges` may concurrently call
+// `schedule()`; the pending immediate cleanup must survive so newly invalidated
+// entries are processed promptly instead of after a full interval.
+TEST(FileCacheSchedulerTest, ScheduleAfterWhileRunningDoesNotReplacePendingImmediate)
+{
+    TestScheduler ts;
+
+    std::atomic<int> runCount{0};
+    // Must be observed false: scheduleAfter reports it did not replace the
+    // pending immediate request.
+    std::atomic<bool> scheduleAfterReturn{true};
+
+    std::promise<void> firstRunning;
+    auto firstRunningFuture = firstRunning.get_future();
+    std::promise<void> releaseFirst;
+    auto releaseFirstFuture = releaseFirst.get_future().share();
+    std::promise<void> scheduleAfterDone;
+    auto scheduleAfterDoneFuture = scheduleAfterDone.get_future();
+    std::promise<void> secondRan;
+    auto secondRanFuture = secondRan.get_future();
+
+    FileCacheScheduledTask * rawTask = nullptr;
+    auto holder = ts.scheduler.createTask(
+        "schedule-after-priority",
+        [&]
+        {
+            const int run = runCount.fetch_add(1);
+            if (run == 0)
+            {
+                // Hold the first run with a barrier so the test can request an
+                // immediate re-run from another thread while we stay Running.
+                firstRunning.set_value();
+                releaseFirstFuture.get();
+
+                // An immediate run is now pending. A far-future delay must be
+                // rejected because immediate work has priority; the
+                // ManualTimekeeper is never advanced, so any wrongly-armed
+                // timer could never fire on its own.
+                scheduleAfterReturn.store(rawTask->scheduleAfter(1000000));
+                scheduleAfterDone.set_value();
+                // Returning now must re-queue the pending immediate run.
+            }
+            else if (run == 1)
+            {
+                secondRan.set_value();
+            }
+        });
+    rawTask = holder.get();
+
+    holder->schedule(); // first run
+    ASSERT_EQ(firstRunningFuture.wait_for(5s), std::future_status::ready);
+
+    // Request an immediate re-run from another thread while the first run is
+    // held. schedule() returns true in the Running state and records exactly one
+    // pending-immediate request.
+    ASSERT_TRUE(holder->schedule());
+
+    releaseFirst.set_value(); // let the callback call scheduleAfter and return
+
+    // scheduleAfter must have reported that it did NOT replace the pending
+    // immediate request.
+    ASSERT_EQ(scheduleAfterDoneFuture.wait_for(5s), std::future_status::ready);
+    EXPECT_FALSE(scheduleAfterReturn.load());
+
+    // The pending immediate run must fire the next callback WITHOUT advancing
+    // the ManualTimekeeper. On the divergent implementation scheduleAfter()
+    // overwrote the immediate request with a far-future delayed one, so this
+    // wait would time out.
+    ASSERT_EQ(secondRanFuture.wait_for(5s), std::future_status::ready);
+    EXPECT_EQ(runCount.load(), 2);
+}
+
 TEST(FileCacheSchedulerTest, MultipleScheduleCallsCoalesceWhileQueued)
 {
     TestScheduler ts;
