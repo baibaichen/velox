@@ -15,8 +15,12 @@
  */
 #pragma once
 
+#include "velox/common/base/Exceptions.h"
+
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
+#include <string_view>
 
 namespace facebook::velox::ch::FileCacheUtils
 {
@@ -45,6 +49,17 @@ inline size_t roundUpToMultiple(size_t num, size_t multiple)
         throw std::overflow_error(
             "FileCacheUtils::roundUpToMultiple: "
             "rounded-up value does not fit in size_t");
+    return result;
+}
+
+/// Returns lhs + rhs, or throws VeloxRuntimeError containing @p operation if
+/// the sum would overflow uint64_t. No wrap, no saturation, no fallback.
+/// Used by Tasks 013 and 014 for checked offset/budget arithmetic.
+inline uint64_t checkedAdd(uint64_t lhs, uint64_t rhs, std::string_view operation)
+{
+    uint64_t result{};
+    if (__builtin_add_overflow(lhs, rhs, &result))
+        VELOX_FAIL("{}: {} + {} overflows uint64_t", operation, lhs, rhs);
     return result;
 }
 

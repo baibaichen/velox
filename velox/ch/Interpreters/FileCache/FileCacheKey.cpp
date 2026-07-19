@@ -55,18 +55,24 @@ FileCacheKey FileCacheKey::fromKeyString(std::string_view key_str)
             "Invalid cache key hex string: expected 32 characters, got {}",
             key_str.size());
 
-    auto hexDigit = [&](char c) -> uint8_t
+    // Nibble lookup matching ClickHouse unhexDigit / hex_char_to_digit_table.
+    // Non-hex characters map to 0xFF and are silently accepted — exactly matching
+    // CH FileCacheKey::fromKeyString -> unhexUInt<UInt128> behavior.
+    // Accumulation uses addition (not OR) to reproduce CH's natural uint64_t
+    // overflow for non-hex nibbles (e.g. 'g' -> 0xFF in position 0 yields
+    // 0xF000000000000000 in the high word after 15 left 4-bit shifts).
+    auto nibble = [](char c) noexcept -> uint64_t
     {
-        if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
-        if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
-        if (c >= 'A' && c <= 'F') return static_cast<uint8_t>(c - 'A' + 10);
-        throwFileCacheException(
-            "Invalid hex character '{}' in cache key string", c);
+        const auto u = static_cast<unsigned char>(c);
+        if (u >= '0' && u <= '9') return static_cast<uint64_t>(u - '0');
+        if (u >= 'a' && u <= 'f') return static_cast<uint64_t>(u - 'a' + 10);
+        if (u >= 'A' && u <= 'F') return static_cast<uint64_t>(u - 'A' + 10);
+        return uint64_t{0xFF};
     };
 
     uint64_t hi = 0, lo = 0;
-    for (size_t i = 0;  i < 16; ++i) hi = (hi << 4) | hexDigit(key_str[i]);
-    for (size_t i = 16; i < 32; ++i) lo = (lo << 4) | hexDigit(key_str[i]);
+    for (size_t i = 0;  i < 16; ++i) hi = (hi << 4) + nibble(key_str[i]);
+    for (size_t i = 16; i < 32; ++i) lo = (lo << 4) + nibble(key_str[i]);
     return FileCacheKey((static_cast<uint128_t>(hi) << 64) | lo);
 }
 
