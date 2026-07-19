@@ -43,3 +43,18 @@ target_link_libraries(
     GTest::gtest
     GTest::gtest_main
 )
+
+# ShardedMap.h is a public header of velox_ch_filecache. Link this focused test
+# directly only to velox_ch_filecache and GTest so a missing public-interface
+# dependency (Folly, fmt, velox_exception) surfaces here instead of being masked
+# by direct links; the velox_ch_filecache PUBLIC interface must propagate them.
+add_executable(velox_ch_sharded_map_test ShardedMapTest.cpp)
+add_test(velox_ch_sharded_map_test velox_ch_sharded_map_test)
+
+target_link_libraries(
+  velox_ch_sharded_map_test
+  PRIVATE
+    velox_ch_filecache
+    GTest::gtest
+    GTest::gtest_main
+)

@@ -47,6 +47,7 @@ if(NOT VELOX_MONO_LIBRARY)
       ${CMAKE_CURRENT_SOURCE_DIR}/FileCache_fwd_internal.h
       ${CMAKE_CURRENT_SOURCE_DIR}/FileCacheKey.h
       ${CMAKE_CURRENT_SOURCE_DIR}/FileCacheUtils.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/ShardedMap.h
   )
 endif()
 
