@@ -30,6 +30,9 @@
 
 #include <gtest/gtest.h>
 
+#include <unistd.h>
+
+#include <cerrno>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -615,6 +618,113 @@ TEST_F(FileCacheBufferedInputTest, TempCacheOnlyMissThrowsAndLeavesNoLeak)
         EXPECT_ANY_THROW(stream->Next(&data, &size));
     }
     // No segment/downloader leaked: a subsequent normal read fully succeeds.
+    {
+        auto input = makeInput(cache, path, key);
+        auto stream = input->read(0, n, dwio::common::LogType::FILE);
+        EXPECT_EQ(readAll(*stream), content);
+    }
+    cache->deactivateBackgroundOperations();
+}
+
+// ==================== external truncation self-heal ====================
+
+// F-014-1: a fully-DOWNLOADED size-in-filename segment whose on-disk cache file
+// is truncated OUTSIDE FileCache must self-heal: getCacheReadBuffer detects the
+// short file, bypasses the cache, and re-fetches the full original bytes from
+// the source. It must NOT short-read and must NOT throw a detach/CANNOT_READ_ALL
+// -class error. Ported from CH CachedOnDiskReadBufferFromFile.cpp:448-472.
+TEST_F(FileCacheBufferedInputTest, ExternalTruncationSelfHealsFromSource)
+{
+    const size_t n = 64;
+    auto content = makeContent(n);
+    // Single segment [0, 64): segment size == n, alignment == n.
+    auto s = settings(n);
+    s.boundaryAlignment = n;
+    std::shared_ptr<FileCache> cache =
+        res_.makeFileCache("truncselfheal", s, "user-A");
+    cache->initialize();
+    auto path = writeSourceFile("src", content);
+    auto key = FileCacheKey::random();
+
+    // Fully download the single segment through a normal read (miss -> fills
+    // cache; on completion the file is renamed to <offset>_<size>).
+    {
+        auto input = makeInput(cache, path, key);
+        auto stream = input->read(0, n, dwio::common::LogType::FILE);
+        ASSERT_EQ(readAll(*stream), content);
+    }
+
+    // Locate the fully-downloaded cache file and confirm it carries the size in
+    // its name (the precondition the self-heal is gated on).
+    std::string cacheFilePath;
+    size_t downloadedSize = 0;
+    {
+        auto holder = cache->get(key, 0, n, 0, "user-A");
+        ASSERT_TRUE(holder && !holder->empty());
+        auto segPtr = holder->getSingleFileSegment();
+        ASSERT_TRUE(segPtr);
+        FileSegment & seg = *segPtr;
+        ASSERT_EQ(seg.state(), FileSegment::State::DOWNLOADED);
+        ASSERT_TRUE(seg.hasSizeInFileName());
+        downloadedSize = seg.getDownloadedSize();
+        ASSERT_EQ(downloadedSize, n);
+        cacheFilePath = seg.getPath();
+    }
+
+    // Externally truncate the on-disk cache file WITHOUT going through FileCache
+    // (simulates truncation outside ClickHouse).
+    const size_t truncatedTo = n / 2;
+    ASSERT_EQ(::truncate(cacheFilePath.c_str(), static_cast<off_t>(truncatedTo)), 0)
+        << "truncate failed: " << std::strerror(errno);
+    ASSERT_EQ(fs::file_size(cacheFilePath), truncatedTo);
+
+    // Read through a NEW stream. The self-heal must re-fetch the FULL original
+    // bytes from the source. Against the pre-fix unconditional-open code this
+    // returns only the truncated prefix (short read) -> the RED failure.
+    {
+        auto input = makeInput(cache, path, key);
+        auto stream = input->read(0, n, dwio::common::LogType::FILE);
+        EXPECT_EQ(readAll(*stream), content);
+    }
+    cache->deactivateBackgroundOperations();
+}
+
+// F-014-1: an EMPTY (zero-byte) cache file for a size-in-filename DOWNLOADED
+// segment is a corrupted-cache case. cacheFileSize == 0 < downloadedSize takes
+// the same bypass branch, so the read still self-heals and returns full bytes.
+TEST_F(FileCacheBufferedInputTest, EmptyCacheFileSelfHealsFromSource)
+{
+    const size_t n = 64;
+    auto content = makeContent(n);
+    auto s = settings(n);
+    s.boundaryAlignment = n;
+    std::shared_ptr<FileCache> cache =
+        res_.makeFileCache("emptyselfheal", s, "user-A");
+    cache->initialize();
+    auto path = writeSourceFile("src", content);
+    auto key = FileCacheKey::random();
+
+    {
+        auto input = makeInput(cache, path, key);
+        auto stream = input->read(0, n, dwio::common::LogType::FILE);
+        ASSERT_EQ(readAll(*stream), content);
+    }
+
+    std::string cacheFilePath;
+    {
+        auto holder = cache->get(key, 0, n, 0, "user-A");
+        ASSERT_TRUE(holder && !holder->empty());
+        auto segPtr = holder->getSingleFileSegment();
+        ASSERT_TRUE(segPtr);
+        ASSERT_TRUE(segPtr->hasSizeInFileName());
+        cacheFilePath = segPtr->getPath();
+    }
+
+    // Truncate to zero bytes (cacheFileSize == 0 < downloadedSize -> bypass).
+    ASSERT_EQ(::truncate(cacheFilePath.c_str(), 0), 0)
+        << "truncate failed: " << std::strerror(errno);
+    ASSERT_EQ(fs::file_size(cacheFilePath), 0u);
+
     {
         auto input = makeInput(cache, path, key);
         auto stream = input->read(0, n, dwio::common::LogType::FILE);
