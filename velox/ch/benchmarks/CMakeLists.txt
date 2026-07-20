@@ -30,3 +30,28 @@ target_link_libraries(
     Folly::follybenchmark
     gflags::gflags
 )
+
+# FileCache wrapper microbenchmark: fcbi (our ch::FileCache, Manager-built) vs
+# cbi (native AsyncDataCache + SsdCache) vs dbi (DirectBufferedInput). Links the
+# mono velox_ch_filecache target once (center SCC + Factory/Manager + DWIO), the
+# native caching library for cbi's AsyncDataCache/SsdCache, and velox_dwio_common
+# for Cached/DirectBufferedInput.
+add_executable(
+  velox_ch_filecache_wrapper_benchmark
+  FileCacheWrapperBenchmark.cpp
+  CacheReadHarness.cpp)
+
+target_link_libraries(
+  velox_ch_filecache_wrapper_benchmark
+  PRIVATE
+    velox_ch_filecache
+    velox_dwio_common
+    velox_caching
+    velox_file
+    velox_exception
+    velox_memory
+    velox_flag_definitions
+    Folly::folly
+    gflags::gflags
+    glog::glog
+)
