@@ -22,6 +22,19 @@ velox_sources(
   FileSegmentKeyType.cpp
   FileCacheKey.cpp
   FileCacheSettings.cpp
+  # Center-SCC sources (Task 012 sub-attempts S2/S3). Registered here so they are
+  # compiled as part of velox_ch_filecache. The dedicated velox_ch_filecache_core
+  # library and the SCC test target are added in S4; a full link is NOT claimed by
+  # S3 (the SCC has no intermediate link step).
+  IFileCachePriority.cpp
+  LRUFileCachePriority.cpp
+  SLRUFileCachePriority.cpp
+  SplitFileCachePriority.cpp
+  EvictionCandidates.cpp
+  FileSegment.cpp
+  Metadata.cpp
+  FileCache.cpp
+  QueryLimit.cpp
 )
 
 # Guards.h is a header-only addition to velox_ch_filecache.
