@@ -75,3 +75,34 @@ target_link_libraries(
     GTest::gtest
     GTest::gtest_main
 )
+
+# Task 012 S4: the center-SCC compile/link closure gate. The nine center-SCC
+# sources (priority/eviction + FileSegment/Metadata/FileCache/QueryLimit) are
+# already compiled into velox_ch_filecache (registered in the parent
+# CMakeLists.txt by S2/S3), so this test links the whole SCC by linking
+# velox_ch_filecache once. A separate velox_ch_filecache_core library is NOT
+# created: that would double-define every SCC symbol and break the link (ODR).
+add_executable(
+  velox_ch_filecache_core_scc_test
+  PriorityEvictionTest.cpp
+  FileSegmentInfoTest.cpp
+  FileSegmentTest.cpp
+  MetadataTest.cpp
+  FileCacheTest.cpp
+  QueryLimitTest.cpp
+)
+add_test(velox_ch_filecache_core_scc_test velox_ch_filecache_core_scc_test)
+
+target_link_libraries(
+  velox_ch_filecache_core_scc_test
+  PRIVATE
+    velox_ch_filecache
+    velox_test_util
+    velox_exception
+    velox_file
+    velox_memory
+    Folly::folly
+    fmt::fmt
+    GTest::gtest
+    GTest::gtest_main
+)
