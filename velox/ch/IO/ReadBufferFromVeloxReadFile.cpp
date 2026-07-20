@@ -118,6 +118,21 @@ void FileCacheBufferState::detach()
     position_ = nullptr;
 }
 
+void FileCacheBufferState::releaseOwnedBuffer()
+{
+    // Detach every view and free the owned pool allocation. Unlike detach(), the
+    // owned BufferPtr is released here (on the calling thread, while its pool is
+    // still alive), so nothing charged to a query-scoped pool survives inside a
+    // reader handed off to a FileSegment for later (possibly asynchronous) reuse.
+    internal_ = CacheBuffer();
+    working_ = CacheBuffer();
+    position_ = nullptr;
+    ownedBuffer_.reset();
+    ownedBegin_ = nullptr;
+    ownedCapacity_ = 0;
+    ownedPool_ = nullptr;
+}
+
 void FileCacheBufferState::resetWorkingView()
 {
     working_ = CacheBuffer(internal_.begin(), internal_.begin());
@@ -169,11 +184,25 @@ bool ReadBufferFromFileBase::next()
 
 bool ReadBufferFromFileBase::nextImpl()
 {
-    char * const dest = internalBuffer().begin();
-    const size_t destCapacity = internalBuffer().size();
+    char * dest = internalBuffer().begin();
+    size_t destCapacity = internalBuffer().size();
     if (dest == nullptr || destCapacity == 0)
-        // The reader is detached (no read target); there is nothing to load.
-        return false;
+    {
+        // A prior set(nullptr, 0) detached the working window but kept the owned
+        // pool allocation. With no external buffer attached, lazily restore the
+        // owned read window so this normal read reuses it; the current file
+        // offset, right bound, and direct-IO alignment are untouched. A reader
+        // that owns no buffer (external-only) genuinely has no read target and
+        // reports end of input.
+        if (state_.hasOwnedBuffer())
+        {
+            state_.restoreOwnedWindow();
+            dest = internalBuffer().begin();
+            destCapacity = internalBuffer().size();
+        }
+        if (dest == nullptr || destCapacity == 0)
+            return false;
+    }
 
     const size_t startOffset = fileOffsetOfBufferEnd_;
     if (startOffset >= readUntil_)
@@ -222,9 +251,15 @@ void ReadBufferFromFileBase::set(char * ptr, size_t size)
     if (ptr == nullptr)
     {
         VELOX_CHECK_EQ(size, 0u, "Detaching set() requires a size of 0");
-        // Detach every caller pointer and restore a coherent empty window over
-        // the owned buffer, preserving the current file offset.
-        state_.restoreOwnedWindow();
+        // Detach every caller pointer AND the owned working view, mirroring CH
+        // BufferBase::set(nullptr, 0): internalBuffer() becomes empty and
+        // available() becomes 0, while the owned pool allocation is retained for
+        // later reuse. The owned read window is restored lazily by the next
+        // normal read (nextImpl) when no external buffer is attached. The current
+        // file offset (getFileOffsetOfBufferEnd) is preserved, so a handed-off
+        // reader still satisfies the FileSegment handoff invariant and a
+        // background-download worker sees the required empty internal buffer.
+        state_.detach();
         return;
     }
 

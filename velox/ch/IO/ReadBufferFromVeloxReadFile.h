@@ -90,9 +90,19 @@ public:
     void set(char * ptr, size_t size, size_t offset);
 
     /// Restores the internal buffer to the owned pool allocation (if any) and
-    /// exposes an empty working window at its start. Used when a caller detaches
-    /// an external buffer via `set(nullptr, 0)`.
+    /// exposes an empty working window at its start. Used lazily by the read
+    /// adapter's `nextImpl` on the first normal read after a `set(nullptr, 0)`
+    /// detach, when no external buffer is attached, so the owned storage is
+    /// reused without a fresh allocation.
     void restoreOwnedWindow();
+
+    /// Drops every view and frees the owned pool allocation, leaving a coherent
+    /// empty state that references no memory. Unlike `detach`, this also releases
+    /// the owned `BufferPtr` so the state holds nothing charged to its pool. Used
+    /// when a reader is handed off to a `FileSegment` for reuse by another query
+    /// or an asynchronous background-download worker that may outlive the
+    /// (query-scoped) pool the owned buffer was charged to.
+    void releaseOwnedBuffer();
 
     /// Discards the working view and drops any external/owned working pointer,
     /// leaving a coherent empty state that references no caller memory. The owned
@@ -206,13 +216,24 @@ public:
 
     /// Installs caller-owned memory as the read target, mirroring
     /// `ReadBuffer::set`: the target persists across reads until another
-    /// explicit `set`. `set(nullptr, 0)` detaches every caller pointer and
-    /// restores the owned internal buffer as a coherent empty window.
+    /// explicit `set`. `set(nullptr, 0)` detaches every caller pointer and the
+    /// owned working view, leaving `internalBuffer().empty()` and
+    /// `available() == 0` (matching CH `BufferBase::set(nullptr, 0)`) while
+    /// retaining the owned pool allocation. A later normal read lazily restores
+    /// the owned read window when no external buffer is attached.
     void set(char * ptr, size_t size);
 
     /// This reader reads directly into the memory installed by `set`, so
     /// zero-copy external reads are supported.
     virtual bool supportsExternalBufferMode() const { return true; }
+
+    /// Frees the owned read buffer (if any) and detaches every view, keeping the
+    /// current file offset. After this the reader holds no pool-charged memory
+    /// and reads only into a subsequently `set` external buffer. Used at reader
+    /// handoff so a reader left in a `FileSegment` -- and possibly destroyed later
+    /// on a background-download worker thread -- never frees memory against a
+    /// query-scoped pool that has already been torn down.
+    void releaseOwnedBuffer() { state_.releaseOwnedBuffer(); }
 
     // --- SeekableReadBuffer surface -----------------------------------------
     /// Repositions the logical file offset (`SEEK_SET` or `SEEK_CUR`) and clears

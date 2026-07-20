@@ -349,9 +349,77 @@ TEST_F(IoAdaptersTest, ReaderSetNullDetaches)
     ASSERT_EQ(reader.internalBuffer().begin(), ext);
 
     EXPECT_NO_THROW(reader.set(nullptr, 0));
+    // Detach mirrors CH BufferBase::set(nullptr, 0): the internal buffer is empty
+    // and no bytes are available. This is exactly the precondition the Task 012
+    // background-download worker asserts (buf->internalBuffer().empty()).
+    EXPECT_TRUE(reader.internalBuffer().empty());
+    EXPECT_EQ(reader.internalBuffer().begin(), nullptr);
     EXPECT_NE(reader.internalBuffer().begin(), ext);
     EXPECT_NE(reader.position(), ext);
     EXPECT_EQ(reader.available(), 0u);
+}
+
+// Reader 5b: after detach leaves an empty internal buffer, a subsequent normal
+// read (no external buffer attached) lazily restores the owned window, reuses the
+// same owned storage, and continues from the preserved file offset.
+TEST_F(IoAdaptersTest, ReaderLazilyReusesOwnedWindowAfterDetach)
+{
+    auto rf = std::make_shared<MockReadFile>("0123456789");
+    ReadBufferFromVeloxReadFile reader(rf, pool_.get(), /*bufferSize=*/4);
+
+    // A first default-mode read fills the owned buffer.
+    ASSERT_TRUE(reader.next());
+    EXPECT_EQ(toString(reader.buffer()), "0123");
+    char * const ownedBegin = reader.internalBuffer().begin();
+    ASSERT_NE(ownedBegin, nullptr);
+
+    // Detach: internalBuffer() is empty and available() is 0, but the owned pool
+    // allocation is retained (the file offset is preserved for the handoff).
+    reader.set(nullptr, 0);
+    ASSERT_TRUE(reader.internalBuffer().empty());
+    EXPECT_EQ(reader.available(), 0u);
+    const size_t offsetAfterDetach = reader.getFileOffsetOfBufferEnd();
+    EXPECT_EQ(offsetAfterDetach, 4u);
+
+    // A subsequent normal read lazily restores the owned window (same storage)
+    // and reads the next chunk from the preserved offset -- not a re-read of the
+    // prefix and not an EOF.
+    ASSERT_TRUE(reader.next());
+    EXPECT_EQ(reader.internalBuffer().begin(), ownedBegin)
+        << "the lazily restored window must reuse the owned allocation";
+    EXPECT_EQ(toString(reader.buffer()), "4567");
+    EXPECT_EQ(reader.getFileOffsetOfBufferEnd(), offsetAfterDetach + 4);
+}
+
+// Reader 5c: releaseOwnedBuffer frees the owned pool allocation and detaches
+// every view; the reader then holds no pool memory yet still reads into an
+// external buffer. This is the reader-handoff contract that keeps a reader left
+// in a FileSegment (and reused by an async background worker) from freeing memory
+// against a query-scoped pool.
+TEST_F(IoAdaptersTest, ReaderReleaseOwnedBufferFreesPoolMemory)
+{
+    auto rf = std::make_shared<MockReadFile>("0123456789");
+    auto pool = memoryManager_.addLeafPool("release-owned-pool");
+    {
+        ReadBufferFromVeloxReadFile reader(rf, pool.get(), /*bufferSize=*/64 * 1024);
+        ASSERT_TRUE(reader.next()); // owned buffer allocated and used
+        EXPECT_GT(pool->usedBytes(), 0);
+
+        reader.releaseOwnedBuffer();
+        EXPECT_EQ(pool->usedBytes(), 0) << "releaseOwnedBuffer must free the owned pool allocation";
+        EXPECT_TRUE(reader.internalBuffer().empty());
+        EXPECT_EQ(reader.available(), 0u);
+
+        // The reader still reads into an external buffer, as the background worker
+        // does via set(memory, size); no owned pool allocation is re-created.
+        reader.seek(0);
+        char ext[4] = {0, 0, 0, 0};
+        reader.set(ext, sizeof(ext));
+        ASSERT_TRUE(reader.next());
+        EXPECT_EQ(std::string(ext, sizeof(ext)), "0123");
+        EXPECT_EQ(pool->usedBytes(), 0) << "an external-buffer read must not re-charge the pool";
+    }
+    EXPECT_EQ(pool->usedBytes(), 0);
 }
 
 // Reader 6: the attach/read/detach handoff satisfies both FileSegment
@@ -373,6 +441,9 @@ TEST_F(IoAdaptersTest, ReaderHandoffSatisfiesFileSegmentInvariants)
 
     reader.set(nullptr, 0); // detach, then hand the reader to FileSegment
     EXPECT_EQ(reader.available(), 0u);
+    // The internal buffer is empty after detach (CH BufferBase::set(nullptr, 0)
+    // semantics); the background-download worker relies on this precondition.
+    EXPECT_TRUE(reader.internalBuffer().empty());
     EXPECT_EQ(reader.getFileOffsetOfBufferEnd(), currentWriteOffset);
     EXPECT_NE(reader.internalBuffer().begin(), queryBuffer);
     EXPECT_NE(reader.position(), queryBuffer);
