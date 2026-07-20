@@ -106,3 +106,24 @@ target_link_libraries(
     GTest::gtest
     GTest::gtest_main
 )
+
+# Task 013: FileCacheFactory + FileCacheManager + the D1/D2 OpenedFileCache B7 seam.
+# The Factory/Manager sources are compiled into velox_ch_filecache (the mono target),
+# so this test links velox_ch_filecache once (a separate velox_ch_filecache_manager
+# library would double-define the SCC symbols and break the link, ODR).
+add_executable(velox_ch_filecache_manager_test FileCacheFactoryManagerTest.cpp)
+add_test(velox_ch_filecache_manager_test velox_ch_filecache_manager_test)
+
+target_link_libraries(
+  velox_ch_filecache_manager_test
+  PRIVATE
+    velox_ch_filecache
+    velox_test_util
+    velox_exception
+    velox_file
+    velox_memory
+    Folly::folly
+    fmt::fmt
+    GTest::gtest
+    GTest::gtest_main
+)

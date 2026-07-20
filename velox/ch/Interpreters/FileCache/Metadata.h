@@ -27,6 +27,7 @@
 #include "velox/ch/Interpreters/FileCache/FileSegment.h"
 #include "velox/ch/Interpreters/FileCache/Guards.h"
 #include "velox/ch/Interpreters/FileCache/IFileCachePriority.h"
+#include "velox/ch/Interpreters/FileCache/OpenedFileCache.h"
 #include "velox/ch/Interpreters/FileCache/ShardedMap.h"
 
 #include <folly/container/F14Map.h>
@@ -163,6 +164,10 @@ struct KeyMetadata : private std::map<size_t, FileSegmentMetadataPtr>,
 
     std::string getPath() const;
 
+    /// D2: reach the Manager-owned opened-file cache (used by the `FileSegment` rename seam).
+    /// Defined out-of-line in `Metadata.cpp` (needs the complete `CacheMetadata`).
+    OpenedFileCache & openedFileCache() const;
+
     std::string getFileSegmentPath(const FileSegment & file_segment) const;
 
     /// Build the path for a segment file directly from its components.
@@ -227,9 +232,18 @@ public:
         /// injected here by reference. `startup` binds the download/cleanup `FileCacheWorker`s to it;
         /// `CacheMetadata` never owns the pool (design 04:11,45-48).
         FileCacheWorkerPool & worker_pool_,
+        /// D2 (Task 013): injected reference to the Manager-owned opened-file (read-handle)
+        /// cache. The remove seam (`removeFileSegmentImpl`) and the rename seam (reached from
+        /// `FileSegment` via its key metadata) invalidate a path's cached handle through this
+        /// reference. `CacheMetadata` never owns it.
+        OpenedFileCache & opened_file_cache_,
         size_t reserve_space_wait_lock_timeout_milliseconds_ = 1000);
 
     virtual ~CacheMetadata();
+
+    /// D2: the Manager-owned opened-file cache injected at construction. Reached by
+    /// `FileSegment` through `KeyMetadata::openedFileCache` for the rename seam.
+    OpenedFileCache & openedFileCache() const { return opened_file_cache; }
 
     void startup();
 
@@ -299,6 +313,8 @@ private:
     /// B3: injected single shared worker pool (owned by `FileCache`/Manager, not by `CacheMetadata`).
     /// `startup` and `setBackgroundDownloadThreads` bind their `FileCacheWorker`s to this pool.
     FileCacheWorkerPool & worker_pool;
+    /// D2: injected Manager-owned opened-file cache (reference, not owned).
+    OpenedFileCache & opened_file_cache;
     /// B2a: injected background-download reserve timeout (CH read this from the global
     /// `Context` in `downloadImpl`; here it comes from `FileCacheConfig`).
     const size_t reserve_space_wait_lock_timeout_milliseconds;

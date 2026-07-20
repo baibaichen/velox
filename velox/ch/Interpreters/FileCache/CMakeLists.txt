@@ -35,6 +35,12 @@ velox_sources(
   Metadata.cpp
   FileCache.cpp
   QueryLimit.cpp
+  # Task 013 Factory + Manager. Registered into velox_ch_filecache (the mono target)
+  # for the same reason as the center-SCC sources: a separate library would
+  # double-define the SCC symbols they link against and break the link (ODR). The
+  # Task-013 test links velox_ch_filecache once.
+  FileCacheFactory.cpp
+  FileCacheManager.cpp
 )
 
 # Guards.h is a header-only addition to velox_ch_filecache.
@@ -64,6 +70,9 @@ if(NOT VELOX_MONO_LIBRARY)
       ${CMAKE_CURRENT_SOURCE_DIR}/ShardedMap.h
       ${CMAKE_CURRENT_SOURCE_DIR}/FileCacheSettings.h
       ${CMAKE_CURRENT_SOURCE_DIR}/FileCacheReadOptions.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/OpenedFileCache.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/FileCacheFactory.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/FileCacheManager.h
   )
 endif()
 
