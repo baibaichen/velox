@@ -92,6 +92,11 @@ public:
     const FileCacheFactory & factory() const { return factory_; }
     FileCachePtr get(const std::string & name) const;
     FileCachePtr getDefault() const;
+    /// True iff a default cache name is configured. Non-throwing companion to
+    /// `getDefault` (which throws when no default is configured). Does NOT verify
+    /// the named cache still exists in the factory — it reflects configuration, the
+    /// same field `getDefault` guards on.
+    bool hasDefault() const;
     const std::string & commonUserId() const { return commonUserId_; }
 
     void initialize();

@@ -152,6 +152,11 @@ FileCachePtr FileCacheManager::getDefault() const
     return factory_.get(defaultCacheName_);
 }
 
+bool FileCacheManager::hasDefault() const
+{
+    return !defaultCacheName_.empty();
+}
+
 void FileCacheManager::initialize()
 {
     {
