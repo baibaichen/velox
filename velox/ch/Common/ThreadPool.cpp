@@ -152,6 +152,11 @@ void FileCacheWorkerPool::setNumThreads(size_t threads)
     executor_.setNumThreads(threads);
 }
 
+size_t FileCacheWorkerPool::numThreads() const
+{
+    return executor_.numThreads();
+}
+
 // ---------------------------------------------------------------------------
 // FileCacheThreadPool
 // ---------------------------------------------------------------------------

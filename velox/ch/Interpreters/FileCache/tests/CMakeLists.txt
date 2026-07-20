@@ -75,3 +75,32 @@ target_link_libraries(
     GTest::gtest
     GTest::gtest_main
 )
+
+# Center-SCC (Task 012) test: exercises the compiled velox_ch_filecache_core
+# library (priority/eviction + FileSegment + Metadata + FileCache + QueryLimit)
+# through its production constructors and real temporary files.
+add_executable(
+  velox_ch_filecache_core_scc_test
+  PriorityEvictionTest.cpp
+  FileSegmentInfoTest.cpp
+  FileSegmentTest.cpp
+  MetadataTest.cpp
+  FileCacheTest.cpp
+  QueryLimitTest.cpp
+)
+add_test(velox_ch_filecache_core_scc_test velox_ch_filecache_core_scc_test)
+
+target_link_libraries(
+  velox_ch_filecache_core_scc_test
+  PRIVATE
+    velox_ch_filecache_core
+    velox_ch_filecache
+    velox_test_util
+    velox_exception
+    velox_file
+    velox_memory
+    Folly::folly
+    fmt::fmt
+    GTest::gtest
+    GTest::gtest_main
+)

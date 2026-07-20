@@ -54,6 +54,54 @@ if(NOT VELOX_MONO_LIBRARY)
   )
 endif()
 
+# The center strongly connected component (SCC) of the FileCache implementation:
+# the Task-011 priority/eviction sources plus the Task-012 center files. These
+# nine translation units are mutually recursive (FileSegment <-> Metadata <->
+# FileCache <-> priority/eviction) and must be compiled and linked together as a
+# single unit; see port/task/012-filecache-core-scc.md "Why the Center SCC
+# Cannot Be Split". In mono builds velox_add_library appends these sources to the
+# velox target and aliases velox_ch_filecache_core to it.
+velox_add_library(
+  velox_ch_filecache_core
+  IFileCachePriority.cpp
+  LRUFileCachePriority.cpp
+  SLRUFileCachePriority.cpp
+  SplitFileCachePriority.cpp
+  EvictionCandidates.cpp
+  FileSegment.cpp
+  Metadata.cpp
+  FileCache.cpp
+  QueryLimit.cpp
+  HEADERS
+    CacheUsage.h
+    IFileCachePriority.h
+    LRUFileCachePriority.h
+    SLRUFileCachePriority.h
+    SplitFileCachePriority.h
+    EvictionCandidates.h
+    FileSegmentInfo.h
+    FileSegment.h
+    Metadata.h
+    FileCache.h
+    QueryLimit.h
+)
+
+# In non-mono builds velox_ch_filecache_core is a real library; link its direct
+# dependencies. In mono builds it is an alias to velox (which already links these)
+# and target_link_libraries() on an alias is an error, so guard on the mode.
+if(NOT VELOX_MONO_LIBRARY)
+  target_link_libraries(
+    velox_ch_filecache_core
+    PUBLIC
+      velox_ch_filecache
+      velox_file
+      velox_memory
+      velox_test_util
+      Folly::folly
+      fmt::fmt
+  )
+endif()
+
 if(${VELOX_BUILD_TESTING} OR ${VELOX_BUILD_TEST_UTILS})
   add_subdirectory(tests)
 endif()

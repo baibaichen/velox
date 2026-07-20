@@ -128,6 +128,13 @@ public:
     /// Adjust the maximum number of threads (thread-safe per Folly contract).
     void setNumThreads(size_t threads);
 
+    /// Current number of threads in the underlying executor. Used by
+    /// FileCache::loadMetadataImpl as a fail-close capacity precondition: the
+    /// shared pool must already provide enough threads for the concurrent
+    /// listing/loading workers (the manager budgets it), and FileCache must never
+    /// resize the shared pool itself.
+    size_t numThreads() const;
+
 private:
     folly::CPUThreadPoolExecutor executor_;
 

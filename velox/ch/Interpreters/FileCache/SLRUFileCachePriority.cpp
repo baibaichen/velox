@@ -580,7 +580,7 @@ bool SLRUFileCachePriority::collectCandidatesForEvictionInProtected(
     /// Set incrementing size callback, as explained in the previous comment.
     res.addAfterEvictStateCallback([=, this](const CacheStateGuard::Lock & lk)
     {
-        /// Fault injection point (no-op until Task 017 real failpoints).
+        /// Fault injection point (TestValue seam; inert unless a test arms it).
         FAIL_POINT_TRIGGER(file_cache_slru_downgrade_fail_before_finalize);
 
         chassert(downgraded_entries->getSize() > 0);
@@ -833,7 +833,7 @@ bool SLRUFileCachePriority::modifySizeLimits(
 
     try
     {
-        /// Fault injection point (no-op until Task 017 real failpoints).
+        /// Fault injection point (TestValue seam; inert unless a test arms it).
         FAIL_POINT_TRIGGER(file_cache_modify_size_limits_fail);
         probationary_queue.modifySizeLimits(getRatio(max_size_, 1 - size_ratio_), getRatio(max_elements_, 1 - size_ratio_), 0, lock);
     }

@@ -24,6 +24,8 @@ inline void add(Metric, int64_t = 1) {}
 
 inline void sub(Metric, int64_t = 1) {}
 
+inline int64_t get(Metric) { return 0; }
+
 class Increment {
  public:
   explicit Increment(Metric, int64_t = 1) {}

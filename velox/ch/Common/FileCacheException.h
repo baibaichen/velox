@@ -19,6 +19,8 @@
 
 #include <fmt/format.h>
 
+#include <cstddef>
+#include <string_view>
 #include <utility>
 
 namespace facebook::velox::ch
@@ -33,5 +35,50 @@ template <typename... Args>
         "{}",
         fmt::format(format, std::forward<Args>(args)...));
 }
+
+/// Typed errno-carrying exception, consumed by `FileSegment::write` to reconcile
+/// a short physical write against the on-disk file size — but only for the
+/// space-exhaustion errnos (`ENOSPC`/`EDQUOT`). It mirrors ClickHouse's
+/// `ErrnoException`/`getErrno()` used by the same code path.
+///
+/// The ClickHouse-shaped design targets `VeloxRuntimeError`, but that class is
+/// `final`; this derives from the non-final `velox::VeloxException` base
+/// instead, carrying the runtime error source/type so it groups with other
+/// runtime failures.
+///
+/// This task only defines and *consumes* the type; the concrete producer (a
+/// Velox `WriteFile` that raises a structured errno on a short write) remains a
+/// separate pre-release gate. Until that producer exists, the reconciliation
+/// branch is exercised only by the FileSegment tests, which raise this type
+/// directly from a real-file-backed throwing writer double.
+class FileCacheErrnoException : public velox::VeloxException
+{
+public:
+    FileCacheErrnoException(
+        const char * file,
+        size_t line,
+        const char * function,
+        std::string_view message,
+        int errnoCode)
+        : velox::VeloxException(
+              file,
+              line,
+              function,
+              /* expression */ "",
+              message,
+              velox::error_source::kErrorSourceRuntime,
+              velox::error_code::kUnknown,
+              /* isRetriable */ false,
+              velox::VeloxException::Type::kSystem,
+              /* exceptionName */ "FileCacheErrnoException"),
+          savedErrno_(errnoCode)
+    {
+    }
+
+    int getErrno() const { return savedErrno_; }
+
+private:
+    int savedErrno_;
+};
 
 }

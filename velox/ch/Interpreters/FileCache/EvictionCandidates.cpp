@@ -304,7 +304,7 @@ void EvictionCandidates::evict()
                     chassert(iterator);
                 }
 
-                /// Fault injection point (no-op until Task 017 real failpoints).
+                /// Fault injection point (TestValue seam; inert unless a test arms it).
                 FAIL_POINT_TRIGGER(file_cache_dynamic_resize_fail_to_evict);
 
                 locked_key->removeFileSegment(
