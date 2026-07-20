@@ -73,3 +73,28 @@ target_link_libraries(
     GTest::gtest
     GTest::gtest_main
 )
+
+# Task 018a: connector integration — FileCacheBufferedInputBuilder routes the
+# Hive connector read path through the FileCache. Drives the real
+# BufferedInputBuilder::create(...) extension point (real FileHandle,
+# ConnectorQueryCtx, and read) and asserts FileCache vs native selection.
+add_executable(
+  velox_ch_filecache_connector_test
+  FileCacheBufferedInputBuilderTest.cpp)
+add_test(velox_ch_filecache_connector_test velox_ch_filecache_connector_test)
+
+target_link_libraries(
+  velox_ch_filecache_connector_test
+  PRIVATE
+    velox_ch_filecache
+    velox_hive_connector
+    velox_dwio_common
+    velox_test_util
+    velox_exception
+    velox_file
+    velox_memory
+    Folly::folly
+    fmt::fmt
+    GTest::gtest
+    GTest::gtest_main
+)

@@ -25,8 +25,14 @@ velox_sources(
   velox_ch_filecache
   PRIVATE
     FileCacheBufferedInput.cpp
+    FileCacheBufferedInputBuilder.cpp
     FileCacheInputStream.cpp
 )
+
+# The connector integration (FileCacheBufferedInputBuilder) uses the Hive
+# connector extension point BufferedInputBuilder / createBufferedInput, so link
+# velox_hive_connector into the target that carries these sources.
+velox_link_libraries(velox_ch_filecache PUBLIC velox_hive_connector)
 
 # In non-mono builds velox_ch_filecache is a real library; register the public
 # headers via FILE_SET so IDE navigation and install work there too. In mono
