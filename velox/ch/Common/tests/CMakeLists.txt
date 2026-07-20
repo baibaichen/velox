@@ -94,3 +94,18 @@ target_link_libraries(
     GTest::gtest
     GTest::gtest_main
 )
+
+add_executable(velox_ch_observability_test ObservabilityTest.cpp)
+add_test(velox_ch_observability_test velox_ch_observability_test)
+
+target_link_libraries(
+  velox_ch_observability_test
+  PRIVATE
+    velox_ch_filecache
+    velox_test_util
+    velox_exception
+    Folly::folly
+    fmt::fmt
+    GTest::gtest
+    GTest::gtest_main
+)

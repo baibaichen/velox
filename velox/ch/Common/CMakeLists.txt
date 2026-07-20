@@ -78,6 +78,8 @@ velox_add_library(
   FileCacheQueryIdScope.cpp
   FileCacheScheduler.cpp
   SipHash128.cpp
+  CurrentMetrics.cpp
+  ProfileEvents.cpp
   HEADERS
     ClickHouseAliases.h
     ClickHouseAssert.h

@@ -17,6 +17,7 @@
 #include "velox/ch/Common/FileCacheQueryIdScope.h"
 
 #include <folly/system/ThreadId.h>
+#include <folly/system/ThreadName.h>
 
 #include <string>
 #include <string_view>
@@ -50,9 +51,18 @@ std::string FileCacheQueryIdScope::getCallerId()
 {
     const auto tid = std::to_string(folly::getOSThreadID());
     const auto & qid = tCurrentQueryId;
-    if (qid.empty())
-        return "None:" + tid;
-    return qid + ":" + tid;
+    if (!qid.empty())
+        return qid + ":" + tid;
+
+    // F-CALLERID (Task 017): restore the CH diagnostic format
+    // `None:<threadname>:<tid>`. `threadname` is diagnostic only and never
+    // participates in downloader-identity correctness (that is carried by the
+    // OS thread id). `folly::getCurrentThreadName()` returns an empty Optional
+    // when the platform cannot report a name; in that case the threadname field
+    // is left empty, yielding `None::<tid>`.
+    const auto threadName = folly::getCurrentThreadName();
+    const std::string_view name = threadName ? std::string_view(*threadName) : std::string_view{};
+    return "None:" + std::string(name) + ":" + tid;
 }
 
 } // namespace facebook::velox::ch
