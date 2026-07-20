@@ -60,17 +60,26 @@ TEST(LoggerUsefulTest, ArgumentsAreNotEvaluated)
     EXPECT_EQ(evaluated, 0);
 }
 
-TEST(LoggerUsefulTest, AllLogMacrosDoNotEvaluateArguments)
+TEST(LoggerUsefulTest, LogTestAndDisabledLevelsDoNotEvaluateArguments)
 {
+    // Task 017: LOG_TEST stays no-op and must never evaluate its arguments.
+    // LOG_TRACE/DEBUG/INFO map to VLOG(3/2/1); at the default glog verbosity
+    // (v=0) those levels are disabled, so their arguments are not evaluated
+    // either (lazy formatting guarded by VLOG_IS_ON).
     int evaluated = 0;
     auto logger = getLogger("test");
     LOG_TEST(logger, "value {}", ++evaluated);
     LOG_TRACE(logger, "value {}", ++evaluated);
     LOG_DEBUG(logger, "value {}", ++evaluated);
     LOG_INFO(logger, "value {}", ++evaluated);
-    LOG_WARNING(logger, "value {}", ++evaluated);
-    LOG_ERROR(logger, "value {}", ++evaluated);
     EXPECT_EQ(evaluated, 0);
+
+    // LOG_WARNING / LOG_ERROR always log, so they DO evaluate their arguments.
+    // This is the real Task-017 behaviour (the old no-op shim did not).
+    LOG_WARNING(logger, "value {}", ++evaluated);
+    EXPECT_EQ(evaluated, 1);
+    LOG_ERROR(logger, "value {}", ++evaluated);
+    EXPECT_EQ(evaluated, 2);
 }
 
 TEST(LoggerUsefulTest, GetLoggerReturnsNonNullWithNameIdentity)
@@ -80,20 +89,24 @@ TEST(LoggerUsefulTest, GetLoggerReturnsNonNullWithNameIdentity)
     EXPECT_EQ(logger->name(), "FileCache(test)");
 }
 
-TEST(LoggerUsefulTest, CurrentExceptionMessageRemainsEmptyFirstPhase)
+TEST(LoggerUsefulTest, CurrentExceptionMessageFormatsInsideCatch)
 {
+    // Task 017: getCurrentExceptionMessage now returns real, non-empty text for
+    // the in-flight exception (previously it was an empty first-phase stub).
+    EXPECT_TRUE(getCurrentExceptionMessage().empty()); // no active exception
     try
     {
         throw std::runtime_error("boom");
     }
     catch (...)
     {
-        EXPECT_TRUE(getCurrentExceptionMessage().empty());
-        EXPECT_TRUE(getCurrentExceptionMessage(/*withStackTrace=*/true).empty());
+        const auto msg = getCurrentExceptionMessage(/*withStackTrace=*/true);
+        EXPECT_FALSE(msg.empty());
+        EXPECT_NE(msg.find("boom"), std::string::npos);
     }
 }
 
-TEST(LoggerUsefulTest, TryLogCurrentExceptionIsNoOpFirstPhase)
+TEST(LoggerUsefulTest, TryLogCurrentExceptionDoesNotThrow)
 {
     try
     {

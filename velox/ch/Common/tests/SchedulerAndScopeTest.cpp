@@ -20,10 +20,12 @@
 #include "velox/common/base/Exceptions.h"
 
 #include <folly/futures/ManualTimekeeper.h>
+#include <folly/system/ThreadId.h>
 
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <future>
 #include <memory>
@@ -646,11 +648,72 @@ TEST(FileCacheQueryIdScopeTest, PhysicalTidChangeMakesCallerIdDiffer)
     EXPECT_EQ(tid2.substr(0, queryId.size()), queryId);
 }
 
-TEST(FileCacheQueryIdScopeTest, NoScopeProducesNonePrefix)
+TEST(FileCacheQueryIdScopeTest, NoScopeProducesExactNoneFormat)
 {
-    // Without a scope the caller id uses the "None" prefix.
+    // F-CALLERID (Task 017): without a scope, the caller id uses the exact CH
+    // diagnostic format `None:<threadname>:<tid>`. This is an EXACT-format check,
+    // not a prefix check: the string must have exactly three colon-separated
+    // fields, the first literally "None", and the last a decimal OS thread id
+    // matching this thread's id.
     const std::string callerId = FileCacheQueryIdScope::getCallerId();
-    EXPECT_EQ(callerId.substr(0, 5), "None:");
+
+    const auto firstColon = callerId.find(':');
+    ASSERT_NE(firstColon, std::string::npos);
+    const auto lastColon = callerId.rfind(':');
+    ASSERT_NE(lastColon, std::string::npos);
+    // Three fields => two distinct colons (threadname may be empty, but both
+    // colons must be present and distinct).
+    ASSERT_NE(firstColon, lastColon)
+        << "caller id must be None:<threadname>:<tid> with two colons: " << callerId;
+
+    const std::string prefix = callerId.substr(0, firstColon);
+    EXPECT_EQ(prefix, "None");
+
+    const std::string tidField = callerId.substr(lastColon + 1);
+    ASSERT_FALSE(tidField.empty());
+    for (char c : tidField)
+        EXPECT_TRUE(std::isdigit(static_cast<unsigned char>(c)))
+            << "tid field must be decimal: " << callerId;
+    EXPECT_EQ(tidField, std::to_string(folly::getOSThreadID()));
+
+    // False-green probe: the previous prefix-only assertion (substr(0,5)=="None:")
+    // would also pass for the OLD `None:<tid>` format, which lacks the threadname
+    // field. Assert the format is NOT the two-field form, so a regression back to
+    // `None:<tid>` fails here.
+    const std::string twoFieldForm = "None:" + std::to_string(folly::getOSThreadID());
+    EXPECT_NE(callerId, twoFieldForm)
+        << "caller id regressed to the two-field None:<tid> form";
+}
+
+// SD8 (Task 017): the scheduler keeps a `std::recursive_mutex` because a timer
+// continuation can run INLINE on the thread that is attaching it while that
+// thread already holds the task mutex. `scheduleAfter(0)` triggers exactly this:
+// `ManualTimekeeper::after(0)` fulfils its promise immediately, so
+// `armTimerLocked`'s `.thenValue()` runs the continuation inline on the current
+// thread (which holds `mutex_` via `scheduleAfter`). The continuation re-locks
+// `mutex_` to call `queueImmediateLocked`. With a NON-recursive mutex this
+// self-deadlocks and this test hangs (RED for resolution option 2); with the
+// retained `std::recursive_mutex` the re-entry is safe and the callback runs.
+TEST(FileCacheSchedulerTest, ZeroDelayInlineContinuationDoesNotSelfDeadlock)
+{
+    TestScheduler ts;
+
+    std::promise<void> ran;
+    auto ranFuture = ran.get_future();
+
+    auto holder = ts.scheduler.createTask("inline-reentry-task", [&ran]
+    {
+        ran.set_value();
+    });
+    ASSERT_TRUE(static_cast<bool>(holder));
+
+    // This call must return (not deadlock) even though it re-enters the task
+    // mutex inline via the immediately-ready timer continuation.
+    const bool scheduled = holder->scheduleAfter(0);
+    EXPECT_TRUE(scheduled);
+
+    // The inline continuation queued the immediate run on the worker pool.
+    ASSERT_EQ(ranFuture.wait_for(5s), std::future_status::ready);
 }
 
 TEST(FileCacheQueryIdScopeTest, SameQueryDifferentResumeProducesDifferentCallerId)

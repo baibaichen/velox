@@ -60,10 +60,12 @@ FileCacheInputStream::FileCacheInputStream(
     FileCacheBufferedInput * owner,
     velox::common::Region region,
     FileCacheRequestContext cacheContext,
-    dwio::common::LogType logType)
+    dwio::common::LogType logType,
+    QueryStatus queryStatus)
     : owner_(owner)
     , region_(region)
     , cacheContext_(std::move(cacheContext))
+    , queryStatus_(std::move(queryStatus))
     , logType_(logType)
     , skipCacheOnDiskFailure_(owner_->fileCache().skipCacheOnDiskFailure())
 {
@@ -253,6 +255,10 @@ uint64_t FileCacheInputStream::getRemainingSizeToRead() const
 
 bool FileCacheInputStream::nextFileSegmentsBatch()
 {
+    // Step 7 safe point 2: before any cache lookup. No downloader lease is held
+    // here (we have not yet elected a downloader for the new batch).
+    queryStatus_.throwIfKilled();
+
     VELOX_CHECK(!readInfo_.fileSegments || readInfo_.fileSegments->empty());
     const uint64_t size = getRemainingSizeToRead();
     if (size == 0)
@@ -311,6 +317,10 @@ void FileCacheInputStream::initializeIfNeeded()
 {
     if (initialized_)
         return;
+
+    // Step 7 safe point 1: before FileCache::getOrSet / get. No downloader lease
+    // is held before initialization.
+    queryStatus_.throwIfKilled();
 
     state_.reset();
     // Absolute region end; readInfo_.readUntilPosition is absolute, not file size.
@@ -384,6 +394,10 @@ FileCacheInputStream::createReadFromFileSegmentState(
                 if (canStartFromCache(offset, fileSegment))
                     return create(ReadType::CACHED);
                 downloadState = fileSegment.wait(offset);
+                // Step 7 safe point 4: after FileSegment::wait() returns. wait()
+                // may block, but this stream holds no downloader lease while
+                // waiting on another downloader, so it is safe to abort here.
+                queryStatus_.throwIfKilled();
                 continue;
             }
             case FileSegment::State::DOWNLOADED:
@@ -762,6 +776,12 @@ bool FileCacheInputStream::Next(const void ** data, int32_t * size)
 
     if (position_ >= region_.length)
         return false;
+
+    // Step 7 safe point 3: at the outer Next() iteration boundary, before
+    // starting (or advancing to) a segment. Any previous segment's downloader
+    // lease was already released at the end of the prior Next() call, so no
+    // lease is held here.
+    queryStatus_.throwIfKilled();
 
     initializeIfNeeded();
 

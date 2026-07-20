@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "velox/ch/Common/QueryStatus.h"
 #include "velox/ch/Disks/IO/FileCacheRequestContext.h"
 #include "velox/ch/IO/ReadBufferFromVeloxReadFile.h"
 #include "velox/ch/Interpreters/FileCache/FileCache.h"
@@ -42,7 +43,8 @@ public:
         FileCacheBufferedInput * owner,
         velox::common::Region region,
         FileCacheRequestContext cacheContext,
-        dwio::common::LogType logType);
+        dwio::common::LogType logType,
+        QueryStatus queryStatus = {});
 
     ~FileCacheInputStream() override;
 
@@ -136,6 +138,9 @@ private:
     FileCacheBufferedInput * owner_;
     velox::common::Region region_;
     FileCacheRequestContext cacheContext_;
+    // Task 017: query cancellation. Default-constructed = never cancels. Checked
+    // only at safe points where no downloader lease is held (see Next / Step 7).
+    QueryStatus queryStatus_;
     // Acquired once in the constructor; never reset by seekToPosition.
     FileCache::QueryContextHolderPtr queryContextHolder_;
     dwio::common::LogType logType_;

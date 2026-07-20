@@ -108,12 +108,20 @@ TEST(CallerIdTest, SameScopeStableId)
     EXPECT_NE(id1, "None:" + std::to_string(folly::getOSThreadID()));
 }
 
-/// Without a query scope, caller is "None:<tid>".
+/// Without a query scope, caller uses the CH diagnostic format
+/// "None:<threadname>:<tid>" (F-CALLERID, Task 017). Exact-format check: three
+/// colon-separated fields, first "None", last a decimal OS tid.
 TEST(CallerIdTest, NoScopeBackgroundId)
 {
     auto id = FileSegment::getCallerId();
-    EXPECT_TRUE(id.rfind("None:", 0) == 0);
-    EXPECT_EQ(id, "None:" + std::to_string(folly::getOSThreadID()));
+    const auto firstColon = id.find(':');
+    ASSERT_NE(firstColon, std::string::npos);
+    const auto lastColon = id.rfind(':');
+    ASSERT_NE(firstColon, lastColon) << "expected None:<threadname>:<tid>: " << id;
+    EXPECT_EQ(id.substr(0, firstColon), "None");
+    EXPECT_EQ(id.substr(lastColon + 1), std::to_string(folly::getOSThreadID()));
+    // Regression guard: must NOT be the old two-field None:<tid> form.
+    EXPECT_NE(id, "None:" + std::to_string(folly::getOSThreadID()));
 }
 
 /// stateToString mirrors the enum names (used by getInfoForLog and system tables).
