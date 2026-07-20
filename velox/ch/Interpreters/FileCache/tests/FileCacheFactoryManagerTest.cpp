@@ -300,6 +300,32 @@ TEST_F(ManagerTest, RefreshStatsReportsCachesAndOpenedFileCache)
     manager->shutdown();
 }
 
+TEST_F(ManagerTest, HasDefaultAgreesWithGetDefault)
+{
+    // Case 1: a non-empty defaultCacheName -> hasDefault() is true AND getDefault()
+    // returns that cache without throwing.
+    {
+        auto o = baseOptions();
+        o.caches.push_back({"a", makeConfig(sub("a")), "conf.a"});
+        o.defaultCacheName = "a";
+        auto manager = FileCacheManager::create(o);
+        EXPECT_TRUE(manager->hasDefault());
+        EXPECT_EQ(manager->getDefault(), manager->get("a"));
+        manager->shutdown();
+    }
+    // Case 2: an empty defaultCacheName -> hasDefault() is false AND getDefault()
+    // throws the "no default cache configured" exception. hasDefault() is false
+    // exactly when getDefault() would throw.
+    {
+        auto o = baseOptions();
+        o.caches.push_back({"a", makeConfig(sub("a")), "conf.a"});
+        auto manager = FileCacheManager::create(o);
+        EXPECT_FALSE(manager->hasDefault());
+        EXPECT_THROW(manager->getDefault(), VeloxRuntimeError);
+        manager->shutdown();
+    }
+}
+
 // ==================== B7: opened-handle invalidation ====================
 
 // A real drop-on-remove/rename test for the D1/D2 OpenedFileCache seam. The handle for a path
