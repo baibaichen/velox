@@ -102,6 +102,37 @@ if(NOT VELOX_MONO_LIBRARY)
   )
 endif()
 
+# Task 013 Factory/Manager: the process-level runtime owner. FileCacheManager
+# owns the shared worker pool, scheduler, and OpenedFileCache and contains one
+# FileCacheFactory (the sole registry). In mono builds velox_add_library appends
+# these sources to the velox target and aliases velox_ch_filecache_manager to it.
+velox_add_library(
+  velox_ch_filecache_manager
+  FileCacheFactory.cpp
+  FileCacheManager.cpp
+  HEADERS
+    FileCacheFactory.h
+    FileCacheManager.h
+    OpenedFileCache.h
+)
+
+# In non-mono builds velox_ch_filecache_manager is a real library; link its
+# direct dependencies. In mono builds it is an alias to velox (which already
+# links these) and target_link_libraries() on an alias is an error, so guard on
+# the mode (mirrors velox_ch_filecache_core above).
+if(NOT VELOX_MONO_LIBRARY)
+  target_link_libraries(
+    velox_ch_filecache_manager
+    PUBLIC
+      velox_ch_filecache_core
+      velox_ch_filecache
+      velox_file
+      velox_memory
+      Folly::folly
+      fmt::fmt
+  )
+endif()
+
 if(${VELOX_BUILD_TESTING} OR ${VELOX_BUILD_TEST_UTILS})
   add_subdirectory(tests)
 endif()

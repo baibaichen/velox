@@ -104,3 +104,29 @@ target_link_libraries(
     GTest::gtest
     GTest::gtest_main
 )
+
+# Task 013 Factory/Manager test: exercises the compiled velox_ch_filecache_manager
+# library (FileCacheFactory registry, FileCacheManager runtime ownership, and the
+# manager-owned OpenedFileCache) through its production entry points and real
+# temporary files.
+add_executable(
+  velox_ch_filecache_manager_test
+  FileCacheFactoryManagerTest.cpp
+)
+add_test(velox_ch_filecache_manager_test velox_ch_filecache_manager_test)
+
+target_link_libraries(
+  velox_ch_filecache_manager_test
+  PRIVATE
+    velox_ch_filecache_manager
+    velox_ch_filecache_core
+    velox_ch_filecache
+    velox_test_util
+    velox_exception
+    velox_file
+    velox_memory
+    Folly::folly
+    fmt::fmt
+    GTest::gtest
+    GTest::gtest_main
+)
