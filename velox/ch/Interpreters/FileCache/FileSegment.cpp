@@ -737,16 +737,13 @@ void FileSegment::renameToIncludeSizeInNameUnlocked(const FileSegmentGuard::Lock
             fmt::format("Failed to rename cache file '{}' to encode its size in the name; keeping the legacy name", old_path));
     }
 
-    /// TODO(Task 013): invalidate opened file handles via the manager-owned OpenedFileCache.
-    /// A reader that opened this segment while it was still named `old_path` left an entry in the
-    /// opened-file cache keyed by `old_path`; a future segment created at the same key/offset is
-    /// again named `old_path`, so opening it could reuse the stale descriptor. CH drops the
-    /// `old_path` entry here via `OpenedFileCache::instance().remove`. This is a no-op in the SCC
-    /// phase: no `OpenedFileCache` exists yet (it is manager-owned, introduced in Task 013), so
-    /// there are no cached handles to go stale. The rename itself (the core operation) already ran
-    /// above per the Task-012 amendment (B2b CORRECTION / B7, user decision 2026-07-20). Task 013
-    /// wires the real Manager-backed invalidation into this same seam.
-    (void)renamed;
+    /// D2 (Task 013): the file previously at `old_path` has been moved to `new_path`. A reader that
+    /// opened this segment while it was still named `old_path` left an entry in the opened-file cache
+    /// keyed by `old_path`; a future segment created at the same key/offset is again named `old_path`,
+    /// so opening it could reuse the stale descriptor. Drop the `old_path` entry (CH
+    /// `FileSegment.cpp:800-802`). Reached through the key metadata's Manager-owned OpenedFileCache.
+    if (renamed)
+        key_metadata_ptr->openedFileCache().removePath(old_path);
 }
 
 void FileSegment::setDownloadFailed()

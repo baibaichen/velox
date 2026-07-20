@@ -173,16 +173,21 @@ bool FileCache::CheckCacheProbability::doCheck()
 FileCache::FileCache(
     const std::string & cache_name,
     const FileCacheSettings & settings,
+    FileCacheWorkerPool & worker_pool_,
+    FileCacheScheduler & scheduler_,
+    OpenedFileCache & opened_file_cache_,
+    filesystems::FileSystem & local_file_system_,
     const std::string & common_user_id_)
     : common_user_id(common_user_id_)
     , common_origin(common_user_id, 0, FileSegmentKeyType::General)
-    /// B3/B6: owned runtime services. The worker pool backs every `FileCacheWorker`
-    /// (metadata download/cleanup threads, the eviction pool, and the load-metadata
-    /// helper threads); the scheduler (over a `folly::Timekeeper`) replaces CH's
-    /// `BackgroundSchedulePool` for the background maintenance tasks.
-    , worker_pool(folly::hardware_concurrency() ? folly::hardware_concurrency() : 8, 0, "FileCache:" + cache_name)
-    , timekeeper(std::make_shared<folly::ThreadWheelTimekeeper>())
-    , scheduler(timekeeper, worker_pool)
+    /// D3: manager-owned runtime services, injected by reference (design 02:373-382). The worker
+    /// pool backs every `FileCacheWorker` (metadata download/cleanup threads, the eviction pool,
+    /// and the load-metadata helper threads); the scheduler replaces CH's `BackgroundSchedulePool`
+    /// for the background maintenance tasks. `FileCache` no longer owns these.
+    , worker_pool(worker_pool_)
+    , scheduler(scheduler_)
+    , opened_file_cache(opened_file_cache_)
+    , local_file_system(local_file_system_)
     , max_file_segment_size(settings.maxFileSegmentSize)
     , bypass_cache_threshold(settings.enableBypassCacheWithThreshold ? settings.bypassCacheThreshold : 0)
     , boundary_alignment(settings.boundaryAlignment)
@@ -216,6 +221,7 @@ FileCache::FileCache(
           settings.backgroundDownloadThreads,
           write_cache_per_user_directory,
           worker_pool,
+          opened_file_cache,
           settings.reserveSpaceWaitLockTimeoutMilliseconds)
     , check_cache_probability(settings.checkCacheProbability)
 {

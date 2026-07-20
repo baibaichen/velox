@@ -16,6 +16,7 @@
 
 #include "velox/ch/Common/FileCacheQueryIdScope.h"
 #include "velox/ch/Interpreters/FileCache/FileCache.h"
+#include "velox/ch/Interpreters/FileCache/tests/FileCacheTestResources.h"
 #include "velox/ch/Interpreters/FileCache/FileCacheErrnoException.h"
 #include "velox/ch/Interpreters/FileCache/FileCacheKey.h"
 #include "velox/ch/Interpreters/FileCache/FileSegment.h"
@@ -154,6 +155,7 @@ protected:
     void SetUp() override { temp_ = TempDirectoryPath::create(); }
     std::string cachePath() const { return (fs::path(temp_->getPath()) / "cache").string(); }
     std::shared_ptr<TempDirectoryPath> temp_;
+    facebook::velox::ch::test::FileCacheTestResources res_;
 };
 
 /// Partial-file resume (mandatory contract): a downloader writes a first prefix, releases the
@@ -168,7 +170,8 @@ TEST_F(FileSegmentDownloadTest, PartialFileResumeAppendsWithoutTruncation)
     const size_t suffix = 2000;
     const size_t total = prefix + suffix; // < seg, so completion stays PARTIALLY_DOWNLOADED
 
-    FileCache cache("resume", fsSettings(cachePath(), seg), "user-A");
+    auto cache_ptr = res_.makeFileCache("resume", fsSettings(cachePath(), seg), "user-A");
+    auto & cache = *cache_ptr;
     cache.initialize();
 
     auto key = FileCacheKey::random();
@@ -308,7 +311,8 @@ TEST_F(FileSegmentDownloadTest, PartialPhysicalAppendFailureReconcilesDownloaded
     const size_t suffix = 4000;   // second append: fails after committing a strict prefix
     const size_t committed_suffix = 1000; // strict prefix of the failing chunk committed to disk
 
-    FileCache cache("append-fail", fsSettings(cachePath(), seg), "user-A");
+    auto cache_ptr = res_.makeFileCache("append-fail", fsSettings(cachePath(), seg), "user-A");
+    auto & cache = *cache_ptr;
     cache.initialize();
 
     // Install the fault factory: the 2nd append commits `committed_suffix` bytes then throws ENOSPC.
@@ -395,7 +399,8 @@ TEST_F(FileSegmentDownloadTest, RemoteReaderHandoffDetachesAndPreservesOffsets)
         std::fclose(f);
     }
 
-    FileCache cache("remote", fsSettings(cachePath(), seg), "user-A");
+    auto cache_ptr = res_.makeFileCache("remote", fsSettings(cachePath(), seg), "user-A");
+    auto & cache = *cache_ptr;
     cache.initialize();
 
     auto key = FileCacheKey::random();

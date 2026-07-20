@@ -191,6 +191,11 @@ std::string KeyMetadata::getPath() const
     return cache_metadata->getKeyPath(key, *origin);
 }
 
+OpenedFileCache & KeyMetadata::openedFileCache() const
+{
+    return cache_metadata->openedFileCache();
+}
+
 std::string KeyMetadata::getFileSegmentPath(const FileSegment & file_segment) const
 {
     std::optional<size_t> size;
@@ -215,12 +220,14 @@ CacheMetadata::CacheMetadata(
     size_t background_download_threads_,
     bool write_cache_per_user_directory_,
     FileCacheWorkerPool & worker_pool_,
+    OpenedFileCache & opened_file_cache_,
     size_t reserve_space_wait_lock_timeout_milliseconds_)
     : path(path_)
     , cleanup_queue(std::make_shared<CleanupQueue>())
     , download_queue(std::make_shared<DownloadQueue>(background_download_queue_size_limit_))
     , write_cache_per_user_directory(write_cache_per_user_directory_)
     , worker_pool(worker_pool_)
+    , opened_file_cache(opened_file_cache_)
     , reserve_space_wait_lock_timeout_milliseconds(reserve_space_wait_lock_timeout_milliseconds_)
     , log(getLogger("CacheMetadata"))
     , origins(ProfileEvents::FilesystemCacheLockOriginPoolMicroseconds)
@@ -1244,11 +1251,13 @@ KeyMetadata::iterator LockedKey::removeFileSegmentImpl(
 
     if (opened_handle_invalidation_required)
     {
-        /// TODO(Task 013): invalidate opened file handles via the manager-owned OpenedFileCache.
-        /// No-op in the SCC phase: no `OpenedFileCache` exists yet (it is manager-owned, introduced
-        /// in Task 013), so there are no cached handles for `removed_path` to go stale. Task 013
-        /// wires the real Manager-backed invalidation into this same seam.
-        (void)removed_path;
+        /// D2 (Task 013): the physical file at `removed_path` is gone; drop any cached open
+        /// read handle so a future segment created at the same key/offset (which is again
+        /// named `removed_path`) never reuses a stale descriptor. CH invalidates
+        /// `remove(path, flags)` and `remove(path, flags | O_DIRECT)` (Metadata.cpp:1267-1268);
+        /// local cache-segment reads do not use O_DIRECT, so we drop all flag-variants for the
+        /// path in one call. The erase of the empty entry stays coupled to the invalidation.
+        key_metadata->openedFileCache().removePath(removed_path);
         return key_metadata->erase(it);
     }
 

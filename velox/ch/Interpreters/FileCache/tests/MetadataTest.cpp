@@ -15,6 +15,7 @@
  */
 
 #include "velox/ch/Interpreters/FileCache/FileCache.h"
+#include "velox/ch/Interpreters/FileCache/tests/FileCacheTestResources.h"
 #include "velox/ch/Interpreters/FileCache/FileCacheKey.h"
 #include "velox/ch/Interpreters/FileCache/Metadata.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
@@ -55,7 +56,7 @@ protected:
     void SetUp() override
     {
         temp_ = TempDirectoryPath::create();
-        cache_ = std::make_unique<FileCache>("m", metaSettings((fs::path(temp_->getPath()) / "cache").string()), "user-A");
+        cache_ = res_.makeFileCache("m", metaSettings((fs::path(temp_->getPath()) / "cache").string()), "user-A");
         cache_->initialize();
     }
 
@@ -66,6 +67,7 @@ protected:
     }
 
     std::shared_ptr<TempDirectoryPath> temp_;
+    facebook::velox::ch::test::FileCacheTestResources res_;
     std::unique_ptr<FileCache> cache_;
 };
 

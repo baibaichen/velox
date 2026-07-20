@@ -17,6 +17,7 @@
 #include "velox/ch/Common/FileCacheBoundedQueue.h"
 #include "velox/ch/Common/StatusFile.h"
 #include "velox/ch/Interpreters/FileCache/FileCache.h"
+#include "velox/ch/Interpreters/FileCache/tests/FileCacheTestResources.h"
 #include "velox/ch/Interpreters/FileCache/FileCacheKey.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
 
@@ -108,11 +109,13 @@ protected:
     }
 
     std::shared_ptr<TempDirectoryPath> temp_;
+    facebook::velox::ch::test::FileCacheTestResources res_;
 };
 
 TEST_F(FileCacheTest, InitializeOnce)
 {
-    FileCache cache("t", makeSettings(cachePath(), 16 * 1024 * 1024, 1024 * 1024), "user-A");
+    auto cache_ptr = res_.makeFileCache("t", makeSettings(cachePath(), 16 * 1024 * 1024, 1024 * 1024), "user-A");
+    auto & cache = *cache_ptr;
     EXPECT_FALSE(cache.isInitialized());
     cache.initialize();
     EXPECT_TRUE(cache.isInitialized());
@@ -127,7 +130,8 @@ TEST_F(FileCacheTest, InitializeOnce)
 
 TEST_F(FileCacheTest, GetDoesNotCreateMetadata)
 {
-    FileCache cache("t", makeSettings(cachePath(), 16 * 1024 * 1024, 1024 * 1024), "user-A");
+    auto cache_ptr = res_.makeFileCache("t", makeSettings(cachePath(), 16 * 1024 * 1024, 1024 * 1024), "user-A");
+    auto & cache = *cache_ptr;
     cache.initialize();
 
     auto key = FileCacheKey::random();
@@ -142,7 +146,8 @@ TEST_F(FileCacheTest, GetDoesNotCreateMetadata)
 
 TEST_F(FileCacheTest, GetOrSetCreatesEmptySegment)
 {
-    FileCache cache("t", makeSettings(cachePath(), 16 * 1024 * 1024, 1024 * 1024), "user-A");
+    auto cache_ptr = res_.makeFileCache("t", makeSettings(cachePath(), 16 * 1024 * 1024, 1024 * 1024), "user-A");
+    auto & cache = *cache_ptr;
     cache.initialize();
 
     auto key = FileCacheKey::random();
@@ -163,7 +168,8 @@ TEST_F(FileCacheTest, DownloadPopulatesCacheSize)
 {
     const size_t seg = 8192;
     const size_t downloaded = 4096; // strict prefix: stays PARTIALLY_DOWNLOADED (no rename)
-    FileCache cache("t", makeSettings(cachePath(), 16 * 1024 * 1024, seg), "user-A");
+    auto cache_ptr = res_.makeFileCache("t", makeSettings(cachePath(), 16 * 1024 * 1024, seg), "user-A");
+    auto & cache = *cache_ptr;
     cache.initialize();
 
     auto key = FileCacheKey::random();
@@ -181,7 +187,8 @@ TEST_F(FileCacheTest, TryReserveEvictsReleasable)
     const size_t seg = 8192;
     const size_t downloaded = 4096;
     // Capacity for exactly one downloaded prefix: the second download must evict the first.
-    FileCache cache("t", makeSettings(cachePath(), downloaded, seg), "user-A");
+    auto cache_ptr = res_.makeFileCache("t", makeSettings(cachePath(), downloaded, seg), "user-A");
+    auto & cache = *cache_ptr;
     cache.initialize();
 
     auto key1 = FileCacheKey::random();
@@ -210,7 +217,8 @@ TEST_F(FileCacheTest, TryReserveEvictsReleasable)
 
 TEST_F(FileCacheTest, ShutdownJoinsWorkers)
 {
-    FileCache cache("t", makeSettings(cachePath(), 16 * 1024 * 1024, 8192), "user-A");
+    auto cache_ptr = res_.makeFileCache("t", makeSettings(cachePath(), 16 * 1024 * 1024, 8192), "user-A");
+    auto & cache = *cache_ptr;
     cache.initialize();
     ASSERT_TRUE(cache.isInitialized());
 
@@ -228,7 +236,8 @@ TEST_F(FileCacheTest, ShutdownJoinsWorkers)
 TEST_F(FileCacheTest, SecondInstanceOnSamePathStatusLockFails)
 {
     auto settings = makeSettings(cachePath(), 16 * 1024 * 1024, 8192);
-    FileCache cache1("t1", settings, "user-A");
+    auto cache1_ptr = res_.makeFileCache("t1", settings, "user-A");
+    auto & cache1 = *cache1_ptr;
     cache1.initialize();
 
     // FileCache::initialize acquires an exclusive StatusFile lock on `<path>/status` (guards
@@ -247,7 +256,8 @@ TEST_F(FileCacheTest, SecondInstanceOnSamePathStatusLockFails)
 /// absent key rather than silently succeeding.
 TEST_F(FileCacheTest, MissingKeyThrows)
 {
-    FileCache cache("t", makeSettings(cachePath(), 16 * 1024 * 1024, 8192), "user-A");
+    auto cache_ptr = res_.makeFileCache("t", makeSettings(cachePath(), 16 * 1024 * 1024, 8192), "user-A");
+    auto & cache = *cache_ptr;
     cache.initialize();
 
     auto missing = FileCacheKey::random();
@@ -294,7 +304,8 @@ TEST_F(FileCacheTest, BoundedQueuePipeline)
 
 TEST_F(FileCacheTest, CommonOriginIsInjectedUserId)
 {
-    FileCache cache("t", makeSettings(cachePath(), 16 * 1024 * 1024, 4096), "injected-user-42");
+    auto cache_ptr = res_.makeFileCache("t", makeSettings(cachePath(), 16 * 1024 * 1024, 4096), "injected-user-42");
+    auto & cache = *cache_ptr;
     EXPECT_EQ(cache.getCommonOrigin().user_id, "injected-user-42");
 }
 
@@ -303,7 +314,8 @@ TEST_F(FileCacheTest, CommonOriginIsInjectedUserId)
 TEST_F(FileCacheTest, InternalOriginIsInternalUser)
 {
     EXPECT_EQ(FileCache::getInternalOrigin().user_id, "internal");
-    FileCache cache("t", makeSettings(cachePath(), 16 * 1024 * 1024, 4096), "some-user");
+    auto cache_ptr = res_.makeFileCache("t", makeSettings(cachePath(), 16 * 1024 * 1024, 4096), "some-user");
+    auto & cache = *cache_ptr;
     EXPECT_NE(FileCache::getInternalOrigin().user_id, cache.getCommonOrigin().user_id);
 }
 
