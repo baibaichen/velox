@@ -30,6 +30,8 @@
 #include "velox/ch/Interpreters/FileCache/QueryLimit.h"
 #include "velox/ch/Interpreters/FileCache/SplitFileCachePriority.h"
 
+#include <folly/futures/Future.h>
+
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -43,6 +45,11 @@
 #include <shared_mutex>
 #include <unordered_map>
 #include <vector>
+
+namespace folly
+{
+class Timekeeper;
+} // namespace folly
 
 namespace facebook::velox::ch
 {
@@ -133,7 +140,17 @@ public:
     using Type = FileSegmentKeyType;
     using CachePriorityCreatorFunction = SplitFileCachePriority::CachePriorityCreatorFunction;
 
-    FileCache(const std::string & cache_name, const FileCacheSettings & settings);
+    /// SCC-phase construction shape (Task 012 amendment B5/B6): CH's 2-arg
+    /// `FileCache(cache_name, settings)` reads the manager-injected dependencies from a
+    /// global `Context`. Velox has no `Context`, so the host injects them explicitly:
+    /// `common_user_id_` (B5) is the stable, non-empty, non-"internal" common cache user id
+    /// (CH derived it from `ServerUUID`); the `FileCacheWorkerPool` (B3) and the
+    /// `folly::Timekeeper`/`FileCacheScheduler` (B6) are owned by `FileCache` in this phase.
+    /// Task 013 moves these to the `FileCacheManager` and injects them the same way.
+    FileCache(
+        const std::string & cache_name,
+        const FileCacheSettings & settings,
+        const std::string & common_user_id_);
 
     ~FileCache();
 
@@ -309,6 +326,23 @@ private:
     void onSegmentEvictedInTheBackground(const FileSegment & segment, const String & user_id) const;
 
     using KeyAndOffset = FileCacheKeyAndOffset;
+
+    /// B5: stable, host-injected common cache user id (replaces CH's ServerUUID-derived id).
+    /// Non-empty and != "internal". Declared before `common_origin`, which caches it.
+    const std::string common_user_id;
+    /// Cached common origin built from `common_user_id` in the constructor; returned by
+    /// `getCommonOrigin` (CH used a function-local static seeded from the global Context).
+    const FileCacheOriginInfo common_origin;
+
+    /// B3/B6: manager-injected runtime services, owned by `FileCache` in the SCC phase.
+    /// Declared before every member that references them (the scheduler task holders,
+    /// `eviction_pool`, `load_metadata_main_thread`, and `metadata`) so they are constructed
+    /// first and destroyed last. `worker_pool` backs all `FileCacheWorker`s and the
+    /// `FileCacheThreadPool`; `scheduler` (over `timekeeper` + `worker_pool`) replaces CH's
+    /// `BackgroundSchedulePool` for the background maintenance tasks.
+    FileCacheWorkerPool worker_pool;
+    std::shared_ptr<folly::Timekeeper> timekeeper;
+    FileCacheScheduler scheduler;
 
     std::atomic<size_t> max_file_segment_size;
     const size_t bypass_cache_threshold;
