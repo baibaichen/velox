@@ -222,7 +222,12 @@ public:
         const std::string & path_,
         size_t background_download_queue_size_limit_,
         size_t background_download_threads_,
-        bool write_cache_per_user_directory_);
+        bool write_cache_per_user_directory_,
+        /// B3: the single shared worker pool is owned by `FileCache` (later the Task-013 Manager) and
+        /// injected here by reference. `startup` binds the download/cleanup `FileCacheWorker`s to it;
+        /// `CacheMetadata` never owns the pool (design 04:11,45-48).
+        FileCacheWorkerPool & worker_pool_,
+        size_t reserve_space_wait_lock_timeout_milliseconds_ = 1000);
 
     virtual ~CacheMetadata();
 
@@ -291,6 +296,12 @@ private:
     const CleanupQueuePtr cleanup_queue;
     const DownloadQueuePtr download_queue;
     const bool write_cache_per_user_directory;
+    /// B3: injected single shared worker pool (owned by `FileCache`/Manager, not by `CacheMetadata`).
+    /// `startup` and `setBackgroundDownloadThreads` bind their `FileCacheWorker`s to this pool.
+    FileCacheWorkerPool & worker_pool;
+    /// B2a: injected background-download reserve timeout (CH read this from the global
+    /// `Context` in `downloadImpl`; here it comes from `FileCacheConfig`).
+    const size_t reserve_space_wait_lock_timeout_milliseconds;
     std::function<void(const UserID &)> on_client_access;
 
     LoggerPtr log;

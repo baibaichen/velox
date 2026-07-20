@@ -122,7 +122,11 @@ public:
     /// still hold raw pointers into the pinned per-client priorities.
     void takeKeptAliveCacheUsage(EvictionInfo & other)
     {
-        kept_alive_cache_usage.merge(other.kept_alive_cache_usage);
+        /// B1 portability fix: this folly's F14FastSet has no `merge`; insert the range instead.
+        /// CH semantics preserved (shared_ptr value dedupes; source entries move into ours).
+        for (auto & usage : other.kept_alive_cache_usage)
+            kept_alive_cache_usage.insert(usage);
+        other.kept_alive_cache_usage.clear();
     }
 
 private:
@@ -154,8 +158,12 @@ public:
     /// Total size in bytes of all eviction candidates.
     size_t bytes() const { return candidates_bytes; }
 
-    auto begin(this auto && self) { return self.candidates.begin(); }
-    auto end(this auto&& self) { return self.candidates.end(); }
+    /// B1 portability fix: g++ 13.3 / gnu++20 has no C++23 "deducing this"; use explicit
+    /// const / non-const begin/end overloads. Behavior unchanged.
+    auto begin() { return candidates.begin(); }
+    auto end() { return candidates.end(); }
+    auto begin() const { return candidates.begin(); }
+    auto end() const { return candidates.end(); }
 
     /// Add a new eviction candidate.
     void add(const FileSegmentMetadataPtr & candidate, LockedKey & locked_key);
