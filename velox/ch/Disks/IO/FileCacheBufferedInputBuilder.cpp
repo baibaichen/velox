@@ -69,8 +69,11 @@ void registerFileCacheBufferedInputBuilder(FileCacheManager & manager)
 {
     // Fail-fast install-time validation: calling this function declares FileCache
     // is being installed, so a Manager without a default cache is a configuration
-    // error. getDefault() throws on a missing default; let it propagate.
-    (void)manager.getDefault();
+    // error. Use the non-throwing hasDefault() predicate (Task 013) rather than
+    // the throwing getDefault() accessor as a validator.
+    VELOX_CHECK(
+        manager.hasDefault(),
+        "registerFileCacheBufferedInputBuilder: FileCacheManager has no default cache configured");
 
     connector::hive::BufferedInputBuilder::registerBuilder(
         std::make_shared<FileCacheBufferedInputBuilder>(manager));
