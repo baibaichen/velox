@@ -142,6 +142,43 @@ FileCacheInputStream::ReaderPtr FileCacheInputStream::getCacheReadBuffer(
     std::shared_ptr<velox::ReadFile> localFile = fs->openFileForRead(path);
     readInfo_.cacheReader = std::make_shared<ReadBufferFromVeloxReadFile>(
         std::move(localFile), owner_->memoryPool());
+
+    // Self-heal on external truncation (ported from CH `getCacheReadBuffer`,
+    // `CachedOnDiskReadBufferFromFile.cpp:448-477`). A fully downloaded regular
+    // segment encodes its size in the file name (`<offset>_<size>`) and startup
+    // metadata loading trusts that size without a `stat`. If such a file was
+    // truncated outside ClickHouse, the segment is restored as fully DOWNLOADED
+    // but the on-disk file is shorter than recorded. The file is already open,
+    // so reading its size needs no extra `stat`.
+    //
+    // Observe the terminal state FIRST, then read the on-disk size: a
+    // size-in-filename DOWNLOADED/DETACHED segment's file is immutable at
+    // `getDownloadedSize()` bytes, so the size read next is final and a shorter
+    // value can only mean an external truncation. `getDownloadedSize()` is final
+    // for both DOWNLOADED and DETACHED (not reset on detach).
+    const auto downloadState = fileSegment.state();
+    const bool trustSizeFromFilename = fileSegment.hasSizeInFileName()
+        && (downloadState == FileSegment::State::DOWNLOADED
+            || downloadState == FileSegment::State::DETACHED);
+
+    const size_t cacheFileSize =
+        readInfo_.cacheReader->tryGetFileSize().value_or(0);
+
+    if (trustSizeFromFilename && cacheFileSize < fileSegment.getDownloadedSize())
+    {
+        // Return nullptr so the caller bypasses the cache and re-fetches from the
+        // source, rather than failing the read. Throwing here (as
+        // CANNOT_READ_ALL_DATA) would be misinterpreted as a broken part during
+        // `MergeTree` part loading when the truncated file backs a mark/metadata
+        // file, wrongly detaching the part instead of self-healing. Covers the
+        // empty-file case too (`cacheFileSize == 0 < downloadedSize`).
+        readInfo_.cacheReader.reset();
+        return nullptr;
+    }
+
+    if (cacheFileSize == 0)
+        VELOX_FAIL("Attempt to read from an empty cache file: {}", path);
+
     return readInfo_.cacheReader;
 }
 
@@ -300,6 +337,14 @@ FileCacheInputStream::createReadFromFileSegmentState(
         {
             case ReadType::CACHED:
                 buf = getCacheReadBuffer(fileSegment);
+                if (!buf)
+                {
+                    // The local cache file was truncated outside ClickHouse
+                    // (see `getCacheReadBuffer` self-heal). Bypass the cache and
+                    // re-fetch from the source instead of failing the read.
+                    type = ReadType::REMOTE_FS_READ_BYPASS_CACHE;
+                    buf = getRemoteReadBuffer(fileSegment, offset, type);
+                }
                 break;
             case ReadType::REMOTE_FS_READ_AND_PUT_IN_CACHE:
             case ReadType::REMOTE_FS_READ_BYPASS_CACHE:
