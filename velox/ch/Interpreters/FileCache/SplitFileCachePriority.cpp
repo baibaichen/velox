@@ -52,7 +52,7 @@ SplitFileCachePriority::SplitFileCachePriority(
     , max_system_segment_elements(getRatio(max_elements_, system_segment_size_ratio))
     , log(getLogger("SplitFileCachePriority(" + description_ + ")"))
 {
-    priorities_holder[std::to_underlying(SegmentType::Data)] = creator_function(
+    priorities_holder[static_cast<std::underlying_type_t<SegmentType>>(SegmentType::Data)] = creator_function(
         queue_type_,
         max_data_segment_size,
         max_data_segment_elements,

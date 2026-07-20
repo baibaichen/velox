@@ -91,6 +91,12 @@ struct FileCacheConfig
     bool exposePrometheusEvictionMetrics = false;
     bool exposePrometheusEvictionMetricsPerUser = false;
 
+    /// B2a: injected into `CacheMetadata` for the background-download reserve path,
+    /// replacing CH's read from the global `Context`
+    /// (`filesystem_cache_settings.reserve_space_wait_lock_timeout_milliseconds`).
+    /// CH default is 1000 ms.
+    uint64_t reserveSpaceWaitLockTimeoutMilliseconds = 1000;
+
     bool operator==(const FileCacheConfig &) const = default;
 };
 

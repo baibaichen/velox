@@ -687,10 +687,11 @@ bool SLRUFileCachePriority::tryIncreasePriority(
     }
 
     bool reset_evicting_flag_for_prev_entry = true;
-    SCOPE_EXIT({
+    SCOPE_EXIT
+    {
         if (reset_evicting_flag_for_prev_entry)
             prev_entry->resetFlag(/* from_state */Entry::State::Moving);
-    });
+    };
 
     /// Entry is in probationary queue.
     /// Check if there is enough space in protected queue to move entry there.

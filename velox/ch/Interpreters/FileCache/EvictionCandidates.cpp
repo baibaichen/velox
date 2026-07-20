@@ -285,7 +285,7 @@ void EvictionCandidates::evict()
             chassert(
                 false, fmt::format(
                     "Failed to lock key {} (state: {}), but had {} eviction candidates from it",
-                    key, key_candidates.key_metadata->getState(), key_candidates.candidates.size()));
+                    key, static_cast<int>(key_candidates.key_metadata->getState()), key_candidates.candidates.size()));
             continue;
         }
 
