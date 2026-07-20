@@ -29,3 +29,26 @@ target_link_libraries(
     GTest::gtest
     GTest::gtest_main
 )
+
+# Task 015: Velox-only end-to-end validation of the assembled public read path
+# (FileCacheBufferedInput -> FileCacheInputStream -> FileCache) driven through a
+# real FileCacheManager. Links the mono velox_ch_filecache target (which contains
+# the center SCC, Factory/Manager, and DWIO sources) once; a separate
+# *_dwio/_manager/_core library set does not exist under VELOX_MONO_LIBRARY.
+add_executable(velox_ch_filecache_e2e_test FileCacheE2ETest.cpp)
+add_test(velox_ch_filecache_e2e_test velox_ch_filecache_e2e_test)
+
+target_link_libraries(
+  velox_ch_filecache_e2e_test
+  PRIVATE
+    velox_ch_filecache
+    velox_dwio_common
+    velox_test_util
+    velox_exception
+    velox_file
+    velox_memory
+    Folly::folly
+    fmt::fmt
+    GTest::gtest
+    GTest::gtest_main
+)
