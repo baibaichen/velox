@@ -227,6 +227,35 @@ String FileSegment::getCallerId()
     return FileCacheQueryIdScope::getCallerId();
 }
 
+namespace
+{
+/// Default local cache writer file: the exact `LocalWriteFile` construction production uses
+/// (seek-to-end append, create-if-absent, buffered). A test may replace this via
+/// `setWriteFileFactoryForTesting` to inject a fault-injecting `velox::WriteFile`.
+FileSegment::WriteFileFactory & writeFileFactoryStorage()
+{
+    static FileSegment::WriteFileFactory factory = [](const std::string & path) -> std::unique_ptr<velox::WriteFile>
+    {
+        return std::make_unique<velox::LocalWriteFile>(
+            path,
+            /* shouldCreateParentDirectories */ false,
+            /* shouldThrowOnFileAlreadyExists */ false,
+            /* bufferIo */ true);
+    };
+    return factory;
+}
+}
+
+void FileSegment::setWriteFileFactoryForTesting(WriteFileFactory factory)
+{
+    writeFileFactoryStorage() = std::move(factory);
+}
+
+std::unique_ptr<velox::WriteFile> FileSegment::createWriteFile(const std::string & path)
+{
+    return writeFileFactoryStorage()(path);
+}
+
 String FileSegment::getDownloader() const
 {
     return getDownloaderUnlocked(lock());
@@ -438,12 +467,10 @@ void FileSegment::write(char * from, size_t size, size_t offset_in_file)
             /// CH creates a `WriteBufferFromFile` with append flags once the segment already has
             /// bytes on disk; here `LocalWriteFile` seeks to end and, with
             /// `shouldThrowOnFileAlreadyExists=false`, appends to an existing file or creates it.
-            auto write_file = std::make_unique<velox::LocalWriteFile>(
-                file_segment_path,
-                /* shouldCreateParentDirectories */ false,
-                /* shouldThrowOnFileAlreadyExists */ false,
-                /* bufferIo */ true);
-            download->cache_writer = std::make_shared<WriteBufferFromVeloxWriteFile>(std::move(write_file));
+            /// The underlying `velox::WriteFile` is built through `createWriteFile` so a test can
+            /// inject a fault-injecting file (partial-physical-append-failure contract); the
+            /// default factory reproduces this exact construction.
+            download->cache_writer = std::make_shared<WriteBufferFromVeloxWriteFile>(createWriteFile(file_segment_path));
         }
 
         /// Size is equal to offset as offset for write buffer points to data end.
@@ -710,21 +737,16 @@ void FileSegment::renameToIncludeSizeInNameUnlocked(const FileSegmentGuard::Lock
             fmt::format("Failed to rename cache file '{}' to encode its size in the name; keeping the legacy name", old_path));
     }
 
-    /// TODO(Task 013): opened-file-handle invalidation via Manager.
+    /// TODO(Task 013): invalidate opened file handles via the manager-owned OpenedFileCache.
     /// A reader that opened this segment while it was still named `old_path` left an entry in the
     /// opened-file cache keyed by `old_path`; a future segment created at the same key/offset is
     /// again named `old_path`, so opening it could reuse the stale descriptor. CH drops the
-    /// `old_path` entry here via `OpenedFileCache::instance().remove`. `OpenedFileCache` is a
-    /// Task-013 Manager concept absent in the SCC phase; per the Task-012 amendment (B2b, user
-    /// decision 2026-07-20) we throw not-implemented rather than silently skipping this
-    /// correctness-relevant step. The throw is raised OUTSIDE the best-effort rename try/catch so it
-    /// propagates loudly instead of being swallowed. Task 013 replaces the throw with Manager-backed
-    /// invalidation. Only fires when the rename actually happened (i.e. an `old_path` entry can exist).
-    if (renamed)
-        VELOX_NYI(
-            "Opened-file-handle invalidation on rename is not implemented in the SCC phase "
-            "(Task 013 Manager); old path: {}",
-            old_path);
+    /// `old_path` entry here via `OpenedFileCache::instance().remove`. This is a no-op in the SCC
+    /// phase: no `OpenedFileCache` exists yet (it is manager-owned, introduced in Task 013), so
+    /// there are no cached handles to go stale. The rename itself (the core operation) already ran
+    /// above per the Task-012 amendment (B2b CORRECTION / B7, user decision 2026-07-20). Task 013
+    /// wires the real Manager-backed invalidation into this same seam.
+    (void)renamed;
 }
 
 void FileSegment::setDownloadFailed()

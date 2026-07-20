@@ -30,6 +30,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <ctime>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -114,6 +115,18 @@ public:
     };
 
     static String getCallerId();
+
+    /// Test-only seam for the local cache writer's underlying file (mandatory Task-012
+    /// partial-physical-append-failure contract). Production `write` creates the segment's
+    /// `velox::WriteFile` through this factory; the default factory reproduces the exact
+    /// `LocalWriteFile` construction (append/create semantics unchanged), so production behavior
+    /// is identical unless a test installs a fault-injecting `velox::WriteFile`. This is the only
+    /// injection point: reconciliation still happens inside production `write`, never in the
+    /// injected file. Installing a factory affects every subsequent writer construction on any
+    /// segment, so a test must reset it (RAII) to avoid leaking the override across tests.
+    using WriteFileFactory = std::function<std::unique_ptr<velox::WriteFile>(const std::string & path)>;
+    static void setWriteFileFactoryForTesting(WriteFileFactory factory);
+    static std::unique_ptr<velox::WriteFile> createWriteFile(const std::string & path);
 
     String getInfoForLog() const;
 

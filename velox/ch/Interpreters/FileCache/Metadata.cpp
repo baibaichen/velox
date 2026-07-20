@@ -1204,14 +1204,12 @@ KeyMetadata::iterator LockedKey::removeFileSegmentImpl(
         /// Do not rethrow, we must delete the file below.
     }
 
-    /// TODO(Task 013): opened-file-handle invalidation via Manager.
-    /// CH clears `OpenedFileCache` here (both with and without `O_DIRECT`) so a stale file
-    /// descriptor for the just-removed path is not reused. `OpenedFileCache` is a Task-013
-    /// Manager singleton absent in the SCC phase; per the Task-012 amendment (B2b, user
-    /// decision 2026-07-20) we throw not-implemented rather than silently skipping this
-    /// correctness-relevant step. Task 013 replaces the throw with Manager-backed invalidation.
-    /// The throw is raised OUTSIDE the fs try/catch below so it propagates loudly instead of being
-    /// swallowed by the catch(...) that only guards filesystem errors.
+    /// In CH the removal site does two adjacent but INDEPENDENT things
+    /// (`Metadata.cpp:1261,1267`): (1) `fs::remove(path)` — the actual file deletion, which is the
+    /// core of eviction and MUST run; and (2) `OpenedFileCache::instance().remove(path, flags)` —
+    /// invalidating cached open handles, a Task-013 Manager concept. We perform (1) normally; (2)
+    /// becomes a no-op here (see below). Per the Task-012 amendment (B2b CORRECTION / B7, user
+    /// decision 2026-07-20) only the opened-handle invalidation is deferred, never the removal.
     bool opened_handle_invalidation_required = false;
     std::string removed_path;
 
@@ -1246,12 +1244,12 @@ KeyMetadata::iterator LockedKey::removeFileSegmentImpl(
 
     if (opened_handle_invalidation_required)
     {
-        auto next_it = key_metadata->erase(it);
-        VELOX_NYI(
-            "Opened-file-handle invalidation on file removal is not implemented in the SCC phase "
-            "(Task 013 Manager); path: {}",
-            removed_path);
-        return next_it;
+        /// TODO(Task 013): invalidate opened file handles via the manager-owned OpenedFileCache.
+        /// No-op in the SCC phase: no `OpenedFileCache` exists yet (it is manager-owned, introduced
+        /// in Task 013), so there are no cached handles for `removed_path` to go stale. Task 013
+        /// wires the real Manager-backed invalidation into this same seam.
+        (void)removed_path;
+        return key_metadata->erase(it);
     }
 
     return key_metadata->erase(it);
