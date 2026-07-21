@@ -130,6 +130,12 @@ private:
     bool completeCurrentSegmentAndAdvance();
     void releaseDownloaderIfNeeded(FileSegment & fileSegment, bool readerCanBeReused);
 
+    // Drop all held segment/reader/downloader/output-buffer state and set the
+    // region-relative logical position to `newPosition`, so the next Next
+    // re-derives the correct segment/reader from scratch. Shared by the seek and
+    // skip slow paths. Does NOT reset queryContextHolder_.
+    void invalidateAndReposition(uint64_t newPosition);
+
     // Ensure the owned output buffer holds at least `bytes` usable bytes.
     char * ensureOutputBuffer(size_t bytes);
 

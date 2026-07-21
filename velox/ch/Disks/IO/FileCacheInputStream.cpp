@@ -929,35 +929,34 @@ void FileCacheInputStream::BackUp(int32_t count)
 bool FileCacheInputStream::SkipInt64(int64_t count)
 {
     VELOX_CHECK_GE(count, 0);
-    uint64_t toSkip = static_cast<uint64_t>(count);
-    while (toSkip > 0)
+    const uint64_t toSkip = static_cast<uint64_t>(count);
+    if (toSkip == 0)
+        return true;
+
+    // Fast path: the skip target stays within the already-published output
+    // buffer. Just advance the region-relative cursors (mirrors CH seek nudging
+    // the pointer inside the current buffer; keeps BackUp semantics intact).
+    if (offsetInOutputBuffer_ < outputBufferSize_)
     {
-        // Consume from the published output buffer first.
-        if (offsetInOutputBuffer_ < outputBufferSize_)
+        const size_t avail = outputBufferSize_ - offsetInOutputBuffer_;
+        if (toSkip <= avail)
         {
-            const size_t avail = outputBufferSize_ - offsetInOutputBuffer_;
-            const size_t step = std::min<uint64_t>(avail, toSkip);
-            offsetInOutputBuffer_ += step;
-            position_ += step;
-            toSkip -= step;
-            continue;
+            offsetInOutputBuffer_ += toSkip;
+            position_ += toSkip;
+            return true;
         }
-        // Otherwise read and discard the next chunk.
-        const void * data = nullptr;
-        int32_t size = 0;
-        if (!Next(&data, &size))
-            return toSkip == 0;
-        // Next advanced position_ by `size`; walk it back so the loop consumes
-        // exactly `toSkip` and leaves the remainder in the output buffer.
-        const size_t produced = static_cast<size_t>(size);
-        const size_t consume = std::min<uint64_t>(produced, toSkip);
-        // Undo the full-buffer advance done by Next, then re-consume `consume`.
-        position_ -= produced;
-        offsetInOutputBuffer_ -= produced;
-        offsetInOutputBuffer_ += consume;
-        position_ += consume;
-        toSkip -= consume;
     }
+
+    // Slow path: the target is outside the current buffer (including crossing a
+    // segment boundary). Do NOT call Next()/completeCurrentSegmentAndAdvance
+    // here: that advance is irreversible and would desync position_ from the
+    // held segment. Instead invalidate all held state (as CH seek does with
+    // info.reset()/state.reset()/initialized=false) and set position_ to the
+    // absolute skip target, so the next real Next re-derives the correct
+    // segment/reader from position_.
+    const uint64_t target = position_ + toSkip;
+    VELOX_CHECK_LE(target, region_.length, "skip beyond region");
+    invalidateAndReposition(target);
     return true;
 }
 
@@ -983,6 +982,11 @@ void FileCacheInputStream::seekToPosition(dwio::common::PositionProvider & posit
     }
 
     // Slow path: release everything except queryContextHolder_.
+    invalidateAndReposition(newPosition);
+}
+
+void FileCacheInputStream::invalidateAndReposition(uint64_t newPosition)
+{
     if (readInfo_.fileSegments && !readInfo_.fileSegments->empty())
         releaseDownloaderIfNeeded(
             readInfo_.fileSegments->front(), /*readerCanBeReused=*/false);
