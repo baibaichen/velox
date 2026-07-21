@@ -17,8 +17,11 @@
 #include "velox/ch/Interpreters/FileCache/SLRUFileCachePriority.h"
 #include "velox/ch/Interpreters/FileCache/SplitFileCachePriority.h"
 
+#include "velox/ch/Interpreters/FileCache/EvictionCandidates.h"
+#include "velox/ch/Interpreters/FileCache/FileCache.h"
 #include "velox/ch/Interpreters/FileCache/FileCacheKey.h"
 #include "velox/ch/Interpreters/FileCache/FileCacheOriginInfo.h"
+#include "velox/ch/Interpreters/FileCache/FileSegment.h"
 #include "velox/ch/Interpreters/FileCache/Guards.h"
 #include "velox/ch/Interpreters/FileCache/IFileCachePriority.h"
 #include "velox/ch/Interpreters/FileCache/Metadata.h"
@@ -28,6 +31,8 @@
 
 #include <gtest/gtest.h>
 
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -75,6 +80,55 @@ protected:
         const auto key = FileCacheKey::random();
         FileCacheOriginInfo origin("user", /*weight*/ 100, type);
         return metadata_->getKeyMetadata(key, CacheMetadata::KeyNotFoundPolicy::CREATE_EMPTY, origin);
+    }
+
+    // Add a real, DOWNLOADED, releasable file segment to `priority` under `km` at
+    // `offset`, backed by a physical file. The priority-level eviction and SLRU
+    // downgrade paths only collect segments whose FileSegmentMetadata is
+    // releasable() (use_count()==1) and whose DOWNLOADED FileSegment has a real
+    // backing file, so a bare priority-queue entry is not enough. Mirrors the CH
+    // gtest_filecache.cpp SLRUDowngradeRollback / SLRUDynamicResize setup, adapted
+    // to the Velox manager-injected CacheMetadata. Returns the queue iterator (an
+    // SLRUIterator for an SLRU priority).
+    IFileCachePriority::IteratorPtr addDownloadedSegment(
+        IFileCachePriority & priority,
+        const KeyMetadataPtr & km,
+        size_t offset,
+        size_t size,
+        IFileCachePriority::QueueEntryType queue_type)
+    {
+        IFileCachePriority::IteratorPtr it;
+        {
+            auto write_lock = queue_guard_.writeLock();
+            auto state_lock = state_guard_.lock();
+            it = priority.addForRestore(km, offset, size, queue_type, write_lock, &state_lock);
+        }
+
+        // The physical file must exist with exactly `size` bytes before the
+        // DOWNLOADED FileSegment is constructed: its constructor asserts
+        // fs::file_size(getPath()) == size. Name is "<offset>" (no size suffix)
+        // because the segment is created with size_in_filename=false.
+        const auto & origin = *km->origin;
+        const auto path = metadata_->getFileSegmentPath(km->key, offset, FileSegmentKind::Regular, origin);
+        std::filesystem::create_directories(std::filesystem::path(path).parent_path());
+        {
+            std::ofstream out(path, std::ios::binary | std::ios::trunc);
+            const std::string data(size, '0');
+            out.write(data.data(), static_cast<std::streamsize>(data.size()));
+        }
+
+        auto file_segment = std::make_shared<FileSegment>(
+            km->key, offset, size, FileSegment::State::DOWNLOADED,
+            CreateFileSegmentSettings{}, /*background_download_enabled*/ false,
+            /*cache*/ nullptr, std::weak_ptr<KeyMetadata>(km), it);
+        FileSegmentPtr forMeta = std::move(file_segment);
+        {
+            // Move the only FileSegment ref into the metadata so releasable()
+            // (use_count()==1) holds; do not keep a live copy in the test.
+            auto locked = km->lock();
+            locked->emplace(offset, std::make_shared<FileSegmentMetadata>(std::move(forMeta)));
+        }
+        return it;
     }
 
     FileCacheWorkerPool workerPool_{4, 1, "prio-test"};
@@ -285,6 +339,187 @@ TEST_F(PriorityEvictionTest, SLRUModifySizeLimitsRollbackOnThrow)
     // With the rollback bug the protected limit was left shrunk to 10; with the fix
     // it is restored to the original 15.
     EXPECT_EQ(priority.getProtectedSizeLimit(state_guard_.lock()), 15u);
+}
+
+// -- SLRU downgrade rollback: an exception between afterEvictWrite and ----------
+//    afterEvictState (driven through the production failpoint) must roll the
+//    downgraded protected entry back from Evicting to Active.
+//    (ClickHouse gtest_filecache.cpp
+//     SLRUDowngradeRollbackResetsEvictingOnSkippedFinalization, driven here
+//     through the real file_cache_slru_downgrade_fail_before_finalize failpoint
+//     via tryIncreasePriority instead of a hand-simulated skip.)
+
+TEST_F(PriorityEvictionTest, SLRUDowngradeFailpointRollsBackBeforeFinalize)
+{
+    // protected 15/3, probationary 15/3
+    const size_t max_size = 30;
+    const size_t max_elements = 6;
+    const double slru_size_ratio = 0.5;
+    SLRUFileCachePriority priority(
+        IFileCachePriority::QueueType::Main, max_size, max_elements, slru_size_ratio, "test_slru_downgrade_rollback");
+
+    auto km = makeKeyMetadata();
+
+    // Fill the protected sub-queue to its limit with 3 releasable 5-byte entries
+    // (15 bytes = protected limit). The oldest (offset 0, queue head) is the one
+    // promotion will downgrade to make room.
+    std::vector<IFileCachePriority::IteratorPtr> protected_iters;
+    protected_iters.push_back(addDownloadedSegment(priority, km, 0, 5, IFileCachePriority::QueueEntryType::SLRU_Protected));
+    protected_iters.push_back(addDownloadedSegment(priority, km, 5, 5, IFileCachePriority::QueueEntryType::SLRU_Protected));
+    protected_iters.push_back(addDownloadedSegment(priority, km, 10, 5, IFileCachePriority::QueueEntryType::SLRU_Protected));
+    ASSERT_EQ(priority.getProtectedSize(state_guard_.lock()), 15u);
+    ASSERT_EQ(priority.getProtectedElementsCount(state_guard_.lock()), 3u);
+
+    // One probationary entry to promote. Its promotion needs protected room, so it
+    // downgrades an existing protected entry (probationary has room for the
+    // downgrade, so no probationary segment is actually evicted).
+    auto probationary_it =
+        addDownloadedSegment(priority, km, 100, 5, IFileCachePriority::QueueEntryType::SLRU_Probationary);
+    ASSERT_EQ(priority.getProbationarySize(state_guard_.lock()), 5u);
+    ASSERT_EQ(priority.getProbationaryElementsCount(state_guard_.lock()), 1u);
+
+    // Arm the production downgrade failpoint. FAIL_POINT_TRIGGER fires it inside
+    // the addAfterEvictStateCallback -- after afterEvictWrite already spliced the
+    // empty PreActive probationary entry but before any downgraded entry's
+    // size/iterator is finalized.
+    facebook::velox::common::testutil::TestValue::enable();
+    SCOPED_TESTVALUE_SET(
+        "facebook::velox::ch::filecache::failpoint::file_cache_slru_downgrade_fail_before_finalize",
+        std::function<void(void *)>([](void *) { VELOX_FAIL("Injected downgrade failure before finalize"); }));
+
+    // Promote: reaches collectCandidatesForEvictionInProtected, queues a
+    // protected entry for downgrade, then throws at the failpoint in the state
+    // phase. The exception must propagate out of tryIncreasePriority.
+    EXPECT_ANY_THROW(priority.tryIncreasePriority(
+        *probationary_it, /*is_space_reservation_complete*/ true, queue_guard_, state_guard_));
+
+    // After the throw, the DowngradedEntriesInfos RAII rollback must have reset
+    // every protected entry queued for downgrade from Evicting back to Active --
+    // none left stuck in Evicting or Moving.
+    for (const auto & it : protected_iters)
+    {
+        EXPECT_EQ(it->getEntry()->getState(), IFileCachePriority::Entry::State::Active)
+            << "A protected entry was left stuck (not reset to Active) after a skipped downgrade finalization";
+    }
+
+    // Sub-queue sizes/elements are back to their exact pre-promotion values: no
+    // byte double-counted or dropped, and the spliced-in empty PreActive
+    // probationary entry contributed no counted size/element.
+    {
+        auto state_lock = state_guard_.lock();
+        EXPECT_EQ(priority.getProtectedSize(state_lock), 15u);
+        EXPECT_EQ(priority.getProtectedElementsCount(state_lock), 3u);
+        EXPECT_EQ(priority.getProbationarySize(state_lock), 5u);
+        EXPECT_EQ(priority.getProbationaryElementsCount(state_lock), 1u);
+    }
+
+    // The original downgraded protected entry's identity is intact: still the
+    // offset-0 head, still Active (it was never spliced -- the finalize loop that
+    // would have moved it never ran).
+    EXPECT_EQ(protected_iters[0]->getEntry()->offset, 0u);
+    EXPECT_EQ(protected_iters[0]->getEntry()->getState(), IFileCachePriority::Entry::State::Active);
+}
+
+// -- SLRU dynamic-resize eviction from BOTH sub-queues --------------------------
+//    A shrink aggressive enough that both the protected and probationary
+//    sub-queues exceed their new per-sub-queue limits must collect eviction from
+//    BOTH; modifySizeLimits must then apply the new limits without a LOGICAL_ERROR.
+//    (ClickHouse gtest_filecache.cpp SLRUDynamicResizeCorrectEviction, exercised
+//     here directly at the SLRUFileCachePriority level since Task 011 has no
+//     FileCache in scope.)
+
+TEST_F(PriorityEvictionTest, SLRUDynamicResizeEvictsFromBothSubQueues)
+{
+    // protected 15/3, probationary 15/3 (CH test's exact shape).
+    const size_t max_size = 30;
+    const size_t max_elements = 6;
+    const double slru_size_ratio = 0.5;
+    SLRUFileCachePriority priority(
+        IFileCachePriority::QueueType::Main, max_size, max_elements, slru_size_ratio, "test_slru_resize");
+
+    auto km = makeKeyMetadata();
+
+    // Populate both sub-queues: protected 15 bytes (3x5), probationary 10 bytes
+    // (2x5) -- mirroring the CH test's 15-bytes-protected / 10-bytes-probationary
+    // starting state.
+    for (size_t i = 0; i < 3; ++i)
+        addDownloadedSegment(priority, km, i * 5, 5, IFileCachePriority::QueueEntryType::SLRU_Protected);
+    for (size_t i = 0; i < 2; ++i)
+        addDownloadedSegment(priority, km, 100 + i * 5, 5, IFileCachePriority::QueueEntryType::SLRU_Probationary);
+    ASSERT_EQ(priority.getProtectedSize(state_guard_.lock()), 15u);
+    ASSERT_EQ(priority.getProbationarySize(state_guard_.lock()), 10u);
+
+    const auto & origin = *km->origin;
+
+    // Resize to max_size=8, max_elements=6 (protected limit 4, probationary limit
+    // 4). Both sub-queues are over their new byte limit, so both must contribute
+    // eviction candidates.
+    EvictionInfoPtr eviction_info;
+    {
+        auto state_lock = state_guard_.lock();
+        eviction_info = priority.collectEvictionInfoForResize(
+            /*desired_max_size*/ 8, /*desired_max_elements*/ 6, origin, state_lock);
+    }
+    ASSERT_TRUE(eviction_info->requiresEviction());
+
+    // The core of the per-sub-queue fix: eviction is required from BOTH the
+    // protected and the probationary portions, not just one. Without the
+    // probationary delegation in collectEvictionInfoForResize, only the protected
+    // sub-queue's QueueEvictionInfo is present and this count is 1.
+    size_t queues_requiring_eviction = 0;
+    for (const auto & [queue_id, queue_info] : *eviction_info)
+    {
+        (void)queue_id;
+        if (queue_info->requiresEviction())
+            ++queues_requiring_eviction;
+    }
+    ASSERT_EQ(queues_requiring_eviction, 2u)
+        << "Both SLRU sub-queues must be asked to shrink; got " << queues_requiring_eviction;
+
+    // Drive the eviction to completion.
+    FileCacheReserveStat stat;
+    IFileCachePriority::InvalidatedEntriesInfos invalidated_entries;
+    EvictionCandidates evicted(IFileCachePriority::OnEvictCallback{});
+    ASSERT_TRUE(priority.collectCandidatesForEviction(
+        *eviction_info,
+        stat,
+        evicted,
+        invalidated_entries,
+        /*reservee*/ nullptr,
+        IFileCachePriority::EvictionCursor::FromHead,
+        /*max_candidates_size*/ 0,
+        /*is_total_space_cleanup*/ true,
+        origin,
+        queue_guard_,
+        state_guard_));
+    evicted.evict();
+    {
+        auto write_lock = queue_guard_.writeLock();
+        evicted.afterEvictWrite(write_lock);
+    }
+    {
+        auto state_lock = state_guard_.lock();
+        evicted.afterEvictState(state_lock);
+    }
+
+    // Applying the new limits must not throw: with the bug (protected-only
+    // eviction) the probationary sub-queue is still over its new 4-byte limit and
+    // modifySizeLimits throws LOGICAL_ERROR. This is the CH regression's core
+    // assertion.
+    {
+        auto state_lock = state_guard_.lock();
+        ASSERT_NO_THROW(priority.modifySizeLimits(8, max_elements, slru_size_ratio, state_lock));
+    }
+
+    // Final usage satisfies the new 8-byte / 6-element limits for the whole cache
+    // and for each sub-queue's 4-byte share.
+    {
+        auto state_lock = state_guard_.lock();
+        EXPECT_LE(priority.getSize(state_lock), 8u);
+        EXPECT_LE(priority.getElementsCount(state_lock), 6u);
+        EXPECT_LE(priority.getProtectedSize(state_lock), 4u);
+        EXPECT_LE(priority.getProbationarySize(state_lock), 4u);
+    }
 }
 
 } // namespace

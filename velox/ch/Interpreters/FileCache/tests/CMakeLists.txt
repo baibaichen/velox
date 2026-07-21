@@ -105,6 +105,34 @@ target_link_libraries(
     GTest::gtest_main
 )
 
+# Task 011 corrective (B2): MoveEvictionPos cursor test. Deliberately a
+# separate executable from velox_ch_filecache_core_scc_test: a global-scope
+# TEST(FileCacheTest, MoveEvictionPos) (required so gtest generates the
+# friend class ::FileCacheTest_MoveEvictionPos_Test that
+# LRUFileCachePriority.h grants) would collide, by gtest test-suite name, with
+# FileCacheTest.cpp's own TEST_F(FileCacheTest, ...) fixture cases if linked
+# into the same binary.
+add_executable(
+  velox_ch_filecache_priority_cursor_test
+  MoveEvictionPosTest.cpp
+)
+add_test(velox_ch_filecache_priority_cursor_test velox_ch_filecache_priority_cursor_test)
+
+target_link_libraries(
+  velox_ch_filecache_priority_cursor_test
+  PRIVATE
+    velox_ch_filecache_core
+    velox_ch_filecache
+    velox_test_util
+    velox_exception
+    velox_file
+    velox_memory
+    Folly::folly
+    fmt::fmt
+    GTest::gtest
+    GTest::gtest_main
+)
+
 # Task 013 Factory/Manager test: exercises the compiled velox_ch_filecache_manager
 # library (FileCacheFactory registry, FileCacheManager runtime ownership, and the
 # manager-owned OpenedFileCache) through its production entry points and real
