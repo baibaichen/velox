@@ -117,6 +117,14 @@ void TpchQueryBuilder::initialize(const std::string& dataPath) {
       if (dirEntry.path().filename().c_str()[0] == '.') {
         continue;
       }
+      // Skip Spark-style empty marker files (e.g. _SUCCESS), which are not
+      // valid Parquet/DWRF. Use the error_code overload so a transient stat
+      // failure cannot throw past the directory_iterator error_code fallback
+      // below.
+      std::error_code sizeError;
+      if (dirEntry.file_size(sizeError) == 0) {
+        continue;
+      }
       if (tableMetadata_[tableName].dataFiles.empty()) {
         anyFound = true;
         readFileSchema(tableName, dirEntry.path().string(), columns);

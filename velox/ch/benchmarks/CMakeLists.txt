@@ -55,3 +55,47 @@ target_link_libraries(
     gflags::gflags
     glog::glog
 )
+
+# Task 018b: three-engine (direct / cbi / filecache) TPCH A/B benchmark. The
+# `filecache` engine routes real TPCH reads through the Task 018a
+# FileCacheBufferedInputBuilder (a FileCacheManager-built default cache), giving
+# an end-to-end validation of the 018a connector integration. Reuses the trunk
+# velox_query_benchmark (QueryBenchmarkBase) and velox_exec_test_lib
+# (TpchQueryBuilder) for plan construction; the mono velox_ch_filecache target
+# supplies the FileCache read path + the 018a builder. Mirrors the link list of
+# ch-filecache's velox_tpch_benchmark_lib.
+add_executable(
+  velox_ch_filecache_tpch_ab_benchmark
+  TpchAbBenchmark.cpp
+  AbBenchmarkBase.cpp
+  AbBenchmarkMain.cpp)
+
+target_link_libraries(
+  velox_ch_filecache_tpch_ab_benchmark
+  PRIVATE
+    velox_ch_filecache
+    velox_query_benchmark
+    velox_aggregates
+    velox_exec
+    velox_exec_test_lib
+    velox_dwio_common
+    velox_dwio_common_exception
+    velox_dwio_parquet_reader
+    velox_dwio_common_test_utils
+    velox_hive_connector
+    velox_caching
+    velox_file
+    velox_exception
+    velox_memory
+    velox_process
+    velox_serialization
+    velox_encode
+    velox_type
+    velox_type_fbhive
+    velox_vector_test_lib
+    Folly::folly
+    Folly::follybenchmark
+    fmt::fmt
+    gflags::gflags
+    glog::glog
+)
