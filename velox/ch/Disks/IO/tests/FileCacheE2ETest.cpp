@@ -373,6 +373,131 @@ TEST_F(FileCacheE2ETest, SkipAcrossSegmentBoundary)
 }
 
 // ============================================================================
+// 5b. SkipFromMidSegmentAcrossBoundary: the real bug pattern. Read only PART of
+// segment 0 (stop mid-segment, never touching the boundary), then SkipInt64 a
+// distance that both exceeds the remaining published buffer AND crosses into
+// segment 1. The pre-fix "advance-via-Next then roll position_ back" desynced
+// position_ from the held segment, drifting later reads into an early EOF
+// ("Reading past end"). Asserts the ACTUAL bytes at the correct absolute offset.
+// ============================================================================
+TEST_F(FileCacheE2ETest, SkipFromMidSegmentAcrossBoundary)
+{
+    const size_t n = 512 * 1024;
+    const size_t seg = 64 * 1024;
+    auto content = makeContent(n);
+    auto cache = makeManagerCache(/*seg*/ seg, /*align*/ 1);
+    auto path = writeSourceFile("src", content);
+    auto key = FileCacheKey::fromPath(path);
+
+    // Pre-warm the whole region so every segment is DOWNLOADED/CACHED. The bug is
+    // on the cache-HIT path (updateCurrentReaderIfNeeded is a no-op for a
+    // DOWNLOADED CACHED segment), so a fresh stream over cached segments is what
+    // exposes the desync.
+    {
+        auto warm = makeInput(cache, path, key);
+        auto ws = warm->enqueue({0, n});
+        ASSERT_EQ(readAll(*ws), content);
+    }
+
+    auto input = makeInput(cache, path, key);
+    auto stream = input->enqueue({0, n});
+
+    // Read only HALF of segment 0 -> stop in the middle, boundary not reached.
+    auto head = readN(*stream, seg / 2);
+    ASSERT_EQ(head, content.substr(0, seg / 2));
+
+    // Skip from mid seg0 into seg1: distance > remaining published buffer and
+    // crossing the segment boundary. Target absolute offset = seg/2 + skip.
+    const int64_t skip = seg; // lands seg/2 into segment 1
+    ASSERT_TRUE(stream->SkipInt64(skip));
+    const size_t target = seg / 2 + skip;
+    EXPECT_EQ(stream->ByteCount(), static_cast<int64_t>(target));
+
+    // The next real read must serve the correct absolute bytes (this is where
+    // the pre-fix drift/early-EOF manifested).
+    auto tail = readN(*stream, 4096);
+    EXPECT_EQ(tail, content.substr(target, 4096));
+}
+
+// ============================================================================
+// 5c. SkipMidSegmentAcrossTwoSegments: skip from the middle of segment 0 all the
+// way past segment 1 into segment 2, again after reading only part of segment 0.
+// ============================================================================
+TEST_F(FileCacheE2ETest, SkipMidSegmentAcrossTwoSegments)
+{
+    const size_t n = 512 * 1024;
+    const size_t seg = 64 * 1024;
+    auto content = makeContent(n);
+    auto cache = makeManagerCache(/*seg*/ seg, /*align*/ 1);
+    auto path = writeSourceFile("src", content);
+    auto key = FileCacheKey::fromPath(path);
+
+    {
+        auto warm = makeInput(cache, path, key);
+        auto ws = warm->enqueue({0, n});
+        ASSERT_EQ(readAll(*ws), content);
+    }
+
+    auto input = makeInput(cache, path, key);
+    auto stream = input->enqueue({0, n});
+
+    auto head = readN(*stream, seg / 2);
+    ASSERT_EQ(head, content.substr(0, seg / 2));
+
+    // seg/2 + 2*seg lands in segment 2.
+    const int64_t skip = 2 * static_cast<int64_t>(seg);
+    ASSERT_TRUE(stream->SkipInt64(skip));
+    const size_t target = seg / 2 + skip;
+    EXPECT_EQ(stream->ByteCount(), static_cast<int64_t>(target));
+
+    auto tail = readN(*stream, 4096);
+    EXPECT_EQ(tail, content.substr(target, 4096));
+}
+
+// ============================================================================
+// 5d. ConsecutiveSkipsAcrossBoundaries: skip across a boundary, read a little,
+// then skip across another boundary. Exercises repeated invalidate/re-derive.
+// ============================================================================
+TEST_F(FileCacheE2ETest, ConsecutiveSkipsAcrossBoundaries)
+{
+    const size_t n = 512 * 1024;
+    const size_t seg = 64 * 1024;
+    auto content = makeContent(n);
+    auto cache = makeManagerCache(/*seg*/ seg, /*align*/ 1);
+    auto path = writeSourceFile("src", content);
+    auto key = FileCacheKey::fromPath(path);
+
+    {
+        auto warm = makeInput(cache, path, key);
+        auto ws = warm->enqueue({0, n});
+        ASSERT_EQ(readAll(*ws), content);
+    }
+
+    auto input = makeInput(cache, path, key);
+    auto stream = input->enqueue({0, n});
+
+    // Read part of segment 0.
+    ASSERT_EQ(readN(*stream, seg / 2), content.substr(0, seg / 2));
+
+    // First cross-boundary skip: land mid segment 1.
+    ASSERT_TRUE(stream->SkipInt64(seg));
+    size_t pos = seg / 2 + seg;
+    EXPECT_EQ(stream->ByteCount(), static_cast<int64_t>(pos));
+
+    // Read a little at the new position.
+    ASSERT_EQ(readN(*stream, 1024), content.substr(pos, 1024));
+    pos += 1024;
+
+    // Second cross-boundary skip from mid buffer into a later segment.
+    ASSERT_TRUE(stream->SkipInt64(seg));
+    pos += seg;
+    EXPECT_EQ(stream->ByteCount(), static_cast<int64_t>(pos));
+
+    auto tail = readN(*stream, 4096);
+    EXPECT_EQ(tail, content.substr(pos, 4096));
+}
+
+// ============================================================================
 // 6. SeekToPositionRegionRelative: seek uses region-relative coordinates.
 // ============================================================================
 TEST_F(FileCacheE2ETest, SeekToPositionRegionRelative)
