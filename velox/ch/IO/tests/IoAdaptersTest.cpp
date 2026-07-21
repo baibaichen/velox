@@ -567,9 +567,9 @@ TEST_F(IoAdaptersTest, ReaderDirectIoUnalignedSeekRejected)
     EXPECT_EQ(rf->preadCalls(), 0);
 }
 
-// Reader 9c (direct-IO): an unaligned file tail is rejected *before* pread, so
-// the mock's pread call count is unchanged (no over-read, no silent rounding).
-TEST_F(IoAdaptersTest, ReaderDirectIoUnalignedTailRejectedBeforePread)
+// Reader 9c (direct-IO): an unaligned logical file tail is served by an aligned
+// physical pread, while only the bytes before EOF are exposed.
+TEST_F(IoAdaptersTest, ReaderDirectIoUnalignedTailUsesAlignedPhysicalRead)
 {
     constexpr uint64_t kAlignment = 512;
     // 512 aligned bytes followed by a 100-byte unaligned tail.
@@ -580,24 +580,36 @@ TEST_F(IoAdaptersTest, ReaderDirectIoUnalignedTailRejectedBeforePread)
     EXPECT_EQ(rf->preadCalls(), 1);
     reader.position() = reader.buffer().end(); // consume the loaded window
 
-    EXPECT_THROW(reader.next(), VeloxException)
-        << "an unaligned file tail must fail closed";
-    EXPECT_EQ(rf->preadCalls(), 1)
-        << "the adapter must reject the unaligned tail before calling pread";
+    ASSERT_TRUE(reader.next());
+    EXPECT_EQ(reader.available(), 100u);
+    EXPECT_EQ(rf->preadCalls(), 2);
+    EXPECT_EQ(rf->lastPreadOffset(), 512u);
+    EXPECT_EQ(rf->lastPreadLength(), kAlignment);
+    EXPECT_EQ(
+        std::string_view(reader.position(), reader.available()),
+        std::string(100, 'D'));
 }
 
-// Reader 9d (direct-IO): an unaligned right bound is rejected before pread.
-TEST_F(IoAdaptersTest, ReaderDirectIoUnalignedRightBoundRejectedBeforePread)
+// Reader 9d (direct-IO): an unaligned logical right bound uses an aligned
+// physical request and hides bytes beyond the bound.
+TEST_F(IoAdaptersTest, ReaderDirectIoUnalignedRightBoundClampsPhysicalRead)
 {
     constexpr uint64_t kAlignment = 512;
     auto rf = std::make_shared<MockReadFile>(std::string(1024, 'D'), kAlignment);
     ReadBufferFromVeloxReadFile reader(rf, pool_.get(), /*bufferSize=*/1024);
 
     reader.setReadUntilPosition(600); // unaligned right bound
-    EXPECT_THROW(reader.next(), VeloxException)
-        << "an unaligned right bound must fail closed";
-    EXPECT_EQ(rf->preadCalls(), 0)
-        << "the adapter must reject the unaligned right bound before calling pread";
+    ASSERT_TRUE(reader.next());
+    EXPECT_EQ(reader.available(), 600u);
+    EXPECT_EQ(reader.getFileOffsetOfBufferEnd(), 600u);
+    EXPECT_EQ(rf->preadCalls(), 1);
+    EXPECT_EQ(rf->lastPreadOffset(), 0u);
+    EXPECT_EQ(rf->lastPreadLength(), 1024u);
+
+    reader.position() = reader.buffer().end();
+    EXPECT_FALSE(reader.next());
+    EXPECT_EQ(rf->preadCalls(), 1)
+        << "reaching the logical right bound must not issue another pread";
 }
 
 // The non-owning raw-pointer constructor does not take ownership of the file.
