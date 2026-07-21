@@ -15,6 +15,7 @@
  */
 #include "velox/ch/Interpreters/FileCache/FileCache.h"
 
+#include "velox/ch/Common/FileCacheBoundedQueue.h"
 #include "velox/ch/Common/FileCacheQueryIdScope.h"
 #include "velox/ch/Common/FileCacheScheduler.h"
 #include "velox/ch/Common/ThreadPool.h"
@@ -33,6 +34,7 @@
 #include <algorithm>
 #include <atomic>
 #include <barrier>
+#include <latch>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -784,6 +786,74 @@ TEST_F(FileCacheTest, TwoCachesShareWorkerPoolConcurrentReload)
 
     cacheA->deactivateBackgroundOperations();
     cacheB->deactivateBackgroundOperations();
+}
+
+// -- B5: SCC-owned queue-pipeline call shapes --------------------------------
+//
+// Exercises the exact FileCacheBoundedQueue call shapes used by FileCache.cpp's
+// eviction/load pipelines and proves this binary catches regressions in those
+// shapes.  The non-blocking tryPop is made observably necessary: replacing it
+// with a blocking pop (the false-green mutation) hangs the test because the
+// queue is not yet finished at that point and no further pushes occur.
+TEST(FileCacheBoundedQueueTest, SccQueuePipelineCallShapes)
+{
+    // (1) Small bounded capacity, matching the bounded eviction queues in
+    //     FileCache.cpp:1626-1627 (FileCacheBoundedQueue<EvictionBatchPtr>).
+    FileCacheBoundedQueue<int> q(4);
+
+    // (2) Timed tryPush — FileCache.cpp:1799 shape: tryPush(batch, push_timeout_ms).
+    EXPECT_TRUE(q.tryPush(10, /*timeoutMilliseconds*/ 10));
+    EXPECT_TRUE(q.tryPush(20, 10));
+
+    // (3) Non-blocking tryPop — FileCache.cpp:1643 finalize_removed(false) shape.
+    // Two items were pushed; FIFO ordering must be preserved.
+    int val = 0;
+    EXPECT_TRUE(q.tryPop(val));
+    EXPECT_EQ(val, 10);
+    EXPECT_TRUE(q.tryPop(val));
+    EXPECT_EQ(val, 20);
+
+    // The queue is now empty; non-blocking tryPop on an empty queue must return
+    // false.  This assertion is observably necessary for the false-green mutation:
+    // replacing this tryPop with a blocking pop causes the test to hang, because
+    // the queue is not yet finished at this point and no further pushes are made
+    // (a blocking pop on an unfinished empty queue waits indefinitely).
+    EXPECT_FALSE(q.tryPop(val));
+
+    // (4) Blocking pop + finish() wake/drain.
+    // Matches pop() at FileCache.cpp:1691 and FileCache.cpp:2250, and the
+    // finish() calls at FileCache.cpp:1720, 1831, 1833, 2241, 2328.
+    // A second queue isolates this path from the timed/non-blocking tests above.
+    FileCacheBoundedQueue<int> q2(4);
+
+    std::promise<bool> pop_result;
+    auto pop_future = pop_result.get_future();
+
+    // One-shot latch: the consumer signals it is about to call pop(), and the
+    // main thread waits on it before calling finish().  This guarantees that
+    // finish() runs only after the consumer has entered pop() — proving the
+    // wake-up path, not a finish-before-pop ordering.
+    std::latch consumer_at_pop(1);
+
+    std::thread consumer([&]
+    {
+        int item = 0;
+        // Signal main that we are immediately about to call pop().
+        consumer_at_pop.count_down();
+        // Blocking pop on an empty queue; blocked until finish() wakes it.
+        pop_result.set_value(q2.pop(item));
+    });
+
+    // Wait until the consumer has reached pop(), then wake it via finish().
+    consumer_at_pop.wait();
+    // finish() wakes the blocked pop; the queue is empty and marked done,
+    // so pop() must return false (drain-and-finish semantics).
+    q2.finish();
+
+    ASSERT_EQ(pop_future.wait_for(std::chrono::seconds(5)), std::future_status::ready)
+        << "blocking pop did not return within 5 s after finish()";
+    EXPECT_FALSE(pop_future.get());
+    consumer.join();
 }
 
 } // namespace

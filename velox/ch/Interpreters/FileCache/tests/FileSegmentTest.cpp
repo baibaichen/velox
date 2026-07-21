@@ -35,6 +35,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <barrier>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -44,6 +45,7 @@
 #include <future>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1016,6 +1018,205 @@ TEST_F(FileSegmentTest, GetInfoSnapshotReflectsSegment)
     EXPECT_FALSE(info.is_unbound);
     EXPECT_GE(info.references, 1u);
     EXPECT_EQ(info.origin.user_id, origin_.user_id);
+}
+
+// -- B4: concurrent extractRemoteFileReader races reset-before-complete -----
+//
+// Proves that after the correct production sequence
+// (resetRemoteFileReader() followed by completePartAndResetDownloader()),
+// every concurrent extractRemoteFileReader() call returns nullptr and
+// reader ownership remains exclusively with the downloader's local copy.
+//
+// The corresponding false-green mutation (scratch copy only): swap steps 3
+// and 5 so thread A calls completePartAndResetDownloader() first (before
+// barrier 2) and resetRemoteFileReader() second (before barrier 3).
+// In the mutation, download_data still holds the reader after barrier 2,
+// so reader_a.use_count() == 2 (not 1), failing the step-4 invariant.
+// resetRemoteFileReader() also throws post-completion because the downloader
+// identity is cleared; that exception must be caught in the scratch copy to
+// avoid deadlocking barrier 3.
+TEST_F(FileSegmentTest, ConcurrentExtractRacesResetBeforeComplete)
+{
+    // ALL downloader operations happen on thread A.  The fixture thread only
+    // acquires a bare EMPTY segment so the test exercises the real concurrent
+    // scheduling path without a fixture-thread downloader lease.
+    auto segment = acquireEmptySegment(100);
+    auto readFile = std::make_shared<velox::InMemoryReadFile>(std::string(100, 'z'));
+
+    std::barrier<> barrier1(2);
+    std::barrier<> barrier2(2);
+    std::barrier<> barrier3(2);
+
+    FileSegment::RemoteFileReaderPtr reader_a;
+
+    // Setup handoff: thread A signals success or failure before the fixture
+    // thread starts thread B.  This avoids a barrier deadlock if setup fails.
+    std::promise<void> setup_promise;
+    auto setup_future = setup_promise.get_future();
+
+    // Captures any unexpected post-setup exception from thread A so it can be
+    // reported on the fixture thread after both threads join.
+    std::exception_ptr thread_a_exception;
+
+    // Thread A: acquires the downloader lease, reserves, writes a partial
+    // download (40 of 100 bytes), stashes the reader, then follows the correct
+    // reset-then-complete production sequence from Metadata.cpp:1049-1050.
+    std::thread threadA([&]()
+    {
+        FileCacheQueryIdScope scope("b4-downloader");
+
+        // Setup phase: communicate success or failure to the fixture thread via
+        // setup_promise.  No fatal assertions here — a failure returns early
+        // without touching the barriers, so thread B is never started.
+        try
+        {
+            if (segment->getOrSetDownloader() != FileSegment::getCallerId())
+            {
+                setup_promise.set_exception(std::make_exception_ptr(
+                    std::runtime_error("getOrSetDownloader returned wrong caller ID")));
+                return;
+            }
+            std::string failure_reason;
+            if (!segment->reserve(40, /*lock_wait_timeout_ms*/ 1000, failure_reason))
+            {
+                setup_promise.set_exception(std::make_exception_ptr(
+                    std::runtime_error("reserve(40) failed: " + failure_reason)));
+                return;
+            }
+
+            std::string data(40, 'z');
+            segment->write(data.data(), data.size(), segment->getCurrentWriteOffset());
+
+            // Stash the reader and capture a shared reference via reader_a.  Drop
+            // the extra local copy so only download_data and reader_a hold the
+            // object (use_count == 2 at this point).
+            auto reader = std::make_shared<ReadBufferFromVeloxReadFile>(readFile, pool_.get());
+            segment->setRemoteFileReader(reader);
+            reader_a = segment->getRemoteFileReader();
+            reader.reset();
+
+            setup_promise.set_value(); // signal success to fixture thread
+        }
+        catch (...)
+        {
+            try
+            {
+                setup_promise.set_exception(std::current_exception());
+            }
+            catch (...)
+            {
+            }
+            return;
+        }
+
+        // Post-setup phase: synchronized work with thread B via barriers.
+        // On any unexpected exception, arrive_and_drop all remaining barriers so
+        // thread B is not stranded, then capture the exception for reporting.
+        bool past_barrier1 = false;
+        bool past_barrier2 = false;
+        bool past_barrier3 = false;
+        try
+        {
+            // Barrier 1: state = DOWNLOADING, reader stashed in download_data.
+            barrier1.arrive_and_wait();
+            past_barrier1 = true;
+
+            // Step 3 (correct order, Metadata.cpp:1049): withdraw the reader while
+            // still the exclusive downloader.  After this call download_data->
+            // remote_file_reader is null and reader_a is the sole owner
+            // (use_count drops to 1).
+            segment->resetRemoteFileReader();
+
+            // Barrier 2: reader withdrawn from download_data.
+            barrier2.arrive_and_wait();
+            past_barrier2 = true;
+
+            // Step 5 (correct order, Metadata.cpp:1050): publish the terminal
+            // download state.  With 40 of 100 bytes written, resetDownloadingState-
+            // Unlocked takes the PARTIALLY_DOWNLOADED path, leaving download_data
+            // intact but clearing the downloader identity.
+            segment->completePartAndResetDownloader();
+
+            // Barrier 3: terminal state published.
+            barrier3.arrive_and_wait();
+            past_barrier3 = true;
+        }
+        catch (...)
+        {
+            thread_a_exception = std::current_exception();
+            // Arrive-and-drop every barrier not yet completed so thread B is
+            // released rather than left blocked indefinitely.
+            if (!past_barrier1) { barrier1.arrive_and_drop(); }
+            if (!past_barrier2) { barrier2.arrive_and_drop(); }
+            if (!past_barrier3) { barrier3.arrive_and_drop(); }
+        }
+    });
+
+    // Wait for thread A's setup to complete before starting thread B.
+    try
+    {
+        setup_future.get(); // throws if setup failed
+    }
+    catch (const std::exception & e)
+    {
+        threadA.join();
+        FAIL() << "Thread A setup failed: " << e.what();
+    }
+    catch (...)
+    {
+        threadA.join();
+        FAIL() << "Thread A setup failed with unknown exception";
+    }
+
+    // Thread B: observes extractRemoteFileReader at each synchronisation point.
+    std::thread threadB([&]()
+    {
+        // Step 2: state is still DOWNLOADING; extractRemoteFileReader is gated
+        // on state (requires DOWNLOADED or PARTIALLY_DOWNLOADED_NO_CONTINUATION)
+        // so it must return nullptr even though a reader is stashed in
+        // download_data.
+        barrier1.arrive_and_wait();
+        EXPECT_EQ(segment->extractRemoteFileReader(), nullptr);
+
+        // Step 4: thread A has called resetRemoteFileReader() (the correct first
+        // half of the production sequence).  The reader has been withdrawn from
+        // download_data, so reader_a is now the sole owner (use_count == 1).
+        // In the false-green mutation (completePartAndResetDownloader first),
+        // download_data still holds the reader and reader_a.use_count() == 2,
+        // failing this assertion and proving that the reversed ordering creates
+        // a double-ownership window visible to concurrent observers.
+        barrier2.arrive_and_wait();
+        EXPECT_EQ(segment->extractRemoteFileReader(), nullptr);
+        EXPECT_EQ(reader_a.use_count(), 1);
+
+        // Step 6: terminal state published; reader_a remains the sole owner.
+        barrier3.arrive_and_wait();
+        EXPECT_EQ(segment->extractRemoteFileReader(), nullptr);
+    });
+
+    threadA.join();
+    threadB.join();
+
+    // Report any unexpected post-setup exception from thread A.
+    if (thread_a_exception)
+    {
+        try
+        {
+            std::rethrow_exception(thread_a_exception);
+        }
+        catch (const std::exception & e)
+        {
+            FAIL() << "Thread A post-setup exception: " << e.what();
+        }
+        catch (...)
+        {
+            FAIL() << "Thread A post-setup unknown exception";
+        }
+    }
+
+    // reader_a must be the only live reference to the reader object.
+    ASSERT_NE(reader_a, nullptr);
+    EXPECT_EQ(reader_a.use_count(), 1);
 }
 
 } // namespace
