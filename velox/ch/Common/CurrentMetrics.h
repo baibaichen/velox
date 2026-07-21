@@ -1,34 +1,48 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
-namespace facebook::velox::ch {
+namespace facebook::velox::ch
+{
 
-namespace CurrentMetrics {
+namespace CurrentMetrics
+{
 
-enum Metric {
-  CacheFileSegments,
-  FilesystemCacheHoldFileSegments,
-  FilesystemCacheDownloadQueueElements,
-  FilesystemCacheDelayedCleanupElements,
-  FilesystemCacheReserveThreads,
-  FilesystemCacheSizeLimit,
-  FilesystemCacheElements,
-  FilesystemCacheInvalidatedElements,
-  FilesystemCachePriorityQueueElements,
-  FilesystemCacheSize,
-  FilesystemCacheKeys,
+enum Metric
+{
+    CacheFileSegments,
+    FilesystemCacheHoldFileSegments,
+    FilesystemCacheDownloadQueueElements,
+    FilesystemCacheDelayedCleanupElements,
+    FilesystemCacheReserveThreads,
+    FilesystemCacheSizeLimit,
+    FilesystemCacheElements,
+    FilesystemCacheInvalidatedElements,
+    FilesystemCachePriorityQueueElements,
+    FilesystemCacheSize,
+    FilesystemCacheKeys,
+    END
 };
 
-inline void add(Metric, int64_t = 1) {}
+inline constexpr size_t kNumMetrics = static_cast<size_t>(END);
 
-inline void sub(Metric, int64_t = 1) {}
+void add(Metric m, int64_t delta = 1);
+void sub(Metric m, int64_t delta = 1);
+int64_t get(Metric m);
+void set(Metric m, int64_t v);
 
-inline int64_t get(Metric) { return 0; }
+class Increment
+{
+public:
+    explicit Increment(Metric m, int64_t delta = 1);
+    ~Increment();
+    Increment(const Increment &) = delete;
+    Increment & operator=(const Increment &) = delete;
 
-class Increment {
- public:
-  explicit Increment(Metric, int64_t = 1) {}
+private:
+    Metric metric_;
+    int64_t delta_;
 };
 
 } // namespace CurrentMetrics

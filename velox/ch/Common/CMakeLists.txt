@@ -73,6 +73,9 @@ configure_file(
 
 velox_add_library(
   velox_ch_filecache
+  CurrentMetrics.cpp
+  ProfileEvents.cpp
+  FileCacheStats.cpp
   StatusFile.cpp
   ThreadPool.cpp
   FileCacheQueryIdScope.cpp
@@ -88,6 +91,7 @@ velox_add_library(
     FileCacheFilesystem.h
     FileCacheQueryIdScope.h
     FileCacheScheduler.h
+    FileCacheStats.h
     FilesystemCacheLog.h
     logger_useful.h
     OpenTelemetryTraceContext.h
