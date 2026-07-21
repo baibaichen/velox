@@ -141,8 +141,33 @@ FileCacheInputStream::ReaderPtr FileCacheInputStream::getCacheReadBuffer(
     // Open the local cache segment file through the local filesystem. This uses
     // the same primitive (filesystems::FileSystem::openFileForRead) as the D1
     // OpenedFileCache; the local scheme is registered by the Manager/tests.
-    auto fs = filesystems::getFileSystem(path, nullptr);
-    std::shared_ptr<velox::ReadFile> localFile = fs->openFileForRead(path);
+    //
+    // Read-while-downloading rename race: a still-DOWNLOADING segment's file is
+    // named <offset>; on download completion `renameToIncludeSizeInNameUnlocked`
+    // renames it to <offset>_<size>. `getPath()` samples the name without a lock,
+    // so a concurrent downloader (another driver) can complete the rename between
+    // sampling `path` above and the open here, making the sampled <offset> path
+    // vanish (FILE_NOT_FOUND). CH does not hit this because it opens the fd once
+    // and the open descriptor survives the rename. We cannot pre-open, so we
+    // re-sample `getPath()` (now the renamed path) and retry once. Re-sampling,
+    // not blind suffix-guessing, keeps this correct for either name.
+    auto openCacheFile = [&](const std::string & p)
+    { return filesystems::getFileSystem(p, nullptr)->openFileForRead(p); };
+
+    std::shared_ptr<velox::ReadFile> localFile;
+    std::string openedPath = path;
+    try
+    {
+        localFile = openCacheFile(openedPath);
+    }
+    catch (const std::exception &)
+    {
+        const auto renamedPath = fileSegment.getPath();
+        if (renamedPath == openedPath)
+            throw; // The name did not change; this is a real open failure.
+        openedPath = renamedPath;
+        localFile = openCacheFile(openedPath);
+    }
     readInfo_.cacheReader = std::make_shared<ReadBufferFromVeloxReadFile>(
         std::move(localFile), owner_->memoryPool());
 
@@ -456,15 +481,28 @@ FileCacheInputStream::prepareReadFromFileSegmentState(
             VELOX_FAIL("Read type not set");
         case ReadType::CACHED:
         {
-            // The local cache file holds the segment's bytes in a SEGMENT-RELATIVE
-            // coordinate space [0, downloadedSize). Bound and seek relatively so we
-            // never over-read past the downloaded prefix.
+            // The local cache file holds the segment's downloaded prefix in a
+            // SEGMENT-RELATIVE coordinate space [0, downloadedSize). Bound and
+            // seek relatively so we never over-read past what is on disk: the
+            // reader wraps a local ReadFile that throws on a short pread (no
+            // implicit EOF clamp), and its size is captured at open, so it cannot
+            // see bytes a concurrent downloader flushes later.
             VELOX_CHECK_GE(
                 offset, range.left, "current offset < file segment start offset");
             const uint64_t downloadedSize = fileSegment.getDownloadedSize();
             state->reader->setReadUntilPosition(downloadedSize);
             const uint64_t seekOffset = offset - range.left;
             state->reader->seek(static_cast<off_t>(seekOffset), SEEK_SET);
+
+            // If the segment is still incomplete, remember where this reader's
+            // downloaded prefix ends (absolute). When the read cursor reaches it,
+            // updateReadStateIfNeeded re-prepares to open a fresh reader over the
+            // grown cache file (or wait for more download) instead of returning a
+            // spurious zero-byte read and reporting premature end of region. A
+            // fully DOWNLOADED segment has downloadedSize == range.size(), so its
+            // bound already covers the whole segment and no re-prepare is needed.
+            if (fileSegment.state() != FileSegment::State::DOWNLOADED)
+                state->cachedPrefixEndAbsolute = range.left + downloadedSize;
             break;
         }
         case ReadType::REMOTE_FS_READ_BYPASS_CACHE:
@@ -668,12 +706,28 @@ bool FileCacheInputStream::updateCurrentReaderIfNeeded()
 void FileCacheInputStream::updateReadStateIfNeeded(
     FileSegment & fileSegment, uint64_t offset)
 {
-    if (state_->readType == ReadType::CACHED
-        && fileSegment.state() != FileSegment::State::DOWNLOADED)
+    if (state_->readType == ReadType::CACHED)
     {
-        // We started from cache but the segment is no longer fully downloaded;
-        // if we caught up to the write offset, re-prepare (may switch to remote).
-        if (offset >= fileSegment.getCurrentWriteOffset())
+        // A CACHED reader over a still-incomplete segment can only serve its
+        // downloaded prefix [range.left, cachedPrefixEndAbsolute); its wrapped
+        // ReadFile cached that size at open and cannot see bytes the concurrent
+        // downloader has flushed since (nor a later rename to <offset>_<size>).
+        // Re-prepare once the cursor reaches the recorded prefix end so a fresh
+        // reader observes the grown/renamed cache file (or the DOWNLOADING branch
+        // waits for more, or we switch to a remote read). Without this the reader
+        // would freeze at the first flushed chunk (e.g. 1 MiB) and report a
+        // premature end of region. `cachedPrefixEndAbsolute == 0` means the
+        // segment was fully DOWNLOADED at prepare time (bound already covers the
+        // whole segment), so no re-prepare is needed on this axis.
+        //
+        // Keep CH's original `offset >= getCurrentWriteOffset()` trigger as well
+        // for the not-yet-DOWNLOADED case.
+        const bool prefixExhausted = state_->cachedPrefixEndAbsolute != 0
+            && offset >= state_->cachedPrefixEndAbsolute;
+        const bool caughtUpToWrite =
+            fileSegment.state() != FileSegment::State::DOWNLOADED
+            && offset >= fileSegment.getCurrentWriteOffset();
+        if (prefixExhausted || caughtUpToWrite)
             state_ = prepareReadFromFileSegmentState(fileSegment, offset);
     }
     else if (state_->readType == ReadType::REMOTE_FS_READ_AND_PUT_IN_CACHE)

@@ -824,5 +824,71 @@ TEST_F(FileCacheE2ETest, RandomSeeksAcrossHitMissBypass)
     }
 }
 
+// ============================================================================
+// Post-acceptance amendment 2: output-buffer refill freeze on a CACHED reader
+// over a still-DOWNLOADING segment.
+//
+// A CACHED reader is bounded to the segment's downloaded prefix at prepare time,
+// and its wrapped ReadFile caches the file size at open. If a concurrent
+// downloader flushes more bytes AFTER prepare but the read cursor has not yet
+// reached the live write offset, the pre-fix updateReadStateIfNeeded never
+// re-prepares, so the reader freezes at the first flushed chunk (e.g. 1 MiB) and
+// Next returns got==0 with the region only partially read -> the DWIO caller
+// aborts "Reading past end". This deterministically reproduces that state with
+// two interleaved streams over one 6 MiB segment, no compressed-page stack:
+//
+//   1. downloader stream D downloads only the first 1 MiB (writeOffset = 1 MiB).
+//   2. reader stream R reads its first 1 MiB CACHED (prepare bound = 1 MiB), so
+//      its cursor sits at 1 MiB while its reader can serve no more.
+//   3. D downloads a further 3 MiB (writeOffset = 4 MiB) -- the prefix grows.
+//   4. R reads on. Pre-fix: R is frozen at its 1 MiB bound and reports a
+//      premature end of region (RED). Post-fix: R re-prepares at the exhausted
+//      prefix, observes the grown cache file, and reads the whole region (GREEN).
+// ============================================================================
+TEST_F(FileCacheE2ETest, CachedReaderRefillsWhenDownloadingSegmentGrows)
+{
+    const size_t seg = 6 * 1024 * 1024; // one segment larger than 1 MiB
+    const size_t n = seg;
+    const size_t chunk = 1024 * 1024; // kDefaultOutputBufferSize
+    auto content = makeContent(n);
+    // align == seg keeps the partial segment at its stable <offset> name so both
+    // streams share the same single [0, seg) segment while it downloads.
+    auto cache = makeManagerCache(/*seg*/ seg, /*align*/ seg, /*maxSize*/ 32 * 1024 * 1024);
+    auto path = writeSourceFile("src", content);
+    auto key = FileCacheKey::fromPath(path);
+
+    // Downloader stream D: reads (and thus downloads) into the shared segment.
+    auto inputD = makeInput(cache, path, key);
+    auto streamD = inputD->enqueue({0, n});
+
+    // Reader stream R: will read the same region CACHED, behind D.
+    auto inputR = makeInput(cache, path, key);
+    auto streamR = inputR->enqueue({0, n});
+
+    // 1. D downloads the first 1 MiB (writeOffset = 1 MiB), segment PARTIALLY.
+    ASSERT_EQ(readN(*streamD, chunk), content.substr(0, chunk));
+
+    // 2. R reads its first 1 MiB from the cache. CACHED is chosen because the
+    //    write offset (1 MiB) is ahead of R's offset (0); R's reader is bounded
+    //    to the 1 MiB prefix present right now.
+    ASSERT_EQ(readN(*streamR, chunk), content.substr(0, chunk));
+
+    // 3. D downloads a further 3 MiB (writeOffset = 4 MiB): the on-disk cache
+    //    file grows past R's reader's frozen 1 MiB bound.
+    ASSERT_EQ(readN(*streamD, 3 * chunk), content.substr(chunk, 3 * chunk));
+
+    // 4. R must read the rest of the region correctly. Pre-fix this is RED: R is
+    //    frozen at the 1 MiB bound and readAll returns only the first 1 MiB.
+    std::string rest;
+    const void * data = nullptr;
+    int32_t size = 0;
+    while (streamR->Next(&data, &size))
+        rest.append(static_cast<const char *>(data), static_cast<size_t>(size));
+    // R already consumed [0, 1 MiB); the remainder must be [1 MiB, seg).
+    ASSERT_EQ(rest.size(), n - chunk)
+        << "CACHED reader froze at its initial 1 MiB prefix (refill bug)";
+    EXPECT_EQ(rest, content.substr(chunk));
+}
+
 } // namespace
 } // namespace facebook::velox::ch
