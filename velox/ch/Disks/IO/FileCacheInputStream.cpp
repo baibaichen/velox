@@ -15,6 +15,7 @@
  */
 #include "velox/ch/Disks/IO/FileCacheInputStream.h"
 
+#include "velox/ch/Common/ProfileEvents.h"
 #include "velox/ch/Disks/IO/FileCacheBufferedInput.h"
 #include "velox/ch/Interpreters/FileCache/FileCacheUtils.h"
 #include "velox/common/file/FileSystems.h"
@@ -525,6 +526,11 @@ bool FileCacheInputStream::writeCache(
             return false;
         throw;
     }
+    // Cache-write attribution (CH `CachedReadBufferCacheWriteBytes`, incremented
+    // inside CH's `writeCache`, `CachedOnDiskReadBufferFromFile.cpp:1298`). Placed
+    // here so BOTH callers — the main-read download and `predownloadForCurrentSegment`
+    // — count the `size` bytes actually written into the cache segment.
+    ProfileEvents::increment(ProfileEvents::CachedReadBufferCacheWriteBytes, size);
     return true;
 }
 
@@ -572,6 +578,14 @@ bool FileCacheInputStream::predownloadForCurrentSegment(
 
         const size_t got = state.reader->buffer().size();
         VELOX_CHECK_LE(got, state.bytesToPredownload);
+
+        // Source attribution for predownload (CH increments
+        // `CachedReadBufferReadFromSourceBytes` for predownloaded chunks,
+        // `CachedOnDiskReadBufferFromFile.cpp:1108`). These `got` bytes were read
+        // from the source to fill the segment prefix. CH's predownload-specific
+        // counters have no port enum, so only the source-bytes total is recorded.
+        ProfileEvents::increment(
+            ProfileEvents::CachedReadBufferReadFromSourceBytes, got);
 
         std::string reason;
         const bool reserved = fileSegment.reserve(
@@ -709,6 +723,14 @@ size_t FileCacheInputStream::readFromCurrentSegment(
     const bool result = state.reader->next();
     size_t size = result ? state.reader->buffer().size() : 0;
 
+    // Classify where these bytes were served FROM, before the readType can be
+    // reassigned below on a cache-write failure. A CACHED read served the bytes
+    // from a local cache segment file (a hit); any remote read type served them
+    // from the source (a miss / refetch). This mirrors CH's read-path split in
+    // `CachedOnDiskReadBufferFromFile::nextImplStep` (`ProfileEvents.cpp`
+    // `CachedReadBufferReadFromCacheBytes` / `CachedReadBufferReadFromSourceBytes`).
+    const bool servedFromCache = state.readType == ReadType::CACHED;
+
     if (size && doDownload)
     {
         VELOX_CHECK_LE(offset + size - 1, fileSegment.range().right);
@@ -745,6 +767,18 @@ size_t FileCacheInputStream::readFromCurrentSegment(
             }
         }
         VELOX_CHECK_LE(offset + size, readInfo_.readUntilPosition);
+    }
+
+    if (size)
+    {
+        // Hit/source byte attribution over the final (trimmed) `size` served to
+        // the caller. Uses the existing `ReadType` decision, no new branching.
+        if (servedFromCache)
+            ProfileEvents::increment(
+                ProfileEvents::CachedReadBufferReadFromCacheBytes, size);
+        else
+            ProfileEvents::increment(
+                ProfileEvents::CachedReadBufferReadFromSourceBytes, size);
     }
 
     return size;
