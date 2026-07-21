@@ -86,6 +86,15 @@ private:
         ReaderPtr reader;
         ReadType readType = ReadType::NONE;
         uint64_t bytesToPredownload = 0;
+        // For a CACHED reader over a still-DOWNLOADING segment, the absolute
+        // offset where the reader's downloaded prefix ends (== range.left +
+        // getDownloadedSize() captured at prepare time). The local cache file
+        // only holds this many bytes right now, so the reader stops here. Once
+        // the read cursor reaches it, updateReadStateIfNeeded re-prepares to pick
+        // up bytes the concurrent downloader has since flushed (the reader's own
+        // ReadFile caches its size at open and cannot see the growth). Zero when
+        // not a CACHED read of an incomplete segment (no re-prepare on this axis).
+        uint64_t cachedPrefixEndAbsolute = 0;
         // Owned scratch used when the reader's own internal buffer is too small
         // for predownload (mirrors CH `predownload_memory`).
         velox::BufferPtr predownloadBuffer;
