@@ -74,6 +74,26 @@ target_link_libraries(
     GTest::gtest_main
 )
 
+# Task 017 post-acceptance amendment 1: prove the three global ProfileEvents
+# hit/source/write byte counters are driven from the assembled read path.
+add_executable(velox_ch_filecache_hit_metrics_test FileCacheHitMetricsTest.cpp)
+add_test(velox_ch_filecache_hit_metrics_test velox_ch_filecache_hit_metrics_test)
+
+target_link_libraries(
+  velox_ch_filecache_hit_metrics_test
+  PRIVATE
+    velox_ch_filecache
+    velox_dwio_common
+    velox_test_util
+    velox_exception
+    velox_file
+    velox_memory
+    Folly::folly
+    fmt::fmt
+    GTest::gtest
+    GTest::gtest_main
+)
+
 # Task 018a: connector integration — FileCacheBufferedInputBuilder routes the
 # Hive connector read path through the FileCache. Drives the real
 # BufferedInputBuilder::create(...) extension point (real FileHandle,
