@@ -12,45 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_executable(
-  velox_ch_filecache_buffered_input_test
-  FileCacheBufferedInputTest.cpp)
-add_test(
-  velox_ch_filecache_buffered_input_test
-  velox_ch_filecache_buffered_input_test)
+add_executable(velox_ch_filecache_seek_benchmark FileCacheSeekBenchmark.cpp)
 
 target_link_libraries(
-  velox_ch_filecache_buffered_input_test
+  velox_ch_filecache_seek_benchmark
   PRIVATE
     velox_ch_filecache_dwio
     velox_ch_filecache_manager
     velox_ch_filecache_core
     velox_ch_filecache
-    velox_test_util
-    velox_exception
     velox_file
-    velox_memory
-    Folly::folly
-    fmt::fmt
-    GTest::gtest
-    GTest::gtest_main)
-
-add_executable(velox_ch_filecache_e2e_test FileCacheE2ETest.cpp)
-add_test(velox_ch_filecache_e2e_test velox_ch_filecache_e2e_test)
-
-target_link_libraries(
-  velox_ch_filecache_e2e_test
-  PRIVATE
-    velox_ch_filecache_dwio
-    velox_ch_filecache_manager
-    velox_ch_filecache_core
-    velox_ch_filecache
-    velox_dwio_common
-    velox_file
-    velox_test_util
     velox_exception
     velox_memory
     Folly::folly
-    fmt::fmt
-    GTest::gtest
-    GTest::gtest_main)
+    Folly::follybenchmark
+    gflags::gflags)

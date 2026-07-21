@@ -209,16 +209,45 @@ bool ReadBufferFromFileBase::nextImpl()
         // The right boundary has been reached.
         return false;
 
-    const size_t toRead = std::min(destCapacity, readUntil_ - startOffset);
-    // Fail closed before issuing an actual pread when direct IO is required.
-    checkDirectIoRead(dest, startOffset, toRead);
-    const size_t bytesRead = readInto(startOffset, dest, toRead);
-    if (bytesRead == 0)
-        // Physical end of input.
-        return false;
+    const size_t logicalToRead = std::min(destCapacity, readUntil_ - startOffset);
 
-    fileOffsetOfBufferEnd_ = startOffset + bytesRead;
-    buffer() = CacheBuffer(dest, dest + bytesRead);
+    if (directIoAlignment_ > 1)
+    {
+        // For direct IO the physical pread length must be an alignment multiple,
+        // but the logical tail (readUntil - startOffset) may not be.  Round the
+        // physical length up so the kernel sees an aligned request; we expose
+        // only the logical bytes.
+        const size_t alignment = directIoAlignment_;
+        // Overflow guard: logicalToRead + alignment - 1 must not wrap.
+        VELOX_CHECK_LE(
+            logicalToRead,
+            std::numeric_limits<size_t>::max() - alignment + 1,
+            "logicalToRead + alignment - 1 would overflow size_t");
+        const size_t physicalToRead =
+            ((logicalToRead + alignment - 1) / alignment) * alignment;
+        // The rounded-up length must fit the pre-aligned destination buffer.
+        VELOX_CHECK_LE(
+            physicalToRead,
+            destCapacity,
+            "Direct-IO physical read length exceeds buffer capacity "
+            "(buffer too small for alignment round-up)");
+        checkDirectIoRead(dest, startOffset, physicalToRead);
+        const size_t bytesRead = readInto(startOffset, dest, physicalToRead);
+        if (bytesRead == 0)
+            return false;
+        // Expose at most the logical bytes so we never publish past readUntil_.
+        const size_t exposed = std::min(bytesRead, logicalToRead);
+        fileOffsetOfBufferEnd_ = startOffset + exposed;
+        buffer() = CacheBuffer(dest, dest + exposed);
+    }
+    else
+    {
+        const size_t bytesRead = readInto(startOffset, dest, logicalToRead);
+        if (bytesRead == 0)
+            return false;
+        fileOffsetOfBufferEnd_ = startOffset + bytesRead;
+        buffer() = CacheBuffer(dest, dest + bytesRead);
+    }
     return true;
 }
 

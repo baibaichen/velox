@@ -262,6 +262,10 @@ public:
     virtual std::string getFileName() const = 0;
     std::optional<size_t> tryGetFileSize() { return fileSize_; }
 
+    /// Returns the direct-IO alignment requirement (power-of-two); 1 means no
+    /// alignment is required (i.e. direct IO is not active for this reader).
+    size_t directIoAlignment() const { return directIoAlignment_; }
+
 protected:
     FileCacheBufferState state_;
 

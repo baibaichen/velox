@@ -36,6 +36,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <filesystem>
+#include <limits>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -995,9 +996,62 @@ void CacheMetadata::downloadImpl(FileSegment & file_segment, BufferPtr & memory)
         buf->internalBuffer().empty(),
         "Memory buffer for buffer must have been reset before being put into background download");
 
-    if (!memory)
-        memory = AlignedBuffer::allocate<char>(std::min(size_t(DBMS_DEFAULT_BUFFER_SIZE), size_to_download), memory_pool);
-    buf->set(memory->asMutable<char>(), std::min(size_to_download, memory->size()));
+    const size_t alignment = buf->directIoAlignment();
+    if (alignment > 1)
+    {
+        // Total bytes the background worker is allowed to download — always an
+        // alignment multiple so every pread satisfies the direct-IO contract.
+        const size_t aligned_download_size = (size_to_download / alignment) * alignment;
+        if (aligned_download_size == 0)
+        {
+            LOG_TEST(
+                log, "Skipping background download for unaligned tail ({} bytes < alignment {}) in {}",
+                size_to_download, alignment, file_segment.getInfoForLog());
+            common::testutil::TestValue::adjust(
+                "facebook::velox::ch::CacheMetadata::downloadImpl::unalignedTailSkip",
+                &file_segment);
+            return;
+        }
+
+        // Per-read scratch capacity: one alignment unit, capped to avoid an
+        // allocation larger than DBMS_DEFAULT_BUFFER_SIZE.  When alignment
+        // itself exceeds the cap (e.g. 2 MiB huge pages), use one alignment
+        // unit so the contract is still satisfiable.
+        const size_t scratch_capacity =
+            alignment <= DBMS_DEFAULT_BUFFER_SIZE
+                ? (DBMS_DEFAULT_BUFFER_SIZE / alignment) * alignment
+                : alignment;
+
+        // (Re)allocate the scratch buffer when the existing one is too small.
+        // Overflow guard: scratch_capacity + alignment must not wrap size_t.
+        VELOX_CHECK_LE(
+            scratch_capacity,
+            std::numeric_limits<size_t>::max() - alignment,
+            "scratch_capacity + alignment would overflow size_t");
+        const size_t needed = scratch_capacity + alignment;
+        if (!memory || memory->size() < needed)
+            memory = AlignedBuffer::allocate<char>(needed, memory_pool);
+
+        // Round the raw pool address up to the required alignment.
+        // Overflow guard: pointer address + alignment - 1 must not wrap.
+        auto * raw = memory->asMutable<char>();
+        VELOX_CHECK_LE(
+            reinterpret_cast<uintptr_t>(raw),
+            std::numeric_limits<uintptr_t>::max() - alignment + 1,
+            "pointer alignment round-up would overflow uintptr_t");
+        auto * aligned = reinterpret_cast<char *>(
+            (reinterpret_cast<uintptr_t>(raw) + alignment - 1) & ~(alignment - 1));
+        buf->set(aligned, scratch_capacity);
+
+        // Clamp size_to_download so the loop never asks for the sub-alignment tail.
+        size_to_download = aligned_download_size;
+    }
+    else
+    {
+        if (!memory)
+            memory = AlignedBuffer::allocate<char>(std::min(size_t(DBMS_DEFAULT_BUFFER_SIZE), size_to_download), memory_pool);
+        buf->set(memory->asMutable<char>(), std::min(size_to_download, memory->size()));
+    }
 
     /// The background reserve timeout is injected from FileCacheConfig (not taken
     /// from a global Context as in ClickHouse).
