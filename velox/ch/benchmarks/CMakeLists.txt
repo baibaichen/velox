@@ -27,3 +27,21 @@ target_link_libraries(
     Folly::folly
     Folly::follybenchmark
     gflags::gflags)
+
+# Dedicated FCBI micro exercising the full FileCacheBufferedInput read()/Next()
+# path (the seek benchmark above measures only seekToPosition).
+add_executable(velox_ch_fcbi_benchmark FileCacheBufferedInputBenchmark.cpp)
+
+target_link_libraries(
+  velox_ch_fcbi_benchmark
+  PRIVATE
+    velox_ch_filecache_dwio
+    velox_ch_filecache_manager
+    velox_ch_filecache_core
+    velox_ch_filecache
+    velox_file
+    velox_exception
+    velox_memory
+    Folly::folly
+    Folly::follybenchmark
+    gflags::gflags)
