@@ -820,7 +820,6 @@ void LRUFileCachePriority::LRUIterator::decrementSize(size_t size)
 
     auto entry_ptr = entry.lock();
     chassert(entry_ptr);
-    chassert(entry_ptr->size >= 0);
     chassert(entry_ptr->size >= size);
 
     LOG_TEST(cache_priority->log,
