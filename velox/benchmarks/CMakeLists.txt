@@ -63,6 +63,25 @@ if(${VELOX_BUILD_TEST_UTILS})
     Folly::follybenchmark
     fmt::fmt
   )
+
+  # A/B sweep base library (Task 018-A). Consumed by the TPC-H A/B benchmark
+  # (Task 018-C); built here as a compile-only library so the FileCacheManager
+  # adapter is validated without registering a TPC-H target or touching a
+  # TPC-H dataset.
+  add_library(velox_benchmark_ab AbBenchmarkBase.cpp AbBenchmarkMain.cpp)
+  velox_add_test_headers(velox_benchmark_ab AbBenchmarkBase.h AbBenchmarkMain.h)
+  target_link_libraries(
+    velox_benchmark_ab
+    velox_query_benchmark
+    velox_cache_read_harness
+    velox_ch_filecache_dwio
+    velox_ch_filecache_manager
+    velox_ch_filecache_core
+    velox_ch_filecache
+    velox_caching
+    Folly::folly
+    fmt::fmt
+    gflags::gflags)
 endif()
 
 if(${VELOX_ENABLE_BENCHMARKS_BASIC})
