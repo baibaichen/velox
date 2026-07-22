@@ -15,6 +15,7 @@
  */
 
 #include "velox/ch/Common/FileCacheQueryIdScope.h"
+#include "velox/ch/Common/QueryStatus.h"
 #include "velox/ch/Interpreters/FileCache/FileCache.h"
 #include "velox/ch/Interpreters/FileCache/tests/FileCacheTestResources.h"
 #include "velox/ch/Interpreters/FileCache/FileCacheErrnoException.h"
@@ -25,15 +26,20 @@
 #include "velox/common/memory/Memory.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
 
+#include <folly/CancellationToken.h>
 #include <folly/system/ThreadId.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace facebook::velox::ch
@@ -451,6 +457,112 @@ TEST_F(FileSegmentDownloadTest, RemoteReaderHandoffDetachesAndPreservesOffsets)
 
     // Release the downloader and holder; the not-downloaded segment is removed cleanly (no file,
     // no rename): downloaded_size is 0 so no on-disk file exists.
+    segment.resetDownloader();
+    holder.reset();
+    cache.deactivateBackgroundOperations();
+}
+
+/// PD-3 parity: a query cancellation observed WHILE a thread is blocked in
+/// `FileSegment::wait` on a DOWNLOADING segment must fire promptly (within one ~1s
+/// wait slice), not only after the bounded 60s deadline. The waiter is handed a
+/// `QueryStatus` built from a live `folly::CancellationToken`; the loop calls
+/// `throwIfKilled` every slice (mirroring ClickHouse `FileSegment::wait`). Timing is
+/// driven by the cancellation token plus the waiter signalling it has entered wait —
+/// no sleeps are used to fix races. RED guard: with the in-loop check removed, the
+/// waiter blocks the full 60s and this <2s assertion fails.
+TEST_F(FileSegmentDownloadTest, WaitObservesQueryCancellationPromptly)
+{
+    const size_t seg = 8192;
+
+    auto cache_ptr = res_.makeFileCache("cancel-wait", fsSettings(cachePath(), seg), "user-A");
+    auto & cache = *cache_ptr;
+    cache.initialize();
+
+    auto key = FileCacheKey::random();
+    CreateFileSegmentSettings create_settings;
+    auto holder = cache.getOrSet(key, 0, seg, seg, create_settings, 0, cache.getCommonOrigin());
+    ASSERT_TRUE(holder);
+    auto segment_ptr = holder->getSingleFileSegment();
+    ASSERT_TRUE(segment_ptr);
+    FileSegment & segment = *segment_ptr;
+
+    // This thread becomes the downloader and NEVER completes the download, so the segment
+    // stays DOWNLOADING and the waiter thread (a different downloader identity) enters the
+    // 1s-slice wait loop.
+    ASSERT_EQ(segment.getOrSetDownloader(), FileSegment::getCallerId());
+    ASSERT_EQ(segment.state(), FileSegmentState::DOWNLOADING);
+
+    folly::CancellationSource cancel_source;
+    QueryStatus query_status(cancel_source.getToken());
+
+    std::atomic<bool> waiter_started{false};
+    std::promise<void> entered_wait;
+    auto entered_future = entered_wait.get_future();
+
+    std::exception_ptr thrown;
+    auto wait_start = std::chrono::steady_clock::time_point{};
+    auto wait_end = std::chrono::steady_clock::time_point{};
+
+    std::thread waiter(
+        [&]()
+        {
+            waiter_started.store(true);
+            entered_wait.set_value();
+            wait_start = std::chrono::steady_clock::now();
+            try
+            {
+                // offset 0 < currentWriteOffset(0) is false, and downloader is set and not us,
+                // so this enters the DOWNLOADING wait loop and blocks on the cv.
+                segment.wait(0, &query_status);
+            }
+            catch (...)
+            {
+                thrown = std::current_exception();
+            }
+            wait_end = std::chrono::steady_clock::now();
+        });
+
+    // Ensure the waiter thread has run far enough to be about to block in wait() before we
+    // request cancellation (drives ordering without a sleep-based race fix).
+    entered_future.wait();
+    ASSERT_TRUE(waiter_started.load());
+
+    cancel_source.requestCancellation();
+
+    // The waiter must return well within the 60s deadline. Bound the join so a regression
+    // (no in-loop check) does not hang the whole suite for 60s.
+    const auto join_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (waiter.joinable())
+    {
+        if (wait_end != std::chrono::steady_clock::time_point{})
+        {
+            waiter.join();
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= join_deadline)
+            break;
+        std::this_thread::yield();
+    }
+    ASSERT_FALSE(waiter.joinable()) << "wait() did not return within 10s of cancellation "
+                                       "(regression: in-loop throwIfKilled missing)";
+
+    // It threw the cancellation exception ...
+    ASSERT_TRUE(thrown);
+    try
+    {
+        std::rethrow_exception(thrown);
+    }
+    catch (const std::exception & e)
+    {
+        EXPECT_NE(std::string(e.what()).find("FileCache query cancelled"), std::string::npos)
+            << e.what();
+    }
+
+    // ... and it did so PROMPTLY: within a couple of slices, not after the 60s deadline.
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(wait_end - wait_start);
+    EXPECT_LT(elapsed.count(), 2000)
+        << "cancellation took " << elapsed.count() << "ms; expected < 2s (in-wait, not post-deadline)";
+
     segment.resetDownloader();
     holder.reset();
     cache.deactivateBackgroundOperations();

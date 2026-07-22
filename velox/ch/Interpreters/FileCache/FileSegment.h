@@ -16,6 +16,7 @@
 #pragma once
 
 #include "velox/ch/Common/ClickHouseAliases.h"
+#include "velox/ch/Common/QueryStatus.h"
 #include "velox/ch/Common/logger_useful.h"
 #include "velox/ch/IO/ReadBufferFromVeloxReadFile.h"
 #include "velox/ch/IO/WriteBufferFromVeloxWriteFile.h"
@@ -164,7 +165,9 @@ public:
     DownloaderId getDownloader() const;
 
     /// Wait for the change of state from DOWNLOADING to any other.
-    State wait(size_t offset);
+    /// If `queryStatus` is non-null, query cancellation is observed within one wait slice
+    /// (~1s) rather than only after the full deadline; a null token preserves existing behaviour.
+    State wait(size_t offset, const QueryStatus * queryStatus = nullptr);
 
     bool isDownloaded() const;
 
