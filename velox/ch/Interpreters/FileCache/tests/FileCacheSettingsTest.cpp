@@ -992,10 +992,12 @@ TEST(FileCacheSettingsLoaderTest, OneHotBooleanMappings)
         for (std::size_t j = 0; j < N; ++j)
         {
             if (j != i)
+            {
                 EXPECT_FALSE(r.*(cases[j].field))
                     << "field for " << cases[j].key
                     << " must remain false when only " << cases[i].key
                     << " is set";
+            }
         }
     }
 }
