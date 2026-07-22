@@ -147,17 +147,31 @@ TEST(CallerIdTest, SameScopeStableId)
     auto id2 = FileSegment::getCallerId();
     EXPECT_EQ(id1, id2);
     // With an active query scope, the id is "<query-id>:<tid>", not the
-    // background "None:<tid>" shape.
+    // background "None:<thread-name>:<tid>" shape.
     EXPECT_EQ(id1.rfind("q1:", 0), 0u);
     EXPECT_NE(id1, "None:" + std::to_string(folly::getOSThreadID()));
 }
 
 TEST(CallerIdTest, NoScopeBackgroundId)
 {
-    // Without a query scope, caller is "None:<tid>".
+    // Without a query scope, caller is "None:<thread-name>:<os-tid>" (three
+    // colon-separated fields). The first colon ends the "None" prefix, the
+    // second colon separates the non-empty thread name from the OS TID suffix.
     auto id = FileSegment::getCallerId();
-    EXPECT_EQ(id.rfind("None:", 0), 0u);
-    EXPECT_EQ(id, "None:" + std::to_string(folly::getOSThreadID()));
+    const std::string tidStr = std::to_string(folly::getOSThreadID());
+
+    EXPECT_EQ(id.rfind("None:", 0), 0u) << "id does not start with 'None:': " << id;
+
+    const auto firstColon = id.find(':');
+    const auto lastColon = id.rfind(':');
+    ASSERT_NE(firstColon, lastColon) << "expected None:<thread-name>:<os-tid>, got: " << id;
+
+    // Middle field (thread name) must be non-empty.
+    const std::string middle = id.substr(firstColon + 1, lastColon - firstColon - 1);
+    EXPECT_FALSE(middle.empty()) << "thread-name field is empty in: " << id;
+
+    // Suffix must be the exact OS TID of this thread.
+    EXPECT_EQ(id.substr(lastColon + 1), tidStr) << "OS TID suffix mismatch in: " << id;
 }
 
 TEST(CallerIdTest, DifferentThreadsHaveDifferentIds)
