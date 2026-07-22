@@ -419,7 +419,7 @@ FileCacheInputStream::createReadFromFileSegmentState(
             {
                 if (canStartFromCache(offset, fileSegment))
                     return create(ReadType::CACHED);
-                downloadState = fileSegment.wait(offset);
+                downloadState = fileSegment.wait(offset, &queryStatus_);
                 // Step 7 safe point 4: after FileSegment::wait() returns. wait()
                 // may block, but this stream holds no downloader lease while
                 // waiting on another downloader, so it is safe to abort here.

@@ -523,7 +523,7 @@ void FileSegment::write(char * from, size_t size, size_t offset_in_file)
     chassert(getCurrentWriteOffset() == offset_in_file + size);
 }
 
-FileSegment::State FileSegment::wait(size_t offset)
+FileSegment::State FileSegment::wait(size_t offset, const QueryStatus * queryStatus)
 {
     auto lk = lock();
 
@@ -543,8 +543,9 @@ FileSegment::State FileSegment::wait(size_t offset)
 
         /// Wait for the download in short slices. The condition variable is only notified on
         /// download progress, so a stalled or dead downloader would otherwise pin this thread until
-        /// the full timeout. Query cancellation is not wired into this MVP (the accepted S1 header
-        /// takes no cancellation token); the bounded 60s deadline still prevents an indefinite hang.
+        /// the full timeout. When a cancellation token is supplied, `throwIfKilled` is called every
+        /// slice (mirroring ClickHouse `FileSegment::wait`) so query cancellation is observed within
+        /// ~1s rather than only after the bounded 60s deadline.
         auto downloaded = [&, this]()
         {
             return download_state != State::DOWNLOADING || offset < getCurrentWriteOffset();
@@ -552,6 +553,8 @@ FileSegment::State FileSegment::wait(size_t offset)
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
         while (true)
         {
+            if (queryStatus)
+                queryStatus->throwIfKilled();
             if (cv.wait_for(lk, std::chrono::seconds(1), downloaded))
                 break;
             if (std::chrono::steady_clock::now() >= deadline)
