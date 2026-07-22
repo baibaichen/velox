@@ -149,9 +149,9 @@ struct WrapperRow {
 
 struct CellRow {
   CellSpec spec;
-  WrapperRow fcbi;
-  WrapperRow cbi;
-  WrapperRow dbi;
+  WrapperRow fcbi{};
+  WrapperRow cbi{};
+  WrapperRow dbi{};
 };
 
 double wallMs(const PassResult& r) {
