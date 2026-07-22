@@ -17,8 +17,12 @@
 #include "velox/ch/Disks/IO/FileCacheInputStream.h"
 
 #include "velox/ch/Common/FileCacheException.h"
+#include "velox/ch/Common/FileCacheStats.h"
+#include "velox/ch/Common/ProfileEvents.h"
 #include "velox/ch/Disks/IO/FileCacheBufferedInput.h"
 #include "velox/ch/Interpreters/FileCache/FileCacheUtils.h"
+
+#include "velox/common/base/RuntimeMetrics.h"
 
 #include <folly/CancellationToken.h>
 #include <folly/ScopeGuard.h>
@@ -69,6 +73,11 @@ FileCacheInputStream::FileCacheInputStream(
     // never reset by seekToPosition.
     queryContextHolder_ =
         owner_->fileCache().getQueryContextHolder(cacheContext_.queryId, owner_->cacheOptions());
+
+    // Capture the per-query ledgers from the owner. They are updated on every I/O
+    // fact independently of the process-wide ProfileEvents ledger.
+    ioStatistics_ = owner_->ioStatistics();
+    ioStats_ = owner_->ioStats();
 }
 
 FileCacheInputStream::~FileCacheInputStream()
@@ -543,7 +552,16 @@ bool FileCacheInputStream::writeCache(char * data, size_t size, uint64_t offset,
 {
     try
     {
-        fileSegment.write(data, size, offset);
+        {
+            ProfileEventTimeIncrement<Microseconds> writeTimer(ProfileEvents::CachedReadBufferCacheWriteMicroseconds);
+            fileSegment.write(data, size, offset);
+        }
+        // The write succeeded: one cache-write fact updates the global ledger and
+        // the query IoStats free-form counter independently.
+        ProfileEvents::increment(ProfileEvents::CachedReadBufferCacheWriteBytes, size);
+        if (ioStats_)
+            ioStats_->addCounter(
+                kFileCacheWriteBytes, RuntimeCounter(static_cast<int64_t>(size), RuntimeCounter::Unit::kBytes));
     }
     catch (const FileCacheErrnoException & e)
     {
@@ -591,7 +609,15 @@ bool FileCacheInputStream::predownloadForCurrentSegment(FileSegment & fileSegmen
     {
         const size_t chunk = std::min<size_t>(scratchCap, state_->bytesToPredownload);
         state_->reader->set(scratch, chunk);
-        const bool hasData = !state_->reader->eof();
+        // The actual source read happens inside eof() (it calls next()/pread when
+        // the buffer is empty). Time exactly that source read into the predownload
+        // source-read latency counter.
+        bool hasData;
+        {
+            ProfileEventTimeIncrement<Microseconds> predownloadTimer(
+                ProfileEvents::CachedReadBufferPredownloadedFromSourceMicroseconds);
+            hasData = !state_->reader->eof();
+        }
         if (!hasData)
         {
             // EOF before the gap was filled: release the segment for waiting
@@ -616,6 +642,24 @@ bool FileCacheInputStream::predownloadForCurrentSegment(FileSegment & fileSegmen
         }
 
         const size_t got = state_->reader->available();
+
+        // Predownloaded gap bytes were just fetched from source. Being physical
+        // source bytes, they update the global source-read ledger
+        // (CachedReadBufferReadFromSourceBytes) just like an ordinary source read,
+        // plus BOTH the global predownload counters and the query read()/prefetch()
+        // counters, but NEVER rawBytesRead: predownload fills the cache and is not
+        // returned to the caller, so counting it as raw input bytes would
+        // double-count the gap. The logical returned bytes are accounted exactly
+        // once on the cache/source return in readFromCurrentSegment.
+        ProfileEvents::increment(ProfileEvents::CachedReadBufferReadFromSourceBytes, got);
+        ProfileEvents::increment(ProfileEvents::CachedReadBufferPredownloadedBytes, got);
+        ProfileEvents::increment(ProfileEvents::CachedReadBufferPredownloadedFromSourceBytes, got);
+        if (ioStatistics_)
+        {
+            ioStatistics_->read().increment(got);
+            ioStatistics_->prefetch().increment(got);
+        }
+
         const uint64_t currentWriteOffset = fileSegment.getCurrentWriteOffset();
         std::string failureReason;
         const uint64_t reserveHint = readInfo_.readUntilPosition - currentWriteOffset;
@@ -664,9 +708,45 @@ size_t FileCacheInputStream::readFromCurrentSegment(
     }
 
     const bool doDownload = state_->readType == ReadType::REMOTE_FS_READ_AND_PUT_IN_CACHE;
+    const bool isCacheRead = state_->readType == ReadType::CACHED;
 
-    if (state_->reader->next())
-        size = state_->reader->available();
+    if (isCacheRead)
+    {
+        ProfileEventTimeIncrement<Microseconds> cacheTimer(ProfileEvents::CachedReadBufferReadFromCacheMicroseconds);
+        if (state_->reader->next())
+            size = state_->reader->available();
+    }
+    else
+    {
+        ProfileEventTimeIncrement<Microseconds> sourceTimer(ProfileEvents::CachedReadBufferReadFromSourceMicroseconds);
+        if (state_->reader->next())
+            size = state_->reader->available();
+        if (ioStatistics_)
+            ioStatistics_->incTotalScanTimeNs(static_cast<int64_t>(sourceTimer.elapsed()) * 1000);
+    }
+
+    // Physical I/O accounting, matching ClickHouse: recorded immediately after
+    // next() determines the physical `size`, before the cache write and before
+    // the final last-segment clamp. Hit/miss and physical bytes reflect what was
+    // actually read from the local cache or from the source -- not the (possibly
+    // smaller, post-clamp) logical bytes returned to the caller. A cache hit maps
+    // to ssdRead; a source read (miss) maps to read(). Hit/miss is counted per
+    // physical read, including a zero-byte EOF read, and never at reader
+    // construction, so a reused bypass reader records one miss per physical read.
+    if (isCacheRead)
+    {
+        ProfileEvents::increment(ProfileEvents::CachedReadBufferReadFromCacheHits);
+        ProfileEvents::increment(ProfileEvents::CachedReadBufferReadFromCacheBytes, size);
+        if (ioStatistics_)
+            ioStatistics_->ssdRead().increment(size);
+    }
+    else
+    {
+        ProfileEvents::increment(ProfileEvents::CachedReadBufferReadFromCacheMisses);
+        ProfileEvents::increment(ProfileEvents::CachedReadBufferReadFromSourceBytes, size);
+        if (ioStatistics_)
+            ioStatistics_->read().increment(size);
+    }
 
     if (size)
     {
@@ -685,8 +765,9 @@ size_t FileCacheInputStream::readFromCurrentSegment(
                 state_->readType = ReadType::REMOTE_FS_READ_BYPASS_CACHE;
         }
 
-        // Last segment: clamp the returned size to the region end. The full read
-        // is still written to cache above.
+        // Last segment: clamp the returned size to the region end. The full
+        // physical read is still accounted (above) and written to cache (above);
+        // only the logical bytes returned to the caller are clamped here.
         if (readInfo_.fileSegments->size() == 1)
         {
             const uint64_t remaining =
@@ -697,6 +778,12 @@ size_t FileCacheInputStream::readFromCurrentSegment(
                 state_->reader->buffer().resize(size);
             }
         }
+
+        // Logical bytes returned to the caller: after the cache write and the
+        // final clamp, only rawBytesRead records the bytes actually handed back.
+        // Predownload never reaches this point, so it never touches rawBytesRead.
+        if (ioStatistics_)
+            ioStatistics_->incRawBytesRead(static_cast<int64_t>(size));
     }
 
     if (size == 0 && offset < readInfo_.readUntilPosition)

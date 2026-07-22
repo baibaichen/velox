@@ -21,7 +21,9 @@
 #include "velox/ch/Interpreters/FileCache/FileSegment.h"
 #include "velox/ch/Interpreters/FileCache/QueryLimit.h"
 
+#include "velox/common/file/File.h"
 #include "velox/common/file/Region.h"
+#include "velox/common/io/IoStatistics.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/buffer/Buffer.h"
 #include "velox/dwio/common/Options.h"
@@ -174,6 +176,11 @@ private:
     FileCacheBufferedInput * owner_;
     velox::common::Region region_;
     FileCacheRequestContext cacheContext_;
+    // Non-owning query ledgers captured from the owner in the constructor. Each
+    // I/O fact updates these independently of the global ProfileEvents ledger;
+    // either may be null (statistics not requested).
+    io::IoStatistics * ioStatistics_ = nullptr;
+    velox::IoStats * ioStats_ = nullptr;
     // Acquired once in the constructor; never reset by seekToPosition; destroyed
     // after readInfo_ so segment completions during teardown still see it alive.
     FileCache::QueryContextHolderPtr queryContextHolder_;

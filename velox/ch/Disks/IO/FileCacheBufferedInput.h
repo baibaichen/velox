@@ -123,6 +123,8 @@ public:
     const FileCacheRequestContext & requestContext() const { return requestContext_; }
     uint64_t fileSize() const { return fileSize_; }
     velox::memory::MemoryPool * memoryPool() const { return memoryPool_; }
+    io::IoStatistics * ioStatistics() const { return ioStatistics_.get(); }
+    velox::IoStats * ioStats() const { return ioStats_.get(); }
 
 private:
     struct Request

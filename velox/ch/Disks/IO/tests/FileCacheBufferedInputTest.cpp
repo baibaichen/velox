@@ -18,6 +18,9 @@
 #include "velox/ch/Disks/IO/FileCacheInputStream.h"
 
 #include "velox/ch/Common/FileCacheException.h"
+#include "velox/ch/Common/FileCacheStats.h"
+#include "velox/ch/Common/ProfileEvents.h"
+#include "velox/common/base/RuntimeMetrics.h"
 #include "velox/ch/Interpreters/FileCache/FileCache.h"
 #include "velox/ch/Interpreters/FileCache/FileCacheFactory.h"
 #include "velox/ch/Interpreters/FileCache/FileCacheManager.h"
@@ -120,6 +123,44 @@ private:
     uint64_t declaredSize_;
     mutable std::atomic<uint64_t> preadBytes_{0};
     mutable std::atomic<uint64_t> preadCalls_{0};
+};
+
+/// Source whose pread busy-spins (never a sleep) for a bounded duration against a
+/// steady-clock deadline before returning data, so the wall-clock time spent
+/// reading the source is observably positive. Used to prove that source-read and
+/// predownload latency counters (scan time / microseconds) are actually wired.
+class SpinningReadFile : public ReadFile
+{
+public:
+    SpinningReadFile(std::string data, std::chrono::microseconds spin)
+        : data_(std::move(data)), spin_(spin)
+    {
+    }
+
+    std::string_view pread(uint64_t offset, uint64_t length, void * buf, const FileIoContext & = {}) const override
+    {
+        // Bounded busy-spin against a steady-clock deadline -- deterministic and
+        // sleep-free, so the source read provably consumes wall-clock time.
+        const auto deadline = std::chrono::steady_clock::now() + spin_;
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+        }
+        if (offset >= data_.size())
+            return {};
+        const uint64_t n = std::min<uint64_t>(length, data_.size() - offset);
+        std::memcpy(buf, data_.data() + offset, n);
+        return std::string_view(static_cast<const char *>(buf), n);
+    }
+
+    uint64_t size() const override { return data_.size(); }
+    uint64_t memoryUsage() const override { return data_.size(); }
+    bool shouldCoalesce() const override { return false; }
+    std::string getName() const override { return "<SpinningReadFile>"; }
+    uint64_t getNaturalReadSize() const override { return 1024; }
+
+private:
+    std::string data_;
+    std::chrono::microseconds spin_;
 };
 
 /// Source whose reads always fail, imitating a network error in a remote reader.
@@ -257,7 +298,9 @@ protected:
         FileCacheKey key,
         FileCacheReadOptions opts = {},
         const std::string & queryId = "q",
-        velox::memory::MemoryPool * readerPool = nullptr)
+        velox::memory::MemoryPool * readerPool = nullptr,
+        std::shared_ptr<io::IoStatistics> ioStatistics = nullptr,
+        std::shared_ptr<velox::IoStats> ioStats = nullptr)
     {
         dwio::common::ReaderOptions readerOptions(readerPool ? readerPool : pool_.get());
         FileCacheRequestContext context;
@@ -272,8 +315,8 @@ protected:
             std::move(opts),
             context,
             dwio::common::MetricsLog::voidLog(),
-            /*ioStatistics*/ nullptr,
-            /*ioStats*/ nullptr,
+            std::move(ioStatistics),
+            std::move(ioStats),
             executor_.get(),
             readerOptions);
     }
@@ -1141,6 +1184,378 @@ TEST_F(FileCacheBufferedInputTest, PathAndEtagKeyDerivation)
     auto streamV2 = inputV2->read(0, dataV2.size(), dwio::common::LogType::STREAM);
     EXPECT_EQ(readAll(*streamV2), dataV2);
     EXPECT_GT(sourceV2->preadBytes(), 0u);
+}
+
+// ===========================================================================
+// double-accounting: every I/O fact updates the global ProfileEvents ledger
+// AND the query IoStatistics/IoStats ledger independently
+// ===========================================================================
+TEST_F(FileCacheBufferedInputTest, CacheReadUpdatesGlobalAndIoStatistics)
+{
+    auto manager = makeManager();
+    auto cache = makeCache(*manager);
+    const auto data = makeData(4096);
+    auto key = FileCacheKey::fromPath("stats-cache-read");
+    auto ioStatistics = std::make_shared<io::IoStatistics>();
+    auto ioStats = std::make_shared<velox::IoStats>();
+
+    // Warm the cache: the first read fully downloads [0, 4096) into one segment.
+    {
+        auto warmSource = std::make_shared<CountingReadFile>(data);
+        auto warm = makeInput(*manager, cache, warmSource, key, {}, "q", nullptr, ioStatistics, ioStats);
+        readAll(*warm->read(0, 4096, dwio::common::LogType::STREAM));
+    }
+
+    // Second read of the same key is a pure cache hit.
+    const uint64_t globalBefore = ProfileEvents::get(ProfileEvents::CachedReadBufferReadFromCacheBytes);
+    const uint64_t ssdSumBefore = ioStatistics->ssdRead().sum();
+    const uint64_t ssdCountBefore = ioStatistics->ssdRead().count();
+    const uint64_t rawBefore = ioStatistics->rawBytesRead();
+
+    auto source = std::make_shared<CountingReadFile>(data);
+    auto input = makeInput(*manager, cache, source, key, {}, "q", nullptr, ioStatistics, ioStats);
+    readAll(*input->read(0, 4096, dwio::common::LogType::STREAM));
+
+    // Cache read: global cache-read bytes and query ssdRead each advance by 4096,
+    // the hit is counted as logical returned bytes (rawBytesRead), and no source
+    // byte is touched.
+    EXPECT_EQ(ProfileEvents::get(ProfileEvents::CachedReadBufferReadFromCacheBytes) - globalBefore, 4096u);
+    EXPECT_EQ(ioStatistics->ssdRead().sum() - ssdSumBefore, 4096u);
+    EXPECT_GT(ioStatistics->ssdRead().count(), ssdCountBefore);
+    EXPECT_EQ(ioStatistics->rawBytesRead() - rawBefore, 4096u);
+    EXPECT_EQ(source->preadBytes(), 0u);
+}
+
+TEST_F(FileCacheBufferedInputTest, SourceReadUpdatesGlobalAndIoStatistics)
+{
+    auto manager = makeManager();
+    auto cache = makeCache(*manager);
+    const auto data = makeData(4096);
+    auto source = std::make_shared<CountingReadFile>(data);
+    auto key = FileCacheKey::fromPath("stats-source-read");
+    auto ioStatistics = std::make_shared<io::IoStatistics>();
+    auto input = makeInput(*manager, cache, source, key, {}, "q", nullptr, ioStatistics);
+
+    const uint64_t globalBefore = ProfileEvents::get(ProfileEvents::CachedReadBufferReadFromSourceBytes);
+    const uint64_t rawBefore = ioStatistics->rawBytesRead();
+    const uint64_t readSumBefore = ioStatistics->read().sum();
+
+    readAll(*input->read(0, 4096, dwio::common::LogType::STREAM));
+
+    // Cold read: 4096 source bytes returned -> global source bytes, query read
+    // sum, and raw input bytes each advance by exactly 4096.
+    EXPECT_EQ(ProfileEvents::get(ProfileEvents::CachedReadBufferReadFromSourceBytes) - globalBefore, 4096u);
+    EXPECT_EQ(ioStatistics->read().sum() - readSumBefore, 4096u);
+    EXPECT_EQ(ioStatistics->rawBytesRead() - rawBefore, 4096u);
+}
+
+TEST_F(FileCacheBufferedInputTest, CacheWriteUpdatesGlobalAndIoStats)
+{
+    auto manager = makeManager();
+    auto cache = makeCache(*manager);
+    const auto data = makeData(4096);
+    auto source = std::make_shared<CountingReadFile>(data);
+    auto key = FileCacheKey::fromPath("stats-cache-write");
+    auto ioStats = std::make_shared<velox::IoStats>();
+    auto input = makeInput(*manager, cache, source, key, {}, "q", nullptr, nullptr, ioStats);
+
+    const uint64_t globalBefore = ProfileEvents::get(ProfileEvents::CachedReadBufferCacheWriteBytes);
+
+    readAll(*input->read(0, 4096, dwio::common::LogType::STREAM));
+
+    // The cold read wrote the whole 4096-byte segment to cache exactly once.
+    EXPECT_EQ(ProfileEvents::get(ProfileEvents::CachedReadBufferCacheWriteBytes) - globalBefore, 4096u);
+    auto stats = ioStats->stats();
+    auto it = stats.find(kFileCacheWriteBytes);
+    ASSERT_NE(it, stats.end());
+    EXPECT_EQ(it->second.sum, 4096);
+}
+
+TEST_F(FileCacheBufferedInputTest, SameFactUpdatesBothLedgers)
+{
+    // A single cold read updates BOTH the global ProfileEvents ledger AND the
+    // query IoStatistics/IoStats ledger independently -- neither is derived from
+    // the other.
+    auto manager = makeManager();
+    auto cache = makeCache(*manager);
+    const auto data = makeData(4096);
+    auto source = std::make_shared<CountingReadFile>(data);
+    auto key = FileCacheKey::fromPath("stats-dual-ledger");
+    auto ioStatistics = std::make_shared<io::IoStatistics>();
+    auto ioStats = std::make_shared<velox::IoStats>();
+    auto input = makeInput(*manager, cache, source, key, {}, "q", nullptr, ioStatistics, ioStats);
+
+    const uint64_t gSrcBefore = ProfileEvents::get(ProfileEvents::CachedReadBufferReadFromSourceBytes);
+    const uint64_t gWrBefore = ProfileEvents::get(ProfileEvents::CachedReadBufferCacheWriteBytes);
+    const uint64_t rawBefore = ioStatistics->rawBytesRead();
+
+    readAll(*input->read(0, 4096, dwio::common::LogType::STREAM));
+
+    EXPECT_EQ(ProfileEvents::get(ProfileEvents::CachedReadBufferReadFromSourceBytes) - gSrcBefore, 4096u);
+    EXPECT_EQ(ProfileEvents::get(ProfileEvents::CachedReadBufferCacheWriteBytes) - gWrBefore, 4096u);
+    EXPECT_EQ(ioStatistics->rawBytesRead() - rawBefore, 4096u);
+    auto stats = ioStats->stats();
+    auto it = stats.find(kFileCacheWriteBytes);
+    ASSERT_NE(it, stats.end());
+    EXPECT_EQ(it->second.sum, 4096);
+}
+
+TEST_F(FileCacheBufferedInputTest, PredownloadUpdatesReadPrefetchButNotRawBytes)
+{
+    // Deterministic predownload built on the accepted
+    // TruncatedObjectPredownloadMetadataAbsent scenario, but with the full object
+    // present so the predownload SUCCEEDS and every byte count is exact. A first
+    // reader partially fills a segment; a second reader seeks past the written
+    // prefix, becomes the downloader, and predownloads the exact gap before its
+    // own read.
+    auto manager = makeManager();
+    auto cache = makeCache(*manager, [](FileCacheConfig & c) { c.maxFileSegmentSize = 10; });
+    const auto data = makeData(10);
+    const auto key = FileCacheKey::fromPath("predownload-stats");
+    const FileCacheOriginInfo origin(manager->commonUserId(), 0);
+
+    // Pin the single segment [0, 10) so its state is observable across readers.
+    auto probe = cache->getOrSet(key, 0, data.size(), data.size(), CreateFileSegmentSettings{}, 0, origin);
+    ASSERT_EQ(probe->size(), 1u);
+
+    // Q1 downloads [0, 2) and stops, leaving the segment PARTIALLY_DOWNLOADED.
+    auto source1 = std::make_shared<CountingReadFile>(data);
+    FileCacheReadOptions q1;
+    q1.remoteFsBufferSize = 2;
+    auto input1 = makeInput(*manager, cache, source1, key, q1, "q1");
+    auto stream1 = input1->read(0, data.size(), dwio::common::LogType::STREAM);
+    const void * chunk = nullptr;
+    int size = 0;
+    ASSERT_TRUE(stream1->Next(&chunk, &size));
+    ASSERT_EQ(probe->front().getCurrentWriteOffset(), 2u);
+
+    // Q2 seeks to offset 5 (> currentWriteOffset 2), becomes the downloader, and
+    // predownloads the exact gap [2, 5) = 3 bytes from source, then reads [5, 10).
+    auto ioStatistics = std::make_shared<io::IoStatistics>();
+    auto source2 = std::make_shared<CountingReadFile>(data);
+    FileCacheReadOptions q2;
+    q2.remoteFsBufferSize = 8;
+    auto input2 = makeInput(*manager, cache, source2, key, q2, "q2", nullptr, ioStatistics);
+
+    const uint64_t gPredownBefore = ProfileEvents::get(ProfileEvents::CachedReadBufferPredownloadedBytes);
+    const uint64_t gPredownSrcBefore = ProfileEvents::get(ProfileEvents::CachedReadBufferPredownloadedFromSourceBytes);
+    const uint64_t gSrcBefore = ProfileEvents::get(ProfileEvents::CachedReadBufferReadFromSourceBytes);
+    const uint64_t readSumBefore = ioStatistics->read().sum();
+    const uint64_t prefetchSumBefore = ioStatistics->prefetch().sum();
+    const uint64_t rawBefore = ioStatistics->rawBytesRead();
+
+    auto stream2 = input2->read(0, data.size(), dwio::common::LogType::STREAM);
+    std::vector<uint64_t> seekPositions{5};
+    dwio::common::PositionProvider provider(seekPositions);
+    stream2->seekToPosition(provider);
+    const void * chunk2 = nullptr;
+    int size2 = 0;
+    ASSERT_TRUE(stream2->Next(&chunk2, &size2));
+    const auto returned = static_cast<uint64_t>(size2);
+    ASSERT_GT(returned, 0u);
+
+    // Predownload of exactly 3 gap bytes: both global predownload counters += 3.
+    EXPECT_EQ(ProfileEvents::get(ProfileEvents::CachedReadBufferPredownloadedBytes) - gPredownBefore, 3u);
+    EXPECT_EQ(ProfileEvents::get(ProfileEvents::CachedReadBufferPredownloadedFromSourceBytes) - gPredownSrcBefore, 3u);
+    // Global source-read total includes BOTH the 3 predownload gap bytes AND the
+    // ordinary physical source read at offset 5: predownload source bytes feed the
+    // same global CachedReadBufferReadFromSourceBytes ledger as an ordinary read.
+    EXPECT_EQ(ProfileEvents::get(ProfileEvents::CachedReadBufferReadFromSourceBytes) - gSrcBefore, 3u + returned);
+    // Query ledger: predownload maps to BOTH read and prefetch (design §3.4).
+    EXPECT_EQ(ioStatistics->prefetch().sum() - prefetchSumBefore, 3u);
+    // read() gets the 3 predownload bytes plus the `returned` bytes read at offset 5.
+    EXPECT_EQ(ioStatistics->read().sum() - readSumBefore, 3u + returned);
+    // KEY invariant (design §3.4): predownload is NOT logical returned bytes, so
+    // rawBytesRead advances only by the bytes returned to the caller -- never the
+    // 3-byte gap. This fails if the predownload path wrongly calls incRawBytesRead.
+    EXPECT_EQ(ioStatistics->rawBytesRead() - rawBefore, returned);
+}
+
+// ===========================================================================
+// hit/miss is counted per returned chunk, not once at reader creation: a reused
+// bypass reader that returns several chunks records one miss per chunk
+// ===========================================================================
+TEST_F(FileCacheBufferedInputTest, MultiChunkBypassCountsMissPerReturnedChunk)
+{
+    auto manager = makeManager();
+    auto cache = makeCache(*manager);
+    const auto data = makeData(30);
+    const auto key = FileCacheKey::fromPath("bypass-multichunk-miss");
+    auto source = std::make_shared<CountingReadFile>(data);
+    FileCacheReadOptions opts;
+    opts.remoteFsBufferSize = 10; // three 10-byte chunks
+    // The segment is absent, so readIfExistsOtherwiseBypass forces a single
+    // REMOTE_FS_READ_BYPASS_CACHE reader that is reused across all chunks.
+    opts.readIfExistsOtherwiseBypass = true;
+    auto input = makeInput(*manager, cache, source, key, opts);
+
+    const uint64_t missBefore = ProfileEvents::get(ProfileEvents::CachedReadBufferReadFromCacheMisses);
+    const uint64_t hitBefore = ProfileEvents::get(ProfileEvents::CachedReadBufferReadFromCacheHits);
+    const uint64_t srcBefore = ProfileEvents::get(ProfileEvents::CachedReadBufferReadFromSourceBytes);
+
+    auto stream = input->read(0, data.size(), dwio::common::LogType::STREAM);
+    int chunks = 0;
+    const void * chunk = nullptr;
+    int size = 0;
+    while (stream->Next(&chunk, &size))
+    {
+        EXPECT_EQ(size, 10);
+        ++chunks;
+    }
+
+    // Three chunks are returned from one reused bypass reader.
+    EXPECT_EQ(chunks, 3);
+    // One miss per returned chunk: the counter advances by the chunk count, not by
+    // 1 (which is what counting at reader creation would give) and not by 0.
+    EXPECT_EQ(ProfileEvents::get(ProfileEvents::CachedReadBufferReadFromCacheMisses) - missBefore, 3u);
+    // A pure bypass read is never a hit.
+    EXPECT_EQ(ProfileEvents::get(ProfileEvents::CachedReadBufferReadFromCacheHits) - hitBefore, 0u);
+    // All 30 bytes came from source.
+    EXPECT_EQ(ProfileEvents::get(ProfileEvents::CachedReadBufferReadFromSourceBytes) - srcBefore, 30u);
+}
+
+// ===========================================================================
+// last-segment clamp: physical bytes read/written differ from logical bytes
+// returned. Cache-write and the physical source-read byte counters (global
+// CachedReadBufferReadFromSourceBytes + query read()) use the physical
+// (pre-clamp) size; only rawBytesRead uses the logical (post-clamp) returned
+// size, matching ClickHouse physical-I/O semantics.
+// ===========================================================================
+TEST_F(FileCacheBufferedInputTest, LastSegmentClampSeparatesPhysicalAndLogicalBytes)
+{
+    auto manager = makeManager();
+    auto cache = makeCache(*manager, [](FileCacheConfig & c) { c.maxFileSegmentSize = 8; });
+    const auto data = makeData(8);
+    const auto key = FileCacheKey::fromPath("clamp-physical-vs-logical");
+    const FileCacheOriginInfo origin(manager->commonUserId(), 0);
+
+    // Pin a single [0, 8) segment so the segment extends past the [0, 7) region
+    // end: the cold download reads and writes the full 8-byte segment, but the
+    // last-segment clamp returns only the 7 requested bytes.
+    auto probe = cache->getOrSet(key, 0, data.size(), data.size(), CreateFileSegmentSettings{}, 0, origin);
+    ASSERT_EQ(probe->size(), 1u);
+    ASSERT_EQ(probe->front().range().right, 7u);
+
+    auto source = std::make_shared<CountingReadFile>(data);
+    auto ioStatistics = std::make_shared<io::IoStatistics>();
+    auto ioStats = std::make_shared<velox::IoStats>();
+    FileCacheReadOptions opts;
+    opts.remoteFsBufferSize = 16; // read the whole segment in one chunk
+    auto input = makeInput(*manager, cache, source, key, opts, "q", nullptr, ioStatistics, ioStats);
+
+    const uint64_t gSrcBefore = ProfileEvents::get(ProfileEvents::CachedReadBufferReadFromSourceBytes);
+    const uint64_t gWrBefore = ProfileEvents::get(ProfileEvents::CachedReadBufferCacheWriteBytes);
+    const uint64_t rawBefore = ioStatistics->rawBytesRead();
+    const uint64_t readSumBefore = ioStatistics->read().sum();
+
+    // Read only [0, 7): the cold download reads and writes the full 8-byte
+    // segment to cache but returns just 7 bytes to the caller.
+    EXPECT_EQ(readAll(*input->read(0, 7, dwio::common::LogType::STREAM)), data.substr(0, 7));
+
+    // Physical (pre-clamp) 8 bytes were written to cache -- both the global cache
+    // write counter and the query fileCacheWriteBytes. Fails if the post-clamp
+    // logical size (7) leaks into the cache-write accounting.
+    EXPECT_EQ(ProfileEvents::get(ProfileEvents::CachedReadBufferCacheWriteBytes) - gWrBefore, 8u);
+    auto stats = ioStats->stats();
+    auto it = stats.find(kFileCacheWriteBytes);
+    ASSERT_NE(it, stats.end());
+    EXPECT_EQ(it->second.sum, 8);
+
+    // Physical (pre-clamp) 8 bytes were read from the source -- the global
+    // source-read byte counter and the query read() both reflect the physical
+    // read, matching ClickHouse. Fails if the post-clamp logical size (7) leaks
+    // into the physical source accounting.
+    EXPECT_EQ(ProfileEvents::get(ProfileEvents::CachedReadBufferReadFromSourceBytes) - gSrcBefore, 8u);
+    EXPECT_EQ(ioStatistics->read().sum() - readSumBefore, 8u);
+
+    // Logical (post-clamp) 7 bytes were returned to the caller -> rawBytesRead
+    // records only the bytes actually handed back. Fails if the pre-clamp physical
+    // size (8) leaks into rawBytesRead.
+    EXPECT_EQ(ioStatistics->rawBytesRead() - rawBefore, 7u);
+}
+
+// ===========================================================================
+// scan time: a source read whose pread busy-spins for a bounded duration records
+// strictly positive scan time in the query IoStatistics (no sleep)
+// ===========================================================================
+TEST_F(FileCacheBufferedInputTest, SourceReadRecordsPositiveScanTime)
+{
+    auto manager = makeManager();
+    auto cache = makeCache(*manager);
+    const auto data = makeData(4096);
+    const auto key = FileCacheKey::fromPath("scan-time");
+    auto source = std::make_shared<SpinningReadFile>(data, std::chrono::microseconds(1000));
+    auto ioStatistics = std::make_shared<io::IoStatistics>();
+    auto input = makeInput(*manager, cache, source, key, {}, "q", nullptr, ioStatistics);
+
+    const uint64_t scanBefore = ioStatistics->totalScanTimeNs();
+    readAll(*input->read(0, 4096, dwio::common::LogType::STREAM));
+
+    // The bounded busy-spin guarantees the source read consumed observable
+    // wall-clock time, so incTotalScanTimeNs strictly advances. Fails if the
+    // source-read scan-time increment is dropped.
+    EXPECT_GT(ioStatistics->totalScanTimeNs(), scanBefore);
+}
+
+// ===========================================================================
+// predownload latency: the predownload source read is timed into
+// CachedReadBufferPredownloadedFromSourceMicroseconds. A bounded busy-spin in the
+// source pread makes that duration strictly positive (no sleep)
+// ===========================================================================
+TEST_F(FileCacheBufferedInputTest, PredownloadRecordsPositiveSourceMicroseconds)
+{
+    // Same deterministic predownload setup as
+    // PredownloadUpdatesReadPrefetchButNotRawBytes. The gap is predownloaded
+    // through the reader Q1 hands off to the segment, which wraps Q1's source, so
+    // Q1's source is the busy-spinning one: its pread is what the predownload
+    // times.
+    auto manager = makeManager();
+    auto cache = makeCache(*manager, [](FileCacheConfig & c) { c.maxFileSegmentSize = 10; });
+    const auto data = makeData(10);
+    const auto key = FileCacheKey::fromPath("predownload-source-micros");
+    const FileCacheOriginInfo origin(manager->commonUserId(), 0);
+
+    auto probe = cache->getOrSet(key, 0, data.size(), data.size(), CreateFileSegmentSettings{}, 0, origin);
+    ASSERT_EQ(probe->size(), 1u);
+
+    // Q1 downloads [0, 2) and stops, leaving the segment PARTIALLY_DOWNLOADED and
+    // handing its busy-spinning source reader off to the segment.
+    auto source1 = std::make_shared<SpinningReadFile>(data, std::chrono::microseconds(1000));
+    FileCacheReadOptions q1;
+    q1.remoteFsBufferSize = 2;
+    auto input1 = makeInput(*manager, cache, source1, key, q1, "q1");
+    auto stream1 = input1->read(0, data.size(), dwio::common::LogType::STREAM);
+    const void * chunk = nullptr;
+    int size = 0;
+    ASSERT_TRUE(stream1->Next(&chunk, &size));
+    ASSERT_EQ(probe->front().getCurrentWriteOffset(), 2u);
+
+    // Q2 seeks past the written prefix, becomes the downloader, reuses Q1's
+    // handed-off (spinning) reader, and predownloads the [2, 5) gap before its
+    // own read.
+    auto source2 = std::make_shared<CountingReadFile>(data);
+    FileCacheReadOptions q2;
+    q2.remoteFsBufferSize = 8;
+    auto input2 = makeInput(*manager, cache, source2, key, q2, "q2");
+
+    const uint64_t microsBefore =
+        ProfileEvents::get(ProfileEvents::CachedReadBufferPredownloadedFromSourceMicroseconds);
+
+    auto stream2 = input2->read(0, data.size(), dwio::common::LogType::STREAM);
+    std::vector<uint64_t> seekPositions{5};
+    dwio::common::PositionProvider provider(seekPositions);
+    stream2->seekToPosition(provider);
+    const void * chunk2 = nullptr;
+    int size2 = 0;
+    ASSERT_TRUE(stream2->Next(&chunk2, &size2));
+    ASSERT_GT(size2, 0);
+
+    // The predownload source read ran a bounded busy-spin, so the predownload
+    // source-latency counter strictly advances. Fails if the predownload source
+    // read is not timed into this counter (it was dead before).
+    EXPECT_GT(
+        ProfileEvents::get(ProfileEvents::CachedReadBufferPredownloadedFromSourceMicroseconds) - microsBefore,
+        0u);
 }
 
 } // namespace
