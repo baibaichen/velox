@@ -20,6 +20,7 @@
 #include "velox/common/base/Exceptions.h"
 
 #include <folly/futures/ManualTimekeeper.h>
+#include <folly/system/ThreadName.h>
 
 #include <gtest/gtest.h>
 
@@ -594,6 +595,100 @@ TEST(FileCacheSchedulerTest, TriggerNowViaScheduleOnDelayedTask)
     ASSERT_EQ(ranFuture.wait_for(5s), std::future_status::ready);
 }
 
+TEST(FileCacheSchedulerTest, InlineTimerCompletionDoesNotDeadlock)
+{
+    // scheduleAfter(0) exercises inline-during-attach deterministically WITHOUT
+    // advancing the clock: folly's ManualTimekeeper::after(0) sets the promise
+    // value immediately (the dur == 0 branch), so the returned future is already
+    // fulfilled. When armTimerLocked attaches .thenValue(), folly therefore runs
+    // the continuation INLINE on this thread. Because armTimerLocked releases
+    // scheduleMutex_ BEFORE attaching, that inline continuation re-locks a FREE
+    // scheduleMutex_, so scheduleAfter() returns normally and the callback is
+    // dispatched exactly once through the worker queue. Under an attach-before-
+    // unlock mutation the same inline continuation would try to re-lock a HELD
+    // (non-recursive) scheduleMutex_ and self-deadlock, so scheduleAfter() would
+    // never return -- which is why no advance() is needed to reveal the bug.
+    TestScheduler ts;
+    std::promise<void> ran;
+    auto ranFuture = ran.get_future();
+    std::atomic<int> runs{0};
+    auto holder = ts.scheduler.createTask("inline-timer", [&]
+    {
+        runs.fetch_add(1);
+        ran.set_value();
+    });
+
+    // Must return (no self-deadlock): the timer fires inline as it is attached.
+    EXPECT_TRUE(holder->scheduleAfter(0));
+    ASSERT_EQ(ranFuture.wait_for(5s), std::future_status::ready);
+    holder->deactivate();
+    EXPECT_EQ(runs.load(), 1);
+}
+
+TEST(FileCacheSchedulerTest, ConcurrentScheduleAndDeactivateReachDeactivated)
+{
+    // Stress concurrent schedule() against deactivate(): the two-lock design must
+    // neither deadlock nor crash, and deactivate() is terminal -- afterwards both
+    // schedule() and scheduleAfter() refuse.
+    TestScheduler ts;
+    std::atomic<int> runs{0};
+    auto holder = ts.scheduler.createTask("concurrent", [&] { runs.fetch_add(1); });
+
+    std::vector<std::thread> threads;
+    threads.reserve(10);
+    for (int i = 0; i < 10; ++i)
+        threads.emplace_back([&] { holder->schedule(); });
+    holder->deactivate();
+    for (auto & t : threads)
+        t.join();
+
+    // Reaching here proves no deadlock. Terminal-state invariant (not a tautology):
+    EXPECT_FALSE(holder->schedule());
+    EXPECT_FALSE(holder->scheduleAfter(5));
+}
+
+TEST(FileCacheSchedulerTest, StaleTimerAfterScheduleIsNoOp)
+{
+    // scheduleAfter arms a real timer (registered with the ManualTimekeeper);
+    // schedule() then supersedes it. In this ordinary, deterministic path the
+    // timer is torn down by cancelTimerLocked(), which calls timerFuture_.cancel()
+    // -- that raises the Future's interrupt on the timer promise, so the
+    // ManualTimekeeper's interrupt handler fulfils the promise with an EXCEPTION.
+    // An exception bypasses the .thenValue() continuation entirely, so the stale
+    // timer's continuation never runs at all; the generation snapshot inside that
+    // continuation (and the Phase-3 reinstall guard) are NOT what neutralise it
+    // here -- those generation guards only matter under the concurrent
+    // supersede-during-the-unlocked-window races, which are covered by the stress
+    // repeats. What this test pins down deterministically is exactly-once
+    // dispatch: superseding an armed timer must run the callback exactly once and
+    // firing the now-dead deadline afterwards must add no second run.
+    TestScheduler ts;
+    std::promise<void> ran;
+    auto ranFuture = ran.get_future();
+    std::atomic<int> runs{0};
+    auto holder = ts.scheduler.createTask("stale-timer", [&]
+    {
+        if (runs.fetch_add(1) == 0)
+            ran.set_value();
+    });
+
+    holder->scheduleAfter(50);
+    // Established idiom in this file: wait until the timer is registered before
+    // advancing (advance() only fires entries already present in the schedule).
+    while (ts.tk->numScheduled() == 0)
+        std::this_thread::yield();
+    holder->schedule(); // supersede: cancelTimerLocked() interrupts the timer
+                        // promise, then queues one immediate run
+    ASSERT_EQ(ranFuture.wait_for(5s), std::future_status::ready);
+
+    // Fire the now-dead deadline: cancel() already fulfilled the timer promise
+    // (with an exception), so trySetTimeout() is a no-op and no second run is
+    // queued.
+    ts.tk->advance(50ms);
+    holder->deactivate();
+    EXPECT_EQ(runs.load(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // FileCacheQueryIdScope tests
 // ---------------------------------------------------------------------------
@@ -678,6 +773,37 @@ TEST(FileCacheQueryIdScopeTest, SameQueryDifferentResumeProducesDifferentCallerI
 
     // Different physical threads → different os-tid component.
     EXPECT_NE(before, after);
+}
+
+TEST(FileCacheQueryIdScopeTest, CallerIdWithoutScopeHasThreadNameFormat)
+{
+    // New coverage for Step 1: without a query scope the id is None:<name>:<tid>
+    // (three colon-separated fields). Read-only -- it never mutates this thread's
+    // name, so it cannot pollute other tests.
+    const std::string id = FileCacheQueryIdScope::getCallerId();
+    ASSERT_EQ(id.substr(0, 5), "None:");
+    const auto firstColon = id.find(':');
+    const auto lastColon = id.rfind(':');
+    EXPECT_NE(firstColon, lastColon) << "expected None:<name>:<tid>, got " << id;
+}
+
+TEST(FileCacheQueryIdScopeTest, NamedThreadAppearsInCallerId)
+{
+    // Folly has no clean way to restore "no name" once a name is set, so run the
+    // whole scenario in a fresh child thread. Its name dies with the thread and
+    // the test-runner thread is never mutated (avoids polluting other tests).
+    std::string callerId;
+    bool nameSet = false;
+    std::thread worker([&]
+    {
+        nameSet = folly::setThreadName("FcTestWorker");
+        callerId = FileCacheQueryIdScope::getCallerId();
+    });
+    worker.join();
+    ASSERT_TRUE(nameSet);
+    EXPECT_EQ(callerId.substr(0, 5), "None:");
+    EXPECT_NE(callerId.find("FcTestWorker"), std::string::npos)
+        << "thread name missing from caller id: " << callerId;
 }
 
 } // namespace

@@ -23,7 +23,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -134,15 +133,17 @@ private:
     // Called by the worker closure when it actually starts executing.
     void runCallback();
 
-    // Cancel the current timer future (if any).  Must be called under mutex_.
+    // Cancel the current timer future (if any).  Must be called under
+    // `scheduleMutex_`.
     void cancelTimerLocked();
 
     // Queue one immediate execution on the worker pool.
-    // Must be called under mutex_.  Transitions state to Queued.
+    // Must be called under `scheduleMutex_`.  Transitions state to Queued.
     void queueImmediateLocked();
 
     // Arm a one-shot delayed timer via the scheduler's Timekeeper.
-    // Must be called under mutex_.  Transitions state to Delayed.
+    // Must be called with `scheduleMutex_` held (passed in as `lock`).
+    // Transitions state to Delayed and returns with `lock` still HELD.
     //
     // The continuation captures a `weak_ptr` to this task (obtained via
     // `weak_from_this()`), never a raw `this`: the holder that owns the only
@@ -157,20 +158,27 @@ private:
     // `timerFuture_`. `Future::thenValue` runs inline on whichever thread
     // fulfils the antecedent promise (the thread that calls
     // `folly::Timekeeper::advance()` in tests, or the Timekeeper's own timer
-    // thread in production). That thread can be the very thread currently
-    // inside this function (already holding the task's `mutex_`, e.g. via
-    // `runCallback`) if the promise is fulfilled concurrently with
-    // `.thenValue()` attaching it — folly resolves that race by running the
-    // continuation inline as part of the attach call itself, on the attaching
-    // thread. `mutex_` is therefore a `std::recursive_mutex`: without it, the
-    // continuation re-locking the same task on the same thread would
-    // self-deadlock.
+    // thread in production). If that promise is already fulfilled when
+    // `.thenValue()` attaches (e.g. a zero delay or a concurrent advance), folly
+    // runs the continuation INLINE on the attaching thread. To make that safe
+    // under two plain mutexes, `scheduleMutex_` is released BEFORE the
+    // continuation is attached: an inline run therefore re-locks a *free*
+    // `scheduleMutex_` and cannot self-deadlock (no recursive mutex is needed).
+    // The `weak_ptr` + `generation_` snapshot still guard lifetime and staleness,
+    // and the timer handle is published only if this timer is still the current
+    // one (see the implementation), so a stale completed future never overwrites
+    // a newer live timer handle.
     // (A `cancel()`-driven completion cannot hit this path: it is skipped
     // entirely rather than re-entering the continuation — see `cancelTimerLocked`.)
-    void armTimerLocked(uint64_t delayMs);
+    void armTimerLocked(std::unique_lock<std::mutex> & lock, uint64_t delayMs);
 
-    mutable std::recursive_mutex mutex_;
-    std::condition_variable_any cv_;
+    // Two plain locks (CH BackgroundSchedulePool structure):
+    //   execMutex_     - serializes callback execution; deactivate() acquires it
+    //                    to drain (block until) any running callback.
+    //   scheduleMutex_ - protects state_/pending*/generation_/timerFuture_.
+    // Lock order when both are needed: execMutex_ THEN scheduleMutex_.
+    mutable std::mutex execMutex_;
+    mutable std::mutex scheduleMutex_;
 
     std::string name_;
     std::function<void()> callback_;
@@ -178,13 +186,6 @@ private:
 
     State state_{State::Idle};
     uint64_t generation_{0}; // incremented on cancel/deactivate
-
-    // True from just before `callback_` is invoked until just after it
-    // returns.  `deactivate()` waits on this (via `cv_`) rather than on
-    // `state_` directly: `deactivate()` overwrites `state_` to `Deactivated`
-    // itself while the callback may still be executing, so `state_` alone
-    // cannot distinguish "callback finished" from "deactivate() requested".
-    bool callbackInFlight_{false};
 
     // Pending next-run request accumulated while Running.
     bool pendingImmediate_{false};

@@ -92,7 +92,7 @@ FileCacheScheduledTask::FileCacheScheduledTask(
 
 void FileCacheScheduledTask::setCallback(std::function<void()> callback)
 {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(scheduleMutex_);
     callback_ = std::move(callback);
 }
 
@@ -103,7 +103,7 @@ const std::string & FileCacheScheduledTask::name() const
 
 bool FileCacheScheduledTask::schedule()
 {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(scheduleMutex_);
 
     if (state_ == State::Deactivated)
         return false;
@@ -127,7 +127,7 @@ bool FileCacheScheduledTask::schedule()
 
 bool FileCacheScheduledTask::scheduleAfter(uint64_t delayMs)
 {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(scheduleMutex_);
 
     if (state_ == State::Deactivated)
         return false;
@@ -135,7 +135,7 @@ bool FileCacheScheduledTask::scheduleAfter(uint64_t delayMs)
     if (state_ == State::Idle || state_ == State::Delayed)
     {
         cancelTimerLocked();
-        armTimerLocked(delayMs);
+        armTimerLocked(lock, delayMs);
         return true;
     }
 
@@ -161,16 +161,14 @@ bool FileCacheScheduledTask::scheduleAfter(uint64_t delayMs)
 
 void FileCacheScheduledTask::deactivate()
 {
-    std::unique_lock<std::recursive_mutex> lock(mutex_);
+    // Acquire execMutex_ first: if a callback is running this blocks until it
+    // returns (the drain). execMutex_ is never held while a callback runs, so no
+    // CV or in-flight flag is needed. Lock order: execMutex_ THEN scheduleMutex_.
+    std::lock_guard<std::mutex> elock(execMutex_);
+    std::lock_guard<std::mutex> slock(scheduleMutex_);
 
     if (state_ == State::Deactivated)
         return;
-
-    cancelTimerLocked();
-    const bool wasRunning = (state_ == State::Running);
-    state_ = State::Deactivated;
-    pendingImmediate_ = false;
-    pendingDelayed_ = false;
 
     // Lifetime safety: a Queued closure already handed to the worker pool, and a
     // Delayed timer continuation still held by `timerFuture_`, both capture a
@@ -181,26 +179,35 @@ void FileCacheScheduledTask::deactivate()
     // does NOT require draining the shared `FileCacheWorkerPool` first: after this
     // `deactivate()` runs, each closure either observes the bumped
     // `generation_`/`Deactivated` state and no-ops, or finds the task already
-    // freed and no-ops. Only a Running callback is waited for below, because only
-    // it may still be dereferencing caller-supplied captured state.
-    if (wasRunning)
-        cv_.wait(lock, [this] { return !callbackInFlight_; });
+    // freed and no-ops. Any Running callback was already drained above by
+    // acquiring `execMutex_`, because only it may still be dereferencing
+    // caller-supplied captured state.
+    cancelTimerLocked();
+    state_ = State::Deactivated;
+    pendingImmediate_ = false;
+    pendingDelayed_ = false;
 }
 
 void FileCacheScheduledTask::runCallback()
 {
-    std::unique_lock<std::recursive_mutex> lock(mutex_);
+    // Acquire execMutex_ to serialize execution. deactivate() also acquires it,
+    // so it drains any running callback automatically. execMutex_ is held for the
+    // whole callback invocation but is NEVER held across a scheduleMutex_-only
+    // path (schedule()/scheduleAfter()/setCallback()), so those never block on a
+    // running callback. Lock order when both are needed: execMutex_ THEN
+    // scheduleMutex_.
+    std::lock_guard<std::mutex> elock(execMutex_);
 
-    // The task may have been deactivated between dispatch (the stale check in
-    // the worker closure created by queueImmediateLocked) and this call.
-    if (state_ == State::Deactivated)
-        return;
-
-    state_ = State::Running;
-    callbackInFlight_ = true;
-    pendingImmediate_ = false;
-    pendingDelayed_ = false;
-    lock.unlock();
+    {
+        std::lock_guard<std::mutex> slock(scheduleMutex_);
+        // The task may have been deactivated between dispatch (the stale check in
+        // the worker closure created by queueImmediateLocked) and this call.
+        if (state_ == State::Deactivated)
+            return;
+        state_ = State::Running;
+        pendingImmediate_ = false;
+        pendingDelayed_ = false;
+    }
 
     try
     {
@@ -215,9 +222,7 @@ void FileCacheScheduledTask::runCallback()
             getCurrentExceptionMessage(/* with_stacktrace */ true));
     }
 
-    lock.lock();
-    callbackInFlight_ = false;
-    cv_.notify_all(); // wake any deactivate() waiting for this run to finish
+    std::unique_lock<std::mutex> slock(scheduleMutex_);
 
     if (state_ == State::Deactivated)
         return;
@@ -232,7 +237,7 @@ void FileCacheScheduledTask::runCallback()
     {
         pendingDelayed_ = false;
         const uint64_t delayMs = pendingDelayMs_;
-        armTimerLocked(delayMs);
+        armTimerLocked(slock, delayMs);
     }
     else
     {
@@ -265,7 +270,7 @@ void FileCacheScheduledTask::queueImmediateLocked()
             if (!self)
                 return; // task destroyed → safe no-op
             {
-                std::lock_guard<std::recursive_mutex> lock(self->mutex_);
+                std::lock_guard<std::mutex> lock(self->scheduleMutex_);
                 if (gen != self->generation_ || self->state_ != State::Queued)
                     return; // stale: cancelled/deactivated/superseded already
             }
@@ -273,27 +278,54 @@ void FileCacheScheduledTask::queueImmediateLocked()
         });
 }
 
-void FileCacheScheduledTask::armTimerLocked(uint64_t delayMs)
+void FileCacheScheduledTask::armTimerLocked(
+    std::unique_lock<std::mutex> & lock, uint64_t delayMs)
 {
+    // Phase 1: publish Delayed state and snapshot the generation under
+    // scheduleMutex_ (held on entry).
     state_ = State::Delayed;
     const uint64_t gen = generation_;
     // Capture a weak_ptr, never a raw `this`: the holder may be destroyed before
     // the timer fires. The continuation locks the task to a shared_ptr and
     // no-ops if it has been freed.
     std::weak_ptr<FileCacheScheduledTask> weakSelf = weak_from_this();
-    timerFuture_ = scheduler_.timekeeper_->after(std::chrono::milliseconds(delayMs))
-                       .toUnsafeFuture()
-                       .thenValue(
-                           [weakSelf, gen](folly::Unit)
-                           {
-                               auto self = weakSelf.lock();
-                               if (!self)
-                                   return; // task destroyed → safe no-op
-                               std::lock_guard<std::recursive_mutex> lock(self->mutex_);
-                               if (gen != self->generation_ || self->state_ != State::Delayed)
-                                   return; // stale: cancelled/rescheduled/deactivated
-                               self->queueImmediateLocked();
-                           });
+
+    // Arm the Timekeeper timer while still holding scheduleMutex_. This only
+    // starts the timer; no continuation runs yet.
+    auto sf = scheduler_.timekeeper_->after(std::chrono::milliseconds(delayMs));
+
+    // Phase 2: release scheduleMutex_ BEFORE attaching .thenValue(). If the
+    // promise is already fulfilled (delayMs == 0, or a concurrent advance()),
+    // folly runs the continuation INLINE on this thread; with the lock released
+    // it re-locks a free scheduleMutex_ instead of self-deadlocking.
+    lock.unlock();
+
+    auto future = std::move(sf)
+                      .toUnsafeFuture()
+                      .thenValue(
+                          [weakSelf, gen](folly::Unit)
+                          {
+                              auto self = weakSelf.lock();
+                              if (!self)
+                                  return; // task destroyed → safe no-op
+                              std::lock_guard<std::mutex> slock(self->scheduleMutex_);
+                              if (gen != self->generation_ || self->state_ != State::Delayed)
+                                  return; // superseded by schedule()/scheduleAfter()/deactivate()
+                              self->queueImmediateLocked();
+                          });
+
+    // Phase 3: reacquire scheduleMutex_ and publish the handle ONLY if this timer
+    // is still the current one. If the generation moved while we were unlocked (a
+    // concurrent schedule()/scheduleAfter()/deactivate(), or an inline run that
+    // already advanced us to Queued), do NOT overwrite timerFuture_: that would
+    // clobber a newer live timer handle with this now-stale one, so a later
+    // cancelTimerLocked() would cancel the wrong (already-completed) future and
+    // leak the real timer. The dropped `future` is harmless -- its continuation
+    // no-ops on the generation check. armTimerLocked always returns with `lock`
+    // HELD, so scheduleAfter()/runCallback() resume with a valid lock.
+    lock.lock();
+    if (gen == generation_ && state_ == State::Delayed)
+        timerFuture_ = std::move(future);
 }
 
 // ---------------------------------------------------------------------------

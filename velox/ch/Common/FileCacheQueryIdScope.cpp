@@ -17,6 +17,7 @@
 #include "velox/ch/Common/FileCacheQueryIdScope.h"
 
 #include <folly/system/ThreadId.h>
+#include <folly/system/ThreadName.h>
 
 #include <string>
 #include <string_view>
@@ -51,7 +52,10 @@ std::string FileCacheQueryIdScope::getCallerId()
     const auto tid = std::to_string(folly::getOSThreadID());
     const auto & qid = tCurrentQueryId;
     if (qid.empty())
-        return "None:" + tid;
+    {
+        std::string name = folly::getCurrentThreadName().value_or("unknown");
+        return "None:" + name + ":" + tid;
+    }
     return qid + ":" + tid;
 }
 
