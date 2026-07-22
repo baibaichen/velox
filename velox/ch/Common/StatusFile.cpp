@@ -16,6 +16,7 @@
 
 #include "velox/ch/Common/StatusFile.h"
 #include "velox/ch/Common/FileCacheException.h"
+#include "velox/ch/Common/logger_useful.h"
 #include "VeloxBuildRevision.h"
 
 #include <folly/FileUtil.h>
@@ -93,6 +94,38 @@ StatusFile::FillFunction StatusFile::writeFullInfo()
 StatusFile::StatusFile(std::string path, FillFunction fill)
     : path_(std::move(path))
 {
+    // If the file already exists, an earlier instance did not remove it on
+    // shutdown, which indicates an unclean restart. Read its old contents and
+    // log them for diagnostics before we truncate the file below.
+    // NOTE Minor race condition.
+    {
+        const int oldFd = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC);
+        if (oldFd != -1)
+        {
+            folly::File oldFile(oldFd, /*ownsFd=*/true);
+            std::string contents;
+            contents.resize(1024);
+            const ssize_t bytesRead =
+                folly::readFull(oldFile.fd(), contents.data(), contents.size());
+            if (bytesRead > 0)
+                contents.resize(static_cast<size_t>(bytesRead));
+            else
+                contents.clear();
+
+            if (!contents.empty())
+                LOG_INFO(
+                    getLogger("StatusFile"),
+                    "Status file {} already exists - unclean restart. Contents:\n{}",
+                    path_,
+                    contents);
+            else
+                LOG_INFO(
+                    getLogger("StatusFile"),
+                    "Status file {} already exists and is empty - probably unclean hardware restart.",
+                    path_);
+        }
+    }
+
     // Open or create the status file.
     const int rawFd = ::open(
         path_.c_str(),
