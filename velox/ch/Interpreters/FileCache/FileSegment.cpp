@@ -244,8 +244,7 @@ time_t FileSegment::getFinishedDownloadTime() const
 String FileSegment::getCallerId()
 {
     /// caller identity = "<query-id>:<os-tid>" inside a FileCacheQueryIdScope, or
-    /// "None:<os-tid>" for background workers. Restoring the "None:<threadname>:<tid>"
-    /// shape is deferred to Task 017 (F-CALLERID); this keeps the Task-006 shape.
+    /// "None:<thread-name>:<os-tid>" for background workers (forwarding format to ClickHouse).
     return FileCacheQueryIdScope::getCallerId();
 }
 

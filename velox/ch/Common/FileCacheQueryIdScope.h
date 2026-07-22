@@ -47,8 +47,8 @@ public:
     static std::string_view currentQueryId();
 
     /// Returns the caller identity string used by `FileSegment::getCallerId`:
-    ///   "<query-id>:<os-tid>"  when a scope is active
-    ///   "None:<os-tid>"        otherwise
+    ///   "<query-id>:<os-tid>"        when a scope is active
+    ///   "None:<thread-name>:<os-tid>" otherwise
     static std::string getCallerId();
 
 private:
