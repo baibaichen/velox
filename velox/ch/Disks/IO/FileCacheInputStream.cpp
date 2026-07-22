@@ -23,6 +23,7 @@
 #include "velox/ch/Interpreters/FileCache/FileCacheUtils.h"
 
 #include "velox/common/base/RuntimeMetrics.h"
+#include "velox/common/testutil/TestValue.h"
 
 #include <folly/CancellationToken.h>
 #include <folly/ScopeGuard.h>
@@ -78,6 +79,10 @@ FileCacheInputStream::FileCacheInputStream(
     // fact independently of the process-wide ProfileEvents ledger.
     ioStatistics_ = owner_->ioStatistics();
     ioStats_ = owner_->ioStats();
+
+    // Copy the cancellation token by value from the owner. It is passed to
+    // FileSegment::wait and checked at the segment-batch safe points.
+    cancellationToken_ = owner_->cancellationToken();
 }
 
 FileCacheInputStream::~FileCacheInputStream()
@@ -256,6 +261,12 @@ void FileCacheInputStream::initializeIfNeeded(uint64_t offset)
 
 bool FileCacheInputStream::nextFileSegmentsBatch(uint64_t offset)
 {
+    // Safe cancellation point: this runs before the first FileCache lookup and
+    // between completed segment batches, never while a downloader lease or a
+    // reserve/write is held (design 4.2).
+    if (cancellationToken_.isCancellationRequested())
+        VELOX_FAIL("FileCache read cancelled before segment batch lookup");
+
     VELOX_CHECK_LE(offset, readInfo_.readUntilPosition, "read offset past the region end");
     const uint64_t remaining = readInfo_.readUntilPosition - offset;
     if (remaining == 0)
@@ -416,7 +427,13 @@ FileCacheInputStream::createReadFromFileSegmentState(FileSegment & fileSegment, 
             case FileSegment::State::DOWNLOADING:
                 if (canStartFromCache(offset, fileSegment))
                     return create(ReadType::CACHED);
-                downloadState = fileSegment.wait(offset, folly::CancellationToken{});
+                // Safe cancellation point: the caller is a pure waiter holding no
+                // downloader lease. The hook lets a test observe that this stream
+                // is about to wait; FileSegment::wait itself checks the token in
+                // short slices and throws on cancellation.
+                common::testutil::TestValue::adjust(
+                    "facebook::velox::ch::FileCacheInputStream::beforeSegmentWait", this);
+                downloadState = fileSegment.wait(offset, cancellationToken_);
                 continue;
             case FileSegment::State::DOWNLOADED:
                 return create(ReadType::CACHED);
@@ -429,6 +446,14 @@ FileCacheInputStream::createReadFromFileSegmentState(FileSegment & fileSegment, 
                 auto downloaderId = fileSegment.getOrSetDownloader();
                 if (downloaderId == FileSegment::getCallerId())
                 {
+                    // This stream just won the downloader lease. No cancellation is
+                    // checked between election and release (design 4.2); the hook
+                    // only lets a test request cancellation mid-transaction to prove
+                    // it is deferred to the next safe boundary, never interrupting a
+                    // reserve/write.
+                    common::testutil::TestValue::adjust(
+                        "facebook::velox::ch::FileCacheInputStream::afterDownloaderElected", this);
+
                     if (canStartFromCache(offset, fileSegment))
                     {
                         fileSegment.resetDownloader();
@@ -821,6 +846,12 @@ bool FileCacheInputStream::completeCurrentSegmentAndAdvance(uint64_t nextOffset)
 
     readInfo_.fileSegments->completeAndPopFront(
         owner_->cacheOptions().allowBackgroundDownload, /*force_shrink_to_downloaded_size=*/false);
+
+    // Safe cancellation point: the just-read segment is completed and its
+    // downloader was already released in readNextChunk, so no lease or in-flight
+    // reserve/write is held (design 4.2).
+    if (cancellationToken_.isCancellationRequested())
+        VELOX_FAIL("FileCache read cancelled after completing a segment");
 
     if (readInfo_.fileSegments->empty() && !nextFileSegmentsBatch(nextOffset))
         return false;

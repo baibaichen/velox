@@ -36,7 +36,8 @@ FileCacheBufferedInput::FileCacheBufferedInput(
     std::shared_ptr<velox::IoStats> ioStats,
     folly::Executor * executor,
     const dwio::common::ReaderOptions & readerOptions,
-    folly::F14FastMap<std::string, std::string> fileReadOps)
+    folly::F14FastMap<std::string, std::string> fileReadOps,
+    folly::CancellationToken cancellationToken)
     : dwio::common::BufferedInput(
           readFile,
           readerOptions.memoryPool(),
@@ -58,7 +59,8 @@ FileCacheBufferedInput::FileCacheBufferedInput(
       executor_(executor),
       readerOptions_(readerOptions),
       memoryPool_(&readerOptions.memoryPool()),
-      fileSize_(sourceReadFile_ ? sourceReadFile_->size() : 0)
+      fileSize_(sourceReadFile_ ? sourceReadFile_->size() : 0),
+      cancellationToken_(std::move(cancellationToken))
 {
     VELOX_CHECK_NOT_NULL(sourceReadFile_, "FileCacheBufferedInput requires a source ReadFile");
     VELOX_CHECK_NOT_NULL(cache_, "FileCacheBufferedInput requires a FileCache");
@@ -157,7 +159,9 @@ std::unique_ptr<dwio::common::BufferedInput> FileCacheBufferedInput::clone() con
         ioStatistics_,
         ioStats_,
         executor_,
-        readerOptions_);
+        readerOptions_,
+        folly::F14FastMap<std::string, std::string>{},
+        cancellationToken_);
 }
 
 } // namespace facebook::velox::ch

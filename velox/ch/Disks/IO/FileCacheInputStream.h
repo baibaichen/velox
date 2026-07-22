@@ -29,6 +29,8 @@
 #include "velox/dwio/common/Options.h"
 #include "velox/dwio/common/SeekableInputStream.h"
 
+#include <folly/CancellationToken.h>
+
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -181,6 +183,10 @@ private:
     // either may be null (statistics not requested).
     io::IoStatistics * ioStatistics_ = nullptr;
     velox::IoStats * ioStats_ = nullptr;
+    // Cancellation token copied from the owner in the constructor. Passed to
+    // FileSegment::wait and checked at the segment-batch safe points; empty when
+    // the caller supplied no token (cancellation never requested).
+    folly::CancellationToken cancellationToken_;
     // Acquired once in the constructor; never reset by seekToPosition; destroyed
     // after readInfo_ so segment completions during teardown still see it alive.
     FileCache::QueryContextHolderPtr queryContextHolder_;

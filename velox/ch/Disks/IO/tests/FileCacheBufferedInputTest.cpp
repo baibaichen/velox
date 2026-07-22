@@ -34,8 +34,11 @@
 #include "velox/common/testutil/TempDirectoryPath.h"
 #include "velox/common/testutil/TestValue.h"
 
+#include <folly/CancellationToken.h>
+#include <folly/ScopeGuard.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/futures/ManualTimekeeper.h>
+#include <folly/synchronization/Baton.h>
 
 #include <gtest/gtest.h>
 
@@ -43,9 +46,11 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -123,6 +128,44 @@ private:
     uint64_t declaredSize_;
     mutable std::atomic<uint64_t> preadBytes_{0};
     mutable std::atomic<uint64_t> preadCalls_{0};
+};
+
+/// Source whose FIRST pread blocks until `release` is posted, parking a downloader
+/// inside a DOWNLOADING segment so another reader is forced onto FileSegment::wait.
+/// Subsequent preads serve data normally.
+class StallingReadFile : public ReadFile
+{
+public:
+    StallingReadFile(std::string data, std::atomic<bool> & entered, folly::Baton<> & release)
+        : data_(std::move(data)), entered_(entered), release_(release)
+    {
+    }
+
+    std::string_view pread(uint64_t offset, uint64_t length, void * buf, const FileIoContext & = {}) const override
+    {
+        if (!stalled_.exchange(true))
+        {
+            entered_.store(true);
+            release_.wait();
+        }
+        if (offset >= data_.size())
+            return {};
+        const uint64_t n = std::min<uint64_t>(length, data_.size() - offset);
+        std::memcpy(buf, data_.data() + offset, n);
+        return std::string_view(static_cast<const char *>(buf), n);
+    }
+
+    uint64_t size() const override { return data_.size(); }
+    uint64_t memoryUsage() const override { return data_.size(); }
+    bool shouldCoalesce() const override { return false; }
+    std::string getName() const override { return "<StallingReadFile>"; }
+    uint64_t getNaturalReadSize() const override { return 1024; }
+
+private:
+    std::string data_;
+    std::atomic<bool> & entered_;
+    folly::Baton<> & release_;
+    mutable std::atomic<bool> stalled_{false};
 };
 
 /// Source whose pread busy-spins (never a sleep) for a bounded duration against a
@@ -300,7 +343,8 @@ protected:
         const std::string & queryId = "q",
         velox::memory::MemoryPool * readerPool = nullptr,
         std::shared_ptr<io::IoStatistics> ioStatistics = nullptr,
-        std::shared_ptr<velox::IoStats> ioStats = nullptr)
+        std::shared_ptr<velox::IoStats> ioStats = nullptr,
+        folly::CancellationToken cancellationToken = {})
     {
         dwio::common::ReaderOptions readerOptions(readerPool ? readerPool : pool_.get());
         FileCacheRequestContext context;
@@ -318,7 +362,9 @@ protected:
             std::move(ioStatistics),
             std::move(ioStats),
             executor_.get(),
-            readerOptions);
+            readerOptions,
+            folly::F14FastMap<std::string, std::string>{},
+            std::move(cancellationToken));
     }
 
     static std::string readAll(dwio::common::SeekableInputStream & stream)
@@ -1556,6 +1602,197 @@ TEST_F(FileCacheBufferedInputTest, PredownloadRecordsPositiveSourceMicroseconds)
     EXPECT_GT(
         ProfileEvents::get(ProfileEvents::CachedReadBufferPredownloadedFromSourceMicroseconds) - microsBefore,
         0u);
+}
+
+// ===========================================================================
+// Cancellation token propagation (Task 017A / Task 3)
+// ===========================================================================
+TEST_F(FileCacheBufferedInputTest, DefaultTokenReadsFully)
+{
+    // Default (empty) token: nothing is ever cancelled, the read completes.
+    auto manager = makeManager();
+    auto cache = makeCache(*manager);
+    const auto data = makeData(4096);
+    auto source = std::make_shared<CountingReadFile>(data);
+    auto key = FileCacheKey::fromPath("cancel-default");
+    auto input = makeInput(*manager, cache, source, key);
+    EXPECT_EQ(readAll(*input->read(0, 4096, dwio::common::LogType::STREAM)).size(), 4096u);
+}
+
+TEST_F(FileCacheBufferedInputTest, CopiedTokenReachesStream)
+{
+    auto manager = makeManager();
+    auto cache = makeCache(*manager);
+    const auto data = makeData(4096);
+    auto source = std::make_shared<CountingReadFile>(data);
+    auto key = FileCacheKey::fromPath("cancel-token-copy");
+
+    folly::CancellationSource src;
+    auto input = makeInput(*manager, cache, source, key, {}, "q", nullptr, nullptr, nullptr, src.getToken());
+
+    EXPECT_FALSE(input->cancellationToken().isCancellationRequested());
+    src.requestCancellation();
+    EXPECT_TRUE(input->cancellationToken().isCancellationRequested());
+}
+
+TEST_F(FileCacheBufferedInputTest, CancellationBeforeLookupThrows)
+{
+    auto manager = makeManager();
+    auto cache = makeCache(*manager);
+    const auto data = makeData(4096);
+    auto source = std::make_shared<CountingReadFile>(data);
+    auto key = FileCacheKey::fromPath("cancel-before-lookup");
+
+    folly::CancellationSource src;
+    src.requestCancellation(); // cancelled before any I/O
+    auto input = makeInput(*manager, cache, source, key, {}, "q", nullptr, nullptr, nullptr, src.getToken());
+
+    // The first nextFileSegmentsBatch check throws before any source read happens.
+    VELOX_ASSERT_THROW(readAll(*input->read(0, 4096, dwio::common::LogType::STREAM)), "cancelled");
+    EXPECT_EQ(source->preadBytes(), 0u);
+}
+
+TEST_F(FileCacheBufferedInputTest, CancellationDuringSegmentWaitThrows)
+{
+    // A downloader parks the segment in DOWNLOADING; a second reader is forced
+    // onto FileSegment::wait with an *uncancelled* token, reaches the
+    // beforeSegmentWait hook, and is cancelled only once it is actually there.
+    // This exercises the cancellation check *inside* FileSegment::wait -- not the
+    // pre-lookup check (the token is still uncancelled when the batch is looked
+    // up).
+    auto manager = makeManager();
+    auto cache = makeCache(*manager);
+    const auto data = makeData(4096);
+    auto key = FileCacheKey::fromPath("cancel-during-wait");
+
+    std::atomic<bool> downloaderParked{false};
+    folly::Baton<> releaseDownloader;
+    std::once_flag releaseOnce;
+    auto releaseDownloaderFn = [&] { std::call_once(releaseOnce, [&] { releaseDownloader.post(); }); };
+    auto stalling = std::make_shared<StallingReadFile>(data, downloaderParked, releaseDownloader);
+
+    // The beforeSegmentWait hook fires once per wait() call; guard the post so a
+    // (theoretical) second wait iteration cannot double-post the baton (UB).
+    folly::Baton<> waiterAtWait;
+    std::once_flag atWaitOnce;
+    ScopedTestValue beforeWait(
+        "facebook::velox::ch::FileCacheInputStream::beforeSegmentWait",
+        std::function<void(void *)>(
+            [&](void *) { std::call_once(atWaitOnce, [&] { waiterAtWait.post(); }); }));
+
+    folly::CancellationSource cancelSrc;
+
+    // Downloader: elects itself and parks in pread, holding the segment DOWNLOADING.
+    std::exception_ptr downloaderError;
+    std::thread downloader([&]
+    {
+        try
+        {
+            auto in = makeInput(*manager, cache, stalling, key, {}, "downloader");
+            readAll(*in->read(0, 4096, dwio::common::LogType::STREAM));
+        }
+        catch (...)
+        {
+            downloaderError = std::current_exception();
+        }
+    });
+    auto downloaderGuard = folly::makeGuard([&]
+    {
+        releaseDownloaderFn();
+        if (downloader.joinable())
+            downloader.join();
+    });
+
+    ASSERT_TRUE(spinUntil([&] { return downloaderParked.load(); }, std::chrono::seconds(20)))
+        << "downloader never parked in pread (segment not DOWNLOADING)";
+
+    // Waiter: same key, uncancelled token. It must reach FileSegment::wait.
+    std::exception_ptr waiterError;
+    std::atomic<bool> waiterDone{false};
+    std::thread waiter([&]
+    {
+        try
+        {
+            auto in = makeInput(*manager, cache, stalling, key, {}, "waiter",
+                                nullptr, nullptr, nullptr, cancelSrc.getToken());
+            readAll(*in->read(0, 4096, dwio::common::LogType::STREAM));
+        }
+        catch (...)
+        {
+            waiterError = std::current_exception();
+        }
+        waiterDone.store(true);
+    });
+    auto waiterGuard = folly::makeGuard([&]
+    {
+        releaseDownloaderFn(); // let the waiter's wait() end even under a mutation
+        if (waiter.joinable())
+            waiter.join();
+    });
+
+    // The waiter is parked immediately before FileSegment::wait: cancel it there.
+    // The wait loop observes the cancellation within one 1s slice and throws.
+    waiterAtWait.wait();
+    cancelSrc.requestCancellation();
+
+    ASSERT_TRUE(spinUntil([&] { return waiterDone.load(); }, std::chrono::seconds(30)))
+        << "waiter never observed cancellation inside FileSegment::wait";
+    waiter.join();
+    waiterGuard.dismiss();
+    ASSERT_TRUE(waiterError != nullptr) << "waiter returned without throwing";
+    VELOX_ASSERT_THROW(std::rethrow_exception(waiterError), "cancelled");
+
+    // Release + join the downloader; its own read is uncancelled and must succeed.
+    releaseDownloaderFn();
+    downloader.join();
+    downloaderGuard.dismiss();
+    if (downloaderError)
+        std::rethrow_exception(downloaderError);
+}
+
+TEST_F(FileCacheBufferedInputTest, CancellationDeferredUntilAfterSegmentWriteCompletes)
+{
+    // Request cancellation the instant this reader owns the downloader lease for
+    // the first segment (mid-transaction). Cancellation must NOT interrupt the
+    // reserve+write; the exception is deferred to the next safe boundary, by
+    // which point the first segment is fully written.
+    auto manager = makeManager();
+    auto cache = makeCache(*manager, [](FileCacheConfig & c) { c.maxFileSegmentSize = 8; });
+    const auto data = makeData(16);
+    auto source = std::make_shared<CountingReadFile>(data);
+    auto key = FileCacheKey::fromPath("cancel-after-downloader-elected");
+
+    folly::CancellationSource cancelSrc;
+    std::atomic<bool> cancelledOnce{false};
+    ScopedTestValue afterElected(
+        "facebook::velox::ch::FileCacheInputStream::afterDownloaderElected",
+        std::function<void(void *)>([&](void *)
+        {
+            if (!cancelledOnce.exchange(true))
+                cancelSrc.requestCancellation();
+        }));
+
+    auto input = makeInput(*manager, cache, source, key, {}, "q",
+                           nullptr, nullptr, nullptr, cancelSrc.getToken());
+
+    // The read throws only at the safe boundary AFTER the first segment's
+    // reserve+write completes -- never mid-transaction.
+    VELOX_ASSERT_THROW(
+        readAll(*input->read(0, 16, dwio::common::LogType::STREAM)), "cancelled");
+
+    // Proof the write/complete happened before the exception: segment [0, 8) is
+    // fully DOWNLOADED (8 bytes) and no segment is left DOWNLOADING.
+    const auto infos = cache->getFileSegmentInfos(manager->commonUserId());
+    bool firstComplete = false;
+    for (const auto & info : infos)
+    {
+        EXPECT_NE(info.state, FileSegment::State::DOWNLOADING)
+            << "segment at " << info.range_left << " left DOWNLOADING after cancellation";
+        if (info.range_left == 0)
+            firstComplete = info.state == FileSegment::State::DOWNLOADED && info.downloaded_size == 8;
+    }
+    EXPECT_TRUE(firstComplete)
+        << "first segment [0, 8) was not fully written before the cancellation exception";
 }
 
 } // namespace

@@ -28,6 +28,7 @@
 #include "velox/dwio/common/MetricsLog.h"
 #include "velox/dwio/common/Options.h"
 
+#include <folly/CancellationToken.h>
 #include <folly/container/F14Map.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 
@@ -77,7 +78,8 @@ public:
         std::shared_ptr<velox::IoStats> ioStats,
         folly::Executor * executor,
         const dwio::common::ReaderOptions & readerOptions,
-        folly::F14FastMap<std::string, std::string> fileReadOps = {});
+        folly::F14FastMap<std::string, std::string> fileReadOps = {},
+        folly::CancellationToken cancellationToken = {});
 
     // BufferedInput overrides. The returned stream borrows `*this` (see the
     // class-level lifetime contract) and must not outlive this owner.
@@ -126,6 +128,14 @@ public:
     io::IoStatistics * ioStatistics() const { return ioStatistics_.get(); }
     velox::IoStats * ioStats() const { return ioStats_.get(); }
 
+    // Cancellation token propagated to FileSegment::wait and the segment-batch
+    // safe points. Copied by value from the caller; empty by default (no
+    // cancellation ever requested).
+    const folly::CancellationToken & cancellationToken() const
+    {
+        return cancellationToken_;
+    }
+
 private:
     struct Request
     {
@@ -145,6 +155,7 @@ private:
     dwio::common::ReaderOptions readerOptions_;
     velox::memory::MemoryPool * memoryPool_;
     uint64_t fileSize_;
+    folly::CancellationToken cancellationToken_;
 
     // Copied region values only; never stream pointers. `load` operates on these
     // copies so a caller that discards an `enqueue` result before `load` cannot
