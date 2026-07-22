@@ -50,8 +50,52 @@ TEST(SipHash128Test, IncrementalEqualsOneShot)
     EXPECT_EQ(one, inc.get128());
 }
 
+// Streaming vs one-shot parity across many split points, including splits that
+// land mid-word (not on an 8-byte boundary) so the partial-buffer carry path in
+// SipHash128::update is exercised. CH sipHash128 supports streaming (see the CH
+// SipHash.h header comment "done streaming"), so on-disk keys must be identical
+// whether the path is hashed whole or in chunks.
+TEST(SipHash128Test, IncrementalEqualsOneShotMultiChunk)
+{
+    // 37 bytes: not a multiple of 8, so tail-handling is covered too.
+    const std::string data = "s3://bucket/some/long/object/key.parquet";
+    const size_t n = data.size();
+    const auto oneShot = sipHash128(data.data(), n);
+
+    for (size_t split1 = 0; split1 <= n; ++split1)
+    {
+        for (size_t split2 = split1; split2 <= n; ++split2)
+        {
+            SipHash128 inc;
+            inc.update(data.data(), split1);
+            inc.update(data.data() + split1, split2 - split1);
+            inc.update(data.data() + split2, n - split2);
+            EXPECT_EQ(oneShot, inc.get128())
+                << "split1=" << split1 << " split2=" << split2;
+        }
+    }
+}
+
+// Golden hashes independently derived from authoritative ClickHouse.
+//
+// Oracle method: compiled a standalone program (clang++-19, -std=c++23) that
+// includes ClickHouse's real src/Common/SipHash.h and base/base/hex.h, computing
+//   getHexUIntLowercase(DB::sipHash128(x.data(), x.size()))
+// for each input. This is CH's exact FileCacheKey::fromPath -> toString path:
+//   FileCacheKey.cpp:33  FileCacheKey(sipHash128(path.data(), path.size()))
+//   FileCacheKey.cpp:23  getHexUIntLowercase(key)
+// Producing (CH master):
+//   ""                                 -> f711edcba8b6b5e5e983a656dbc1b532
+//   "abc"                              -> 53a3124ce5655a686c6b96daa215b4b6
+//   "s3://bucket/key"                  -> 6ba3177b6fbaa4c9f65873033e35aeaa
+//   "0123456789abcdef0123456789abcdef" -> 77dd7dd78fa45ef0b93cc3b8df847cbd
+// These match our impl below, so the goldens are provably CH-anchored (byte
+// identical), not self-referential. If any of these ever diverge, our
+// SipHash128/toString has a real CH-parity bug — do not adjust the golden.
+
 TEST(FileCacheKeyTest, GoldenEmpty)
 {
+    // CH oracle: DB::sipHash128("", 0) -> f711edcba8b6b5e5e983a656dbc1b532
     EXPECT_EQ(
         FileCacheKey::fromPath("").toString(),
         "f711edcba8b6b5e5e983a656dbc1b532");
@@ -59,6 +103,7 @@ TEST(FileCacheKeyTest, GoldenEmpty)
 
 TEST(FileCacheKeyTest, GoldenAbc)
 {
+    // CH oracle: DB::sipHash128("abc", 3) -> 53a3124ce5655a686c6b96daa215b4b6
     EXPECT_EQ(
         FileCacheKey::fromPath("abc").toString(),
         "53a3124ce5655a686c6b96daa215b4b6");
@@ -66,6 +111,7 @@ TEST(FileCacheKeyTest, GoldenAbc)
 
 TEST(FileCacheKeyTest, GoldenS3Path)
 {
+    // CH oracle: DB::sipHash128("s3://bucket/key") -> 6ba3177b6fbaa4c9f65873033e35aeaa
     EXPECT_EQ(
         FileCacheKey::fromPath("s3://bucket/key").toString(),
         "6ba3177b6fbaa4c9f65873033e35aeaa");
@@ -73,6 +119,7 @@ TEST(FileCacheKeyTest, GoldenS3Path)
 
 TEST(FileCacheKeyTest, GoldenLong)
 {
+    // CH oracle: DB::sipHash128("0123...abcdef") -> 77dd7dd78fa45ef0b93cc3b8df847cbd
     EXPECT_EQ(
         FileCacheKey::fromPath("0123456789abcdef0123456789abcdef").toString(),
         "77dd7dd78fa45ef0b93cc3b8df847cbd");
@@ -108,6 +155,8 @@ TEST(FileCacheKeyTest, FromKeyStringBadLength)
 
 TEST(FileCacheKeyTest, FromKeyStringMalformedCharCompatibility)
 {
+    // CH-oracle verified: DB::unhexUInt<UInt128>("g0...0") -> f0...0 (the exact
+    // path CH FileCacheKey::fromKeyString takes for 32-char input, FileCacheKey.cpp:45).
     // CH FileCacheKey::fromKeyString delegates all 32-byte input to unhexUInt
     // without per-character validation. Non-hex 'g' maps to nibble 0xFF via the
     // lookup table; accumulation via addition (not OR) with natural uint64_t
@@ -120,6 +169,8 @@ TEST(FileCacheKeyTest, FromKeyStringMalformedCharCompatibility)
 
 TEST(FileCacheKeyTest, UppercaseParserRoundTrip)
 {
+    // CH-oracle verified: DB::unhexUInt<UInt128>("AABBCCDD...") == the lowercase
+    // parse, and getHexUIntLowercase emits lowercase "aabbccdd...".
     // CH unhexUInt accepts both upper- and lower-case hex via hex_char_to_digit_table.
     // Parse the same 128-bit value as lowercase and uppercase; results must be equal.
     // toString must emit the exact lowercase numeric form (fmt {:016x} format).
@@ -140,6 +191,7 @@ TEST(FileCacheKeyTest, UppercaseParserRoundTrip)
 
 TEST(FileCacheKeyTest, MalformedCarryHighWord)
 {
+    // CH-oracle verified: DB::unhexUInt<UInt128>("fg0...0") -> ef0...0.
     // 'f'=15, 'g'=0xFF (invalid). Using addition (not OR), the high word accumulates:
     //   i=0: hi = 0x0F
     //   i=1: hi = (0x0F << 4) + 0xFF = 0xF0 + 0xFF = 0x1EF
@@ -154,6 +206,7 @@ TEST(FileCacheKeyTest, MalformedCarryHighWord)
 
 TEST(FileCacheKeyTest, MalformedCarryLowWord)
 {
+    // CH-oracle verified: DB::unhexUInt<UInt128>("0..fg..0") -> 0..ef..0.
     // Same carry arithmetic as MalformedCarryHighWord but exercised in the low
     // 64-bit accumulation loop (chars 16..31). High word is all '0' so hi = 0.
     // With addition: lo = 0xEF00000000000000. With OR: lo = 0xFF00000000000000.
