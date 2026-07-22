@@ -47,6 +47,17 @@ function install_fmt {
   cmake_install_dir fmt -DFMT_TEST=OFF
 }
 
+function install_gflags {
+  wget_and_untar https://github.com/gflags/gflags/archive/"${GFLAGS_VERSION}".tar.gz gflags
+  cmake_install_dir gflags \
+    -DBUILD_SHARED_LIBS="${GFLAGS_BUILD_SHARED_LIBS:-ON}" \
+    -DBUILD_STATIC_LIBS=ON \
+    -DBUILD_gflags_LIB=ON \
+    -DBUILD_gflags_nothreads_LIB=OFF \
+    -DGFLAGS_REGISTER_BUILD_DIR=OFF \
+    -DGFLAGS_REGISTER_INSTALL_PREFIX=OFF
+}
+
 function install_folly {
   wget_and_untar https://github.com/facebook/folly/archive/refs/tags/"${FB_OS_VERSION}".tar.gz folly
   local FOLLY_FLAGS=(-DBUILD_SHARED_LIBS="$VELOX_BUILD_SHARED" -DBUILD_TESTS=OFF -DFOLLY_HAVE_INT128_T=ON)
@@ -207,7 +218,12 @@ function install_re2 {
 
 function install_glog {
   wget_and_untar https://github.com/google/glog/archive/"${GLOG_VERSION}".tar.gz glog
-  cmake_install_dir glog -DBUILD_SHARED_LIBS=ON
+  cmake_install_dir glog \
+    -DBUILD_SHARED_LIBS="${GLOG_BUILD_SHARED_LIBS:-ON}" \
+    -DBUILD_TESTING=OFF \
+    -DWITH_GFLAGS=ON \
+    -DWITH_GTEST=OFF \
+    -DWITH_UNWIND="${GLOG_WITH_UNWIND:-ON}"
 }
 
 function install_lzo {

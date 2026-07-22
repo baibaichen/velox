@@ -134,6 +134,9 @@ set(
   CACHE STRING
   "Specify whether to find the gflags package as a shared or static package"
 )
+if(DEFINED ENV{VELOX_GFLAGS_TYPE})
+  set(VELOX_GFLAGS_TYPE "$ENV{VELOX_GFLAGS_TYPE}")
+endif()
 option(VELOX_ENABLE_EXEC "Build exec." ON)
 option(VELOX_ENABLE_AGGREGATES "Build aggregates." ON)
 option(VELOX_ENABLE_HIVE_CONNECTOR "Build Hive connector." ON)
