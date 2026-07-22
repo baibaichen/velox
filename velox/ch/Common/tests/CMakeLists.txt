@@ -109,3 +109,19 @@ target_link_libraries(
     GTest::gtest
     GTest::gtest_main
 )
+
+add_executable(velox_ch_status_file_test StatusFileTest.cpp)
+add_test(velox_ch_status_file_test velox_ch_status_file_test)
+
+target_link_libraries(
+  velox_ch_status_file_test
+  PRIVATE
+    velox_ch_filecache
+    velox_test_util
+    velox_exception
+    Folly::folly
+    fmt::fmt
+    glog::glog
+    GTest::gtest
+    GTest::gtest_main
+)
