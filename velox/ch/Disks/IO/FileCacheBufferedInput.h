@@ -101,6 +101,9 @@ public:
     const FileCacheReadOptions & cacheOptions() const { return cacheOptions_; }
     velox::memory::MemoryPool * memoryPool() const { return &readerOptions_.memoryPool(); }
     uint64_t fileSize() const { return fileSize_; }
+    // Per-split IoStatistics from the connector (may be null). Operator-level
+    // hit/miss byte attribution is recorded here so it reaches OperatorStats.
+    io::IoStatistics * ioStatistics() const { return ioStatistics_.get(); }
 
 private:
     struct Request

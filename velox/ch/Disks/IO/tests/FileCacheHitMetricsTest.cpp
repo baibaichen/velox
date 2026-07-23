@@ -155,12 +155,18 @@ protected:
     dwio::common::ReaderOptions readerOptions() { return dwio::common::ReaderOptions(pool_.get()); }
 
     std::unique_ptr<FileCacheBufferedInput> makeInput(
-        FileCachePtr cache, const std::string & path, const FileCacheKey & key, FileCacheReadOptions readOptions = {})
+        FileCachePtr cache,
+        const std::string & path,
+        const FileCacheKey & key,
+        FileCacheReadOptions readOptions = {},
+        std::shared_ptr<io::IoStatistics> ioStats = nullptr)
     {
         FileCacheRequestContext ctx;
         ctx.queryId = "q1";
         ctx.userId = manager_->commonUserId();
         auto origin = cache->getCommonOrigin();
+        if (!ioStats)
+            ioStats = std::make_shared<io::IoStatistics>();
         return std::make_unique<FileCacheBufferedInput>(
             std::make_shared<velox::LocalReadFile>(path),
             std::move(cache),
@@ -169,7 +175,7 @@ protected:
             readOptions,
             ctx,
             dwio::common::MetricsLog::voidLog(),
-            std::make_shared<io::IoStatistics>(),
+            std::move(ioStats),
             std::make_shared<velox::IoStats>(),
             executor_.get(),
             readerOptions());
@@ -339,6 +345,62 @@ TEST_F(FileCacheHitMetricsTest, PredownloadCountsSourceAndWriteBytes)
         << "predownloaded prefix must be counted as cache-write bytes";
     // Nothing was served from an existing cache segment on this cold read.
     EXPECT_EQ(after.cacheBytes - before.cacheBytes, 0u);
+}
+
+// ============================================================================
+// Operator-level attribution (Task #29): the per-split IoStatistics passed by
+// the connector must receive the same hit/source bytes as the global counters,
+// mapped to ssdRead (localReadBytes / hit) and read (storageReadBytes / source).
+// This is what surfaces per-operator in Spark UI. RED check: neutralising the
+// ssdRead()/read().increment calls in FileCacheInputStream drops these to 0.
+// ============================================================================
+TEST_F(FileCacheHitMetricsTest, ColdMissRecordsSourceInIoStatistics)
+{
+    const size_t n = 128 * 1024;
+    auto content = makeContent(n);
+    auto cache = makeManagerCache(/*seg*/ 64 * 1024, /*align*/ 1);
+    auto path = writeSourceFile("src", content);
+    auto key = FileCacheKey::fromPath(path);
+
+    auto ioStats = std::make_shared<io::IoStatistics>();
+    {
+        auto input = makeInput(cache, path, key, {}, ioStats);
+        EXPECT_EQ(readAll(*input->enqueue({0, n})), content);
+    }
+
+    // A cold miss reads all N bytes from the source -> read() (storageReadBytes).
+    // Nothing is served from a local cache segment -> ssdRead() stays 0.
+    EXPECT_EQ(ioStats->read().sum(), n);
+    EXPECT_EQ(ioStats->ssdRead().sum(), 0u);
+    EXPECT_GE(ioStats->rawBytesRead(), n);
+}
+
+TEST_F(FileCacheHitMetricsTest, HitRecordsLocalInIoStatistics)
+{
+    const size_t n = 128 * 1024;
+    auto content = makeContent(n);
+    auto cache = makeManagerCache(/*seg*/ 64 * 1024, /*align*/ 1);
+    auto path = writeSourceFile("src", content);
+    auto key = FileCacheKey::fromPath(path);
+
+    // Warm the cache (its own IoStatistics, discarded).
+    {
+        auto input = makeInput(cache, path, key);
+        EXPECT_EQ(readAll(*input->enqueue({0, n})), content);
+    }
+
+    auto ioStats = std::make_shared<io::IoStatistics>();
+    {
+        auto input = makeInput(cache, path, key, {}, ioStats);
+        EXPECT_TRUE(input->isBuffered(0, n));
+        EXPECT_EQ(readAll(*input->enqueue({0, n})), content);
+    }
+
+    // A pure hit serves all N bytes from the local cache -> ssdRead()
+    // (localReadBytes). The source is not touched -> read() stays 0.
+    EXPECT_EQ(ioStats->ssdRead().sum(), n);
+    EXPECT_EQ(ioStats->read().sum(), 0u);
+    EXPECT_GE(ioStats->rawBytesRead(), n);
 }
 
 } // namespace

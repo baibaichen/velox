@@ -625,6 +625,13 @@ bool FileCacheInputStream::predownloadForCurrentSegment(
         ProfileEvents::increment(
             ProfileEvents::CachedReadBufferReadFromSourceBytes, got);
 
+        // Operator-level: predownloaded source bytes are a real remote read.
+        if (auto * ioStats = owner_->ioStatistics())
+        {
+            ioStats->read().increment(got);
+            ioStats->incRawBytesRead(static_cast<int64_t>(got));
+        }
+
         std::string reason;
         const bool reserved = fileSegment.reserve(
             got,
@@ -827,12 +834,25 @@ size_t FileCacheInputStream::readFromCurrentSegment(
     {
         // Hit/source byte attribution over the final (trimmed) `size` served to
         // the caller. Uses the existing `ReadType` decision, no new branching.
+        // Operator-level attribution: mirror the global counter into the
+        // per-split IoStatistics so it reaches OperatorStats. Local cache hits
+        // map to ssdRead (customStats "localReadBytes"); source reads map to
+        // read (customStats "storageReadBytes"). Both count as raw bytes read.
         if (servedFromCache)
             ProfileEvents::increment(
                 ProfileEvents::CachedReadBufferReadFromCacheBytes, size);
         else
             ProfileEvents::increment(
                 ProfileEvents::CachedReadBufferReadFromSourceBytes, size);
+
+        if (auto * ioStats = owner_->ioStatistics())
+        {
+            if (servedFromCache)
+                ioStats->ssdRead().increment(size);
+            else
+                ioStats->read().increment(size);
+            ioStats->incRawBytesRead(static_cast<int64_t>(size));
+        }
     }
 
     return size;
