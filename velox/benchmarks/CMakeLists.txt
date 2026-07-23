@@ -73,6 +73,7 @@ if(${VELOX_BUILD_TEST_UTILS})
   target_link_libraries(
     velox_benchmark_ab
     velox_query_benchmark
+    velox_exec_test_lib
     velox_cache_read_harness
     velox_ch_filecache_dwio
     velox_ch_filecache_manager

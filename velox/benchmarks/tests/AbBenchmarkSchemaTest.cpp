@@ -15,6 +15,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <gtest/gtest-spi.h>
 
 #include <sstream>
 #include <string>
@@ -22,39 +23,43 @@
 
 #include "velox/benchmarks/AbBenchmarkBase.h"
 #include "velox/benchmarks/AbBenchmarkMain.h"
+#include "velox/exec/tests/utils/QueryAssertions.h"
+#include "velox/type/Type.h"
+#include "velox/vector/BaseVector.h"
+#include "velox/vector/tests/utils/VectorTestBase.h"
 
 namespace facebook::velox::benchmarks {
 namespace {
 
-// The exact 14-field header required by Task 018-C Step 0c.
+using namespace facebook::velox::test;
+
+// The exact 15-field header required by Task 018 parallel verification.
 constexpr const char* kExpectedHeader =
-    "round,query_id,wall_ms,rows,result_hash,bytes_read,hit_pct,"
+    "round,query_id,wall_ms,rows,result_hash,result_match,bytes_read,hit_pct,"
     "cache_read_mib,predownload_mib,evict_mib,evict_count,"
     "op_p50_us,op_p95_us,error";
 
-TEST(AbBenchmarkSchemaTest, CsvHeaderHasExactly14Fields)
+TEST(AbBenchmarkSchemaTest, CsvHeaderHasExactly15Fields)
 {
   std::ostringstream oss;
   writeCsvHeader(oss);
   std::string header = oss.str();
-  // Remove trailing newline for comparison.
   if (!header.empty() && header.back() == '\n')
   {
     header.pop_back();
   }
   EXPECT_EQ(header, kExpectedHeader)
-      << "CSV header must match the 14-field schema exactly";
-  // Count commas (N-1 commas for N fields).
+      << "CSV header must match the 15-field schema exactly";
   int commas = 0;
   for (char c : header)
   {
     if (c == ',')
       ++commas;
   }
-  EXPECT_EQ(commas, 13) << "14 fields require exactly 13 commas";
+  EXPECT_EQ(commas, 14) << "15 fields require exactly 14 commas";
 }
 
-TEST(AbBenchmarkSchemaTest, CsvRowHas14FieldsForSuccess)
+TEST(AbBenchmarkSchemaTest, CsvRowHas15FieldsForSuccess)
 {
   AbCsvRow row;
   row.round = 1;
@@ -62,6 +67,7 @@ TEST(AbBenchmarkSchemaTest, CsvRowHas14FieldsForSuccess)
   row.wallMs = 123.456;
   row.rows = 100;
   row.resultHash = 999;
+  row.resultMatch = std::nullopt;
   row.bytesRead = 5000;
   row.hitPct = 95.0;
   row.cacheReadMib = 4.5;
@@ -85,13 +91,244 @@ TEST(AbBenchmarkSchemaTest, CsvRowHas14FieldsForSuccess)
     if (c == ',')
       ++commas;
   }
-  EXPECT_EQ(commas, 13) << "14 fields require exactly 13 commas";
+  EXPECT_EQ(commas, 14) << "15 fields require exactly 14 commas";
+}
+
+TEST(AbBenchmarkSchemaTest, ResultMatchSerializesEmpty)
+{
+  AbCsvRow row{};
+  row.round = 1;
+  row.queryId = 1;
+  row.resultMatch = std::nullopt;
+
+  std::ostringstream oss;
+  writeCsvRow(oss, row);
+  std::string line = oss.str();
+  // result_match field is after result_hash (field 5, 0-indexed),
+  // and must be empty when nullopt.
+  // Split by commas and check field 5.
+  std::vector<std::string> fields;
+  std::istringstream ss(line);
+  std::string field;
+  while (std::getline(ss, field, ','))
+  {
+    fields.push_back(field);
+  }
+  // Last field may have a newline
+  if (!fields.empty() && !fields.back().empty() && fields.back().back() == '\n')
+  {
+    fields.back().pop_back();
+  }
+  ASSERT_EQ(fields.size(), 15) << "Must have exactly 15 fields";
+  EXPECT_EQ(fields[5], "") << "result_match must be empty for nullopt";
+}
+
+TEST(AbBenchmarkSchemaTest, ResultMatchSerializesTrue)
+{
+  AbCsvRow row{};
+  row.round = 1;
+  row.queryId = 1;
+  row.resultMatch = true;
+
+  std::ostringstream oss;
+  writeCsvRow(oss, row);
+  std::string line = oss.str();
+  std::vector<std::string> fields;
+  std::istringstream ss(line);
+  std::string field;
+  while (std::getline(ss, field, ','))
+  {
+    fields.push_back(field);
+  }
+  if (!fields.empty() && !fields.back().empty() && fields.back().back() == '\n')
+  {
+    fields.back().pop_back();
+  }
+  ASSERT_EQ(fields.size(), 15) << "Must have exactly 15 fields";
+  EXPECT_EQ(fields[5], "1") << "result_match must be 1 for true";
+}
+
+TEST(AbBenchmarkSchemaTest, ResultMatchSerializesFalse)
+{
+  AbCsvRow row{};
+  row.round = 1;
+  row.queryId = 1;
+  row.resultMatch = false;
+
+  std::ostringstream oss;
+  writeCsvRow(oss, row);
+  std::string line = oss.str();
+  std::vector<std::string> fields;
+  std::istringstream ss(line);
+  std::string field;
+  while (std::getline(ss, field, ','))
+  {
+    fields.push_back(field);
+  }
+  if (!fields.empty() && !fields.back().empty() && fields.back().back() == '\n')
+  {
+    fields.back().pop_back();
+  }
+  ASSERT_EQ(fields.size(), 15) << "Must have exactly 15 fields";
+  EXPECT_EQ(fields[5], "0") << "result_match must be 0 for false";
+}
+
+class AbBenchmarkHelpersTest : public VectorTestBase,
+                               public testing::Test
+{
+ protected:
+  static void SetUpTestSuite()
+  {
+    memory::MemoryManager::testingSetInstance({});
+  }
+};
+
+TEST_F(AbBenchmarkHelpersTest, CountResultRowsSkipsNullptr)
+{
+  auto rows2 = makeRowVector(
+      {"a"}, {makeFlatVector<int64_t>({1, 2})});
+  auto rows3 = makeRowVector(
+      {"a"}, {makeFlatVector<int64_t>({3, 4, 5})});
+  std::vector<RowVectorPtr> results = {rows2, nullptr, rows3};
+  EXPECT_EQ(countResultRows(results), 5);
+}
+
+TEST_F(AbBenchmarkHelpersTest, CountResultRowsEmptyVector)
+{
+  std::vector<RowVectorPtr> results = {};
+  EXPECT_EQ(countResultRows(results), 0);
+}
+
+TEST_F(AbBenchmarkHelpersTest, ComputeResultHashDeterministic)
+{
+  auto rows = makeRowVector(
+      {"a", "b"},
+      {makeFlatVector<int64_t>({10, 20}),
+       makeFlatVector<double>({1.5, 2.5})});
+  uint64_t expected = 0;
+  for (vector_size_t r = 0; r < rows->size(); ++r)
+  {
+    expected += rows->hashValueAt(r);
+  }
+  std::vector<RowVectorPtr> results = {rows};
+  EXPECT_EQ(computeResultHash(results), expected);
+}
+
+TEST_F(AbBenchmarkHelpersTest, ComputeResultHashSkipsNullptr)
+{
+  auto rows = makeRowVector(
+      {"a"}, {makeFlatVector<int64_t>({42})});
+  uint64_t expected = rows->hashValueAt(0);
+  std::vector<RowVectorPtr> results = {nullptr, rows, nullptr};
+  EXPECT_EQ(computeResultHash(results), expected);
+}
+
+// --- Flag validation tests ---
+
+TEST(AbBenchmarkFlagTest, ValidateReferenceDriversAllowsZero)
+{
+  EXPECT_NO_THROW(validateReferenceDrivers(0, 4));
+}
+
+TEST(AbBenchmarkFlagTest, ValidateReferenceDriversAllowsOne)
+{
+  EXPECT_NO_THROW(validateReferenceDrivers(1, 4));
+}
+
+TEST(AbBenchmarkFlagTest, ValidateReferenceDriversAllowsEqualToRequested)
+{
+  EXPECT_NO_THROW(validateReferenceDrivers(4, 4));
+}
+
+TEST(AbBenchmarkFlagTest, ValidateReferenceDriversRejectsNegative)
+{
+  EXPECT_THROW(validateReferenceDrivers(-1, 4), VeloxUserError);
+}
+
+TEST(AbBenchmarkFlagTest, ValidateReferenceDriversRejectsGreaterThanRequested)
+{
+  EXPECT_THROW(validateReferenceDrivers(5, 4), VeloxUserError);
+}
+
+TEST(AbBenchmarkFlagTest, ValidateReferenceDriversRejectsZeroRequested)
+{
+  EXPECT_THROW(validateReferenceDrivers(1, 0), VeloxUserError);
+}
+
+// --- Epsilon comparator tests ---
+
+TEST_F(AbBenchmarkHelpersTest, EpsilonComparatorMatchesNearDoubles)
+{
+  // Reference: large double sum from one-driver aggregation
+  auto reference = makeRowVector(
+      {"key", "val"},
+      {makeFlatVector<int64_t>({1}),
+       makeFlatVector<double>({5.660776097195746e12})});
+  // Actual: slightly different from four-driver aggregation
+  auto actual = makeRowVector(
+      {"key", "val"},
+      {makeFlatVector<int64_t>({1}),
+       makeFlatVector<double>({5.660776097193966e12})});
+
+  EXPECT_TRUE(exec::test::assertEqualResults({reference}, {actual}));
+}
+
+TEST_F(AbBenchmarkHelpersTest, EpsilonComparatorRejectsChangedKey)
+{
+  auto reference = makeRowVector(
+      {"key", "val"},
+      {makeFlatVector<int64_t>({1}),
+       makeFlatVector<double>({100.0})});
+  auto actual = makeRowVector(
+      {"key", "val"},
+      {makeFlatVector<int64_t>({2}),
+       makeFlatVector<double>({100.0})});
+
+  bool result = true;
+  EXPECT_NONFATAL_FAILURE(
+      { result = exec::test::assertEqualResults({reference}, {actual}); },
+      "");
+  EXPECT_FALSE(result);
+}
+
+TEST_F(AbBenchmarkHelpersTest, EpsilonComparatorRejectsMissingRow)
+{
+  auto reference = makeRowVector(
+      {"key", "val"},
+      {makeFlatVector<int64_t>({1, 2}),
+       makeFlatVector<double>({100.0, 200.0})});
+  auto actual = makeRowVector(
+      {"key", "val"},
+      {makeFlatVector<int64_t>({1}),
+       makeFlatVector<double>({100.0})});
+
+  bool result = true;
+  EXPECT_NONFATAL_FAILURE(
+      { result = exec::test::assertEqualResults({reference}, {actual}); },
+      "");
+  EXPECT_FALSE(result);
+}
+
+TEST_F(AbBenchmarkHelpersTest, EpsilonComparatorRejectsMateriallyDifferent)
+{
+  auto reference = makeRowVector(
+      {"key", "val"},
+      {makeFlatVector<int64_t>({1}),
+       makeFlatVector<double>({100.0})});
+  auto actual = makeRowVector(
+      {"key", "val"},
+      {makeFlatVector<int64_t>({1}),
+       makeFlatVector<double>({200.0})});
+
+  bool result = true;
+  EXPECT_NONFATAL_FAILURE(
+      { result = exec::test::assertEqualResults({reference}, {actual}); },
+      "");
+  EXPECT_FALSE(result);
 }
 
 TEST(AbBenchmarkSchemaTest, BackendSnapshotFileCacheMapping)
 {
-  // Verify that FileCache backend populates cacheReadBytes, predownloadBytes,
-  // evictedBytes, evictionCount as separate quantities.
   BackendSnapshot snap;
   snap.lookups = 100;
   snap.hits = 80;
@@ -119,8 +356,6 @@ TEST(AbBenchmarkSchemaTest, BackendSnapshotFileCacheMapping)
 
 TEST(AbBenchmarkSchemaTest, BackendSnapshotCbiMapping)
 {
-  // CBI: cacheReadBytes is hitBytes, predownload is zero, evictedBytes is zero,
-  // evictionCount is numEvict.
   BackendSnapshot snap;
   snap.lookups = 50;
   snap.hits = 40;
@@ -148,9 +383,6 @@ TEST(AbBenchmarkSchemaTest, BackendSnapshotCbiMapping)
 
 TEST(AbBenchmarkSchemaTest, MutationSwapBytesCountFails)
 {
-  // If someone accidentally puts evictionCount into evictMib, the values would
-  // not make sense. This test ensures the numeric distinction is maintained:
-  // evict_mib should be in MiB (bytes / 2^20), evict_count should be an integer.
   BackendSnapshot snap;
   snap.lookups = 10;
   snap.hits = 10;
@@ -162,28 +394,21 @@ TEST(AbBenchmarkSchemaTest, MutationSwapBytesCountFails)
   BackendSnapshot before{};
   AbCsvRow row{};
   populateBackendDelta(row, before, snap);
-  // evict_mib must be 7.0 (from bytes), NOT 7 (from count)
   EXPECT_DOUBLE_EQ(row.evictMib, 7.0);
-  // evict_count must be integer 7 (from segments), NOT bytes
   EXPECT_EQ(row.evictCount, 7);
-  // Key assertion: if bytes and count were swapped, evictMib would be
-  // 7 / (1024*1024) ≈ 0.0000067, not 7.0, and evictCount would be
-  // 1024*1024*7 = 7340032, not 7.
   EXPECT_GT(row.evictMib, 1.0);
   EXPECT_LT(row.evictCount, 100);
 }
 
-TEST(AbBenchmarkSchemaTest, CsvRowHas14FieldsForFailure)
+TEST(AbBenchmarkSchemaTest, CsvRowHas15FieldsForFailure)
 {
-  // The actual fixed error string emitted by AbBenchmarkBase::runAb() when
-  // cursor == nullptr (task failure). The row must still round-trip through
-  // exactly 14 fields even with a non-empty error column.
   AbCsvRow row;
   row.round = 1;
   row.queryId = 1;
   row.wallMs = 12.0;
   row.rows = 0;
   row.resultHash = 0;
+  row.resultMatch = std::nullopt;
   row.bytesRead = 0;
   row.hitPct = 0.0;
   row.cacheReadMib = 0.0;
@@ -209,7 +434,52 @@ TEST(AbBenchmarkSchemaTest, CsvRowHas14FieldsForFailure)
     if (c == ',')
       ++commas;
   }
-  EXPECT_EQ(commas, 13) << "14 fields require exactly 13 commas, even on failure";
+  EXPECT_EQ(commas, 14) << "15 fields require exactly 14 commas, even on failure";
+}
+
+TEST(AbBenchmarkSchemaTest, FailedReferenceCheckedRowSerializesResultMatchFalse)
+{
+  // Simulates AbBenchmarkBase::runAb() when cursor == nullptr (task failure)
+  // while reference verification is enabled: resultMatch must be set to
+  // false (not left as nullopt) alongside the fixed failure error string, so
+  // downstream analysis can distinguish "failed and unverifiable" rows from
+  // "failed, not reference-checked" rows.
+  AbCsvRow row;
+  row.round = 1;
+  row.queryId = 1;
+  row.wallMs = 12.0;
+  row.rows = 0;
+  row.resultHash = 0;
+  row.resultMatch = false;
+  row.bytesRead = 0;
+  row.hitPct = 0.0;
+  row.cacheReadMib = 0.0;
+  row.predownloadMib = 0.0;
+  row.evictMib = 0.0;
+  row.evictCount = 0;
+  row.opP50Us = 0.0;
+  row.opP95Us = 0.0;
+  row.error = "task failed (see ERROR log)";
+
+  std::ostringstream oss;
+  writeCsvRow(oss, row);
+  std::string line = oss.str();
+  if (!line.empty() && line.back() == '\n')
+  {
+    line.pop_back();
+  }
+  std::vector<std::string> fields;
+  std::istringstream ss(line);
+  std::string field;
+  while (std::getline(ss, field, ','))
+  {
+    fields.push_back(field);
+  }
+  ASSERT_EQ(fields.size(), 15) << "Must have exactly 15 fields";
+  EXPECT_EQ(fields[5], "0")
+      << "result_match must serialize as 0 for a failed, reference-checked row";
+  EXPECT_FALSE(fields.back().empty())
+      << "error column must be nonempty for a failed row";
 }
 
 TEST(AbBenchmarkSchemaTest, ExitCodeIsZeroWhenNoQueriesFailed)
@@ -219,8 +489,6 @@ TEST(AbBenchmarkSchemaTest, ExitCodeIsZeroWhenNoQueriesFailed)
 
 TEST(AbBenchmarkSchemaTest, ExitCodeIsNonzeroForAnyFailedQuery)
 {
-  // Any failed query (however few) must produce a nonzero process exit code;
-  // there must be no soft cap that tolerates a handful of failures.
   EXPECT_NE(abExitCode(1), 0);
   EXPECT_NE(abExitCode(10), 0);
 }

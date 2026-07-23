@@ -16,6 +16,7 @@
 #pragma once
 
 #include <functional>
+#include <optional>
 #include <ostream>
 #include <string>
 
@@ -37,6 +38,7 @@ struct AbCsvRow
   double wallMs{};
   uint64_t rows{};
   uint64_t resultHash{};
+  std::optional<bool> resultMatch;
   uint64_t bytesRead{};
   double hitPct{};
   double cacheReadMib{};
@@ -59,7 +61,7 @@ struct BackendSnapshot
   uint64_t evictionCount{0};
 };
 
-/// Writes the 14-field CSV header.
+/// Writes the 15-field CSV header.
 void writeCsvHeader(std::ostream& out);
 
 /// Writes one data row.
@@ -70,6 +72,21 @@ void populateBackendDelta(
     AbCsvRow& row,
     const BackendSnapshot& before,
     const BackendSnapshot& after);
+
+/// Counts the total number of final result rows across all returned
+/// RowVectors, skipping nullptrs. Pipeline/operator statistics never
+/// contribute to this count.
+uint64_t countResultRows(const std::vector<RowVectorPtr>& results);
+
+/// Computes an exact commutative hash over every row of every returned
+/// RowVector, skipping nullptrs.
+uint64_t computeResultHash(const std::vector<RowVectorPtr>& results);
+
+/// Validates reference_num_drivers against the requested num_drivers.
+/// Throws on invalid combinations.
+void validateReferenceDrivers(
+    int32_t referenceDrivers,
+    int32_t requestedDrivers);
 
 /// Base class for benchmarks that need the FileCache-vs-CBI A/B sweep harness:
 /// snapshot backend stats, run one query, snapshot again, emit one CSV row,

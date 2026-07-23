@@ -17,6 +17,8 @@ add_executable(velox_ab_benchmark_schema_test AbBenchmarkSchemaTest.cpp)
 target_link_libraries(
   velox_ab_benchmark_schema_test
   velox_benchmark_ab
+  velox_exec_test_lib
+  velox_vector_test_lib
   GTest::gtest
   GTest::gtest_main)
 

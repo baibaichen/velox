@@ -19,6 +19,9 @@
 #include "velox/ch/Common/FileCacheStats.h"
 #include "velox/ch/Interpreters/FileCache/FileCacheManager.h"
 #include "velox/common/caching/AsyncDataCache.h"
+#include "velox/exec/tests/utils/QueryAssertions.h"
+
+#include <folly/ScopeGuard.h>
 
 #include <algorithm>
 #include <chrono>
@@ -71,9 +74,16 @@ DEFINE_bool(
     "cold and rounds 2+ are warm. Lets a single process collect multiple cold "
     "wall_ms samples without per-process restart overhead.");
 
+DEFINE_int32(
+    reference_num_drivers,
+    0,
+    "If positive, run each query once with this driver count outside timing "
+    "and compare every timed result using Velox epsilon-aware result equality.");
+
 // num_repeats is owned by QueryBenchmarkBase.cpp but not declared in its
 // header. runAb() asserts it is 1 to keep the outer --rounds loop honest.
 DECLARE_int32(num_repeats);
+DECLARE_int32(num_drivers);
 
 namespace facebook::velox::benchmarks {
 
@@ -95,15 +105,18 @@ double quantileUs(const std::vector<int64_t>& samplesNs, double q) {
 } // namespace
 
 void writeCsvHeader(std::ostream& out) {
-  out << "round,query_id,wall_ms,rows,result_hash,bytes_read,hit_pct,"
-         "cache_read_mib,predownload_mib,evict_mib,evict_count,"
+  out << "round,query_id,wall_ms,rows,result_hash,result_match,bytes_read,"
+         "hit_pct,cache_read_mib,predownload_mib,evict_mib,evict_count,"
          "op_p50_us,op_p95_us,error\n";
 }
 
 void writeCsvRow(std::ostream& out, const AbCsvRow& row) {
+  const std::string resultMatch = !row.resultMatch.has_value()
+      ? ""
+      : (*row.resultMatch ? "1" : "0");
   out << row.round << "," << fmt::format("q{:02d}", row.queryId) << ","
       << fmt::format("{:.3f}", row.wallMs) << "," << row.rows << ","
-      << row.resultHash << "," << row.bytesRead << ","
+      << row.resultHash << "," << resultMatch << "," << row.bytesRead << ","
       << fmt::format("{:.4f}", row.hitPct) << ","
       << fmt::format("{:.4f}", row.cacheReadMib) << ","
       << fmt::format("{:.4f}", row.predownloadMib) << ","
@@ -139,6 +152,44 @@ void populateBackendDelta(
   row.predownloadMib = static_cast<double>(predownloadDelta) / (1ULL << 20);
   row.evictMib = static_cast<double>(evictBytesDelta) / (1ULL << 20);
   row.evictCount = evictCountDelta;
+}
+
+uint64_t countResultRows(const std::vector<RowVectorPtr>& results) {
+  uint64_t rows = 0;
+  for (const auto& result : results) {
+    if (result != nullptr) {
+      rows += result->size();
+    }
+  }
+  return rows;
+}
+
+uint64_t computeResultHash(const std::vector<RowVectorPtr>& results) {
+  uint64_t hash = 0;
+  for (const auto& result : results) {
+    if (result == nullptr) {
+      continue;
+    }
+    for (vector_size_t row = 0; row < result->size(); ++row) {
+      hash += result->hashValueAt(row);
+    }
+  }
+  return hash;
+}
+
+void validateReferenceDrivers(
+    int32_t referenceDrivers,
+    int32_t requestedDrivers) {
+  VELOX_USER_CHECK_GE(
+      requestedDrivers, 1, "num_drivers must be positive");
+  VELOX_USER_CHECK_GE(
+      referenceDrivers, 0, "reference_num_drivers must be non-negative");
+  VELOX_USER_CHECK_LE(
+      referenceDrivers,
+      requestedDrivers,
+      "reference_num_drivers ({}) must not exceed num_drivers ({})",
+      referenceDrivers,
+      requestedDrivers);
 }
 
 namespace {
@@ -214,6 +265,37 @@ int32_t AbBenchmarkBase::runAb() {
     plans.push_back(buildPlan(q));
   }
 
+  // Collect in-process reference results outside timed rounds.
+  std::vector<std::unique_ptr<exec::TaskCursor>> referenceCursors;
+  std::vector<std::vector<RowVectorPtr>> referenceResults;
+  const int32_t requestedDrivers = FLAGS_num_drivers;
+  validateReferenceDrivers(FLAGS_reference_num_drivers, requestedDrivers);
+
+  if (FLAGS_reference_num_drivers > 0) {
+    referenceResults.reserve(plans.size());
+    referenceCursors.reserve(plans.size());
+    FLAGS_num_drivers = FLAGS_reference_num_drivers;
+    auto restoreDrivers = folly::makeGuard(
+        [&] { FLAGS_num_drivers = requestedDrivers; });
+
+    for (size_t i = 0; i < plans.size(); ++i) {
+      auto [cursor, results] = run(plans[i], queryConfigs_);
+      VELOX_USER_CHECK(
+          cursor != nullptr,
+          "Reference query q{:02d} failed",
+          queryIds[i]);
+      referenceCursors.push_back(std::move(cursor));
+      referenceResults.push_back(std::move(results));
+    }
+
+    FLAGS_num_drivers = requestedDrivers;
+    restoreDrivers.dismiss();
+    VELOX_USER_CHECK(
+        static_cast<bool>(coldResetFn_),
+        "reference_num_drivers requires a backend reset callback");
+    coldResetFn_();
+  }
+
   std::ofstream csv(FLAGS_out, std::ios::out | std::ios::trunc);
   VELOX_USER_CHECK(
       csv.is_open(), "Failed to open --out for write: {}", FLAGS_out);
@@ -221,9 +303,10 @@ int32_t AbBenchmarkBase::runAb() {
 
   int32_t failed = 0;
   for (int32_t round = 1; round <= FLAGS_rounds; ++round) {
-    // Round 1 is already cold (caches wiped at process startup). For rounds
-    // 2+, --cold_each_round returns the active backend to a cold state so each
-    // round is an independent cold sample.
+    // Round 1 is already cold (caches wiped at process startup or by the
+    // reference reset above). For rounds 2+, --cold_each_round returns
+    // the active backend to a cold state so each round is an independent
+    // cold sample.
     if (FLAGS_cold_each_round && round > 1 && coldResetFn_) {
       coldResetFn_();
     }
@@ -240,17 +323,25 @@ int32_t AbBenchmarkBase::runAb() {
           std::chrono::duration<double, std::milli>(wallEnd - wallStart)
               .count();
       if (cursor == nullptr) {
+        if (!referenceResults.empty()) {
+          row.resultMatch = false;
+        }
         row.error = "task failed (see ERROR log)";
         ++failed;
       } else {
-        for (const auto& rv : results) {
-          if (rv == nullptr) {
-            continue;
-          }
-          for (vector_size_t r = 0; r < rv->size(); ++r) {
-            row.resultHash += rv->hashValueAt(r);
+        row.rows = countResultRows(results);
+        row.resultHash = computeResultHash(results);
+
+        if (!referenceResults.empty()) {
+          const bool matches =
+              exec::test::assertEqualResults(referenceResults[i], results);
+          row.resultMatch = matches;
+          if (!matches) {
+            row.error = "result mismatch against one-driver reference";
+            ++failed;
           }
         }
+
         const auto stats = cursor->task()->taskStats();
         std::vector<int64_t> samplesNs;
         for (const auto& pipeline : stats.pipelineStats) {
@@ -261,7 +352,6 @@ int32_t AbBenchmarkBase::runAb() {
           if (leaf.operatorType == "TableScan") {
             row.bytesRead += leaf.rawInputBytes;
           }
-          row.rows += pipeline.operatorStats.back().outputPositions;
           for (const auto& op : pipeline.operatorStats) {
             if (op.getOutputTiming.count > 0) {
               samplesNs.push_back(static_cast<int64_t>(
