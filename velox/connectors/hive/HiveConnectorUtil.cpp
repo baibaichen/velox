@@ -18,6 +18,10 @@
 
 #include "velox/connectors/hive/FileColumnHandle.h"
 
+#include "velox/ch/Disks/IO/FileCacheBufferedInput.h"
+#include "velox/ch/Disks/IO/FileCacheFileIdentity.h"
+#include "velox/ch/Disks/IO/FileCacheRequestContext.h"
+#include "velox/ch/Interpreters/FileCache/FileCacheManager.h"
 #include "velox/connectors/hive/FileConfig.h"
 #include "velox/connectors/hive/FileConnectorSplit.h"
 #include "velox/connectors/hive/FileConnectorUtil.h"
@@ -658,6 +662,45 @@ std::unique_ptr<dwio::common::BufferedInput> createBufferedInput(
     std::shared_ptr<IoStats> ioStats,
     folly::Executor* executor,
     const folly::F14FastMap<std::string, std::string>& fileReadOps) {
+  if (auto* manager = ch::FileCacheManager::getInstance()) {
+    VELOX_USER_CHECK_NULL(
+        connectorQueryCtx->cache(),
+        "FileCache and AsyncDataCache cannot both be installed");
+
+    auto cache = manager->getDefault();
+    VELOX_USER_CHECK_NOT_NULL(cache, "FileCacheManager has no default cache");
+
+    ch::FileCacheRequestContext requestContext;
+    requestContext.queryId = connectorQueryCtx->queryId();
+    requestContext.userId = manager->commonUserId();
+    requestContext.userWeight = 0;
+    requestContext.cacheable = readerOpts.cacheable();
+    requestContext.segmentType = ch::FileSegmentKeyType::Data;
+
+    ch::FileCacheOriginInfo origin(
+        requestContext.userId,
+        requestContext.userWeight,
+        requestContext.segmentType);
+
+    const ch::FileCacheFileIdentity identity{
+        .path = fileHandle.file->getName(),
+        .etag = ""};
+
+    return std::make_unique<ch::FileCacheBufferedInput>(
+        fileHandle.file,
+        std::move(cache),
+        ch::FileCacheFileIdentity::deriveKey(identity),
+        std::move(origin),
+        ch::FileCacheReadOptions{},
+        std::move(requestContext),
+        dwio::common::MetricsLog::voidLog(),
+        std::move(ioStatistics),
+        std::move(ioStats),
+        executor,
+        readerOpts,
+        fileReadOps,
+        connectorQueryCtx->cancellationToken());
+  }
   if (connectorQueryCtx->cache()) {
     return std::make_unique<dwio::common::CachedBufferedInput>(
         fileHandle.file,

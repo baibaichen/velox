@@ -89,6 +89,10 @@ velox_link_libraries(
     velox_exec
     velox_hive_partition_function
     velox_key_encoder
+    velox_ch_filecache_dwio
+    velox_ch_filecache_manager
+    velox_ch_filecache_core
+    velox_ch_filecache
 )
 
 if(VELOX_ENABLE_PARQUET)

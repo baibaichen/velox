@@ -55,3 +55,39 @@ if(VELOX_ENABLE_PARQUET)
     velox_dwio_parquet_reader
   )
 endif()
+
+# Dedicated executable (Task 018 Hive FCBI adapter): selection, mapping,
+# mutual exclusion, and real miss-fill-hit tests for the current FileCache
+# adapter in `createBufferedInput`. Kept separate from the monolithic
+# `velox_hive_connector_test` so this focused suite builds/links/runs without
+# compiling the rest of the (much larger) Hive connector test set, in both
+# mono and non-mono trees.
+add_executable(
+  velox_hive_filecache_buffered_input_test
+  HiveFileCacheBufferedInputTest.cpp
+)
+add_test(
+  velox_hive_filecache_buffered_input_test
+  velox_hive_filecache_buffered_input_test
+)
+
+target_link_libraries(
+  velox_hive_filecache_buffered_input_test
+  PRIVATE
+    velox_hive_connector
+    velox_connector
+    velox_dwio_common
+    velox_dwio_common_exception
+    velox_ch_filecache_dwio
+    velox_ch_filecache_manager
+    velox_ch_filecache_core
+    velox_ch_filecache
+    velox_caching
+    velox_file
+    velox_memory
+    velox_exception
+    velox_test_util
+    Folly::folly
+    GTest::gtest
+    GTest::gtest_main
+)
