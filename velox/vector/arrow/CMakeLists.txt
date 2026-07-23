@@ -15,6 +15,6 @@ velox_add_library(velox_arrow_bridge Bridge.cpp HEADERS Abi.h Bridge.h)
 
 velox_link_libraries(velox_arrow_bridge velox_memory velox_type velox_buffer velox_exception)
 
-if(VELOX_BUILD_TESTING AND VELOX_ENABLE_ARROW)
+if(VELOX_BUILD_TESTING AND VELOX_ENABLE_ARROW AND VELOX_ENABLE_ARROW_TESTING)
   add_subdirectory(tests)
 endif()
