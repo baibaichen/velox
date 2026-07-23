@@ -42,6 +42,26 @@ class AdaptivePrefetch {
     return lookAhead_;
   }
 
+  /// Computes the look-ahead for a measured elapsed duration (in
+  /// nanoseconds) covering kMeasurementIterations iterations. Exposed as a
+  /// pure, deterministic calculation so it can be unit tested directly
+  /// without depending on clock resolution or timing behavior. An elapsed
+  /// value of zero or less means the measured loop completed faster than
+  /// the clock can resolve (observed in practice on clocksources with
+  /// coarse ticks, e.g. Hyper-V's hyperv_clocksource_tsc_page), so the
+  /// maximum look-ahead is selected and division by zero is avoided.
+  static int32_t computeLookAheadForElapsedNs(int64_t elapsedNs) {
+    if (elapsedNs <= 0) {
+      return kMaxLookAhead;
+    }
+    return std::clamp(
+        static_cast<int32_t>(
+            kCoefficient * kAssumedDramLatencyNs * kMeasurementIterations /
+            elapsedNs),
+        kMinLookAhead,
+        kMaxLookAhead);
+  }
+
  private:
   static constexpr int32_t kMeasurementIterations = 16;
   static constexpr int32_t kMinLookAhead = 4;
@@ -53,12 +73,7 @@ class AdaptivePrefetch {
     auto elapsedNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
                          std::chrono::steady_clock::now() - start_)
                          .count();
-    lookAhead_ = std::clamp(
-        static_cast<int32_t>(
-            kCoefficient * kAssumedDramLatencyNs * kMeasurementIterations /
-            elapsedNs),
-        kMinLookAhead,
-        kMaxLookAhead);
+    lookAhead_ = computeLookAheadForElapsedNs(elapsedNs);
   }
 
   int32_t numIterations_;

@@ -47,6 +47,25 @@ TEST(AdaptivePrefetchTest, fastIterationsProduceHighLookAhead) {
   EXPECT_LE(lookAhead, 32);
 }
 
+TEST(AdaptivePrefetchTest, zeroElapsedSelectsMaxLookAhead) {
+  // A measured elapsed duration of zero (or less) means the loop completed
+  // faster than the clock can resolve. It must select kMaxLookAhead and
+  // must never divide by zero. This is deterministic and does not depend
+  // on clock resolution or timing behavior.
+  EXPECT_EQ(AdaptivePrefetch::computeLookAheadForElapsedNs(0), 32);
+  EXPECT_EQ(AdaptivePrefetch::computeLookAheadForElapsedNs(-1), 32);
+}
+
+TEST(AdaptivePrefetchTest, positiveElapsedRetainsFormulaAndClamps) {
+  // Positive elapsed values must retain the existing formula and clamp
+  // behavior: kCoefficient * kAssumedDramLatencyNs * kMeasurementIterations
+  // == 4 * 100 * 16 == 6400.
+  EXPECT_EQ(AdaptivePrefetch::computeLookAheadForElapsedNs(6400), 4);
+  EXPECT_EQ(AdaptivePrefetch::computeLookAheadForElapsedNs(200), 32);
+  EXPECT_EQ(AdaptivePrefetch::computeLookAheadForElapsedNs(1600), 4);
+  EXPECT_EQ(AdaptivePrefetch::computeLookAheadForElapsedNs(1), 32);
+}
+
 TEST(AdaptivePrefetchTest, returnsZeroNearEnd) {
   AdaptivePrefetch prefetch(20);
   int zeroCount = 0;
