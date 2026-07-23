@@ -21,12 +21,19 @@ namespace facebook::velox::benchmarks {
 
 class AbBenchmarkBase;
 
+/// Maps a query-failure count (as returned by AbBenchmarkBase::runAb()) to a
+/// process exit code. Any failed query (failed > 0) must be surfaced as a
+/// nonzero exit code so shell scripts/orchestrators can detect it; only a
+/// clean sweep (failed == 0) returns 0. Pure function, safe to unit test
+/// directly.
+int32_t abExitCode(int32_t failed);
+
 /// Common --input_source dispatch for any AbBenchmarkBase-derived suite:
 ///   empty       -> runLegacy() (the suite's existing folly::runBenchmarks path)
 ///   "filecache" -> install ch::FileCache, force --cache_gb=0, call ab.runAb()
 ///   "cbi"       -> require --cache_gb>0, call ab.runAb()
-/// Returns the process exit code (0 unless more than 10 query failures, in
-/// which case 1).
+/// Returns the process exit code from abExitCode(failed): 0 if no queries
+/// failed, 1 otherwise.
 int32_t dispatchAbMain(
     AbBenchmarkBase& ab,
     const std::function<void()>& runLegacy);

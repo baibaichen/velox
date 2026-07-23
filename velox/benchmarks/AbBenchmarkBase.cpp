@@ -79,41 +79,6 @@ namespace facebook::velox::benchmarks {
 
 namespace {
 
-struct AbCsvRow {
-  int round{};
-  int32_t queryId{};
-  double wallMs{};
-  uint64_t rows{};
-  uint64_t resultHash{};
-  uint64_t bytesRead{};
-  double hitPct{};
-  double bytesDlMib{};
-  double evictMib{};
-  double opP50Us{};
-  double opP95Us{};
-  std::string error;
-};
-
-void writeCsvHeader(std::ostream& out) {
-  // Column names are shared across backends so a single merge script reads
-  // both the FileCache and CBI runs with the same parser. The bytes_dl_mib /
-  // evict_mib semantics differ per backend by necessity -- see the comments in
-  // snapshotBackend() and populateBackendDelta() where they are populated.
-  out << "round,query_id,wall_ms,rows,result_hash,bytes_read,hit_pct,"
-         "bytes_dl_mib,evict_mib,op_p50_us,op_p95_us,error\n";
-}
-
-void writeCsvRow(std::ostream& out, const AbCsvRow& row) {
-  out << row.round << "," << fmt::format("q{:02d}", row.queryId) << ","
-      << fmt::format("{:.3f}", row.wallMs) << "," << row.rows << ","
-      << row.resultHash << "," << row.bytesRead << ","
-      << fmt::format("{:.4f}", row.hitPct) << ","
-      << fmt::format("{:.4f}", row.bytesDlMib) << ","
-      << fmt::format("{:.4f}", row.evictMib) << ","
-      << fmt::format("{:.3f}", row.opP50Us) << ","
-      << fmt::format("{:.3f}", row.opP95Us) << "," << row.error << "\n";
-}
-
 // getOutputTiming is the operator hot path that emits batches; using it as the
 // per-call latency sample matches what production profilers focus on. The
 // alternatives (addInputTiming / finishTiming / backgroundTiming) either fire
@@ -127,57 +92,25 @@ double quantileUs(const std::vector<int64_t>& samplesNs, double q) {
   return samplesNs[idx] / 1000.0;
 }
 
-// Both ch::FileCache::stats() and AsyncDataCache::refreshStats() expose
-// monotonic process-wide counters. To get per-query numbers we snapshot the
-// relevant fields before each query's run() and record (after - before) into
-// the CSV row. Without this delta the merge script would compare
-// cumulative-since-start values across queries within a round, which is
-// meaningless (q22-round-2 would dwarf q01-round-2 just by being later).
-struct BackendSnapshot {
-  uint64_t lookups{0};
-  uint64_t hits{0};
-  uint64_t downloadBytes{0};
-  // Eviction volume. The FileCache backend reports it in bytes (see
-  // evictInBytes); AsyncDataCache has no evicted-bytes counter, so it reports a
-  // raw eviction count instead.
-  uint64_t evictUnits{0};
-  // True when evictUnits is a byte count (FileCache), so populateBackendDelta
-  // knows to convert to MiB. False keeps the AsyncDataCache raw count as-is.
-  bool evictInBytes{false};
-};
+} // namespace
 
-BackendSnapshot snapshotBackend() {
-  BackendSnapshot s;
-  if (ch::FileCacheManager::getInstance() != nullptr) {
-    // takeFileCacheStatsSnapshot() reads the process-wide FileCache metrics
-    // (CurrentMetrics gauges + ProfileEvents counters) maintained by the
-    // installed FileCacheManager; runAb() records the (after - before) delta.
-    const auto fc = ch::takeFileCacheStatsSnapshot();
-    s.hits = fc.cacheHitCount;
-    s.lookups = fc.cacheHitCount + fc.cacheMissCount;
-    // bytes_dl_mib: predownloadedFromSourceBytes is the cumulative bytes
-    // fetched from the source into the cache -- a true per-query download delta
-    // once runAb() subtracts the before-snapshot.
-    s.downloadBytes = fc.predownloadedFromSourceBytes;
-    // evict_mib: the FileCache tracks evicted bytes, so report them and convert
-    // to MiB in populateBackendDelta -- the column unit is then truthful.
-    s.evictUnits = fc.evictedBytes;
-    s.evictInBytes = true;
-  } else if (auto* dataCache = cache::AsyncDataCache::getInstance()) {
-    const auto dc = dataCache->refreshStats();
-    s.hits = static_cast<uint64_t>(dc.numHit);
-    s.lookups =
-        static_cast<uint64_t>(dc.numHit + dc.numNew + dc.numWaitExclusive);
-    // bytes_dl_mib: AsyncDataCache exposes hitBytes (bytes served, not bytes
-    // downloaded). No bytesNew-equivalent field exists.
-    s.downloadBytes = static_cast<uint64_t>(dc.hitBytes);
-    // evict_mib: AsyncDataCache exposes only an eviction count (no evicted-byte
-    // counter); report the raw count and leave evictInBytes false so
-    // populateBackendDelta does not misrepresent it as MiB.
-    s.evictUnits = static_cast<uint64_t>(dc.numEvict);
-    s.evictInBytes = false;
-  }
-  return s;
+void writeCsvHeader(std::ostream& out) {
+  out << "round,query_id,wall_ms,rows,result_hash,bytes_read,hit_pct,"
+         "cache_read_mib,predownload_mib,evict_mib,evict_count,"
+         "op_p50_us,op_p95_us,error\n";
+}
+
+void writeCsvRow(std::ostream& out, const AbCsvRow& row) {
+  out << row.round << "," << fmt::format("q{:02d}", row.queryId) << ","
+      << fmt::format("{:.3f}", row.wallMs) << "," << row.rows << ","
+      << row.resultHash << "," << row.bytesRead << ","
+      << fmt::format("{:.4f}", row.hitPct) << ","
+      << fmt::format("{:.4f}", row.cacheReadMib) << ","
+      << fmt::format("{:.4f}", row.predownloadMib) << ","
+      << fmt::format("{:.4f}", row.evictMib) << ","
+      << row.evictCount << ","
+      << fmt::format("{:.3f}", row.opP50Us) << ","
+      << fmt::format("{:.3f}", row.opP95Us) << "," << row.error << "\n";
 }
 
 void populateBackendDelta(
@@ -188,19 +121,51 @@ void populateBackendDelta(
       after.lookups >= before.lookups ? after.lookups - before.lookups : 0;
   const uint64_t hits =
       after.hits >= before.hits ? after.hits - before.hits : 0;
-  const uint64_t downloadDelta = after.downloadBytes >= before.downloadBytes
-      ? after.downloadBytes - before.downloadBytes
+  const uint64_t cacheReadDelta = after.cacheReadBytes >= before.cacheReadBytes
+      ? after.cacheReadBytes - before.cacheReadBytes
       : 0;
-  const uint64_t evictDelta = after.evictUnits >= before.evictUnits
-      ? after.evictUnits - before.evictUnits
+  const uint64_t predownloadDelta =
+      after.predownloadBytes >= before.predownloadBytes
+      ? after.predownloadBytes - before.predownloadBytes
+      : 0;
+  const uint64_t evictBytesDelta = after.evictedBytes >= before.evictedBytes
+      ? after.evictedBytes - before.evictedBytes
+      : 0;
+  const uint64_t evictCountDelta = after.evictionCount >= before.evictionCount
+      ? after.evictionCount - before.evictionCount
       : 0;
   row.hitPct = lookups ? 100.0 * hits / lookups : 0.0;
-  row.bytesDlMib = static_cast<double>(downloadDelta) / (1ULL << 20);
-  // FileCache: evicted bytes converted to MiB (truthful unit). AsyncDataCache:
-  // raw eviction count (no byte counter exists on that backend).
-  row.evictMib = before.evictInBytes
-      ? static_cast<double>(evictDelta) / (1024.0 * 1024.0)
-      : static_cast<double>(evictDelta);
+  row.cacheReadMib = static_cast<double>(cacheReadDelta) / (1ULL << 20);
+  row.predownloadMib = static_cast<double>(predownloadDelta) / (1ULL << 20);
+  row.evictMib = static_cast<double>(evictBytesDelta) / (1ULL << 20);
+  row.evictCount = evictCountDelta;
+}
+
+namespace {
+
+BackendSnapshot snapshotBackend() {
+  BackendSnapshot s;
+  if (ch::FileCacheManager::getInstance() != nullptr) {
+    const auto fc = ch::takeFileCacheStatsSnapshot();
+    s.hits = fc.cacheHitCount;
+    s.lookups = fc.cacheHitCount + fc.cacheMissCount;
+    s.cacheReadBytes = fc.cacheReadBytes;
+    s.predownloadBytes = fc.predownloadedFromSourceBytes;
+    s.evictedBytes = fc.evictedBytes;
+    s.evictionCount = fc.evictedSegments;
+  } else if (auto* dataCache = cache::AsyncDataCache::getInstance()) {
+    const auto dc = dataCache->refreshStats();
+    s.hits = static_cast<uint64_t>(dc.numHit);
+    s.lookups =
+        static_cast<uint64_t>(dc.numHit + dc.numNew + dc.numWaitExclusive);
+    // CBI: hitBytes maps to cache_read_mib; no predownload concept.
+    s.cacheReadBytes = static_cast<uint64_t>(dc.hitBytes);
+    s.predownloadBytes = 0;
+    // CBI: no evicted-byte counter; evict_mib stays zero. evict_count = numEvict.
+    s.evictedBytes = 0;
+    s.evictionCount = static_cast<uint64_t>(dc.numEvict);
+  }
+  return s;
 }
 
 } // namespace
@@ -264,33 +229,20 @@ int32_t AbBenchmarkBase::runAb() {
     }
     for (size_t i = 0; i < queryIds.size(); ++i) {
       const int32_t q = queryIds[i];
-      // On the failure path below, the unfilled numeric fields stay at their
-      // brace-default zeros and the error column carries the marker -- the
-      // documented "all zeros + error message" row shape.
       AbCsvRow row;
       row.round = round;
       row.queryId = q;
       const auto backendBefore = snapshotBackend();
       const auto wallStart = std::chrono::steady_clock::now();
-      // wall_ms covers exactly one execution because the VELOX_USER_CHECK_EQ
-      // on FLAGS_num_repeats above forbids the internal loop in run().
       auto [cursor, results] = run(plans[i], queryConfigs_);
       const auto wallEnd = std::chrono::steady_clock::now();
       row.wallMs =
           std::chrono::duration<double, std::milli>(wallEnd - wallStart)
               .count();
       if (cursor == nullptr) {
-        // run() catches std::exception, LOG(ERROR)'s it, and returns
-        // {nullptr, {}}. Record a marker so downstream tooling can count
-        // failures without re-reading the ERROR log.
         row.error = "task failed (see ERROR log)";
         ++failed;
       } else {
-        // Order-independent (commutative) checksum over every result row so
-        // multi-driver row reordering does not change it: identical result
-        // content yields an identical hash across cbi/filecache/direct modes,
-        // turning correctness into a byte-content comparison, not just a row
-        // count. BaseVector::hashValueAt returns uint64_t.
         for (const auto& rv : results) {
           if (rv == nullptr) {
             continue;
@@ -300,11 +252,6 @@ int32_t AbBenchmarkBase::runAb() {
           }
         }
         const auto stats = cursor->task()->taskStats();
-        // rawInputBytes lives on the leaf TableScan operator of each
-        // pipeline (matching runMain's bytes accounting). Per-pipeline output
-        // row count is taken from that pipeline's root operator (last entry);
-        // for multi-stage plans this sums across pipelines rather than
-        // reporting only the final result cardinality.
         std::vector<int64_t> samplesNs;
         for (const auto& pipeline : stats.pipelineStats) {
           if (pipeline.operatorStats.empty()) {
@@ -329,7 +276,6 @@ int32_t AbBenchmarkBase::runAb() {
         row.opP95Us = quantileUs(samplesNs, 0.95);
       }
       writeCsvRow(csv, row);
-      // Flush so a mid-sweep crash still leaves a parseable partial CSV.
       csv.flush();
     }
   }

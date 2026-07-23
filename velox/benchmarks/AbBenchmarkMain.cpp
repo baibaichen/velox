@@ -120,6 +120,12 @@ void teardownFileCache() {
 
 } // namespace
 
+int32_t abExitCode(int32_t failed) {
+  // Any failed query must produce a nonzero process exit so shell scripts and
+  // orchestrators can detect it; only a clean sweep returns 0.
+  return failed > 0 ? 1 : 0;
+}
+
 int32_t dispatchAbMain(
     AbBenchmarkBase& ab,
     const std::function<void()>& runLegacy) {
@@ -135,7 +141,6 @@ int32_t dispatchAbMain(
     // QueryBenchmarkBase::initialize skips AsyncDataCache construction when
     // FLAGS_cache_gb == 0; force it so the CBI tier stays nullptr.
     FLAGS_cache_gb = 0;
-    installFileCache();
   } else if (FLAGS_input_source == "cbi") {
     VELOX_USER_CHECK_GT(
         FLAGS_cache_gb, 0, "--input_source=cbi requires --cache_gb > 0");
@@ -153,6 +158,12 @@ int32_t dispatchAbMain(
 
   ab.initialize();
 
+  // Install FileCache after ab.initialize() since it needs the memory manager
+  // that QueryBenchmarkBase::initialize sets up.
+  if (FLAGS_input_source == "filecache") {
+    installFileCache();
+  }
+
   // Wire the per-backend cold-reset used by --cold_each_round. filecache tears
   // down and reinstalls its singleton (re-wiping disk + metadata via the same
   // installFileCache() path used at startup); the else branch covers cbi (clears
@@ -169,9 +180,9 @@ int32_t dispatchAbMain(
   const int32_t failed = ab.runAb();
   ab.shutdown();
 
-  // Soft-cap: only signal systemic failure to the shell when more than 10
-  // queries failed. Sweep results are still in --out.
-  return failed > 10 ? 1 : 0;
+  // Any failed query must produce a nonzero process exit; sweep results
+  // (including per-query errors) are still recorded in --out.
+  return abExitCode(failed);
 }
 
 } // namespace facebook::velox::benchmarks

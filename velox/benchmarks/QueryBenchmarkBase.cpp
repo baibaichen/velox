@@ -15,9 +15,11 @@
  */
 
 #include "velox/benchmarks/QueryBenchmarkBase.h"
+#include <gflags/gflags.h>
 #include <iostream>
 #include "velox/common/base/SuccinctPrinter.h"
 #include "velox/common/file/FileSystems.h"
+#include "velox/common/memory/MmapAllocator.h"
 #include "velox/connectors/ConnectorRegistry.h"
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/dwio/dwrf/RegisterDwrfReader.h"
@@ -44,6 +46,12 @@ bool validateDataFormat(const char* flagname, const std::string& value) {
 }
 } // namespace
 
+// Defined in velox/flag_definitions/flags.cpp. The global default is true
+// (O_DIRECT for SSD cache IO), which can return corrupt bytes from the SSD
+// cache on some filesystems. This benchmark defaults it to false (buffered IO)
+// to match Gluten's production setup (VeloxBackend uses ssd-odirect=false).
+DECLARE_bool(velox_ssd_odirect);
+
 DEFINE_string(data_format, "parquet", "Data format: parquet or dwrf.");
 
 DEFINE_validator(data_format, &validateDataFormat);
@@ -61,6 +69,33 @@ DEFINE_int32(
     0,
     "GB of process memory for cache and query.. if "
     "non-0, uses mmap to allocator and in-process data cache.");
+DEFINE_int32(
+    cache_num_shards,
+    facebook::velox::cache::AsyncDataCache::kDefaultNumShards,
+    "Number of shards for the in-process AsyncDataCache. Must be a power of "
+    "two. Only used when --cache_gb is non-0.");
+DEFINE_int32(
+    cache_mem_gb,
+    0,
+    "If > 0, the in-process AsyncDataCache uses a dedicated MmapAllocator "
+    "hard-capped at this many GB, separate from query memory (--cache_gb). "
+    "This mirrors how Gluten/Presto separate cache memory from query memory: "
+    "allocator-backed cache data cannot exceed this size, while query "
+    "execution gets the full --cache_gb budget on its own allocator. Note the "
+    "two budgets are additive: total process RSS can approach --cache_gb + "
+    "--cache_mem_gb, and query memory pressure no longer evicts the cache. If "
+    "0, the cache shares the query allocator (legacy behavior, where the cache "
+    "can grow to fill --cache_gb).");
+DEFINE_int32(
+    query_mem_gb,
+    0,
+    "GB of process memory for the query mmap allocator when --cache_gb is 0 "
+    "(e.g. the FileCache and Direct backends, which build no in-process "
+    "AsyncDataCache). If > 0, the MemoryManager uses an MmapAllocator capped at "
+    "this size so all backends share the same allocator behavior (the mmap "
+    "arena pre-reserves address space and recycles pages, avoiding the page "
+    "faults the default malloc allocator incurs). Ignored when --cache_gb is "
+    "non-0, where the allocator is sized by --cache_gb instead.");
 DEFINE_int32(num_repeats, 1, "Number of times to run each query");
 DEFINE_int32(num_io_threads, 8, "Threads for speculative IO");
 DEFINE_string(
@@ -168,16 +203,39 @@ void QueryBenchmarkBase::printResults(
 }
 
 void QueryBenchmarkBase::initialize() {
-  if (FLAGS_cache_gb) {
+  // Register the local file system before constructing the SsdCache below: the
+  // SsdCache constructor resolves its on-disk path via getFileSystem(), which
+  // fails if no file system is registered yet.
+  filesystems::registerLocalFileSystem();
+  // Decide the query memory budget backing the MmapAllocator-based
+  // MemoryManager. CBI sizes it from --cache_gb; the FileCache and Direct
+  // backends run with --cache_gb 0 but can opt into the same mmap query
+  // allocator via --query_mem_gb, so every backend shares one allocator
+  // behavior (the mmap arena recycles pages instead of faulting in fresh ones
+  // like the default malloc allocator).
+  const int64_t mmapCapacityGb =
+      FLAGS_cache_gb > 0 ? FLAGS_cache_gb : FLAGS_query_mem_gb;
+  if (mmapCapacityGb > 0) {
     memory::MemoryManager::Options options;
-    int64_t memoryBytes = FLAGS_cache_gb * (1LL << 30);
     options.useMmapAllocator = true;
-    options.allocatorCapacity = memoryBytes;
+    options.allocatorCapacity = mmapCapacityGb * (1LL << 30);
     options.useMmapArena = true;
     options.mmapArenaCapacityRatio = 1;
     memory::MemoryManager::testingSetInstance(options);
+  } else {
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
+  }
+
+  if (FLAGS_cache_gb) {
     std::unique_ptr<cache::SsdCache> ssdCache;
     if (FLAGS_ssd_cache_gb) {
+      // Default the SSD cache to buffered IO (matching Gluten), unless the
+      // user explicitly set --velox_ssd_odirect on the command line. O_DIRECT
+      // (the velox global default) can return corrupt bytes from the SSD cache
+      // on some filesystems.
+      if (gflags::GetCommandLineFlagInfoOrDie("velox_ssd_odirect").is_default) {
+        FLAGS_velox_ssd_odirect = false;
+      }
       constexpr int32_t kNumSsdShards = 16;
       cacheExecutor_ =
           std::make_unique<folly::IOThreadPoolExecutor>(kNumSsdShards);
@@ -190,16 +248,33 @@ void QueryBenchmarkBase::initialize() {
       ssdCache = std::make_unique<cache::SsdCache>(config);
     }
 
+    cache::AsyncDataCache::Options cacheOptions;
+    cacheOptions.numShards = FLAGS_cache_num_shards;
+
+    // Select the allocator backing the in-process cache. When --cache_mem_gb
+    // is set, the cache gets its own MmapAllocator hard-capped at that size,
+    // fully separate from query memory (the MemoryManager allocator sized by
+    // --cache_gb). This mirrors Gluten's VeloxBackend::initCache(), which
+    // builds a dedicated MmapAllocator for AsyncDataCache so the cache can
+    // never grow into query memory. When --cache_mem_gb is 0 the cache shares
+    // the query allocator (legacy behavior).
+    memory::MemoryAllocator* cacheAllocator;
+    if (FLAGS_cache_mem_gb > 0) {
+      memory::MemoryAllocator::Options allocatorOptions;
+      allocatorOptions.capacity =
+          static_cast<size_t>(FLAGS_cache_mem_gb) * (1LL << 30);
+      allocator_ = std::make_shared<memory::MmapAllocator>(allocatorOptions);
+      cacheAllocator = allocator_.get();
+    } else {
+      cacheAllocator = memory::memoryManager()->allocator();
+    }
     cache_ = cache::AsyncDataCache::create(
-        memory::memoryManager()->allocator(), std::move(ssdCache));
+        cacheAllocator, std::move(ssdCache), cacheOptions);
     cache::AsyncDataCache::setInstance(cache_.get());
-  } else {
-    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
   functions::prestosql::registerAllScalarFunctions();
   aggregate::prestosql::registerAllAggregateFunctions();
   parse::registerTypeResolver();
-  filesystems::registerLocalFileSystem();
 
   ioExecutor_ =
       std::make_unique<folly::IOThreadPoolExecutor>(FLAGS_num_io_threads);
@@ -248,6 +323,7 @@ QueryBenchmarkBase::listSplits(
 void QueryBenchmarkBase::shutdown() {
   if (cache_) {
     cache_->shutdown();
+    cache::AsyncDataCache::setInstance(nullptr);
   }
 }
 

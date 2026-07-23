@@ -16,6 +16,8 @@
 #pragma once
 
 #include <functional>
+#include <ostream>
+#include <string>
 
 #include "velox/benchmarks/QueryBenchmarkBase.h"
 
@@ -26,6 +28,48 @@ DECLARE_string(filecache_root);
 DECLARE_string(out);
 
 namespace facebook::velox::benchmarks {
+
+/// One CSV row emitted per (round, query) pair by the A/B sweep.
+struct AbCsvRow
+{
+  int round{};
+  int32_t queryId{};
+  double wallMs{};
+  uint64_t rows{};
+  uint64_t resultHash{};
+  uint64_t bytesRead{};
+  double hitPct{};
+  double cacheReadMib{};
+  double predownloadMib{};
+  double evictMib{};
+  uint64_t evictCount{};
+  double opP50Us{};
+  double opP95Us{};
+  std::string error;
+};
+
+/// Point-in-time snapshot of backend counters for per-query deltas.
+struct BackendSnapshot
+{
+  uint64_t lookups{0};
+  uint64_t hits{0};
+  uint64_t cacheReadBytes{0};
+  uint64_t predownloadBytes{0};
+  uint64_t evictedBytes{0};
+  uint64_t evictionCount{0};
+};
+
+/// Writes the 14-field CSV header.
+void writeCsvHeader(std::ostream& out);
+
+/// Writes one data row.
+void writeCsvRow(std::ostream& out, const AbCsvRow& row);
+
+/// Computes the per-query delta and fills backend columns.
+void populateBackendDelta(
+    AbCsvRow& row,
+    const BackendSnapshot& before,
+    const BackendSnapshot& after);
 
 /// Base class for benchmarks that need the FileCache-vs-CBI A/B sweep harness:
 /// snapshot backend stats, run one query, snapshot again, emit one CSV row,

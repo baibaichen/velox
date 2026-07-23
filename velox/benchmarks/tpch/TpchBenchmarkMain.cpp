@@ -17,6 +17,7 @@
 #include <folly/init/Init.h>
 #include <gflags/gflags.h>
 
+#include "velox/benchmarks/AbBenchmarkMain.h"
 #include "velox/benchmarks/tpch/TpchBenchmark.h"
 
 int main(int argc, char** argv) {
@@ -25,5 +26,6 @@ int main(int argc, char** argv) {
   gflags::SetUsageMessage(kUsage);
   folly::Init init{&argc, &argv, false};
   benchmark = std::make_unique<TpchBenchmark>();
-  tpchBenchmarkMain();
+  return facebook::velox::benchmarks::dispatchAbMain(
+      *benchmark, tpchBenchmarkMain);
 }

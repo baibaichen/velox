@@ -117,6 +117,11 @@ void TpchQueryBuilder::initialize(const std::string& dataPath) {
       if (dirEntry.path().filename().c_str()[0] == '.') {
         continue;
       }
+      // Ignore Hadoop marker files (e.g., `_SUCCESS`, `_metadata`,
+      // `_common_metadata`).
+      if (dirEntry.path().filename().c_str()[0] == '_') {
+        continue;
+      }
       if (tableMetadata_[tableName].dataFiles.empty()) {
         anyFound = true;
         readFileSchema(tableName, dirEntry.path().string(), columns);
