@@ -352,6 +352,63 @@ TEST_F(FileCacheBufferedInputBuilderTest, FileCacheSelectedAndCacheHit)
 }
 
 // ============================================================================
+// Case 1b: the IoStatistics handed to the builder's create() (the exact path
+// the Hive connector / Gluten use) receives the operator-level hit/source
+// bytes. This is what surfaces as storageReadBytes / localReadBytes in
+// OperatorStats. Proves the builder path forwards ioStats end to end, isolating
+// any missing-metric problem to the layer above (Gluten).
+// ============================================================================
+TEST_F(FileCacheBufferedInputBuilderTest, BuilderPathRecordsBytesInIoStatistics)
+{
+    const size_t n = 200 * 1024;
+    auto content = makeContent(n);
+    auto cache = makeManagerCache();
+    ASSERT_NE(cache, nullptr);
+    auto path = writeSourceFile("src", content);
+
+    registerFileCacheBufferedInputBuilder(*manager_);
+    auto ctx = makeCtx(/*cache*/ nullptr);
+
+    // Cold read through the builder: source bytes -> read() (storageReadBytes).
+    auto ioStatsCold = std::make_shared<io::IoStatistics>();
+    {
+        auto handle = makeFileHandle(std::make_shared<CountingReadFile>(path));
+        auto input = BufferedInputBuilder::getInstance()->create(
+            handle,
+            readerOptions(),
+            ctx.get(),
+            ioStatsCold,
+            std::make_shared<velox::IoStats>(),
+            executor_.get());
+        ASSERT_NE(dynamic_cast<FileCacheBufferedInput *>(input.get()), nullptr);
+        EXPECT_EQ(readAll(*input->enqueue({0, n})), content);
+    }
+    // Both sum and count must be non-zero: getRuntimeStats gates on count() > 0,
+    // so a metric with count 0 never reaches OperatorStats.
+    EXPECT_EQ(ioStatsCold->read().sum(), n);
+    EXPECT_GT(ioStatsCold->read().count(), 0u);
+    EXPECT_EQ(ioStatsCold->ssdRead().sum(), 0u);
+
+    // Warm read through the builder: cache hit -> ssdRead() (localReadBytes).
+    auto ioStatsWarm = std::make_shared<io::IoStatistics>();
+    {
+        auto handle = makeFileHandle(std::make_shared<CountingReadFile>(path));
+        auto input = BufferedInputBuilder::getInstance()->create(
+            handle,
+            readerOptions(),
+            ctx.get(),
+            ioStatsWarm,
+            std::make_shared<velox::IoStats>(),
+            executor_.get());
+        ASSERT_NE(dynamic_cast<FileCacheBufferedInput *>(input.get()), nullptr);
+        EXPECT_EQ(readAll(*input->enqueue({0, n})), content);
+    }
+    EXPECT_EQ(ioStatsWarm->ssdRead().sum(), n);
+    EXPECT_GT(ioStatsWarm->ssdRead().count(), 0u);
+    EXPECT_EQ(ioStatsWarm->read().sum(), 0u);
+}
+
+// ============================================================================
 // Case 2: not-installed deployment keeps the native buffered input.
 // ============================================================================
 TEST_F(FileCacheBufferedInputBuilderTest, NotInstalledKeepsNative)
