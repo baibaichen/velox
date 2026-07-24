@@ -1721,11 +1721,14 @@ TpchPlan TpchQueryBuilder::getQ15Plan() const {
       "l_shipdate", lineitemSelectedRowType, "'1996-01-01'", "'1996-03-31'");
 
   auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
-  core::PlanNodeId lineitemScanNodeIdSubQuery;
   core::PlanNodeId lineitemScanNodeId;
   core::PlanNodeId supplierScanNodeId;
 
-  auto maxRevenue =
+  // Aggregate revenue once per supplier, then keep only suppliers with the
+  // maximum total_revenue via dense_rank. This avoids duplicating the
+  // floating-point aggregation and joining on exact double equality, which
+  // produces non-deterministic results under parallel execution.
+  auto supplierWithMaxRevenue =
       PlanBuilder(planNodeIdGenerator, pool_.get())
           .filtersAsNode(filtersAsNode_)
           .tableScan(
@@ -1735,37 +1738,18 @@ TpchPlan TpchQueryBuilder::getQ15Plan() const {
               {shipDateFilter})
           .captureScanNodeId(lineitemScanNodeId)
           .project(
-              {"l_suppkey",
-               "l_extendedprice * (1.0 - l_discount) as part_revenue"})
-          .partialAggregation(
-              {"l_suppkey"}, {"sum(part_revenue) as total_revenue"})
-          .localPartition(std::vector<std::string>{})
-          .finalAggregation()
-          .singleAggregation({}, {"max(total_revenue) as max_revenue"})
-          .planNode();
-
-  auto supplierWithMaxRevenue =
-      PlanBuilder(planNodeIdGenerator, pool_.get())
-          .filtersAsNode(filtersAsNode_)
-          .tableScan(
-              kLineitem,
-              lineitemSelectedRowType,
-              lineitemFileColumns,
-              {shipDateFilter})
-          .captureScanNodeId(lineitemScanNodeIdSubQuery)
-          .project(
               {"l_suppkey as supplier_no",
                "l_extendedprice * (1.0 - l_discount) as part_revenue"})
           .partialAggregation(
               {"supplier_no"}, {"sum(part_revenue) as total_revenue"})
           .localPartition(std::vector<std::string>{})
           .finalAggregation()
-          .hashJoin(
-              {"total_revenue"},
-              {"max_revenue"},
-              maxRevenue,
-              "",
-              {"supplier_no", "total_revenue"})
+          .topNRank(
+              "dense_rank",
+              {},
+              {"total_revenue DESC"},
+              1,
+              false)
           .planNode();
 
   auto plan =
@@ -1784,7 +1768,6 @@ TpchPlan TpchQueryBuilder::getQ15Plan() const {
 
   TpchPlan context;
   context.plan = std::move(plan);
-  context.dataFiles[lineitemScanNodeIdSubQuery] = getTableFilePaths(kLineitem);
   context.dataFiles[lineitemScanNodeId] = getTableFilePaths(kLineitem);
   context.dataFiles[supplierScanNodeId] = getTableFilePaths(kSupplier);
   context.dataFileFormat = format_;
