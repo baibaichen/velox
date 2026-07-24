@@ -28,6 +28,7 @@
 #include "velox/common/testutil/TempDirectoryPath.h"
 
 #include <folly/futures/ManualTimekeeper.h>
+#include "folly/synchronization/CallOnce.h"
 
 #include <gtest/gtest.h>
 
@@ -48,6 +49,36 @@
 
 namespace facebook::velox::ch
 {
+
+// ---------------------------------------------------------------------------
+// Structural invariant (file scope, inside the anonymous namespace so that the
+// explicit instantiation is at namespace scope as required by the standard).
+// This explicit template instantiation forms a pointer-to-member of type
+// `folly::once_flag FileCache::*`; it compiles only when FileCache has a
+// member named `initialize_once_flag` of exactly that type.
+//
+// Any mutation that restores the old plain mutex+bool guard (making the field
+// absent or the wrong type) turns this instantiation into a compile error —
+// the build goes RED.  Substituting `std::once_flag` also goes RED because
+// `std::once_flag FileCache::*` ≠ `folly::once_flag FileCache::*`.
+// No public API is added: the member remains private; the standard allows
+// pointer-to-member formation in explicit-instantiation arguments without
+// access checks.
+// ---------------------------------------------------------------------------
+namespace
+{
+    template <typename Tag, typename Tag::type M>
+    struct PrivateMemberPin {};
+
+    struct FileCacheOnceFlagPin
+    {
+        using type = folly::once_flag FileCache::*;
+    };
+
+    // RED until `folly::once_flag initialize_once_flag` is added to FileCache.
+    template struct PrivateMemberPin<FileCacheOnceFlagPin, &FileCache::initialize_once_flag>;
+} // namespace
+
 namespace
 {
 
@@ -321,7 +352,8 @@ TEST_F(FileCacheTest, ShutdownJoinsWorkers)
     EXPECT_NO_THROW(cache->deactivateBackgroundOperations());
 }
 
-// -- a second live cache on the same path fails the StatusFile process lock --
+// -- a second live cache on the same path fails the StatusFile process lock,
+//    can retry after the first is gone, and does not re-run after success ----
 
 TEST_F(FileCacheTest, SecondProcessStatusLockFails)
 {
@@ -331,14 +363,77 @@ TEST_F(FileCacheTest, SecondProcessStatusLockFails)
 
     // A second cache instance over the same directory must fail to acquire the
     // <base>/status exclusive lock during initialize(). initialize() must throw a
-    // catchable exception (not abort): the retry-safe mutex+flag once-guard
-    // propagates it cleanly and leaves the cache uninitialized for a later retry.
+    // catchable exception (not abort): folly::call_once leaves the once_flag in
+    // the incomplete state on a throw, so the cache remains uninitialized and a
+    // later call can retry.
     auto cache2 = makeCache({}, "second");
     EXPECT_ANY_THROW(cache2->initialize());
     EXPECT_FALSE(cache2->isInitialized());
 
+    // Release cache1: deactivate background tasks then destroy it; destroying the
+    // FileCache object destroys `status_file`, releasing the exclusive flock.
     cache1->deactivateBackgroundOperations();
+    cache1.reset();
+
+    // Retry: the status lock is now free; cache2's once_flag was left incomplete
+    // by the first (throwing) call, so folly::call_once retries the body and
+    // this call succeeds.
+    EXPECT_NO_THROW(cache2->initialize());
+    EXPECT_TRUE(cache2->isInitialized());
+
+    // No-rerun: calling initialize() again on an already-initialized cache is a
+    // no-op.  folly::call_once finds the flag in the `done` state and returns
+    // immediately without invoking the callback.
+    EXPECT_NO_THROW(cache2->initialize());
+    EXPECT_TRUE(cache2->isInitialized());
+
     cache2->deactivateBackgroundOperations();
+}
+
+// -- bounded concurrent callers: every thread succeeds, cache initializes once
+
+TEST_F(FileCacheTest, ConcurrentInitializersSucceedOnce)
+{
+    // N threads all call initialize() concurrently on the same FileCache.
+    // folly::call_once must: let exactly one thread run the body; block the
+    // others until that body completes (or fails); publish `is_initialized`
+    // safely to all callers.  Every thread must return without throwing, and
+    // the cache must be initialized afterwards.
+    constexpr int N = 8;
+    auto cache = makeCache();
+    EXPECT_FALSE(cache->isInitialized());
+
+    std::latch start_gate(N);
+    std::atomic<int> throw_count{0};
+    std::vector<std::thread> threads;
+    threads.reserve(N);
+
+    for (int i = 0; i < N; ++i)
+    {
+        threads.emplace_back([&]
+        {
+            start_gate.arrive_and_wait(); // all start together
+            try
+            {
+                cache->initialize();
+            }
+            catch (...)
+            {
+                ++throw_count;
+            }
+        });
+    }
+
+    for (auto & t : threads)
+        t.join();
+
+    // Every concurrent caller must have succeeded.
+    EXPECT_EQ(throw_count.load(), 0);
+    // The cache was initialized exactly once (no double-init conflict; status
+    // file created once; is_initialized is true).
+    EXPECT_TRUE(cache->isInitialized());
+
+    cache->deactivateBackgroundOperations();
 }
 
 // -- the internal origin can access keys created by any user ----------------

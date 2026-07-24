@@ -38,6 +38,7 @@
 #include "velox/common/time/CpuWallTimer.h"
 
 #include <folly/ScopeGuard.h>
+#include "folly/synchronization/CallOnce.h"
 
 #include <fmt/format.h>
 
@@ -424,55 +425,49 @@ void FileCache::assertInitialized() const
 
 void FileCache::initialize()
 {
-    // Prevent initialize() from running twice. This may be caused by two cache disks being created with the same path (see integration/test_filesystem_cache).
-    // NOTE: This mirrors ClickHouse's `callOnce` retry-on-exception semantics with
-    // a plain mutex+flag rather than `std::call_once`. `std::call_once` cannot be
-    // used here: this build statically links libstdc++/libgcc, so an exception
-    // thrown by the callable unwinds through glibc's `pthread_once` (which carries
-    // no unwind tables) and aborts instead of leaving the flag unset for a retry.
-    // A throw below leaves `initialize_completed` false, so a subsequent call
-    // retries exactly as CH's `callOnce` requires.
-    std::lock_guard<std::mutex> init_once_lock(initialize_mutex);
-    if (initialize_completed)
-        return;
-
-    bool need_to_load_metadata = fs::exists(getBasePath());
-    try
+    // Prevent initialize() from running twice. This may be caused by two cache
+    // disks being created with the same path (see integration/test_filesystem_cache).
+    // `folly::call_once` provides ClickHouse's `callOnce` retry-on-exception
+    // semantics: a throw leaves `initialize_once_flag` in the incomplete state so
+    // a subsequent call retries the body exactly as CH's `callOnce` requires.
+    folly::call_once(initialize_once_flag, [this]
     {
-        if (!need_to_load_metadata)
-            fs::create_directories(getBasePath());
+        bool need_to_load_metadata = fs::exists(getBasePath());
+        try
+        {
+            if (!need_to_load_metadata)
+                fs::create_directories(getBasePath());
 
-        auto fs_info = std::filesystem::space(getBasePath());
-        const size_t size_limit = main_priority->getSizeLimit(cache_state_guard.lock());
-        if (fs_info.capacity < size_limit)
-            VELOX_FAIL("The total capacity of the disk containing cache path {} is less than the specified max_size {} bytes",
-                            getBasePath(), std::to_string(size_limit));
+            auto fs_info = std::filesystem::space(getBasePath());
+            const size_t size_limit = main_priority->getSizeLimit(cache_state_guard.lock());
+            if (fs_info.capacity < size_limit)
+                VELOX_FAIL("The total capacity of the disk containing cache path {} is less than the specified max_size {} bytes",
+                                getBasePath(), std::to_string(size_limit));
 
-        status_file = std::make_unique<StatusFile>(fs::path(getBasePath()) / "status", StatusFile::writeFullInfo());
-    }
-    catch (const std::filesystem::filesystem_error & e)
-    {
-        init_exception = std::current_exception();
-        VELOX_FAIL("Failed to retrieve filesystem information for cache path {}. Error: {}",
-                        getBasePath(), e.what());
-    }
-    catch (...)
-    {
-        init_exception = std::current_exception();
-        tryLogCurrentException(__PRETTY_FUNCTION__);
-        throw;
-    }
+            status_file = std::make_unique<StatusFile>(fs::path(getBasePath()) / "status", StatusFile::writeFullInfo());
+        }
+        catch (const std::filesystem::filesystem_error & e)
+        {
+            init_exception = std::current_exception();
+            VELOX_FAIL("Failed to retrieve filesystem information for cache path {}. Error: {}",
+                            getBasePath(), e.what());
+        }
+        catch (...)
+        {
+            init_exception = std::current_exception();
+            tryLogCurrentException(__PRETTY_FUNCTION__);
+            throw;
+        }
 
-    if (load_metadata_asynchronously)
-    {
-        load_metadata_main_thread = std::make_unique<FileCacheWorker>(worker_pool, [this, need_to_load_metadata] { initializeImpl(need_to_load_metadata); });
-    }
-    else
-    {
-        initializeImpl(need_to_load_metadata);
-    }
-
-    initialize_completed = true;
+        if (load_metadata_asynchronously)
+        {
+            load_metadata_main_thread = std::make_unique<FileCacheWorker>(worker_pool, [this, need_to_load_metadata] { initializeImpl(need_to_load_metadata); });
+        }
+        else
+        {
+            initializeImpl(need_to_load_metadata);
+        }
+    });
 }
 
 void FileCache::initializeImpl(bool load_metadata)

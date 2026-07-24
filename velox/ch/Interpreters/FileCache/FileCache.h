@@ -43,6 +43,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "folly/synchronization/CallOnce.h"
+
 namespace facebook::velox
 {
 class ReadFile;
@@ -360,13 +362,14 @@ private:
 
     std::exception_ptr init_exception;
     std::atomic<bool> is_initialized = false;
-    /// Exception-safe once guard for initialize(). std::call_once cannot be used
-    /// here: this build statically links libstdc++/libgcc, so an exception thrown
-    /// by the callable unwinds through glibc's pthread_once (no unwind tables) and
-    /// aborts instead of retrying. A plain mutex+flag preserves ClickHouse's
-    /// callOnce retry-on-exception semantics (a throw leaves the flag unset).
-    std::mutex initialize_mutex;
-    bool initialize_completed = false;
+    /// Folly once guard for `initialize()`.  `folly::call_once` provides
+    /// ClickHouse's `callOnce` retry-on-exception semantics: a throw leaves the
+    /// flag in the incomplete state so a subsequent call retries the body.
+    /// `std::call_once` cannot be used here — this build statically links
+    /// libstdc++/libgcc, so an exception thrown by the callable would unwind
+    /// through glibc's `pthread_once` (no unwind tables) and abort instead of
+    /// allowing a retry.
+    folly::once_flag initialize_once_flag;
     mutable std::mutex init_mutex;
     std::unique_ptr<StatusFile> status_file;
     std::atomic<bool> shutdown = false;
