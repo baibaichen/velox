@@ -21,6 +21,8 @@
 #include "velox/ch/Interpreters/FileCache/FileCacheKey.h"
 #include "velox/ch/Interpreters/FileCache/FileCacheOriginInfo.h"
 #include "velox/ch/Interpreters/FileCache/FileCacheReadOptions.h"
+#include "velox/common/caching/ScanTracker.h"
+#include "velox/common/caching/StringIdMap.h"
 #include "velox/common/io/IoStatistics.h"
 #include "velox/dwio/common/BufferedInput.h"
 #include "velox/dwio/common/Options.h"
@@ -51,6 +53,9 @@ public:
         FileCacheReadOptions cacheOptions,
         FileCacheRequestContext requestContext,
         const dwio::common::MetricsLogPtr & metricsLog,
+        velox::StringIdLease fileNum,
+        velox::StringIdLease groupId,
+        std::shared_ptr<velox::cache::ScanTracker> tracker,
         std::shared_ptr<io::IoStatistics> ioStatistics,
         std::shared_ptr<velox::IoStats> ioStats,
         folly::Executor * executor,
@@ -105,6 +110,12 @@ public:
     // hit/miss byte attribution is recorded here so it reaches OperatorStats.
     io::IoStatistics * ioStatistics() const { return ioStatistics_.get(); }
 
+    // A1: upstream context held for later planning/prefetch stages (stored, not
+    // yet used to drive logic).
+    const std::shared_ptr<velox::cache::ScanTracker> & tracker() const { return tracker_; }
+    const velox::StringIdLease & fileNum() const { return fileNum_; }
+    const velox::StringIdLease & groupId() const { return groupId_; }
+
 private:
     struct Request
     {
@@ -118,6 +129,9 @@ private:
     FileCacheOriginInfo origin_;
     FileCacheReadOptions cacheOptions_;
     FileCacheRequestContext requestContext_;
+    velox::StringIdLease fileNum_;
+    velox::StringIdLease groupId_;
+    std::shared_ptr<velox::cache::ScanTracker> tracker_;
     std::shared_ptr<io::IoStatistics> ioStatistics_;
     std::shared_ptr<velox::IoStats> ioStats_;
     folly::Executor * executor_;

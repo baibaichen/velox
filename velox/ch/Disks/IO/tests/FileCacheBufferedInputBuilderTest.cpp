@@ -30,6 +30,7 @@
 #include "velox/common/caching/AsyncDataCache.h"
 #include "velox/common/caching/FileHandle.h"
 #include "velox/common/caching/SsdCache.h"
+#include "velox/common/caching/StringIdMap.h"
 #include "velox/common/file/FileSystems.h"
 #include "velox/common/file/LocalFile.h"
 #include "velox/common/memory/Memory.h"
@@ -406,6 +407,47 @@ TEST_F(FileCacheBufferedInputBuilderTest, BuilderPathRecordsBytesInIoStatistics)
     EXPECT_EQ(ioStatsWarm->ssdRead().sum(), n);
     EXPECT_GT(ioStatsWarm->ssdRead().count(), 0u);
     EXPECT_EQ(ioStatsWarm->read().sum(), 0u);
+}
+
+// ============================================================================
+// Case 1c (A1): the builder propagates the upstream ScanTracker / fileNum /
+// groupId into FileCacheBufferedInput. These are stored (not yet used) for the
+// later planning/prefetch stages. Proves the builder wires
+// Connector::getTracker(scanId, loadQuantum) and fileHandle.uuid/groupId.
+// ============================================================================
+TEST_F(FileCacheBufferedInputBuilderTest, BuilderPropagatesTrackerAndFileIds)
+{
+    const size_t n = 64 * 1024;
+    auto content = makeContent(n);
+    auto cache = makeManagerCache();
+    ASSERT_NE(cache, nullptr);
+    auto path = writeSourceFile("src", content);
+
+    registerFileCacheBufferedInputBuilder(*manager_);
+    auto ctx = makeCtx(/*cache*/ nullptr);
+
+    // Assign a real uuid/groupId to the file handle so we can compare the
+    // StringIdLease ids threaded through the builder.
+    StringIdMap fileIds;
+    FileHandle handle;
+    handle.file = std::make_shared<CountingReadFile>(path);
+    handle.uuid = StringIdLease(fileIds, path);
+    handle.groupId = StringIdLease(fileIds, "group-A");
+
+    auto input = BufferedInputBuilder::getInstance()->create(
+        handle,
+        readerOptions(),
+        ctx.get(),
+        std::make_shared<io::IoStatistics>(),
+        std::make_shared<velox::IoStats>(),
+        executor_.get());
+
+    auto * fcInput = dynamic_cast<FileCacheBufferedInput *>(input.get());
+    ASSERT_NE(fcInput, nullptr);
+
+    EXPECT_NE(fcInput->tracker(), nullptr) << "builder must supply a non-null ScanTracker";
+    EXPECT_EQ(fcInput->fileNum().id(), handle.uuid.id());
+    EXPECT_EQ(fcInput->groupId().id(), handle.groupId.id());
 }
 
 // ============================================================================

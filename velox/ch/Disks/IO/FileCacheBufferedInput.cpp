@@ -29,6 +29,9 @@ FileCacheBufferedInput::FileCacheBufferedInput(
     FileCacheReadOptions cacheOptions,
     FileCacheRequestContext requestContext,
     const dwio::common::MetricsLogPtr & metricsLog,
+    velox::StringIdLease fileNum,
+    velox::StringIdLease groupId,
+    std::shared_ptr<velox::cache::ScanTracker> tracker,
     std::shared_ptr<io::IoStatistics> ioStatistics,
     std::shared_ptr<velox::IoStats> ioStats,
     folly::Executor * executor,
@@ -50,6 +53,9 @@ FileCacheBufferedInput::FileCacheBufferedInput(
     , origin_(std::move(origin))
     , cacheOptions_(cacheOptions)
     , requestContext_(std::move(requestContext))
+    , fileNum_(std::move(fileNum))
+    , groupId_(std::move(groupId))
+    , tracker_(std::move(tracker))
     , ioStatistics_(std::move(ioStatistics))
     , ioStats_(std::move(ioStats))
     , executor_(executor)
@@ -156,6 +162,9 @@ std::unique_ptr<dwio::common::BufferedInput> FileCacheBufferedInput::clone() con
         cacheOptions_,
         requestContext_,
         dwio::common::MetricsLog::voidLog(),
+        fileNum_,
+        groupId_,
+        tracker_,
         ioStatistics_,
         ioStats_,
         executor_,
