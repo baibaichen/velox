@@ -313,7 +313,7 @@ bool FileCacheInputStream::canStartFromCache(uint64_t offset, const FileSegment 
 std::shared_ptr<ReadBufferFromVeloxReadFile> FileCacheInputStream::getCacheReadBuffer(
     const FileSegment & fileSegment)
 {
-    const auto path = fileSegment.getPath();
+    auto path = fileSegment.getPath();
     if (readInfo_.cacheReader)
     {
         if (readInfo_.cacheReader->getFileName() == path)
@@ -321,10 +321,87 @@ std::shared_ptr<ReadBufferFromVeloxReadFile> FileCacheInputStream::getCacheReadB
         readInfo_.cacheReader.reset();
     }
 
-    // Open the local cache segment file through the Manager-injected cache
-    // factory (never through FileCacheBufferedInput, which would re-enter the
-    // cache).
-    readInfo_.cacheReader = owner_->fileCache().createCacheReadBuffer(path);
+    // Test-only injection point: fires after the path is captured and before
+    // the first open attempt, so a test can interpose a concurrent rename and
+    // verify the retry logic below. Has no effect in production builds
+    // (TestValue::adjust is a no-op unless TestValue::enable() was called).
+    common::testutil::TestValue::adjust(
+        "facebook::velox::ch::FileCacheInputStream::beforeCacheFileOpen", this);
+
+    // A size-suffixed segment file is renamed from `<offset>` to
+    // `<offset>_<size>` by setDownloadedUnlocked while we may still be holding
+    // a path computed from getPath() before the rename. The open then fails
+    // with FILE_NOT_FOUND because the old name is gone. Recompute the path
+    // while holding the segment lock — the rename runs under the same lock, so
+    // this serialises against it and observes the final name — and retry once.
+    // If the path is unchanged, the missing file is not explained by a rename,
+    // so rethrow. Any other open error is unrelated to the rename and is
+    // propagated immediately. Matches CachedOnDiskReadBufferFromFile.cpp:366-395.
+    try
+    {
+        // Open the local cache segment file through the Manager-injected cache
+        // factory (never through FileCacheBufferedInput, which would re-enter
+        // the cache).
+        readInfo_.cacheReader = owner_->fileCache().createCacheReadBuffer(path);
+    }
+    catch (const velox::VeloxException & e)
+    {
+        if (e.errorCode() != velox::error_code::kFileNotFound)
+            throw;
+        std::string newPath;
+        {
+            auto lk = fileSegment.lock();
+            newPath = fileSegment.getPath();
+        }
+        if (newPath == path)
+            throw;
+        path = std::move(newPath);
+        readInfo_.cacheReader = owner_->fileCache().createCacheReadBuffer(path);
+    }
+
+    // CH source of truth: src/Disks/IO/CachedOnDiskReadBufferFromFile.cpp:448-472.
+    //
+    // Observe state and hasSizeInFileName AFTER opening the file, matching CH
+    // exactly. The invariant that matters is: state must be observed before the
+    // physical size is sampled. setDownloadedUnlocked does: (1) write final
+    // bytes, (2) rename + size_in_filename=true, (3) download_state=DOWNLOADED.
+    // Observing DOWNLOADED means the rename already completed (happens-before),
+    // so the on-disk file is at its final size; a mismatch can only mean an
+    // external truncation. Observing DOWNLOADING/PARTIALLY_DOWNLOADED keeps
+    // trustSizeFromFilename false, avoiding spurious warnings during ordinary
+    // in-progress reads. Placing the observation after the rename-race retry
+    // ensures it reflects the state of the file that was actually opened: after
+    // a retry the segment is DOWNLOADED and the truncation check correctly fires
+    // if the renamed file was externally shortened.
+    const auto downloadState = fileSegment.state();
+    const bool trustSizeFromFilename =
+        fileSegment.hasSizeInFileName()
+        && (downloadState == FileSegment::State::DOWNLOADED
+            || downloadState == FileSegment::State::DETACHED);
+
+    if (trustSizeFromFilename)
+    {
+        const auto physicalSize = readInfo_.cacheReader->tryGetFileSize();
+        if (physicalSize.has_value() && *physicalSize < fileSegment.getDownloadedSize())
+        {
+            // The segment is shorter than its recorded downloaded size.
+            // Bypass the broken cache file so the caller re-fetches the data
+            // from the remote source. The segment is intentionally left in
+            // place: removing it from this read path would invalidate its
+            // priority-queue entry without holding the cache priority lock,
+            // which can race tryIncreasePriority (see the detailed comment in
+            // CH CachedOnDiskReadBufferFromFile.cpp getCacheReadBuffer).
+            LOG_WARNING(
+                getLogger("FileCacheInputStream"),
+                "Cache file {} is shorter than its recorded size ({} < {}); "
+                "it was likely truncated outside ClickHouse. Bypassing the "
+                "cache; the data will be re-fetched from the source",
+                path, *physicalSize, fileSegment.getDownloadedSize());
+            readInfo_.cacheReader.reset();
+            return nullptr;
+        }
+    }
+
     return readInfo_.cacheReader;
 }
 
@@ -386,6 +463,17 @@ FileCacheInputStream::createReadFromFileSegmentState(FileSegment & fileSegment, 
         {
             case ReadType::CACHED:
                 reader = getCacheReadBuffer(fileSegment);
+                if (!reader)
+                {
+                    // getCacheReadBuffer detected a size-suffixed segment
+                    // whose physical file is shorter than its recorded
+                    // downloaded size (external truncation). Switch to bypass
+                    // so the source re-fetches the data. A state with
+                    // reader == nullptr and readType == CACHED would dereference
+                    // null in prepareReadFromFileSegmentState.
+                    type = ReadType::REMOTE_FS_READ_BYPASS_CACHE;
+                    reader = getRemoteReadBuffer(fileSegment, offset, type);
+                }
                 break;
             case ReadType::REMOTE_FS_READ_AND_PUT_IN_CACHE:
             case ReadType::REMOTE_FS_READ_BYPASS_CACHE:

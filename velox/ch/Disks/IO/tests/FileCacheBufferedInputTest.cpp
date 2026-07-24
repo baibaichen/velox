@@ -1795,5 +1795,140 @@ TEST_F(FileCacheBufferedInputTest, CancellationDeferredUntilAfterSegmentWriteCom
         << "first segment [0, 8) was not fully written before the cancellation exception";
 }
 
+// ===========================================================================
+// G-CACHEOPEN-RENAME-01: retry after segment rename races the local open
+// ===========================================================================
+TEST_F(FileCacheBufferedInputTest, CacheRenameOpenRaceRetries)
+{
+    // Deterministic race: getCacheReadBuffer computes path "0" (no size suffix)
+    // for a PARTIALLY_DOWNLOADED segment; a concurrent completer renames "0" to
+    // "0_512" before the first open; the retry path must recompute the path
+    // under the segment lock, observe "0_512" ≠ "0", and open the new name.
+    //
+    // Thread layout:
+    //   Main   – Phase 1: partial download (Q1, 256 bytes → PARTIALLY_DOWNLOADED)
+    //            Phase 4: Q3 completes the segment (renames "0" → "0_512")
+    //            Phase 5: releases the hook
+    //   Worker – Phase 3: Q2 reads; hits the beforeCacheFileOpen hook with
+    //            path "0"; is blocked until Phase 5; retries with "0_512".
+    auto manager = makeManager();
+    // One segment covering the full file.
+    auto cache = makeCache(*manager, [](FileCacheConfig & c) { c.maxFileSegmentSize = 1024; });
+    const auto data = makeData(512);
+    const auto key = FileCacheKey::fromPath("rename-race");
+    const FileCacheOriginInfo origin(manager->commonUserId(), 0);
+
+    // Pin the segment to prevent eviction during the test.
+    auto probe = cache->getOrSet(key, 0, data.size(), data.size(), CreateFileSegmentSettings{}, 0, origin);
+    ASSERT_EQ(probe->size(), 1u);
+
+    // ---- Phase 1: Q1 downloads the first 256 bytes ----
+    // remoteFsBufferSize=256 makes one Next() call consume exactly one 256-byte
+    // chunk, leaving the segment PARTIALLY_DOWNLOADED with currentWriteOffset=256
+    // and on-disk path "0" (no size suffix).
+    auto source1 = std::make_shared<CountingReadFile>(data);
+    FileCacheReadOptions q1opts;
+    q1opts.remoteFsBufferSize = 256;
+    auto input1 = makeInput(*manager, cache, source1, key, q1opts, "q1");
+    auto stream1 = input1->read(0, data.size(), dwio::common::LogType::STREAM);
+    {
+        const void * chunk = nullptr;
+        int sz = 0;
+        ASSERT_TRUE(stream1->Next(&chunk, &sz));
+        ASSERT_EQ(sz, 256);
+    }
+    ASSERT_EQ(probe->front().getCurrentWriteOffset(), 256u);
+    ASSERT_EQ(probe->front().state(), FileSegment::State::PARTIALLY_DOWNLOADED);
+
+    // ---- Phase 2: Install hook blocking only the first open attempt ----
+    // The hook fires in getCacheReadBuffer after path is computed and before the
+    // first createCacheReadBuffer() call. It blocks only the very first
+    // invocation (count == 0); later invocations (from Q3, or from Q2's retry
+    // after the path changes) pass through immediately.
+    folly::Baton<> hookEntered;
+    folly::Baton<> hookRelease;
+    std::atomic<int> hookCount{0};
+    ScopedTestValue beforeOpen(
+        "facebook::velox::ch::FileCacheInputStream::beforeCacheFileOpen",
+        std::function<void(void *)>([&](void *)
+        {
+            if (hookCount.fetch_add(1) == 0)
+            {
+                hookEntered.post();
+                hookRelease.wait();
+            }
+        }));
+
+    // ---- Phase 3: Q2 reads from offset 0 (CACHED path) ----
+    // canStartFromCache(0) = (256 > 0) = true → getCacheReadBuffer is called.
+    // The hook blocks Q2 with the old path "0" still in flight.
+    auto source2 = std::make_shared<CountingReadFile>(data);
+    auto input2 = makeInput(*manager, cache, source2, key, {}, "q2");
+    auto stream2 = input2->read(0, data.size(), dwio::common::LogType::STREAM);
+
+    std::exception_ptr q2Error;
+    std::string q2Result;
+    std::thread q2Thread([&]()
+    {
+        try
+        {
+            q2Result = readAll(*stream2);
+        }
+        catch (...)
+        {
+            q2Error = std::current_exception();
+        }
+    });
+    auto q2ThreadGuard = folly::makeGuard([&]()
+    {
+        hookRelease.post();
+        if (q2Thread.joinable())
+            q2Thread.join();
+    });
+
+    // Wait until Q2 is parked at the hook with the old path "0".
+    ASSERT_TRUE(hookEntered.try_wait_for(std::chrono::seconds(20)))
+        << "Q2 never reached the beforeCacheFileOpen hook";
+
+    // ---- Phase 4: Q3 completes the full download ----
+    // Q3 reads [0,256) from the existing cache file (CACHED prefix), then
+    // downloads [256,512) from its source. completePartAndResetDownloader
+    // calls setDownloadedUnlocked which renames "0" → "0_512".
+    // hookCount is already 1 (Q2's invocation), so Q3's hook invocation
+    // (count=1 → 2) passes through without blocking.
+    auto source3 = std::make_shared<CountingReadFile>(data);
+    {
+        auto input3 = makeInput(*manager, cache, source3, key, {}, "q3");
+        ASSERT_EQ(
+            readAll(*input3->read(0, data.size(), dwio::common::LogType::STREAM)),
+            data)
+            << "Q3 failed to complete the segment";
+    }
+
+    ASSERT_EQ(probe->front().state(), FileSegment::State::DOWNLOADED)
+        << "segment not DOWNLOADED after Q3 completed";
+    // The on-disk file is now "0_512"; "0" no longer exists.
+
+    // ---- Phase 5: Release the hook ----
+    // Without the fix: Q2 opens "0" → ENOENT → VeloxException(kFileNotFound).
+    // With the fix: Q2 catches kFileNotFound, recomputes path under the segment
+    // lock → "0_512" ≠ "0" → retries → opens "0_512" → reads all 512 bytes.
+    hookRelease.post();
+
+    q2Thread.join();
+    q2ThreadGuard.dismiss();
+
+    // ---- GREEN assertions ----
+    if (q2Error)
+    {
+        try { std::rethrow_exception(q2Error); }
+        catch (const std::exception & e) { FAIL() << "Q2 threw: " << e.what(); }
+        catch (...) { FAIL() << "Q2 threw unknown exception"; }
+    }
+    ASSERT_EQ(q2Result, data);
+    // Q2 read everything from the local cache file; no remote pread was needed.
+    EXPECT_EQ(source2->preadBytes(), 0u);
+}
+
 } // namespace
 } // namespace facebook::velox::ch

@@ -36,6 +36,7 @@
 
 #include <gtest/gtest.h>
 
+#include <filesystem>
 #include <random>
 
 namespace facebook::velox::ch
@@ -518,6 +519,82 @@ TEST_F(FileCacheE2ETest, CacheWriteFailureConfiguredBypassOrPropagate)
             cache_->getFileSegmentInfos(key, commonUser()), VeloxException)
             << "bypass must leave zero metadata entries for this key";
     }
+}
+
+// ===========================================================================
+// ExternalTruncationSelfHeal
+// ===========================================================================
+// Regression test for G-CACHEBUF-01: a size-suffixed DOWNLOADED segment whose
+// physical cache file has been truncated outside the process must cause
+// FileCacheInputStream to bypass the cache and re-fetch from the remote source.
+// The full original bytes must be returned and source pread calls must be > 0.
+//
+// Pre-fix (RED): getCacheReadBuffer returns the reader without checking the
+// physical size; prepareReadFromFileSegmentState bounds the read to
+// getDownloadedSize() and LocalReadFile::preadInternal receives a short pread
+// (VELOX_CHECK_EQ bytesRead == length fails).
+//
+// Post-fix (GREEN): getCacheReadBuffer detects physical < downloaded for a
+// size-suffixed DOWNLOADED/DETACHED segment, resets the reader, and returns
+// nullptr; createReadFromFileSegmentState switches to REMOTE_FS_READ_BYPASS_CACHE
+// and produces the correct bytes from source.
+TEST_F(FileCacheE2ETest, ExternalTruncationSelfHeal)
+{
+    initManager();
+    const auto data = makeDeterministicData(8192);
+    const auto key = FileCacheKey::fromPath("ext-truncation-heal");
+
+    // Step 1: Fill the cache from source.
+    {
+        auto source1 = std::make_shared<CountingReadFile>(data);
+        auto inp1 = input(source1, key);
+        EXPECT_EQ(
+            readAll(*inp1->read(0, data.size(), dwio::common::LogType::STREAM)),
+            data);
+        EXPECT_GT(source1->preadCalls(), 0u);
+    }
+
+    // Step 2: Confirm the segment is DOWNLOADED (has a size-suffixed path).
+    auto segDownloaded = [&]()
+    {
+        const auto infos = cache_->getFileSegmentInfos(key, commonUser());
+        return !infos.empty() && infos[0].state == FileSegment::State::DOWNLOADED;
+    };
+    ASSERT_TRUE(spinUntil(segDownloaded, std::chrono::seconds(5)))
+        << "segment must reach DOWNLOADED state after a full read";
+
+    // Step 3: Obtain the physical path and verify it is size-suffixed.
+    const auto segs = cache_->getFileSegmentInfos(key, commonUser());
+    ASSERT_EQ(segs.size(), 1u);
+    const std::string physicalPath = segs[0].path;
+    ASSERT_FALSE(physicalPath.empty());
+    // The filename component must be exactly "<offset>_<size>", i.e. "0_8192"
+    // for a single-segment 8192-byte file.  Checking rfind('_') on the full
+    // path is not sufficient: a parent temp directory may contain underscores.
+    {
+        const auto fn = std::filesystem::path(physicalPath).filename().string();
+        ASSERT_EQ(fn, "0_8192")
+            << "expected size-suffixed cache filename '0_8192', got path: "
+            << physicalPath;
+    }
+
+    // Step 4: Truncate the physical file to half its size, simulating an
+    // external tool shortening the file outside ClickHouse.
+    std::error_code truncEc;
+    std::filesystem::resize_file(physicalPath, data.size() / 2, truncEc);
+    ASSERT_FALSE(truncEc) << "resize_file failed: " << truncEc.message();
+
+    // Step 5: A fresh FileCacheInputStream must detect the short physical file
+    // and fall back to REMOTE_FS_READ_BYPASS_CACHE.  The full original bytes
+    // must be returned and the source must be read (preadCalls > 0).
+    auto source2 = std::make_shared<CountingReadFile>(data);
+    auto inp2 = input(source2, key);
+    auto stream2 = inp2->read(0, data.size(), dwio::common::LogType::STREAM);
+    const auto bytes2 = readAll(*stream2);
+    EXPECT_EQ(bytes2, data)
+        << "must return full source bytes after external truncation";
+    EXPECT_GT(source2->preadCalls(), 0u)
+        << "must re-fetch from source for the externally truncated segment";
 }
 
 // ===========================================================================
