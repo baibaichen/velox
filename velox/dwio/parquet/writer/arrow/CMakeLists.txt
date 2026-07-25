@@ -14,7 +14,7 @@
 
 add_subdirectory(util)
 
-if(VELOX_BUILD_TESTING AND VELOX_ENABLE_ARROW_TESTING)
+if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)
 endif()
 
