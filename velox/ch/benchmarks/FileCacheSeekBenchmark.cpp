@@ -169,6 +169,7 @@ std::unique_ptr<FileCacheBufferedInput> makeInput(
         cache->getCommonOrigin(),
         opts,
         ctx,
+        QueryStatus{},
         dwio::common::MetricsLog::voidLog(),
         velox::StringIdLease{},
         velox::StringIdLease{},

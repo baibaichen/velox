@@ -22,6 +22,7 @@ velox_sources(
   PRIVATE
     ReadBufferFromVeloxReadFile.cpp
     WriteBufferFromVeloxWriteFile.cpp
+    FileCacheLocalWriteFile.cpp
 )
 
 # In non-mono builds velox_ch_filecache is a real library; register the public
@@ -37,6 +38,7 @@ if(NOT VELOX_MONO_LIBRARY)
     FILES
       ${CMAKE_CURRENT_SOURCE_DIR}/ReadBufferFromVeloxReadFile.h
       ${CMAKE_CURRENT_SOURCE_DIR}/WriteBufferFromVeloxWriteFile.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/FileCacheLocalWriteFile.h
   )
 endif()
 

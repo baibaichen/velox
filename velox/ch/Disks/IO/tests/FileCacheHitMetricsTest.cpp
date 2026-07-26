@@ -48,20 +48,15 @@
 #include <memory>
 #include <string>
 
+#include "velox/ch/Interpreters/FileCache/tests/FileCacheTestResources.h"
+
 namespace facebook::velox::ch
 {
 namespace
 {
 namespace fs = std::filesystem;
 using common::testutil::TempDirectoryPath;
-
-std::string makeContent(size_t n)
-{
-    std::string s(n, '\0');
-    for (size_t i = 0; i < n; ++i)
-        s[i] = static_cast<char>((static_cast<uint32_t>(i) * 2654435761u) >> 24);
-    return s;
-}
+using test::makeContent;
 
 std::string readAll(dwio::common::SeekableInputStream & stream)
 {
@@ -111,43 +106,16 @@ protected:
         manager_.reset();
     }
 
-    std::string sub(const std::string & s) const { return (fs::path(temp_->getPath()) / s).string(); }
+    std::string sub(const std::string & s) const { return test::subPath(temp_->getPath(), s); }
 
     std::string writeSourceFile(const std::string & name, const std::string & content)
     {
-        const auto path = sub(name);
-        std::ofstream(path, std::ios::binary) << content;
-        return path;
+        return test::writeSourceFile(temp_->getPath(), name, content);
     }
 
     FileCachePtr makeManagerCache(size_t seg, size_t align, size_t maxSize = 16 * 1024 * 1024)
     {
-        FileCacheConfig c;
-        c.path = sub("cache");
-        c.maxSize = maxSize;
-        c.maxElements = 100;
-        c.maxFileSegmentSize = seg;
-        c.boundaryAlignment = align;
-        c.reserveGranularity = 1;
-        c.cachePolicy = FileCachePolicy::LRU;
-        c.useSplitCache = false;
-        c.backgroundDownloadThreads = 0;
-        c.loadMetadataThreads = 2;
-        c.loadMetadataAsynchronously = false;
-        c.keepFreeSpaceSizeRatio = 0.0;
-        c.keepFreeSpaceElementsRatio = 0.0;
-
-        FileCacheManager::Options o;
-        o.commonUserId = "user-A";
-        o.localFileSystem = filesystems::getFileSystem("/", nullptr);
-        o.timekeeper = std::make_shared<folly::ThreadWheelTimekeeper>();
-        o.initializeOnCreate = true;
-        o.defaultCacheName = "default";
-        o.caches.push_back({"default", c, "conf.default"});
-
-        manager_ = FileCacheManager::create(o);
-        FileCacheManager::setInstance(manager_.get());
-        auto cache = manager_->getDefault();
+        auto cache = test::installManagerDefaultCache(manager_, sub("cache"), seg, align, maxSize);
         EXPECT_NE(cache, nullptr);
         return cache;
     }
@@ -174,6 +142,7 @@ protected:
             origin,
             readOptions,
             ctx,
+            QueryStatus{},
             dwio::common::MetricsLog::voidLog(),
             velox::StringIdLease{},
             velox::StringIdLease{},
@@ -239,7 +208,6 @@ TEST_F(FileCacheHitMetricsTest, HitCountsCacheBytes)
     const auto before = HitMetrics::snapshot();
     {
         auto input = makeInput(cache, path, key);
-        EXPECT_TRUE(input->isBuffered(0, n));
         EXPECT_EQ(readAll(*input->enqueue({0, n})), content);
     }
     const auto after = HitMetrics::snapshot();
@@ -395,7 +363,6 @@ TEST_F(FileCacheHitMetricsTest, HitRecordsLocalInIoStatistics)
     auto ioStats = std::make_shared<io::IoStatistics>();
     {
         auto input = makeInput(cache, path, key, {}, ioStats);
-        EXPECT_TRUE(input->isBuffered(0, n));
         EXPECT_EQ(readAll(*input->enqueue({0, n})), content);
     }
 

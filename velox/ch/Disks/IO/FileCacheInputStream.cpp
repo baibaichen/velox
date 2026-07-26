@@ -17,11 +17,15 @@
 
 #include "velox/ch/Common/ProfileEvents.h"
 #include "velox/ch/Disks/IO/FileCacheBufferedInput.h"
+#include "velox/ch/Disks/IO/FileCacheCoalescedLoad.h"
+#include "velox/ch/Interpreters/FileCache/FileCacheErrnoException.h"
 #include "velox/ch/Interpreters/FileCache/FileCacheUtils.h"
 #include "velox/common/file/FileSystems.h"
+#include "velox/common/time/Timer.h"
 #include "velox/dwio/common/PositionProvider.h"
 
 #include <algorithm>
+#include <cerrno>
 
 namespace facebook::velox::ch
 {
@@ -33,6 +37,13 @@ namespace
 /// Default owned output-buffer size, matching CH's remote read buffer default.
 constexpr size_t kDefaultOutputBufferSize = 1u << 20; // 1 MiB
 } // namespace
+
+CacheWriteErrorAction classifyCacheWriteError(int error, bool skipOnDiskFailure) noexcept
+{
+    if (error == ENOSPC || error == EDQUOT)
+        return CacheWriteErrorAction::Bypass;
+    return skipOnDiskFailure ? CacheWriteErrorAction::Bypass : CacheWriteErrorAction::Rethrow;
+}
 
 void FileCacheInputStream::ReadInfo::reset()
 {
@@ -58,35 +69,51 @@ std::string FileCacheInputStream::toString(ReadType type)
 }
 
 FileCacheInputStream::FileCacheInputStream(
-    FileCacheBufferedInput * owner,
+    FileCacheBufferedInput * bufferedInput,
+    std::shared_ptr<const FileCacheReadContext> context,
     velox::common::Region region,
-    FileCacheRequestContext cacheContext,
     dwio::common::LogType logType,
-    QueryStatus queryStatus)
-    : owner_(owner)
+    velox::cache::TrackingId trackingId)
+    : bufferedInput_(bufferedInput)
+    , context_(std::move(context))
     , region_(region)
-    , cacheContext_(std::move(cacheContext))
-    , queryStatus_(std::move(queryStatus))
+    , queryStatus_(context_->queryStatus)
+    , trackingId_(trackingId)
     , logType_(logType)
-    , skipCacheOnDiskFailure_(owner_->fileCache().skipCacheOnDiskFailure())
+    , skipCacheOnDiskFailure_(context_->cache->skipCacheOnDiskFailure())
 {
-    VELOX_CHECK_NOT_NULL(owner_);
+    VELOX_CHECK_NOT_NULL(context_);
     // Validate region against the source file size up front; all cache/file
     // offsets are absolute = region.offset + relative position.
     const uint64_t absEnd =
         checkedAdd(region_.offset, region_.length, "region.offset + region.length");
     VELOX_CHECK_LE(
         absEnd,
-        owner_->fileSize(),
+        context_->fileSize,
         "FileCacheInputStream region [{}, {}) exceeds file size {}",
         region_.offset,
         absEnd,
-        owner_->fileSize());
+        context_->fileSize);
 
     // Acquire the query context holder once; it lives until destruction and is
     // never reset by seekToPosition.
-    queryContextHolder_ = owner_->fileCache().getQueryContextHolder(
-        cacheContext_.queryId, owner_->cacheOptions());
+    queryContextHolder_ = context_->cache->getQueryContextHolder(
+        context_->requestContext.queryId, context_->cacheOptions);
+}
+
+std::unique_ptr<FileCacheInputStream> FileCacheInputStream::createCoalescedInternal(
+    std::shared_ptr<const FileCacheReadContext> context,
+    velox::common::Region region,
+    dwio::common::LogType logType)
+{
+    // Internal role: no back-pointer to the buffered input, empty TrackingId so
+    // its reads are never accounted as business delivery.
+    return std::make_unique<FileCacheInputStream>(
+        /*bufferedInput=*/nullptr,
+        std::move(context),
+        region,
+        logType,
+        velox::cache::TrackingId{});
 }
 
 FileCacheInputStream::~FileCacheInputStream()
@@ -117,10 +144,11 @@ uint64_t FileCacheInputStream::absolutePosition() const
 
 FileCacheInputStream::ReaderPtr FileCacheInputStream::createRemoteReadBuffer()
 {
-    // Remote reader over the source ReadFile (non-owning: the BufferedInput owns
-    // the shared source file for the stream's lifetime).
+    // Remote reader over the source ReadFile, routed through the base
+    // ReadFileInputStream so ReadFile::pread receives the populated
+    // FileIoContext (ioStats + fileOpts + cacheable) instead of a bare context.
     return std::make_shared<ReadBufferFromVeloxReadFile>(
-        owner_->sourceReadFile(), owner_->memoryPool());
+        context_->source, context_->pool.get(), logType_);
 }
 
 FileCacheInputStream::ReaderPtr FileCacheInputStream::getCacheReadBuffer(
@@ -169,7 +197,7 @@ FileCacheInputStream::ReaderPtr FileCacheInputStream::getCacheReadBuffer(
         localFile = openCacheFile(openedPath);
     }
     readInfo_.cacheReader = std::make_shared<ReadBufferFromVeloxReadFile>(
-        std::move(localFile), owner_->memoryPool());
+        std::move(localFile), context_->pool.get());
 
     // Self-heal on external truncation (ported from CH `getCacheReadBuffer`,
     // `CachedOnDiskReadBufferFromFile.cpp:448-477`). A fully downloaded regular
@@ -290,53 +318,59 @@ bool FileCacheInputStream::nextFileSegmentsBatch()
     if (size == 0)
         return false;
 
-    auto & cache = owner_->fileCache();
     const uint64_t absPos = absolutePosition();
-    const auto & options = owner_->cacheOptions();
+    readInfo_.fileSegments = getFileSegmentsForRead(*context_, absPos, size);
+
+    return readInfo_.fileSegments && !readInfo_.fileSegments->empty();
+}
+
+FileSegmentsHolderPtr getFileSegmentsForRead(
+    const FileCacheReadContext & ctx,
+    uint64_t absPos,
+    uint64_t size)
+{
+    auto & cache = (*ctx.cache);
+    const auto & options = ctx.cacheOptions;
 
     if (options.tempCacheOnly)
     {
-        readInfo_.fileSegments = cache.getDownloadedContiguousOrEmpty(
-            owner_->cacheKey(), absPos, size, owner_->origin().user_id);
+        auto fileSegments = cache.getDownloadedContiguousOrEmpty(
+            ctx.key, absPos, size, ctx.origin.user_id);
         // Throw, not return false: an empty batch is a hard error for cache-only
         // reads (mirrors CH throwTemporaryDataNotInCache).
         VELOX_CHECK(
-            readInfo_.fileSegments && !readInfo_.fileSegments->empty(),
+            fileSegments && !fileSegments->empty(),
             "Temporary data is no longer present in the cache "
             "(cache-only read of [{}, {}) for key {})",
             absPos,
             absPos + size,
-            owner_->cacheKey().toString());
-        return true;
+            ctx.key.toString());
+        return fileSegments;
     }
 
     if (options.readIfExistsOtherwiseBypass)
     {
-        readInfo_.fileSegments = cache.get(
-            owner_->cacheKey(),
+        return cache.get(
+            ctx.key,
             absPos,
             size,
             options.segmentsBatchSize,
-            owner_->origin().user_id);
-    }
-    else
-    {
-        CreateFileSegmentSettings createSettings(FileSegmentKind::Regular);
-        std::optional<size_t> alignment;
-        if (options.boundaryAlignment.has_value())
-            alignment = options.boundaryAlignment.value();
-        readInfo_.fileSegments = cache.getOrSet(
-            owner_->cacheKey(),
-            absPos,
-            size,
-            owner_->fileSize(),
-            createSettings,
-            options.segmentsBatchSize,
-            owner_->origin(),
-            alignment);
+            ctx.origin.user_id);
     }
 
-    return readInfo_.fileSegments && !readInfo_.fileSegments->empty();
+    CreateFileSegmentSettings createSettings(FileSegmentKind::Regular);
+    std::optional<size_t> alignment;
+    if (options.boundaryAlignment.has_value())
+        alignment = options.boundaryAlignment.value();
+    return cache.getOrSet(
+        ctx.key,
+        absPos,
+        size,
+        ctx.fileSize,
+        createSettings,
+        options.segmentsBatchSize,
+        ctx.origin,
+        alignment);
 }
 
 void FileCacheInputStream::initializeIfNeeded()
@@ -396,7 +430,7 @@ FileCacheInputStream::createReadFromFileSegmentState(
         return s;
     };
 
-    const auto & options = owner_->cacheOptions();
+    const auto & options = context_->cacheOptions;
     auto downloadState = fileSegment.state();
 
     if (options.tempCacheOnly)
@@ -510,14 +544,14 @@ FileCacheInputStream::prepareReadFromFileSegmentState(
             // Remote readers use ABSOLUTE source-file offsets; bound to the
             // segment's absolute end (clamped to the file size).
             state->reader->setReadUntilPosition(
-                std::min<uint64_t>(range.right + 1, owner_->fileSize()));
+                std::min<uint64_t>(range.right + 1, context_->fileSize));
             state->reader->seek(static_cast<off_t>(offset), SEEK_SET);
             break;
         }
         case ReadType::REMOTE_FS_READ_AND_PUT_IN_CACHE:
         {
             state->reader->setReadUntilPosition(
-                std::min<uint64_t>(range.right + 1, owner_->fileSize()));
+                std::min<uint64_t>(range.right + 1, context_->fileSize));
             VELOX_CHECK(fileSegment.isDownloader());
             if (state->bytesToPredownload)
             {
@@ -546,30 +580,51 @@ FileCacheInputStream::prepareReadFromFileSegmentState(
 
 // ==================== cache write / predownload ====================
 
-bool FileCacheInputStream::writeCache(
+bool writeSegmentChunk(
+    FileSegment & segment,
     char * data,
     size_t size,
     uint64_t offset,
-    FileSegment & fileSegment)
+    bool skipOnDiskFailure)
 {
     try
     {
-        fileSegment.write(data, size, offset);
+        segment.write(data, size, offset);
     }
-    catch (const std::exception &)
+    catch (const FileCacheErrnoException & e)
     {
-        // The Velox FileSegment::write already transitioned the segment to
+        // FileSegment::write already transitioned the segment to
         // PARTIALLY_DOWNLOADED_NO_CONTINUATION on a physical write failure.
-        if (skipCacheOnDiskFailure_)
+        if (classifyCacheWriteError(e.getErrno(), skipOnDiskFailure) == CacheWriteErrorAction::Bypass)
             return false;
         throw;
     }
+    // Non-errno (logic) exceptions are intentionally NOT caught here: a program
+    // bug (bad offset/state/reserve invariant, a VELOX_CHECK failure) propagates
+    // even when skipOnDiskFailure is true, so it is never silently swallowed into
+    // a cache bypass (mirrors CH catching only ErrnoException).
     // Cache-write attribution (CH `CachedReadBufferCacheWriteBytes`, incremented
     // inside CH's `writeCache`, `CachedOnDiskReadBufferFromFile.cpp:1298`). Placed
-    // here so BOTH callers — the main-read download and `predownloadForCurrentSegment`
-    // — count the `size` bytes actually written into the cache segment.
+    // here so ALL cache-fill paths — demand download, predownload, warm and
+    // preload — count the `size` bytes actually written into the cache segment.
     ProfileEvents::increment(ProfileEvents::CachedReadBufferCacheWriteBytes, size);
     return true;
+}
+
+bool reserveAndWriteSegmentChunk(
+    FileSegment & segment,
+    char * data,
+    size_t size,
+    uint64_t offset,
+    uint64_t reserveTimeoutMs,
+    size_t reserveHint,
+    bool skipOnDiskFailure)
+{
+    std::string reason;
+    if (!segment.reserve(size, reserveTimeoutMs, reason, /*reserve_stat=*/nullptr, reserveHint))
+        return false;
+    VELOX_CHECK_EQ(segment.getCurrentWriteOffset(), offset);
+    return writeSegmentChunk(segment, data, size, offset, skipOnDiskFailure);
 }
 
 bool FileCacheInputStream::predownloadForCurrentSegment(
@@ -584,13 +639,21 @@ bool FileCacheInputStream::predownloadForCurrentSegment(
     // scratch memory (never the query output buffer), then the read resumes at
     // `offset`. Mirrors CH predownloadForFileSegment.
     uint64_t currentWriteOffset = fileSegment.getCurrentWriteOffset();
+    // Invariant shared with prepareReadFromFileSegmentState and the demand write
+    // below: on a cache-write path the reader position must equal the segment's
+    // current write offset. Expressed identically at every site so a mismatch
+    // reports the same way wherever it is first observed.
     VELOX_CHECK_EQ(
-        static_cast<uint64_t>(state.reader->getPosition()), currentWriteOffset);
+        currentWriteOffset,
+        static_cast<uint64_t>(state.reader->getPosition()),
+        "Buffer offsets mismatch: current_write_offset {} != reader position {}",
+        currentWriteOffset,
+        state.reader->getPosition());
 
     const size_t scratchSize =
         std::min<size_t>(state.bytesToPredownload, kDefaultOutputBufferSize);
     state.predownloadBuffer =
-        velox::AlignedBuffer::allocate<char>(scratchSize, owner_->memoryPool());
+        velox::AlignedBuffer::allocate<char>(scratchSize, context_->pool.get());
     char * scratch = state.predownloadBuffer->asMutable<char>();
 
     while (state.bytesToPredownload > 0)
@@ -598,7 +661,17 @@ bool FileCacheInputStream::predownloadForCurrentSegment(
         const size_t chunk =
             std::min<size_t>(scratchSize, state.bytesToPredownload);
         state.reader->set(scratch, chunk);
-        const bool hasMore = !state.reader->eof();
+        // Predownload always reads from the source (it fills the segment prefix
+        // that no reader/cache has yet). Time the real physical read so the
+        // per-split IoStatistics carries the source read latency; the base
+        // ReadFileInputStream::read already records rawBytes/totalScanTimeNs, so
+        // those are not touched here (no double-count).
+        uint64_t predownloadReadUs = 0;
+        bool hasMore = false;
+        {
+            velox::MicrosecondWallTimer timer(&predownloadReadUs);
+            hasMore = !state.reader->eof();
+        }
         if (!hasMore)
         {
             // Source exhausted before predownload finished: release the segment
@@ -626,22 +699,30 @@ bool FileCacheInputStream::predownloadForCurrentSegment(
             ProfileEvents::CachedReadBufferReadFromSourceBytes, got);
 
         // Operator-level: predownloaded source bytes are a real remote read.
-        if (auto * ioStats = owner_->ioStatistics())
+        if (auto * ioStats = context_->ioStatistics.get())
         {
             ioStats->read().increment(got);
-            ioStats->incRawBytesRead(static_cast<int64_t>(got));
+            // Source read latency for the predownload physical read. Mirrors the
+            // demand path and DirectInputStream; totalScanTimeNs stays with the
+            // base ReadFileInputStream::read to avoid double-counting.
+            ioStats->queryThreadIoLatencyUs().increment(predownloadReadUs);
+            ioStats->storageReadLatencyUs().increment(predownloadReadUs);
         }
 
-        std::string reason;
-        const bool reserved = fileSegment.reserve(
+        // reserve_hint = the bytes this predownload still has to fill (remaining
+        // read horizon for the predownloaded prefix), so the reserve-ahead is
+        // bounded to that horizon rather than the reserve granularity. This is
+        // the PRE-decrement value of `state.bytesToPredownload`: the subtraction
+        // of `got` happens only at the end of this iteration (below), so the hint
+        // passed here still includes the `got` bytes being written this pass.
+        const bool cont = reserveAndWriteSegmentChunk(
+            fileSegment,
+            state.reader->buffer().begin(),
             got,
-            owner_->cacheOptions().reserveSpaceWaitLockTimeoutMs,
-            reason);
-
-        bool cont = reserved;
-        if (reserved)
-            cont = writeCache(
-                state.reader->buffer().begin(), got, currentWriteOffset, fileSegment);
+            currentWriteOffset,
+            context_->cacheOptions.reserveSpaceWaitLockTimeoutMs,
+            /*reserveHint=*/state.bytesToPredownload,
+            skipCacheOnDiskFailure_);
 
         if (!cont)
         {
@@ -684,7 +765,7 @@ bool FileCacheInputStream::completeCurrentSegmentAndAdvance()
     readInfo_.remoteReader.reset();
 
     readInfo_.fileSegments->completeAndPopFront(
-        owner_->cacheOptions().allowBackgroundDownload,
+        context_->cacheOptions.allowBackgroundDownload,
         /*force_shrink_to_downloaded_size=*/false);
 
     if (readInfo_.fileSegments->empty() && !nextFileSegmentsBatch())
@@ -780,9 +861,25 @@ size_t FileCacheInputStream::readFromCurrentSegment(
     const bool doDownload = state.readType == ReadType::REMOTE_FS_READ_AND_PUT_IN_CACHE;
 
     // Single chunk read into the reader's currently installed buffer (the query
-    // output buffer, installed by Next before this call).
-    const bool result = state.reader->next();
-    size_t size = result ? state.reader->buffer().size() : 0;
+    // output buffer, installed by Next before this call). Time the physical read
+    // so a source (miss) read records its latency below; a CACHED (hit) read
+    // reuses the same timing but is attributed to the local-cache path, not the
+    // source latency counters.
+    uint64_t readUs = 0;
+    bool result = false;
+    {
+        velox::MicrosecondWallTimer timer(&readUs);
+        result = state.reader->next();
+    }
+
+    // actualBytes = physical bytes the source/cache read produced (untrimmed).
+    // Everything about what physically moved (reserve, writeCache, source-IO
+    // accounting) uses actualBytes. deliveredBytes is the trimmed size handed
+    // to the caller and consumed by the ScanTracker; it starts equal to
+    // actualBytes and is trimmed below for the last held segment. CH records
+    // actual source/cache bytes BEFORE the final region trim (§11.9).
+    const size_t actualBytes = result ? state.reader->buffer().size() : 0;
+    size_t deliveredBytes = actualBytes;
 
     // Classify where these bytes were served FROM, before the readType can be
     // reassigned below on a cache-write failure. A CACHED read served the bytes
@@ -792,98 +889,329 @@ size_t FileCacheInputStream::readFromCurrentSegment(
     // `CachedReadBufferReadFromCacheBytes` / `CachedReadBufferReadFromSourceBytes`).
     const bool servedFromCache = state.readType == ReadType::CACHED;
 
-    if (size && doDownload)
+    if (actualBytes && doDownload)
     {
-        VELOX_CHECK_LE(offset + size - 1, fileSegment.range().right);
-        std::string reason;
-        bool success = fileSegment.reserve(
-            size, owner_->cacheOptions().reserveSpaceWaitLockTimeoutMs, reason);
+        VELOX_CHECK_LE(offset + actualBytes - 1, fileSegment.range().right);
+        // Same reader-position vs current-write-offset invariant as
+        // prepareReadFromFileSegmentState and predownloadForCurrentSegment,
+        // expressed identically here at the demand write site.
+        VELOX_CHECK_EQ(
+            fileSegment.getCurrentWriteOffset(),
+            static_cast<uint64_t>(state.reader->getPosition()),
+            "Buffer offsets mismatch: current_write_offset {} != reader position {}",
+            fileSegment.getCurrentWriteOffset(),
+            state.reader->getPosition());
+        // reserve_hint = the bytes still to read to the region end from the
+        // current write offset (== offset here), so the reserve-ahead never
+        // balloons past what this read will consume. readUntilPosition is the
+        // absolute region end, not the whole file.
+        const size_t reserveHint = readInfo_.readUntilPosition - offset;
+        const bool success = reserveAndWriteSegmentChunk(
+            fileSegment,
+            state.reader->buffer().begin(),
+            actualBytes,
+            offset,
+            context_->cacheOptions.reserveSpaceWaitLockTimeoutMs,
+            reserveHint,
+            skipCacheOnDiskFailure_);
         if (success)
-        {
-            VELOX_CHECK_EQ(
-                fileSegment.getCurrentWriteOffset(),
-                static_cast<uint64_t>(state.reader->getPosition()));
-            success = writeCache(
-                state.reader->buffer().begin(), size, offset, fileSegment);
-            if (success)
-                readerCanBeReused = true;
-        }
-        if (!success)
+            readerCanBeReused = true;
+        else
             state.readType = ReadType::REMOTE_FS_READ_BYPASS_CACHE;
     }
 
-    if (size)
+    if (actualBytes)
     {
-        // For the last held segment, trim to what the region actually needs.
+        // For the last held segment, trim the DELIVERED size to what the region
+        // actually needs. actualBytes (the physical read) is left intact so the
+        // cache stored the whole chunk and source-IO accounting reflects it.
         if (readInfo_.fileSegments->size() == 1)
         {
             const uint64_t currentRight =
                 std::min<uint64_t>(
                     fileSegment.range().right, readInfo_.readUntilPosition - 1);
             const size_t remaining = currentRight - offset + 1;
-            if (size > remaining)
+            if (deliveredBytes > remaining)
             {
-                size = remaining;
-                state.reader->buffer().resize(size);
+                deliveredBytes = remaining;
+                state.reader->buffer().resize(deliveredBytes);
             }
         }
-        VELOX_CHECK_LE(offset + size, readInfo_.readUntilPosition);
+        VELOX_CHECK_LE(offset + deliveredBytes, readInfo_.readUntilPosition);
     }
 
-    if (size)
+    if (actualBytes)
     {
-        // Hit/source byte attribution over the final (trimmed) `size` served to
-        // the caller. Uses the existing `ReadType` decision, no new branching.
+        // Hit/source byte attribution over the ACTUAL (physical) bytes served,
+        // matching CH which records source/cache bytes before the final trim.
+        // Uses the existing `ReadType` decision, no new branching.
         // Operator-level attribution: mirror the global counter into the
         // per-split IoStatistics so it reaches OperatorStats. Local cache hits
         // map to ssdRead (customStats "localReadBytes"); source reads map to
-        // read (customStats "storageReadBytes"). Both count as raw bytes read.
+        // read (customStats "storageReadBytes").
         if (servedFromCache)
             ProfileEvents::increment(
-                ProfileEvents::CachedReadBufferReadFromCacheBytes, size);
+                ProfileEvents::CachedReadBufferReadFromCacheBytes, actualBytes);
         else
             ProfileEvents::increment(
-                ProfileEvents::CachedReadBufferReadFromSourceBytes, size);
+                ProfileEvents::CachedReadBufferReadFromSourceBytes, actualBytes);
 
-        if (auto * ioStats = owner_->ioStatistics())
+        if (auto * ioStats = context_->ioStatistics.get())
         {
             if (servedFromCache)
-                ioStats->ssdRead().increment(size);
+            {
+                ioStats->ssdRead().increment(actualBytes);
+                // Cache hits read through the local cache reader (bare-pread
+                // ctor, no auto-accounting), so incRawBytesRead here over the
+                // physical bytes. Source reads go through the base
+                // ReadFileInputStream::read, which already increments raw bytes
+                // for the actual physical read -- do not double-count them.
+                ioStats->incRawBytesRead(static_cast<int64_t>(actualBytes));
+            }
             else
-                ioStats->read().increment(size);
-            ioStats->incRawBytesRead(static_cast<int64_t>(size));
+            {
+                ioStats->read().increment(actualBytes);
+                // Source (miss) read latency. Recorded only on the source path so
+                // a local cache hit is not miscounted as a storage read. The base
+                // ReadFileInputStream::read already records rawBytes and
+                // totalScanTimeNs for this physical read -- do not add those here.
+                ioStats->queryThreadIoLatencyUs().increment(readUs);
+                ioStats->storageReadLatencyUs().increment(readUs);
+            }
+        }
+
+        // B1: record the actually-DELIVERED (trimmed) bytes on the ScanTracker
+        // so future read-percentage decisions reflect real consumption. This is
+        // the demand read path (bytes handed to the caller), never a background
+        // download. No-op for internal (coalesced) streams: they carry an empty
+        // TrackingId, so their reads are never accounted as business delivery.
+        if (context_->tracker && !trackingId_.empty())
+        {
+            context_->tracker->recordRead(
+                trackingId_,
+                deliveredBytes,
+                context_->fileNum.id(),
+                context_->groupId.id());
         }
     }
 
-    return size;
+    return deliveredBytes;
 }
 
 char * FileCacheInputStream::ensureOutputBuffer(size_t bytes)
 {
     if (!outputBuffer_ || outputBuffer_->capacity() < bytes)
         outputBuffer_ =
-            velox::AlignedBuffer::allocate<char>(bytes, owner_->memoryPool());
+            velox::AlignedBuffer::allocate<char>(bytes, context_->pool.get());
     return outputBuffer_->asMutable<char>();
+}
+
+std::optional<FileCachePreparedBuffer> FileCacheInputStream::takeLastOutputBuffer()
+{
+    // Empty window: nothing to hand off.
+    if (outputBufferSize_ == 0)
+        return std::nullopt;
+
+    // A non-owning preload slice can never be moved out: its memory is owned by
+    // the buffered input, not this stream. Preloaded business streams are never
+    // used as coalesced-load internal streams, so this must not happen.
+    VELOX_CHECK(
+        preloadWindow_ == nullptr,
+        "takeLastOutputBuffer must not move a non-owning preload slice");
+
+    // Absolute region covered by the published window. outputBufferStart_ is the
+    // region-relative position where the window began; its byte length is
+    // outputBufferSize_.
+    const velox::common::Region region{
+        region_.offset + outputBufferStart_, outputBufferSize_};
+
+    FileCachePreparedBuffer prepared{std::move(outputBuffer_), region};
+
+    // Clear the window metadata so the next Next allocates/reuses a fresh buffer
+    // (outputBuffer_ was just moved out) and never reads the moved-out one. Per
+    // contract, BackUp must not be called after this.
+    outputBufferStart_ = 0;
+    offsetInOutputBuffer_ = 0;
+    outputBufferSize_ = 0;
+
+    return prepared;
+}
+
+void FileCacheInputStream::installCoalescedBuffers(
+    std::vector<FileCachePreparedBuffer> buffers)
+{
+    coalescedWindows_ = std::move(buffers);
+    std::sort(
+        coalescedWindows_.begin(),
+        coalescedWindows_.end(),
+        [](const FileCachePreparedBuffer & a, const FileCachePreparedBuffer & b)
+        { return a.region.offset < b.region.offset; });
+}
+
+// R2-4: business-role first-Next trigger. On the first Next, fetch the coalesced
+// load bindings for this stream, drive/await each load, and install the RAM
+// buffers it prepared for this stream's requests. Internal streams (no
+// bufferedInput_) never do this. Returns without installing anything when there
+// are no bindings or getData yields nullopt -- the plain demand path takes over.
+void FileCacheInputStream::triggerCoalescedLoadIfNeeded()
+{
+    if (coalescedLoadTriggered_ || bufferedInput_ == nullptr)
+        return;
+    coalescedLoadTriggered_ = true;
+
+    auto bindings = bufferedInput_->coalescedLoads(this);
+    if (bindings.empty())
+        return;
+
+    std::vector<FileCachePreparedBuffer> installed;
+    for (auto & binding : bindings)
+    {
+        auto & load = binding.load;
+        if (load == nullptr)
+            continue;
+        folly::SemiFuture<bool> wait(false);
+        if (!load->loadOrFuture(&wait))
+            wait.wait();
+        auto data = load->getData(binding.requestIndices);
+        if (data.has_value())
+        {
+            for (auto & buffer : data.value())
+                installed.push_back(std::move(buffer));
+        }
+    }
+    if (!installed.empty())
+        installCoalescedBuffers(std::move(installed));
+}
+
+bool FileCacheInputStream::serveCoalescedWindow(const void ** data, int32_t * size)
+{
+    if (coalescedWindows_.empty())
+        return false;
+
+    const uint64_t absPos = absolutePosition();
+    for (auto & window : coalescedWindows_)
+    {
+        const uint64_t winStart = window.region.offset;
+        const uint64_t winEnd = winStart + window.region.length;
+        if (absPos < winStart || absPos >= winEnd)
+            continue;
+
+        const uint64_t within = absPos - winStart;
+        const uint64_t avail = winEnd - absPos;
+        const char * const slice = window.data->as<char>() + within;
+        *data = slice;
+        *size = static_cast<int32_t>(avail);
+        // B1: publish the coalesced slice as a non-owning window (mirrors
+        // servePreloadWindow) so BackUp / SkipInt64 / a subsequent pending-window
+        // Next all operate on it uniformly. Without this the window metadata stays
+        // stale (offsetInOutputBuffer_ == 0) and a decoder BackUp inside a
+        // coalesced RAM window throws "BackUp beyond output buffer".
+        preloadWindow_ = slice;
+        outputBufferStart_ = position_;
+        outputBufferSize_ = avail;
+        offsetInOutputBuffer_ = avail;
+        position_ += avail;
+        // Business delivered-bytes accounting (no-op for empty tracking id /
+        // internal streams). The coalesced payload is delivered exactly once here;
+        // any bytes replayed after a BackUp are re-counted by the pending-window
+        // fast path in Next.
+        if (bufferedInput_ != nullptr)
+            bufferedInput_->recordReadBytes(trackingId_, avail);
+        return true;
+    }
+    return false;
+}
+
+const char * FileCacheInputStream::currentWindowBase() const
+{
+    if (preloadWindow_ != nullptr)
+        return preloadWindow_;
+    return outputBuffer_ ? outputBuffer_->as<char>() : nullptr;
+}
+
+// C6: publish the next zero-copy slice of the whole-file RAM preload covering the
+// current absolute position. Reuses the outputBufferStart_/offsetInOutputBuffer_/
+// outputBufferSize_ window metadata (so pending-serve + BackUp work uniformly)
+// but points them at a non-owning slice into preloadData_ rather than an owned
+// outputBuffer_. Never touches the FileSegment state machine, so no source /
+// local / ssd read is incurred: the bytes are already resident in RAM.
+bool FileCacheInputStream::servePreloadWindow(const void ** data, int32_t * size)
+{
+    const uint64_t remaining = region_.length - position_;
+    if (remaining == 0)
+        return false;
+
+    // Contiguous slice from the current absolute position to (at most) the end of
+    // the current preload-storage run. May be shorter than `remaining`; the next
+    // Next resumes at the following run.
+    const folly::Range<const char *> slice =
+        bufferedInput_->preloadedData(absolutePosition(), remaining);
+    const size_t avail = slice.size();
+    VELOX_CHECK_GT(avail, 0, "preloadedData returned an empty slice");
+
+    // Publish as a non-owning window: outputBuffer_ stays whatever it was, but
+    // currentWindowBase() now returns preloadWindow_.
+    preloadWindow_ = slice.data();
+    outputBufferStart_ = position_;
+    outputBufferSize_ = avail;
+    offsetInOutputBuffer_ = avail;
+    position_ += avail;
+
+    // Business delivered-bytes accounting (no-op for empty tracking id). Preload
+    // slices are delivered exactly once, mirroring the coalesced/demand paths.
+    bufferedInput_->recordReadBytes(trackingId_, avail);
+
+    *data = slice.data();
+    *size = static_cast<int32_t>(avail);
+    return true;
 }
 
 // ============================ Next ============================
 
 bool FileCacheInputStream::Next(const void ** data, int32_t * size)
 {
-    // Serve any bytes still pending in the published output buffer first
-    // (BackUp / SkipInt64 leave the buffer in place).
+    // Serve any bytes still pending in the published window first (BackUp /
+    // SkipInt64 leave the window in place). The window may be the owned
+    // outputBuffer_ or a non-owning preload slice (currentWindowBase()).
     if (offsetInOutputBuffer_ < outputBufferSize_)
     {
         const size_t avail = outputBufferSize_ - offsetInOutputBuffer_;
-        *data = outputBuffer_->as<char>() + offsetInOutputBuffer_;
+        *data = currentWindowBase() + offsetInOutputBuffer_;
         *size = static_cast<int32_t>(avail);
         position_ += avail;
         offsetInOutputBuffer_ = outputBufferSize_;
+        // Business delivered-bytes accounting for the REPLAY path. On the initial
+        // publish the whole window was recorded at once (offsetInOutputBuffer_ was
+        // set to the full size), so this branch only fires after a BackUp / local
+        // seek reopened part of the window. Those bytes are delivered again and
+        // must be re-counted, mirroring DirectInputStream::Next which records
+        // recordRead on every delivery, including replays (no-op for empty
+        // tracking id / internal streams).
+        if (bufferedInput_ != nullptr)
+            bufferedInput_->recordReadBytes(trackingId_, avail);
         return true;
     }
 
     if (position_ >= region_.length)
         return false;
+
+    // C6: after a whole-file preload, serve zero-copy slices straight out of RAM.
+    // Business-role streams built by makePreloadedStream take this path; it never
+    // touches the FileSegment / coalesced state machine. Preloaded inputs never
+    // build coalesced loads for their streams, so bindings are always empty here.
+    if (bufferedInput_ != nullptr && bufferedInput_->preloaded())
+    {
+        return servePreloadWindow(data, size);
+    }
+
+    // R2-4: business-role first-Next coalesced-load trigger. Runs at most once;
+    // installs RAM windows this stream can serve from before touching the segment
+    // state machine. Internal streams and streams without bindings are no-ops.
+    triggerCoalescedLoadIfNeeded();
+
+    // Serve from a coalesced RAM window covering the current position, if any.
+    if (serveCoalescedWindow(data, size))
+        return true;
 
     // Step 7 safe point 3: at the outer Next() iteration boundary, before
     // starting (or advancing to) a segment. Any previous segment's downloader
@@ -900,8 +1228,8 @@ bool FileCacheInputStream::Next(const void ** data, int32_t * size)
     // Honor the configured remote buffer size when set (mirrors CH, which passes
     // remote_fs_buffer_size to the reader); otherwise use the default. A smaller
     // configured size limits how much one downloader term writes per Next.
-    const size_t bufCapacity = owner_->cacheOptions().remoteFsBufferSize > 0
-        ? owner_->cacheOptions().remoteFsBufferSize
+    const size_t bufCapacity = context_->cacheOptions.remoteFsBufferSize > 0
+        ? context_->cacheOptions.remoteFsBufferSize
         : kDefaultOutputBufferSize;
     char * out = ensureOutputBuffer(bufCapacity);
 
@@ -949,6 +1277,7 @@ bool FileCacheInputStream::Next(const void ** data, int32_t * size)
         return false;
 
     // Publish the output buffer window to the caller.
+    preloadWindow_ = nullptr; // owned buffer window; not a preload slice
     outputBufferStart_ = position_;
     outputBufferSize_ = got;
     offsetInOutputBuffer_ = got;
@@ -1070,6 +1399,7 @@ void FileCacheInputStream::invalidateAndReposition(uint64_t newPosition)
     outputBufferStart_ = 0;
     outputBufferSize_ = 0;
     offsetInOutputBuffer_ = 0;
+    preloadWindow_ = nullptr;
     initialized_ = false;
     // queryContextHolder_ is intentionally NOT reset.
 }
@@ -1078,7 +1408,7 @@ std::string FileCacheInputStream::getName() const
 {
     return fmt::format(
         "FileCacheInputStream(key={}, region=[{}, {}))",
-        owner_->cacheKey().toString(),
+        context_->key.toString(),
         region_.offset,
         region_.offset + region_.length);
 }

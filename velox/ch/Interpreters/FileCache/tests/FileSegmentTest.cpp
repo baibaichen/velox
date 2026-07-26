@@ -21,7 +21,9 @@
 #include "velox/ch/Interpreters/FileCache/FileCacheErrnoException.h"
 #include "velox/ch/Interpreters/FileCache/FileCacheKey.h"
 #include "velox/ch/Interpreters/FileCache/FileSegment.h"
+#include "velox/ch/IO/FileCacheLocalWriteFile.h"
 #include "velox/ch/IO/ReadBufferFromVeloxReadFile.h"
+#include "velox/common/base/Exceptions.h"
 #include "velox/common/file/LocalFile.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
@@ -301,13 +303,16 @@ struct ScopedWriteFileFactory
     }
     ~ScopedWriteFileFactory()
     {
-        // Reinstall a factory equivalent to the production default (identical LocalWriteFile
-        // construction). The seam is a single process-wide static, so this restores default
-        // behavior for later tests; these scopes are used flat (not nested).
+        // Reinstall the real production default writer (FileCacheLocalWriteFile),
+        // NOT velox::LocalWriteFile. The seam is a single process-wide static, so a
+        // later test in the same process must see production's typed
+        // FileCacheErrnoException write behavior -- restoring a plain LocalWriteFile
+        // here would leak a different writer based on test order. These scopes are
+        // used flat (not nested).
         FileSegment::setWriteFileFactoryForTesting(
             [](const std::string & path) -> std::unique_ptr<velox::WriteFile>
             {
-                return std::make_unique<velox::LocalWriteFile>(path, false, false, true);
+                return std::make_unique<FileCacheLocalWriteFile>(path);
             });
     }
 };
@@ -565,6 +570,94 @@ TEST_F(FileSegmentDownloadTest, WaitObservesQueryCancellationPromptly)
 
     segment.resetDownloader();
     holder.reset();
+    cache.deactivateBackgroundOperations();
+}
+
+/// §11.5 reserve-ahead horizon: with a coarse reserve granularity (8 MiB), a
+/// first small write (64 KiB) into a large segment would normally balloon the
+/// reservation up to the whole 8 MiB granularity. Passing a reserve_hint equal
+/// to the remaining read horizon (1 MiB) must CAP the reserve-ahead to that
+/// horizon, so reserved_size stays <= 1 MiB instead of jumping to 8 MiB. The
+/// 1 MiB horizon must still read back correctly. RED (hint=0) balloons to 8 MiB.
+TEST_F(FileSegmentDownloadTest, ReserveHintCapsReserveAheadToReadHorizon)
+{
+    constexpr size_t kGranularity = 8 * 1024 * 1024; // 8 MiB
+    constexpr size_t kHorizon = 1 * 1024 * 1024; // 1 MiB
+    constexpr size_t kFirstChunk = 64 * 1024; // 64 KiB
+    const size_t seg = kGranularity; // segment large enough that granularity applies
+
+    auto settings = fsSettings(cachePath(), seg);
+    settings.reserveGranularity = kGranularity;
+    settings.maxSize = 4 * kGranularity; // room for the 8 MiB reserve of the RED case
+    auto cache_ptr = res_.makeFileCache("reserve-hint", settings, "user-A");
+    auto & cache = *cache_ptr;
+    cache.initialize();
+
+    auto key = FileCacheKey::random();
+    CreateFileSegmentSettings create_settings;
+    auto holder = cache.getOrSet(key, 0, seg, seg, create_settings, 0, cache.getCommonOrigin());
+    ASSERT_TRUE(holder);
+    ASSERT_FALSE(holder->empty());
+    auto segment_ptr = holder->getSingleFileSegment();
+    ASSERT_TRUE(segment_ptr);
+    FileSegment & segment = *segment_ptr;
+
+    std::vector<char> data(kHorizon);
+    for (size_t i = 0; i < kHorizon; ++i)
+        data[i] = static_cast<char>('A' + (i % 26));
+
+    ASSERT_EQ(segment.getOrSetDownloader(), FileSegment::getCallerId());
+
+    // First 64 KiB chunk through the core API, with the read horizon as hint.
+    std::string reason;
+    ASSERT_TRUE(segment.reserve(
+        kFirstChunk,
+        /*lockWaitMs=*/100,
+        reason,
+        /*reserveStat=*/nullptr,
+        /*reserveHint=*/kHorizon));
+    segment.write(
+        data.data(),
+        kFirstChunk,
+        segment.getCurrentWriteOffset());
+
+    // The reserve-ahead must be capped to the 1 MiB horizon, NOT the 8 MiB
+    // granularity. With hint=0 (RED) this would be 8 MiB.
+    EXPECT_LE(segment.getReservedSize(), kHorizon)
+        << "reserve ballooned to granularity; reserve_hint not honored";
+
+    // Finish reading the 1 MiB horizon correctly, chunk by chunk.
+    size_t written = kFirstChunk;
+    while (written < kHorizon)
+    {
+        const size_t chunk = std::min<size_t>(kFirstChunk, kHorizon - written);
+        ASSERT_TRUE(segment.reserve(
+            chunk,
+            /*lockWaitMs=*/100,
+            reason,
+            /*reserveStat=*/nullptr,
+            /*reserveHint=*/kHorizon - written));
+        segment.write(
+            data.data() + written,
+            chunk,
+            segment.getCurrentWriteOffset());
+        written += chunk;
+    }
+    EXPECT_EQ(segment.getDownloadedSize(), kHorizon);
+
+    // The 1 MiB horizon reads back byte-for-byte.
+    const auto seg_path = segment.getPath();
+    std::vector<char> readback(kHorizon);
+    {
+        std::FILE * f = std::fopen(seg_path.c_str(), "rb");
+        ASSERT_NE(f, nullptr);
+        ASSERT_EQ(std::fread(readback.data(), 1, kHorizon, f), kHorizon);
+        std::fclose(f);
+    }
+    EXPECT_EQ(readback, data);
+
+    segment.completePartAndResetDownloader();
+    holder->completeAndPopFront(false, false);
     cache.deactivateBackgroundOperations();
 }
 

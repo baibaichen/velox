@@ -20,6 +20,7 @@
 #include "velox/ch/Common/FileCacheException.h"
 #include "velox/common/file/File.h"
 #include "velox/common/memory/MemoryPool.h"
+#include "velox/dwio/common/InputStream.h"
 
 #include <sys/types.h>
 
@@ -297,6 +298,17 @@ public:
         velox::memory::MemoryPool * pool,
         size_t bufferSize = kDefaultBufferSize);
 
+    /// Wraps a base `ReadFileInputStream` (taking shared ownership). Source
+    /// reads are routed through `input->read(...)` so `ReadFile::pread` receives
+    /// the populated `FileIoContext` (ioStats + fileOpts + cacheable) that the
+    /// owning `BufferedInput` built, instead of a bare context-less `pread`.
+    /// `logType` selects the read-purpose tag for that path.
+    ReadBufferFromVeloxReadFile(
+        std::shared_ptr<dwio::common::ReadFileInputStream> input,
+        velox::memory::MemoryPool * pool,
+        dwio::common::LogType logType,
+        size_t bufferSize = kDefaultBufferSize);
+
     ReadBufferFromVeloxReadFile(const ReadBufferFromVeloxReadFile &) = delete;
     ReadBufferFromVeloxReadFile &
     operator=(const ReadBufferFromVeloxReadFile &) = delete;
@@ -305,6 +317,8 @@ public:
 
     std::string getFileName() const override
     {
+        if (sourceInput_)
+            return sourceInput_->getName();
         return readFile_ ? readFile_->getName() : std::string{};
     }
 
@@ -314,10 +328,16 @@ protected:
 private:
     void initialize(velox::memory::MemoryPool * pool, size_t bufferSize);
 
-    // Non-owning view of the wrapped file; always valid after construction.
+    // Non-owning view of the wrapped file; always valid after construction in
+    // the readFile_-based ctors. Null in source-input mode.
     velox::ReadFile * readFile_{nullptr};
     // Holds ownership when constructed from a shared_ptr; empty otherwise.
     std::shared_ptr<velox::ReadFile> ownedReadFile_;
+    // Set only in source-input mode: reads route through this base stream so
+    // `ReadFile::pread` receives the populated `FileIoContext`.
+    std::shared_ptr<dwio::common::ReadFileInputStream> sourceInput_;
+    // Read-purpose tag used for source-input reads.
+    dwio::common::LogType logType_{dwio::common::LogType::FILE};
 };
 
 } // namespace facebook::velox::ch

@@ -343,6 +343,21 @@ ReadBufferFromVeloxReadFile::ReadBufferFromVeloxReadFile(
     initialize(pool, bufferSize);
 }
 
+ReadBufferFromVeloxReadFile::ReadBufferFromVeloxReadFile(
+    std::shared_ptr<dwio::common::ReadFileInputStream> input,
+    velox::memory::MemoryPool * pool,
+    dwio::common::LogType logType,
+    size_t bufferSize)
+    : sourceInput_(std::move(input)), logType_(logType)
+{
+    VELOX_CHECK_NOT_NULL(sourceInput_, "A source ReadFileInputStream is required");
+    // `initialize` only queries directIo/size on the underlying file (both
+    // context-free); actual data reads go through `sourceInput_->read` so the
+    // populated FileIoContext is used.
+    readFile_ = sourceInput_->getReadFile().get();
+    initialize(pool, bufferSize);
+}
+
 void ReadBufferFromVeloxReadFile::initialize(
     velox::memory::MemoryPool * pool,
     size_t bufferSize)
@@ -375,6 +390,15 @@ size_t ReadBufferFromVeloxReadFile::readInto(
     char * dest,
     size_t destCapacity)
 {
+    if (sourceInput_)
+    {
+        // Source-input mode: route through the base ReadFileInputStream so
+        // ReadFile::pread receives the populated FileIoContext (ioStats +
+        // fileOpts + cacheable). The scalar read reads exactly destCapacity
+        // bytes (the caller bounds destCapacity by readUntil_/file size).
+        sourceInput_->read(dest, destCapacity, startOffset, logType_);
+        return destCapacity;
+    }
     const std::string_view chunk = readFile_->pread(startOffset, destCapacity, dest);
     return chunk.size();
 }

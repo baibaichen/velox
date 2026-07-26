@@ -26,6 +26,7 @@ velox_sources(
   PRIVATE
     FileCacheBufferedInput.cpp
     FileCacheBufferedInputBuilder.cpp
+    FileCacheCoalescedLoad.cpp
     FileCacheInputStream.cpp
 )
 

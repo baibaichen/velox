@@ -16,16 +16,22 @@
 
 #include "velox/ch/IO/ReadBufferFromVeloxReadFile.h"
 #include "velox/ch/IO/WriteBufferFromVeloxWriteFile.h"
+#include "velox/ch/IO/FileCacheLocalWriteFile.h"
+#include "velox/ch/Interpreters/FileCache/FileCacheErrnoException.h"
 
 #include "velox/buffer/Buffer.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/file/File.h"
 #include "velox/common/memory/Memory.h"
+#include "velox/common/testutil/TempDirectoryPath.h"
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 
@@ -33,6 +39,9 @@ namespace facebook::velox::ch
 {
 namespace
 {
+
+namespace fs = std::filesystem;
+using common::testutil::TempDirectoryPath;
 
 // ---------------------------------------------------------------------------
 // Mock ReadFile: serves in-memory data, counts preads, records the read
@@ -893,6 +902,90 @@ TEST_F(IoAdaptersTest, WriterPartialWriteCommitsPrefixThenThrows)
     EXPECT_EQ(observer.appendCalls, 0) << "the failed append did not complete";
     EXPECT_THROW(writer.write("more", 4), VeloxException)
         << "a canceled writer must not retry the write";
+}
+
+// ===========================================================================
+// FileCacheLocalWriteFile
+// ===========================================================================
+
+/// Design 9.5a: append/flush after close is a caller ordering bug, not a disk
+/// fault. It must throw a plain VeloxException (VeloxRuntimeError), NOT a
+/// FileCacheErrnoException, so no errno consumer can treat it as a bypassable
+/// disk failure. Pure state check -- no injection needed. RED before the fix:
+/// both threw FileCacheErrnoException(EBADF).
+TEST(FileCacheLocalWriteFileTest, AppendOrFlushAfterCloseIsNonErrnoLogicError)
+{
+    auto tmp = TempDirectoryPath::create();
+    const std::string path = (fs::path(tmp->getPath()) / "seg.bin").string();
+
+    {
+        FileCacheLocalWriteFile wf(path);
+        wf.close();
+        EXPECT_THROW(wf.append(std::string(10, 'x')), VeloxException);
+        // Must NOT be the typed errno exception (which an errno consumer could bypass).
+        bool typed = false;
+        try
+        {
+            wf.append(std::string(10, 'x'));
+        }
+        catch (const FileCacheErrnoException &)
+        {
+            typed = true;
+        }
+        catch (const VeloxException &)
+        {
+        }
+        EXPECT_FALSE(typed) << "append-after-close must not be a FileCacheErrnoException";
+    }
+    {
+        FileCacheLocalWriteFile wf(path);
+        wf.close();
+        EXPECT_THROW(wf.flush(), VeloxException);
+        bool typed = false;
+        try
+        {
+            wf.flush();
+        }
+        catch (const FileCacheErrnoException &)
+        {
+            typed = true;
+        }
+        catch (const VeloxException &)
+        {
+        }
+        EXPECT_FALSE(typed) << "flush-after-close must not be a FileCacheErrnoException";
+    }
+}
+
+/// Normal path regression: with no fault, the producer appends, seeks-to-end on reopen
+/// (PARTIALLY_DOWNLOADED resume), and reports the correct size -- proving the writer is
+/// semantically equivalent to LocalWriteFile(bufferIo=true) on the happy path and that
+/// removing the test seams did not break the production write path.
+TEST(FileCacheLocalWriteFileTest, NormalAppendResumeAndSize)
+{
+    auto tmp = TempDirectoryPath::create();
+    const std::string path = (fs::path(tmp->getPath()) / "seg.bin").string();
+
+    {
+        FileCacheLocalWriteFile wf(path);
+        wf.append(std::string(100, 'a'));
+        EXPECT_EQ(wf.size(), 100u);
+        wf.flush();
+        wf.close();
+    }
+    // Reopen: lseek-to-end must resume at the existing tail (append, not truncate).
+    {
+        FileCacheLocalWriteFile wf(path);
+        EXPECT_EQ(wf.size(), 100u);
+        wf.append(std::string(50, 'b'));
+        EXPECT_EQ(wf.size(), 150u);
+        wf.close();
+    }
+    EXPECT_EQ(fs::file_size(path), 150u);
+    // On-disk bytes are the concatenation of both appends (prefix preserved).
+    std::ifstream in(path, std::ios::binary);
+    std::string on_disk((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    EXPECT_EQ(on_disk, std::string(100, 'a') + std::string(50, 'b'));
 }
 
 } // namespace

@@ -19,6 +19,7 @@
 #include "velox/ch/Interpreters/FileCache/FileCache.h"
 #include "velox/ch/Interpreters/FileCache/FileCacheErrnoException.h"
 #include "velox/ch/Interpreters/FileCache/FileCacheUtils.h"
+#include "velox/ch/IO/FileCacheLocalWriteFile.h"
 #include "velox/common/file/LocalFile.h"
 
 #include <folly/ScopeGuard.h>
@@ -236,11 +237,7 @@ FileSegment::WriteFileFactory & writeFileFactoryStorage()
 {
     static FileSegment::WriteFileFactory factory = [](const std::string & path) -> std::unique_ptr<velox::WriteFile>
     {
-        return std::make_unique<velox::LocalWriteFile>(
-            path,
-            /* shouldCreateParentDirectories */ false,
-            /* shouldThrowOnFileAlreadyExists */ false,
-            /* bufferIo */ true);
+        return std::make_unique<FileCacheLocalWriteFile>(path);
     };
     return factory;
 }

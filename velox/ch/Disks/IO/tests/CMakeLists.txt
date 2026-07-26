@@ -21,6 +21,7 @@ target_link_libraries(
     velox_ch_filecache
     velox_dwio_common
     velox_test_util
+    velox_file_test_utils
     velox_exception
     velox_file
     velox_memory
@@ -109,6 +110,36 @@ target_link_libraries(
     velox_ch_filecache
     velox_hive_connector
     velox_dwio_common
+    velox_test_util
+    velox_exception
+    velox_file
+    velox_memory
+    Folly::folly
+    fmt::fmt
+    GTest::gtest
+    GTest::gtest_main
+)
+
+# Design 6.11: real format-level end-to-end validation. A real DWRF reader is
+# driven over the assembled FileCache read path (clone -> enqueue(stack sid) ->
+# load -> ColumnReader consume), proving cold-scan cache fill and warm-scan cache
+# serve. Uses the native DWRF Writer/Reader (in the mono velox library, already
+# pulled via velox_hive_connector) so no Arrow / Parquet-writer dependency is
+# introduced; velox_dwio_dwrf_writer/reader are listed for non-mono builds.
+add_executable(velox_ch_filecache_format_e2e_test FileCacheFormatE2ETest.cpp)
+add_test(velox_ch_filecache_format_e2e_test velox_ch_filecache_format_e2e_test)
+
+target_link_libraries(
+  velox_ch_filecache_format_e2e_test
+  PRIVATE
+    velox_ch_filecache
+    velox_hive_connector
+    velox_dwio_dwrf_writer
+    velox_dwio_dwrf_reader
+    velox_dwio_parquet_writer
+    velox_dwio_parquet_reader
+    velox_dwio_common
+    velox_vector
     velox_test_util
     velox_exception
     velox_file

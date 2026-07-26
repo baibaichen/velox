@@ -18,6 +18,7 @@
 
 #include "velox/ch/Disks/IO/FileCacheBufferedInput.h"
 #include "velox/ch/Disks/IO/FileCacheRequestContext.h"
+#include "velox/ch/Common/QueryStatus.h"
 #include "velox/ch/Interpreters/FileCache/FileCache.h"
 #include "velox/ch/Interpreters/FileCache/FileCacheKey.h"
 #include "velox/ch/Interpreters/FileCache/FileCacheManager.h"
@@ -57,6 +58,7 @@ std::unique_ptr<dwio::common::BufferedInput> FileCacheBufferedInputBuilder::crea
         cache->getCommonOrigin(),
         FileCacheReadOptions{},
         requestContext,
+        QueryStatus{connectorQueryCtx->cancellationToken()},
         dwio::common::MetricsLog::voidLog(),
         fileHandle.uuid,
         fileHandle.groupId,

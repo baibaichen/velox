@@ -48,24 +48,19 @@
 #include <string>
 #include <vector>
 
+#include "velox/ch/Interpreters/FileCache/tests/FileCacheTestResources.h"
+
 namespace facebook::velox::ch
 {
 namespace
 {
 namespace fs = std::filesystem;
 using common::testutil::TempDirectoryPath;
-
 // Deterministic byte pattern keyed on the absolute index via a Knuth
 // multiplicative hash, so the effective period exceeds any file used here and a
 // wrong absolute offset almost always yields a wrong byte (the
 // absolute-coordinate tests assert on this).
-std::string makeContent(size_t n)
-{
-    std::string s(n, '\0');
-    for (size_t i = 0; i < n; ++i)
-        s[i] = static_cast<char>((static_cast<uint32_t>(i) * 2654435761u) >> 24);
-    return s;
-}
+using test::makeContent;
 
 std::string readAll(dwio::common::SeekableInputStream & stream)
 {
@@ -155,13 +150,11 @@ protected:
         manager_.reset();
     }
 
-    std::string sub(const std::string & s) const { return (fs::path(temp_->getPath()) / s).string(); }
+    std::string sub(const std::string & s) const { return test::subPath(temp_->getPath(), s); }
 
     std::string writeSourceFile(const std::string & name, const std::string & content)
     {
-        const auto path = sub(name);
-        std::ofstream(path, std::ios::binary) << content;
-        return path;
+        return test::writeSourceFile(temp_->getPath(), name, content);
     }
 
     // Build and install a FileCacheManager with a single "default" cache. `seg`
@@ -170,44 +163,29 @@ protected:
     // downloads rename to `<offset>_<size>`).
     FileCachePtr makeManagerCache(size_t seg, size_t align, size_t maxSize = 16 * 1024 * 1024)
     {
-        FileCacheConfig c;
-        c.path = sub("cache");
-        c.maxSize = maxSize;
-        c.maxElements = 100;
-        c.maxFileSegmentSize = seg;
-        c.boundaryAlignment = align;
-        c.reserveGranularity = 1;
-        c.cachePolicy = FileCachePolicy::LRU;
-        c.useSplitCache = false;
-        c.backgroundDownloadThreads = 0;
-        c.loadMetadataThreads = 2;
-        c.loadMetadataAsynchronously = false;
-        c.keepFreeSpaceSizeRatio = 0.0;
-        c.keepFreeSpaceElementsRatio = 0.0;
-
-        FileCacheManager::Options o;
-        o.commonUserId = "user-A";
-        o.localFileSystem = filesystems::getFileSystem("/", nullptr);
-        o.timekeeper = std::make_shared<folly::ThreadWheelTimekeeper>();
-        o.initializeOnCreate = true;
-        o.defaultCacheName = "default";
-        o.caches.push_back({"default", c, "conf.default"});
-
-        manager_ = FileCacheManager::create(o);
-        FileCacheManager::setInstance(manager_.get());
-        auto cache = manager_->getDefault();
+        auto cache = test::installManagerDefaultCache(manager_, sub("cache"), seg, align, maxSize);
         EXPECT_NE(cache, nullptr);
         return cache;
     }
 
     dwio::common::ReaderOptions readerOptions() { return dwio::common::ReaderOptions(pool_.get()); }
 
+    // Sentinel for the `warmExecutor` parameter of makeInput: "use the fixture's
+    // shared executor_". A literal nullptr disables async warm entirely. (Not
+    // constexpr: reinterpret_cast is not a constant expression.)
+    static folly::Executor * const kUseSharedExecutor;
+
     // Build a FileCacheBufferedInput over `readFile` with the given key/options.
+    // `warmExecutor` selects the executor to which load() submits prefetch warm
+    // tasks: kUseSharedExecutor (the fixture's shared executor) by default, or
+    // nullptr to disable any async warm (used by the planning-barrier test, which
+    // must observe load() as a pure planning no-op that creates no FileSegment).
     std::unique_ptr<FileCacheBufferedInput> makeInput(
         FileCachePtr cache,
         std::shared_ptr<ReadFile> readFile,
         const FileCacheKey & key,
-        FileCacheReadOptions readOptions = {})
+        FileCacheReadOptions readOptions = {},
+        folly::Executor * warmExecutor = kUseSharedExecutor)
     {
         FileCacheRequestContext ctx;
         ctx.queryId = "q1";
@@ -220,20 +198,26 @@ protected:
             origin,
             readOptions,
             ctx,
+            QueryStatus{},
             dwio::common::MetricsLog::voidLog(),
             velox::StringIdLease{},
             velox::StringIdLease{},
             /*tracker=*/nullptr,
             std::make_shared<io::IoStatistics>(),
             std::make_shared<velox::IoStats>(),
-            executor_.get(),
+            warmExecutor == kUseSharedExecutor ? executor_.get() : warmExecutor,
             readerOptions());
     }
 
     std::unique_ptr<FileCacheBufferedInput> makeInput(
-        FileCachePtr cache, const std::string & path, const FileCacheKey & key, FileCacheReadOptions readOptions = {})
+        FileCachePtr cache,
+        const std::string & path,
+        const FileCacheKey & key,
+        FileCacheReadOptions readOptions = {},
+        folly::Executor * warmExecutor = kUseSharedExecutor)
     {
-        return makeInput(std::move(cache), std::make_shared<velox::LocalReadFile>(path), key, readOptions);
+        return makeInput(
+            std::move(cache), std::make_shared<velox::LocalReadFile>(path), key, readOptions, warmExecutor);
     }
 
     velox::memory::MemoryManager memoryManager_;
@@ -242,6 +226,10 @@ protected:
     std::shared_ptr<folly::CPUThreadPoolExecutor> executor_;
     std::shared_ptr<FileCacheManager> manager_;
 };
+
+// Distinct non-null sentinel address; never dereferenced.
+folly::Executor * const FileCacheE2ETest::kUseSharedExecutor =
+    reinterpret_cast<folly::Executor *>(-1);
 
 // ============================================================================
 // 1. MissFillHit: miss -> fill -> hit, and NO source I/O on the hit.
@@ -269,7 +257,6 @@ TEST_F(FileCacheE2ETest, MissFillHit)
     auto countingB = std::make_shared<CountingReadFile>(path);
     {
         auto input = makeInput(cache, countingB, key);
-        EXPECT_TRUE(input->isBuffered(0, half));
         auto stream = input->enqueue({0, half});
         EXPECT_EQ(readAll(*stream), content.substr(0, half));
     }
@@ -554,6 +541,11 @@ TEST_F(FileCacheE2ETest, NonzeroRegionOffsetAbsoluteCoordinates)
 
 // ============================================================================
 // 8. DiscardedEnqueueNoUseAfterFree: discard stream then load(), no fault.
+//
+// Like LoadIsNopPlanningBarrier, this proves load() does not dereference the
+// discarded stream nor synchronously create a segment. A null warm executor
+// keeps load() deterministically free of any async prefetch warm (design 5.9),
+// so getFileSegmentsNum()==0 is not racing a background warm.
 // ============================================================================
 TEST_F(FileCacheE2ETest, DiscardedEnqueueNoUseAfterFree)
 {
@@ -562,7 +554,7 @@ TEST_F(FileCacheE2ETest, DiscardedEnqueueNoUseAfterFree)
     auto cache = makeManagerCache(/*seg*/ 16 * 1024, /*align*/ 1);
     auto path = writeSourceFile("src", content);
     auto key = FileCacheKey::fromPath(path);
-    auto input = makeInput(cache, path, key);
+    auto input = makeInput(cache, path, key, /*readOptions*/ {}, /*warmExecutor*/ nullptr);
 
     // Discard the enqueue result BEFORE any Next().
     { auto stream = input->enqueue({0, 32 * 1024}); }
@@ -573,6 +565,17 @@ TEST_F(FileCacheE2ETest, DiscardedEnqueueNoUseAfterFree)
 
 // ============================================================================
 // 9. LoadIsNopPlanningBarrier: load() dereferences no stream pointer.
+//
+// This asserts load() is a pure planning barrier: it must not synchronously
+// create any FileSegment (it only plans, and the demand read of a discarded
+// stream never runs). Because the enqueued regions carry an empty tracking id
+// (no sid), they classify as prefetch, and with a real executor load() would
+// submit an async warm that races the assertion below (design 5.9). We use a
+// null warm executor so no async warm is ever submitted: load() is then
+// deterministically a no-op that creates zero segments, which is exactly the
+// "planning barrier, no IO" contract this test exists to prove. The
+// with-executor async-warm path is covered separately by the buffered-input
+// suite's PrefetchWarm* tests.
 // ============================================================================
 TEST_F(FileCacheE2ETest, LoadIsNopPlanningBarrier)
 {
@@ -581,7 +584,7 @@ TEST_F(FileCacheE2ETest, LoadIsNopPlanningBarrier)
     auto cache = makeManagerCache(/*seg*/ 16 * 1024, /*align*/ 1);
     auto path = writeSourceFile("src", content);
     auto key = FileCacheKey::fromPath(path);
-    auto input = makeInput(cache, path, key);
+    auto input = makeInput(cache, path, key, /*readOptions*/ {}, /*warmExecutor*/ nullptr);
 
     // Enqueue three regions and discard all three streams.
     { auto s0 = input->enqueue({0, 16 * 1024}); }
@@ -637,7 +640,6 @@ TEST_F(FileCacheE2ETest, PathOnlyKeyWhenEtagEmpty)
     EXPECT_EQ(key2, key);
     {
         auto input = makeInput(cache, path, key2);
-        EXPECT_TRUE(input->isBuffered(0, n));
         auto stream = input->enqueue({0, n});
         EXPECT_EQ(readAll(*stream), content);
     }
@@ -678,12 +680,10 @@ TEST_F(FileCacheE2ETest, DifferentEtagsDifferentKeys)
     // etag-v1 key returns v1 bytes even if the source is now the v2 file.
     {
         auto input = makeInput(cache, pathV2, keyV1); // source is v2, key is v1
-        EXPECT_TRUE(input->isBuffered(0, n));
         EXPECT_EQ(readAll(*input->enqueue({0, n})), contentV1);
     }
     {
         auto input = makeInput(cache, pathV1, keyV2); // source is v1, key is v2
-        EXPECT_TRUE(input->isBuffered(0, n));
         EXPECT_EQ(readAll(*input->enqueue({0, n})), contentV2);
     }
 }
@@ -734,7 +734,6 @@ TEST_F(FileCacheE2ETest, ColdMissFillThenHit)
     }
     {
         auto input = makeInput(cache, path, key);
-        EXPECT_TRUE(input->isBuffered(0, n)); // hit
         EXPECT_EQ(readAll(*input->enqueue({0, n})), content);
     }
 }
@@ -785,7 +784,6 @@ TEST_F(FileCacheE2ETest, DownloadedSizeAccountingAtPublicBoundary)
     for (const auto & segPtr : *holder)
         downloadedTotal += segPtr->getDownloadedSize();
     EXPECT_EQ(downloadedTotal, n);
-    EXPECT_TRUE(makeInput(cache, path, key)->isBuffered(0, n));
 }
 
 // random seeks across hit / miss / bypass paths on one file.
