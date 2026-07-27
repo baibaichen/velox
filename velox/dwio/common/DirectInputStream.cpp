@@ -66,6 +66,10 @@ bool DirectInputStream::Next(const void** buffer, int32_t* size) {
   if (tracker_) {
     tracker_->recordRead(trackingId_, *size, fileNum_, groupId_);
   }
+  if (ioStats_)
+  {
+    ioStats_->recordBufferedInputNext(static_cast<uint64_t>(*size));
+  }
   return true;
 }
 
@@ -97,6 +101,10 @@ int64_t DirectInputStream::ByteCount() const {
 void DirectInputStream::seekToPosition(PositionProvider& seekPosition) {
   offsetInRegion_ = seekPosition.next();
   VELOX_CHECK_LE(offsetInRegion_, region_.length);
+  if (ioStats_)
+  {
+    ioStats_->recordBufferedInputSeek();
+  }
 }
 
 std::string DirectInputStream::getName() const {

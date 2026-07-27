@@ -22,9 +22,11 @@
 #include "velox/exec/tests/utils/QueryAssertions.h"
 
 #include <folly/ScopeGuard.h>
+#include <sys/resource.h>
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 
 DEFINE_string(
@@ -107,7 +109,15 @@ double quantileUs(const std::vector<int64_t>& samplesNs, double q) {
 void writeCsvHeader(std::ostream& out) {
   out << "round,query_id,wall_ms,rows,result_hash,result_match,bytes_read,"
          "hit_pct,cache_read_mib,predownload_mib,evict_mib,evict_count,"
-         "op_p50_us,op_p95_us,error\n";
+         "op_p50_us,op_p95_us,error,"
+         "user_ns,system_ns,voluntary_csw,involuntary_csw,"
+         "storage_read_ops,storage_read_bytes,"
+         "local_read_ops,local_read_bytes,"
+         "prefetch_ops,prefetch_bytes,"
+         "enqueue_count,enqueue_bytes,"
+         "next_count,returned_bytes,"
+         "seek_count,max_chunk_bytes,"
+         "passthrough_read_bytes\n";
 }
 
 void writeCsvRow(std::ostream& out, const AbCsvRow& row) {
@@ -123,7 +133,16 @@ void writeCsvRow(std::ostream& out, const AbCsvRow& row) {
       << fmt::format("{:.4f}", row.evictMib) << ","
       << row.evictCount << ","
       << fmt::format("{:.3f}", row.opP50Us) << ","
-      << fmt::format("{:.3f}", row.opP95Us) << "," << row.error << "\n";
+      << fmt::format("{:.3f}", row.opP95Us) << "," << row.error << ","
+      << row.rusage.userNanos << "," << row.rusage.systemNanos << ","
+      << row.rusage.voluntaryCsw << "," << row.rusage.involuntaryCsw << ","
+      << row.scanIo.storageReadOps << "," << row.scanIo.storageReadBytes << ","
+      << row.scanIo.localReadOps << "," << row.scanIo.localReadBytes << ","
+      << row.scanIo.prefetchOps << "," << row.scanIo.prefetchBytes << ","
+      << row.scanIo.enqueueCount << "," << row.scanIo.enqueueBytes << ","
+      << row.scanIo.nextCount << "," << row.scanIo.returnedBytes << ","
+      << row.scanIo.seekCount << "," << row.scanIo.maxChunkBytes << ","
+      << row.scanIo.passthroughReadBytes << "\n";
 }
 
 void populateBackendDelta(
@@ -192,6 +211,187 @@ void validateReferenceDrivers(
       requestedDrivers);
 }
 
+void validateBufferedInputTraceConfig(
+    const BufferedInputTraceRunConfig& config,
+    AbInputSource src,
+    bool probeEnabled,
+    int32_t queryIdFlag,
+    int32_t numDrivers,
+    int32_t rounds,
+    int32_t numQueriesTotal)
+{
+    if (config.traceRoot.empty())
+    {
+        return; // Capture disabled — no gates apply.
+    }
+
+    // --- Boolean / range gates (steps 2–14) ---
+    // These fire before any filesystem operation so that tests for early gates
+    // can use fake paths without triggering path validation.
+    VELOX_USER_CHECK(
+        src == AbInputSource::kDirect,
+        "Trace capture requires --input_source=direct");
+    VELOX_USER_CHECK(
+        !probeEnabled,
+        "Trace capture requires --buffered_input_perf_probe=false");
+    VELOX_USER_CHECK(
+        queryIdFlag >= 1 && queryIdFlag <= numQueriesTotal,
+        "--query_id={} out of range [1, {}] for trace capture",
+        queryIdFlag,
+        numQueriesTotal);
+    // Finding 1: config.queryId must match queryIdFlag exactly; a mismatch
+    // would leave doCapture false for the only query, silently skipping the
+    // trace without any error.
+    VELOX_USER_CHECK_EQ(
+        config.queryId,
+        queryIdFlag,
+        "config.queryId={} does not match --query_id={}",
+        config.queryId,
+        queryIdFlag);
+    VELOX_USER_CHECK_EQ(
+        numDrivers, 1, "Trace capture requires --num_drivers=1");
+    VELOX_USER_CHECK_EQ(
+        rounds, 1, "Trace capture requires --rounds=1");
+    VELOX_USER_CHECK_EQ(
+        config.round, 1, "Trace round must be 1 (trace_round={})", config.round);
+    VELOX_USER_CHECK(
+        !config.datasetRoot.empty(),
+        "Trace capture requires a nonempty dataset root");
+    VELOX_USER_CHECK(
+        !config.veloxHead.empty(),
+        "Trace capture requires a nonempty velox HEAD hash");
+    VELOX_USER_CHECK(
+        !config.glutenHead.empty(),
+        "Trace capture requires a nonempty gluten HEAD hash");
+    VELOX_USER_CHECK(
+        !config.clickhouseHead.empty(),
+        "Trace capture requires a nonempty ClickHouse HEAD hash");
+    VELOX_USER_CHECK(
+        !config.binaryBuildId.empty(),
+        "Trace capture requires a nonempty binary build ID");
+    VELOX_USER_CHECK_GT(
+        config.maxEvents,
+        0u,
+        "Trace capture requires maxEvents > 0");
+
+    // --- Filesystem / path gates (steps 15–16) ---
+    // Finding 2: canonicalize datasetRoot and require it to be an existing
+    // directory.  Fail closed on missing or unresolvable paths.
+    std::error_code datasetEc;
+    const auto canonicalDataset =
+        std::filesystem::canonical(config.datasetRoot, datasetEc);
+    VELOX_USER_CHECK(
+        !datasetEc,
+        "datasetRoot is not a resolvable path: {} ({})",
+        config.datasetRoot,
+        datasetEc.message());
+    VELOX_USER_CHECK(
+        std::filesystem::is_directory(canonicalDataset),
+        "datasetRoot must resolve to a directory: {}",
+        config.datasetRoot);
+
+    // Finding 3: traceRoot must not already exist; its parent must exist and
+    // be a directory.  Fail closed on stat errors.
+    const std::filesystem::path traceRootPath(config.traceRoot);
+    const auto traceParent = traceRootPath.parent_path();
+    std::error_code parentEc;
+    const bool parentIsDir =
+        std::filesystem::is_directory(traceParent, parentEc);
+    VELOX_USER_CHECK(
+        !parentEc && parentIsDir,
+        "traceRoot parent must exist and be a directory: {}",
+        traceParent.string());
+
+    std::error_code existsEc;
+    const bool traceRootExists =
+        std::filesystem::exists(traceRootPath, existsEc);
+    VELOX_USER_CHECK(
+        !existsEc,
+        "Failed to stat traceRoot {}: {}",
+        config.traceRoot,
+        existsEc.message());
+    VELOX_USER_CHECK(
+        !traceRootExists,
+        "traceRoot must not already exist (must be a fresh path): {}",
+        config.traceRoot);
+}
+
+namespace {
+// Converts a `timeval` to nanoseconds.
+int64_t timevalToNs(const timeval& tv)
+{
+  return static_cast<int64_t>(tv.tv_sec) * 1'000'000'000LL +
+      static_cast<int64_t>(tv.tv_usec) * 1'000LL;
+}
+} // namespace
+
+RusageDelta computeRusageDelta(const rusage& before, const rusage& after)
+{
+  RusageDelta d;
+  const int64_t userAfter = timevalToNs(after.ru_utime);
+  const int64_t userBefore = timevalToNs(before.ru_utime);
+  d.userNanos = userAfter > userBefore ? userAfter - userBefore : 0;
+
+  const int64_t sysAfter = timevalToNs(after.ru_stime);
+  const int64_t sysBefore = timevalToNs(before.ru_stime);
+  d.systemNanos = sysAfter > sysBefore ? sysAfter - sysBefore : 0;
+
+  d.voluntaryCsw = after.ru_nvcsw >= before.ru_nvcsw
+      ? after.ru_nvcsw - before.ru_nvcsw
+      : 0;
+  d.involuntaryCsw = after.ru_nivcsw >= before.ru_nivcsw
+      ? after.ru_nivcsw - before.ru_nivcsw
+      : 0;
+  return d;
+}
+
+namespace {
+// Returns the int64_t value of a RuntimeMetric by key, or 0 if absent.
+int64_t getRtStat(
+    const std::unordered_map<std::string, RuntimeMetric>& stats,
+    const std::string& key)
+{
+  auto it = stats.find(key);
+  return it == stats.end() ? 0 : it->second.sum;
+}
+} // namespace
+
+ScanIoSnapshot collectScanIoStats(const exec::TaskStats& taskStats)
+{
+  ScanIoSnapshot snap;
+  for (const auto& pipeline : taskStats.pipelineStats)
+  {
+    for (const auto& op : pipeline.operatorStats)
+    {
+      if (op.operatorType != "TableScan")
+      {
+        continue;
+      }
+      const auto& rs = op.runtimeStats;
+      snap.storageReadOps += getRtStat(rs, "storageReadOps");
+      snap.storageReadBytes += getRtStat(rs, "storageReadBytes");
+      snap.localReadOps += getRtStat(rs, "localReadOps");
+      snap.localReadBytes += getRtStat(rs, "localReadBytes");
+      snap.prefetchOps += getRtStat(rs, "prefetchOps");
+      snap.prefetchBytes += getRtStat(rs, "prefetchBytes");
+      snap.enqueueCount += getRtStat(rs, "bufferedInputEnqueueCount");
+      snap.enqueueBytes += getRtStat(rs, "bufferedInputEnqueueBytes");
+      snap.nextCount += getRtStat(rs, "bufferedInputNextCount");
+      snap.returnedBytes += getRtStat(rs, "bufferedInputReturnedBytes");
+      snap.seekCount += getRtStat(rs, "bufferedInputSeekCount");
+      snap.passthroughReadBytes +=
+          getRtStat(rs, "fileCachePassthroughReadBytes");
+      // Max chunk: retain the running maximum, not the sum.
+      const int64_t opMax = getRtStat(rs, "bufferedInputMaxChunkBytes");
+      if (opMax > snap.maxChunkBytes)
+      {
+        snap.maxChunkBytes = opMax;
+      }
+    }
+  }
+  return snap;
+}
+
 namespace {
 
 BackendSnapshot snapshotBackend() {
@@ -225,6 +425,38 @@ void AbBenchmarkBase::clearCbiCache() {
   if (cache_ != nullptr) {
     cache_->clear();
   }
+}
+
+std::string finishTraceCaptureOrError(
+    dwio::common::ScopedBufferedInputTraceCapture& traceGuard)
+{
+    try
+    {
+        traceGuard.finish();
+    }
+    catch (const VeloxException& e)
+    {
+        // Log the full elaborate exception (multi-line, with stack trace) so no
+        // diagnostic detail is lost from the operator's point of view.
+        LOG(ERROR) << "trace capture failed: " << e.what();
+
+        // Build the CSV field from the reason only (message()), never what():
+        // what() is a multi-line elaborate message that can contain commas,
+        // newlines and stack text, which would corrupt the unquoted 32-field
+        // CSV schema written by writeCsvRow.  Sanitize the comma delimiter and
+        // the CR/LF row terminators into single-line spaces so the reason stays
+        // a single CSV-safe field without hiding why capture failed.
+        std::string reason = e.message();
+        for (char& c : reason)
+        {
+            if (c == ',' || c == '\n' || c == '\r')
+            {
+                c = ' ';
+            }
+        }
+        return std::string("trace capture failed: ") + reason;
+    }
+    return {};
 }
 
 int32_t AbBenchmarkBase::runAb() {
@@ -316,9 +548,41 @@ int32_t AbBenchmarkBase::runAb() {
       row.round = round;
       row.queryId = q;
       const auto backendBefore = snapshotBackend();
+
+      // Activate trace capture for the exact matching round+query when
+      // configured.  The guard is scoped to this single run() call.
+      const bool doCapture =
+          traceRunConfig_.has_value() &&
+          !traceRunConfig_->traceRoot.empty() &&
+          round == traceRunConfig_->round &&
+          q == traceRunConfig_->queryId;
+
+      std::optional<dwio::common::ScopedBufferedInputTraceCapture> traceGuard;
+      if (doCapture)
+      {
+          dwio::common::BufferedInputTraceCaptureConfig captureConfig;
+          captureConfig.traceRoot = traceRunConfig_->traceRoot;
+          captureConfig.datasetRoot = traceRunConfig_->datasetRoot;
+          captureConfig.queryId = q;
+          captureConfig.drivers = FLAGS_num_drivers;
+          captureConfig.binaryRealPath =
+              std::filesystem::canonical("/proc/self/exe").string();
+          captureConfig.binaryBuildId = traceRunConfig_->binaryBuildId;
+          captureConfig.veloxHead = traceRunConfig_->veloxHead;
+          captureConfig.glutenHead = traceRunConfig_->glutenHead;
+          captureConfig.clickhouseHead = traceRunConfig_->clickhouseHead;
+          captureConfig.maxEvents = traceRunConfig_->maxEvents;
+          traceGuard.emplace(std::move(captureConfig));
+      }
+
       const auto wallStart = std::chrono::steady_clock::now();
+      rusage rusageBefore{};
+      getrusage(RUSAGE_SELF, &rusageBefore);
       auto [cursor, results] = run(plans[i], queryConfigs_);
+      rusage rusageAfter{};
+      getrusage(RUSAGE_SELF, &rusageAfter);
       const auto wallEnd = std::chrono::steady_clock::now();
+      row.rusage = computeRusageDelta(rusageBefore, rusageAfter);
       row.wallMs =
           std::chrono::duration<double, std::milli>(wallEnd - wallStart)
               .count();
@@ -343,6 +607,7 @@ int32_t AbBenchmarkBase::runAb() {
         }
 
         const auto stats = cursor->task()->taskStats();
+        row.scanIo = collectScanIoStats(stats);
         std::vector<int64_t> samplesNs;
         for (const auto& pipeline : stats.pipelineStats) {
           if (pipeline.operatorStats.empty()) {
@@ -365,6 +630,49 @@ int32_t AbBenchmarkBase::runAb() {
         row.opP50Us = quantileUs(samplesNs, 0.50);
         row.opP95Us = quantileUs(samplesNs, 0.95);
       }
+
+      // Finalize trace capture before writing the CSV row so a capture failure
+      // is recorded as a failed row instead of a success-shaped one, and so a
+      // finish() exception cannot escape runAb and reach std::terminate.
+      if (doCapture)
+      {
+          // 'results' borrow memory owned by 'cursor', so destroy them first;
+          // the cursor (and its Task) is destroyed next so every
+          // TracingBufferedInput wrapper closes its streams before finalization.
+          releaseResultsThenCursor(results, cursor);
+
+          // finish() validates the buffered events and writes the trace; it may
+          // throw on lifecycle, overflow, or I/O errors.  Convert any failure
+          // into a failed row rather than letting it propagate.
+          const std::string captureError =
+              finishTraceCaptureOrError(*traceGuard);
+          traceGuard.reset();
+          if (!captureError.empty())
+          {
+              if (row.error.empty())
+              {
+                  // No prior failure: this row fails solely due to capture.
+                  ++failed;
+                  row.error = captureError;
+              }
+              else
+              {
+                  // A task failure or result mismatch was already recorded for
+                  // this row.  Preserve that earlier diagnostic and append the
+                  // capture failure with a CSV-safe delimiter (no comma) rather
+                  // than overwriting it; the row is already failed and counted,
+                  // so do not double-count.
+                  row.error += "; ";
+                  row.error += captureError;
+              }
+              // A failed capture must not leave a success-shaped result_match.
+              if (!referenceResults.empty())
+              {
+                  row.resultMatch = false;
+              }
+          }
+      }
+
       writeCsvRow(csv, row);
       csv.flush();
     }

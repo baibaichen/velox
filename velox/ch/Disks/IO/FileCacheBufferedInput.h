@@ -66,6 +66,15 @@ class FileCacheInputStream;
 class FileCacheBufferedInput : public dwio::common::BufferedInput
 {
 public:
+    /// Selects whether this input uses the full FileCache path (kCache) or
+    /// the passthrough path (kPassthrough) that reads directly from the source
+    /// without touching any FileCache state.
+    enum class ReadMode : uint8_t
+    {
+        kCache,       ///< Normal FileCache-backed read (default).
+        kPassthrough, ///< Direct source read; no FileCache state changes.
+    };
+
     FileCacheBufferedInput(
         std::shared_ptr<ReadFile> readFile,
         FileCachePtr cache,
@@ -79,7 +88,8 @@ public:
         folly::Executor * executor,
         const dwio::common::ReaderOptions & readerOptions,
         folly::F14FastMap<std::string, std::string> fileReadOps = {},
-        folly::CancellationToken cancellationToken = {});
+        folly::CancellationToken cancellationToken = {},
+        ReadMode readMode = ReadMode::kCache);
 
     // BufferedInput overrides. The returned stream borrows `*this` (see the
     // class-level lifetime contract) and must not outlive this owner.
@@ -114,7 +124,13 @@ public:
     bool hasCache() const override { return false; }
 
     // Accessors for FileCacheInputStream.
-    FileCache & fileCache() const { return *cache_; }
+    FileCache & fileCache() const
+    {
+        VELOX_CHECK(
+            readMode_ == ReadMode::kCache,
+            "fileCache() called on passthrough FileCacheBufferedInput");
+        return *cache_;
+    }
     const std::shared_ptr<ReadFile> & sourceReadFile() const
     {
         return sourceReadFile_;
@@ -127,6 +143,9 @@ public:
     velox::memory::MemoryPool * memoryPool() const { return memoryPool_; }
     io::IoStatistics * ioStatistics() const { return ioStatistics_.get(); }
     velox::IoStats * ioStats() const { return ioStats_.get(); }
+
+    ReadMode readMode() const { return readMode_; }
+    bool isPassthrough() const { return readMode_ == ReadMode::kPassthrough; }
 
     // Cancellation token propagated to FileSegment::wait and the segment-batch
     // safe points. Copied by value from the caller; empty by default (no
@@ -156,6 +175,7 @@ private:
     velox::memory::MemoryPool * memoryPool_;
     uint64_t fileSize_;
     folly::CancellationToken cancellationToken_;
+    ReadMode readMode_;
 
     // Copied region values only; never stream pointers. `load` operates on these
     // copies so a caller that discards an `enqueue` result before `load` cannot

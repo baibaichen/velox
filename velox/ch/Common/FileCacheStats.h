@@ -10,6 +10,12 @@ namespace facebook::velox::ch
 /// OperatorStats -> TaskStats -> Gluten JNI -> Spark SQLMetric.
 inline constexpr const char * kFileCacheWriteBytes = "fileCacheWriteBytes";
 
+/// RuntimeMetric key for bytes read through the FileCacheBufferedInput
+/// passthrough path (no FileCache state changes). Used in IoStats
+/// free-form counters; flows through the same pipeline as kFileCacheWriteBytes.
+inline constexpr const char * kFileCachePassthroughReadBytes =
+    "fileCachePassthroughReadBytes";
+
 /// Point-in-time snapshot of FileCache gauges + cumulative counters.
 struct FileCacheStatsSnapshot
 {

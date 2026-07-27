@@ -32,6 +32,7 @@ velox_add_library(
   BitConcatenation.cpp
   BitPackDecoder.cpp
   BufferedInput.cpp
+  BufferedInputTrace.cpp
   CacheInputStream.cpp
   CachedBufferedInput.cpp
   ColumnLoader.cpp
@@ -78,6 +79,7 @@ velox_add_library(
   BitPackDecoder.h
   BufferUtil.h
   BufferedInput.h
+  BufferedInputTrace.h
   CacheInputStream.h
   CachedBufferedInput.h
   ChainedBuffer.h

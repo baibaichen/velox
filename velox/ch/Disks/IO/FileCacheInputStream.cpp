@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
+#include <ctime>
 
 namespace facebook::velox::ch
 {
@@ -70,10 +71,14 @@ FileCacheInputStream::FileCacheInputStream(
     owner_->sourceReadFile()->directIo(alignment);
     directIoAlignment_ = alignment > 0 ? alignment : 1;
 
-    // Acquire the query context holder once. It lives until destruction and is
-    // never reset by seekToPosition.
-    queryContextHolder_ =
-        owner_->fileCache().getQueryContextHolder(cacheContext_.queryId, owner_->cacheOptions());
+    // Acquire the query context holder only in cache mode. Passthrough reads
+    // bypass the FileCache state machine entirely; acquiring the holder would
+    // pollute the query-context registry and access cache_ (which is null).
+    if (!owner_->isPassthrough())
+    {
+        queryContextHolder_ =
+            owner_->fileCache().getQueryContextHolder(cacheContext_.queryId, owner_->cacheOptions());
+    }
 
     // Capture the per-query ledgers from the owner. They are updated on every I/O
     // fact independently of the process-wide ProfileEvents ledger.
@@ -179,6 +184,8 @@ bool FileCacheInputStream::Next(const void ** data, int * size)
         *size = static_cast<int>(avail);
         position_ += avail;
         offsetInOutputBuffer_ = outputBufferSize_;
+        if (ioStatistics_)
+            ioStatistics_->recordBufferedInputNext(avail);
         return true;
     }
 
@@ -194,6 +201,8 @@ bool FileCacheInputStream::Next(const void ** data, int * size)
     *size = static_cast<int>(got);
     position_ += got;
     offsetInOutputBuffer_ = got;
+    if (ioStatistics_)
+        ioStatistics_->recordBufferedInputNext(got);
     return true;
 }
 
@@ -245,6 +254,8 @@ void FileCacheInputStream::seekToPosition(dwio::common::PositionProvider & posit
     outputBufferSize_ = 0;
     offsetInOutputBuffer_ = 0;
     initialized_ = false;
+    if (ioStatistics_)
+        ioStatistics_->recordBufferedInputSeek();
 }
 
 void FileCacheInputStream::initializeIfNeeded(uint64_t offset)
@@ -982,8 +993,61 @@ bool FileCacheInputStream::isRemoteTruncationConfirmed(
     return metadata.has_value() && metadata->size == offset;
 }
 
+size_t FileCacheInputStream::readNextPassthroughChunk()
+{
+    if (region_.length == 0)
+        return 0;
+
+    const uint64_t offset = absolutePosition();
+    const uint64_t readUntil =
+        FileCacheUtils::checkedAdd(region_.offset, region_.length, "passthrough read-until");
+    if (offset >= readUntil)
+        return 0;
+
+    allocateOutputBufferIfNeeded();
+
+    const size_t toRead =
+        static_cast<size_t>(std::min<uint64_t>(outputBufferCapacity_, readUntil - offset));
+
+    struct timespec t0 {};
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    // pread writes directly into the aligned output buffer; no FileCache state
+    // is touched.
+    owner_->sourceReadFile()->pread(offset, toRead, outputBufferData_);
+
+    struct timespec t1 {};
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    const int64_t elapsedNs =
+        (static_cast<int64_t>(t1.tv_sec - t0.tv_sec) * 1'000'000'000LL)
+        + (t1.tv_nsec - t0.tv_nsec);
+
+    if (ioStatistics_)
+    {
+        ioStatistics_->read().increment(toRead);
+        ioStatistics_->incRawBytesRead(static_cast<int64_t>(toRead));
+        ioStatistics_->incTotalScanTimeNs(elapsedNs);
+        ioStatistics_->storageReadLatencyUs().increment(elapsedNs / 1000);
+        ioStatistics_->queryThreadIoLatencyUs().increment(elapsedNs / 1000);
+    }
+    if (ioStats_)
+    {
+        ioStats_->addCounter(
+            ch::kFileCachePassthroughReadBytes,
+            RuntimeCounter(static_cast<int64_t>(toRead), RuntimeCounter::Unit::kBytes));
+    }
+
+    outputBufferStart_ = position_;
+    outputBufferSize_ = toRead;
+    offsetInOutputBuffer_ = 0;
+    return toRead;
+}
+
 size_t FileCacheInputStream::readNextChunk()
 {
+    if (owner_->isPassthrough())
+        return readNextPassthroughChunk();
+
     if (region_.length == 0)
         return 0;
 

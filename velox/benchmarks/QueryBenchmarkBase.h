@@ -25,6 +25,8 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <unordered_map>
+#include "velox/core/QueryCtx.h"
 #include "velox/exec/Cursor.h"
 #include "velox/exec/tests/utils/TpchQueryBuilder.h"
 
@@ -50,6 +52,12 @@ struct ParameterDim {
   std::string flag;
   std::vector<std::string> values;
 };
+
+/// Map from connector ID → (property key → string value). Used by
+/// `QueryBenchmarkBase::applyConnectorSessionProperties` to push per-query
+/// session overrides into a `core::QueryCtx` before task execution.
+using ConnectorSessionProperties =
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>>;
 
 class QueryBenchmarkBase {
  public:
@@ -84,6 +92,32 @@ class QueryBenchmarkBase {
 
   virtual std::shared_ptr<config::ConfigBase> makeConnectorProperties();
 
+  /// Applies `properties` to `queryCtx` as connector-specific session
+  /// overrides. Calls `queryCtx.setConnectorSessionOverridesUnsafe` for each
+  /// connector ID in `properties`. Not thread-safe; must be called before the
+  /// task starts.
+  static void applyConnectorSessionProperties(
+      core::QueryCtx& queryCtx,
+      const ConnectorSessionProperties& properties);
+
+  /// Stores connector session properties to be applied via
+  /// `applyConnectorSessionProperties` in every subsequent `run()` call.
+  void setConnectorSessionProperties(ConnectorSessionProperties props)
+  {
+    connectorSessionProperties_ = std::move(props);
+  }
+
+  /// Sets a single connector session property (additive; existing keys
+  /// are preserved).
+  void setConnectorSessionProperty(
+      std::string connectorId,
+      std::string key,
+      std::string value)
+  {
+    connectorSessionProperties_[std::move(connectorId)][std::move(key)] =
+        std::move(value);
+  }
+
  protected:
   std::unique_ptr<folly::IOThreadPoolExecutor> ioExecutor_;
   std::unique_ptr<folly::IOThreadPoolExecutor> cacheExecutor_;
@@ -98,5 +132,8 @@ class QueryBenchmarkBase {
   std::vector<ParameterDim> parameters_;
 
   std::vector<RunStats> runStats_;
+
+  /// Per-query connector session property overrides applied before each task.
+  ConnectorSessionProperties connectorSessionProperties_;
 };
 } // namespace facebook::velox

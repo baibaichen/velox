@@ -129,6 +129,11 @@ private:
     // the front of `outputBuffer_` (0 at end of region).
     size_t readNextChunk();
 
+    // Passthrough variant of readNextChunk: reads directly from sourceReadFile
+    // without touching any FileCache state. Returns the number of bytes placed
+    // at the front of `outputBuffer_` (0 at end of region).
+    size_t readNextPassthroughChunk();
+
     std::unique_ptr<ReadFromFileSegmentState> prepareReadFromFileSegmentState(
         FileSegment & fileSegment,
         uint64_t offset);

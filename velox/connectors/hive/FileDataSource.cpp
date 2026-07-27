@@ -122,6 +122,9 @@ void addIoStatsToRuntimeStats(
       key(FileDataSource::kPrefetchBytes),
       RuntimeCounter::Unit::kBytes,
       res);
+  // Ops-count aliases consumed by collectScanIoStats in AbBenchmarkBase.
+  addIoCounterMetric(
+      ioStats.prefetch(), key(FileDataSource::kPrefetchOps), res);
   addIoCounterMetric(
       ioStats.totalScanTimeNs(),
       key(FileDataSource::kTotalScanTime),
@@ -139,7 +142,11 @@ void addIoStatsToRuntimeStats(
       RuntimeCounter::Unit::kBytes,
       res);
   addIoCounterMetric(
+      ioStats.read(), key(FileDataSource::kStorageReadOps), res);
+  addIoCounterMetric(
       ioStats.ssdRead(), key(FileDataSource::kNumLocalRead), res);
+  addIoCounterMetric(
+      ioStats.ssdRead(), key(FileDataSource::kLocalReadOps), res);
   addIoStatsMetric(
       ioStats.ssdRead(),
       key(FileDataSource::kLocalReadBytes),
@@ -672,6 +679,51 @@ FileDataSource::getRuntimeStats() {
     } else {
       res.emplace(key, value);
     }
+  }
+
+  // Export BufferedInput probe counters as nonzero RuntimeMetrics when enabled.
+  const auto probe = dataIoStats_->bufferedInputProbeSnapshot();
+  if (probe.enqueueCount > 0)
+  {
+    res.emplace(
+        std::string(kBufferedInputEnqueueCount),
+        RuntimeMetric(static_cast<int64_t>(probe.enqueueCount)));
+  }
+  if (probe.enqueueBytes > 0)
+  {
+    res.emplace(
+        std::string(kBufferedInputEnqueueBytes),
+        RuntimeMetric(
+            static_cast<int64_t>(probe.enqueueBytes),
+            RuntimeCounter::Unit::kBytes));
+  }
+  if (probe.nextCount > 0)
+  {
+    res.emplace(
+        std::string(kBufferedInputNextCount),
+        RuntimeMetric(static_cast<int64_t>(probe.nextCount)));
+  }
+  if (probe.returnedBytes > 0)
+  {
+    res.emplace(
+        std::string(kBufferedInputReturnedBytes),
+        RuntimeMetric(
+            static_cast<int64_t>(probe.returnedBytes),
+            RuntimeCounter::Unit::kBytes));
+  }
+  if (probe.seekCount > 0)
+  {
+    res.emplace(
+        std::string(kBufferedInputSeekCount),
+        RuntimeMetric(static_cast<int64_t>(probe.seekCount)));
+  }
+  if (probe.maxChunkBytes > 0)
+  {
+    res.emplace(
+        std::string(kBufferedInputMaxChunkBytes),
+        RuntimeMetric(
+            static_cast<int64_t>(probe.maxChunkBytes),
+            RuntimeCounter::Unit::kBytes));
   }
   return res;
 }

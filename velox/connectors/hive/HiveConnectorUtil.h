@@ -15,9 +15,11 @@
  */
 
 #pragma once
+#include <atomic>
 #include <folly/container/F14Map.h>
 
 #include "velox/connectors/hive/FileConnectorUtil.h"
+#include "velox/common/base/Exceptions.h"
 #include "velox/dwio/common/BufferedInput.h"
 
 namespace facebook::velox::exec {
@@ -31,6 +33,32 @@ class HiveColumnHandle;
 class HiveTableHandle;
 class HiveConfig;
 struct HiveConnectorSplit;
+
+/// Session-property key that enables per-query BufferedInput probe statistics.
+/// When set to "true" in the connector session, `createBufferedInput` enables
+/// the IoStatistics probe so per-query I/O metrics can be collected.
+constexpr std::string_view kBufferedInputPerfProbeSession =
+    "buffered_input_perf_probe";
+
+/// Process-wide RAII guard that enables the FileCacheBufferedInput passthrough
+/// mode for the benchmark. Only one instance may be live at a time; the
+/// constructor CAS-sets a process-wide atomic and throws `VeloxException` if
+/// the flag is already set. The destructor clears the flag.
+class ScopedFileCachePassthroughForBenchmark
+{
+ public:
+  ScopedFileCachePassthroughForBenchmark();
+  ~ScopedFileCachePassthroughForBenchmark();
+
+  ScopedFileCachePassthroughForBenchmark(
+      const ScopedFileCachePassthroughForBenchmark&) = delete;
+  ScopedFileCachePassthroughForBenchmark& operator=(
+      const ScopedFileCachePassthroughForBenchmark&) = delete;
+};
+
+/// Returns true when a `ScopedFileCachePassthroughForBenchmark` is live.
+/// Used by `createBufferedInput` to select the passthrough path.
+bool fileCachePassthroughForBenchmarkEnabled();
 
 const std::string& getColumnName(const common::Subfield& subfield);
 

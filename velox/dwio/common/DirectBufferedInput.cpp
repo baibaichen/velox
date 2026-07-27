@@ -52,6 +52,12 @@ std::unique_ptr<SeekableInputStream> DirectBufferedInput::enqueue(
   if (tracker_) {
     tracker_->recordReference(id, region.length, fileNum_.id(), groupId_.id());
   }
+
+  if (ioStatistics_)
+  {
+    ioStatistics_->recordBufferedInputEnqueue(region.length);
+  }
+
   auto stream = std::make_unique<DirectInputStream>(
       this,
       ioStatistics_.get(),

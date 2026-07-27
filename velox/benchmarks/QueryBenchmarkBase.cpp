@@ -25,6 +25,7 @@
 #include "velox/dwio/dwrf/RegisterDwrfReader.h"
 #include "velox/dwio/parquet/RegisterParquetReader.h"
 #include "velox/exec/Split.h"
+#include "velox/exec/Task.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 #include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
@@ -327,6 +328,18 @@ void QueryBenchmarkBase::shutdown() {
   }
 }
 
+// static
+void QueryBenchmarkBase::applyConnectorSessionProperties(
+    core::QueryCtx& queryCtx,
+    const ConnectorSessionProperties& properties)
+{
+  for (const auto& [connectorId, props] : properties)
+  {
+    auto copy = props;
+    queryCtx.setConnectorSessionOverridesUnsafe(connectorId, std::move(copy));
+  }
+}
+
 std::pair<std::unique_ptr<TaskCursor>, std::vector<RowVectorPtr>>
 QueryBenchmarkBase::run(
     const TpchPlan& tpchPlan,
@@ -341,6 +354,17 @@ QueryBenchmarkBase::run(
       params.queryConfigs[core::QueryConfig::kMaxSplitPreloadPerDriver] =
           std::to_string(FLAGS_split_preload_per_driver);
       const int numSplitsPerFile = FLAGS_num_splits_per_file;
+
+      // Apply connector session overrides (e.g., probe stats) before the task
+      // starts. Captured by value so the lambda is self-contained.
+      const ConnectorSessionProperties& sessionProps =
+          connectorSessionProperties_;
+      if (!sessionProps.empty())
+      {
+        params.beforeTaskStart = [&sessionProps](exec::Task& task) {
+          applyConnectorSessionProperties(*task.queryCtx(), sessionProps);
+        };
+      }
 
       auto addSplits = [&](TaskCursor* taskCursor) {
         auto& task = taskCursor->task();

@@ -147,6 +147,40 @@ void IoStatistics::merge(const IoStatistics& other) {
       operationStats_[item.first].merge(item.second);
     }
   }
+
+  // Merge probe counters: if the source has the probe enabled, enable the
+  // destination and accumulate its counts. The max chunk is retained as the
+  // running maximum across both.
+  if (other.probeEnabled_.load(std::memory_order_acquire))
+  {
+    probeEnabled_.store(true, std::memory_order_release);
+    probeEnqueueCount_.fetch_add(
+        other.probeEnqueueCount_.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    probeEnqueueBytes_.fetch_add(
+        other.probeEnqueueBytes_.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    probeNextCount_.fetch_add(
+        other.probeNextCount_.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    probeReturnedBytes_.fetch_add(
+        other.probeReturnedBytes_.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    probeSeekCount_.fetch_add(
+        other.probeSeekCount_.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    const uint64_t otherMax =
+        other.probeMaxChunkBytes_.load(std::memory_order_relaxed);
+    uint64_t curMax = probeMaxChunkBytes_.load(std::memory_order_relaxed);
+    while (otherMax > curMax)
+    {
+      if (probeMaxChunkBytes_.compare_exchange_weak(
+              curMax, otherMax, std::memory_order_relaxed))
+      {
+        break;
+      }
+    }
+  }
 }
 
 void OperationCounters::merge(const OperationCounters& other) {

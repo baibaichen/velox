@@ -1045,4 +1045,115 @@ TEST_F(DirectBufferedInputTest, readGapTracking) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Task-2: BufferedInput probe statistics for DirectBufferedInput (planned and
+// unplanned read paths). The probe must be explicitly enabled on the
+// IoStatistics instance; the fixture's dataIoStats_ is shared, so each test
+// creates its own IoStatistics to avoid cross-test interference.
+// ---------------------------------------------------------------------------
+
+TEST_F(DirectBufferedInputTest, PlannedReadPathReportsProbeStats)
+{
+  constexpr uint32_t kRegionSize = 1 << 20; // 1 MiB
+  std::string content(kRegionSize * 2, 'x');
+  auto readFile = std::make_shared<InMemoryReadFile>(content);
+
+  auto ioStats = std::make_shared<IoStatistics>();
+  ioStats->enableBufferedInputProbe();
+
+  io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setDataIoStats(ioStats);
+  readerOptions.setMetadataIoStats(metadataIoStats_);
+  readerOptions.setLoadQuantum(1 << 20);
+
+  auto& ids = fileIds();
+  StringIdLease fileId(ids, "probe-planned-file");
+  StringIdLease groupId(ids, "probe-planned-group");
+
+  DirectBufferedInput input(
+      readFile,
+      MetricsLog::voidLog(),
+      std::move(fileId),
+      tracker_,
+      std::move(groupId),
+      ioStats,
+      nullptr,
+      executor_.get(),
+      readerOptions);
+
+  // Planned path: enqueue -> load -> Next -> seekToPosition.
+  auto stream = input.enqueue(common::Region{0, kRegionSize}, nullptr);
+  ASSERT_NE(stream, nullptr);
+  input.load(LogType::TEST);
+
+  const void* buf = nullptr;
+  int32_t size = 0;
+  ASSERT_TRUE(stream->Next(&buf, &size));
+  EXPECT_GT(size, 0);
+
+  // Seek via PositionProvider.
+  std::vector<uint64_t> positions{0};
+  PositionProvider provider(positions);
+  stream->seekToPosition(provider);
+
+  const auto snap = ioStats->bufferedInputProbeSnapshot();
+  EXPECT_GT(snap.enqueueCount, 0) << "planned enqueue must be recorded";
+  EXPECT_GT(snap.enqueueBytes, 0);
+  EXPECT_GT(snap.nextCount, 0);
+  EXPECT_GT(snap.returnedBytes, 0);
+  EXPECT_GT(snap.seekCount, 0);
+  EXPECT_GT(snap.maxChunkBytes, 0);
+}
+
+TEST_F(DirectBufferedInputTest, UnplannedReadPathReportsProbeStats)
+{
+  constexpr uint32_t kRegionSize = 1 << 20; // 1 MiB
+  std::string content(kRegionSize, 'y');
+  auto readFile = std::make_shared<InMemoryReadFile>(content);
+
+  auto ioStats = std::make_shared<IoStatistics>();
+  ioStats->enableBufferedInputProbe();
+
+  io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setDataIoStats(ioStats);
+  readerOptions.setMetadataIoStats(metadataIoStats_);
+  readerOptions.setLoadQuantum(1 << 20);
+
+  auto& ids = fileIds();
+  StringIdLease fileId(ids, "probe-unplanned-file");
+  StringIdLease groupId(ids, "probe-unplanned-group");
+
+  DirectBufferedInput input(
+      readFile,
+      MetricsLog::voidLog(),
+      std::move(fileId),
+      tracker_,
+      std::move(groupId),
+      ioStats,
+      nullptr,
+      executor_.get(),
+      readerOptions);
+
+  // Unplanned path: read() bypasses enqueue; only Next/seek are recorded.
+  auto stream = input.read(0, kRegionSize, LogType::TEST);
+  ASSERT_NE(stream, nullptr);
+
+  const void* buf = nullptr;
+  int32_t size = 0;
+  ASSERT_TRUE(stream->Next(&buf, &size));
+  EXPECT_GT(size, 0);
+
+  std::vector<uint64_t> positions{0};
+  PositionProvider provider(positions);
+  stream->seekToPosition(provider);
+
+  const auto snap = ioStats->bufferedInputProbeSnapshot();
+  // Unplanned read: no enqueue call, so enqueueCount must remain zero.
+  EXPECT_EQ(snap.enqueueCount, 0) << "unplanned read must not record enqueue";
+  EXPECT_GT(snap.nextCount, 0);
+  EXPECT_GT(snap.returnedBytes, 0);
+  EXPECT_GT(snap.seekCount, 0);
+  EXPECT_GT(snap.maxChunkBytes, 0);
+}
+
 } // namespace

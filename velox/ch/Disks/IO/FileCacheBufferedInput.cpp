@@ -37,7 +37,8 @@ FileCacheBufferedInput::FileCacheBufferedInput(
     folly::Executor * executor,
     const dwio::common::ReaderOptions & readerOptions,
     folly::F14FastMap<std::string, std::string> fileReadOps,
-    folly::CancellationToken cancellationToken)
+    folly::CancellationToken cancellationToken,
+    ReadMode readMode)
     : dwio::common::BufferedInput(
           readFile,
           readerOptions.memoryPool(),
@@ -60,10 +61,18 @@ FileCacheBufferedInput::FileCacheBufferedInput(
       readerOptions_(readerOptions),
       memoryPool_(&readerOptions.memoryPool()),
       fileSize_(sourceReadFile_ ? sourceReadFile_->size() : 0),
-      cancellationToken_(std::move(cancellationToken))
+      cancellationToken_(std::move(cancellationToken)),
+      readMode_(readMode)
 {
     VELOX_CHECK_NOT_NULL(sourceReadFile_, "FileCacheBufferedInput requires a source ReadFile");
-    VELOX_CHECK_NOT_NULL(cache_, "FileCacheBufferedInput requires a FileCache");
+    if (readMode_ == ReadMode::kCache)
+    {
+        VELOX_CHECK_NOT_NULL(cache_, "cache mode requires a FileCache");
+    }
+    else
+    {
+        VELOX_CHECK_NULL(cache_, "passthrough mode must not own a FileCache");
+    }
     VELOX_CHECK_NOT_NULL(memoryPool_, "ReaderOptions::memoryPool must be non-null");
 }
 
@@ -71,6 +80,11 @@ std::unique_ptr<dwio::common::SeekableInputStream> FileCacheBufferedInput::enque
     velox::common::Region region,
     const dwio::common::StreamIdentifier * sid)
 {
+    // Record probe stats for every enqueued region, cache and passthrough alike.
+    if (ioStatistics_)
+    {
+        ioStatistics_->recordBufferedInputEnqueue(region.length);
+    }
     // Record only the copied region value (and non-owning stream-identifier
     // metadata); never a stream pointer. `load` operates on these copies.
     requests_.push_back({region, sid});
@@ -104,6 +118,12 @@ std::unique_ptr<dwio::common::SeekableInputStream> FileCacheBufferedInput::read(
 
 bool FileCacheBufferedInput::isBuffered(uint64_t offset, uint64_t length) const
 {
+    // Passthrough mode never pre-buffers.
+    if (isPassthrough())
+    {
+        return false;
+    }
+
     if (length == 0)
         return false;
 
@@ -147,7 +167,7 @@ bool FileCacheBufferedInput::isBuffered(uint64_t offset, uint64_t length) const
 std::unique_ptr<dwio::common::BufferedInput> FileCacheBufferedInput::clone() const
 {
     // A clean instance sharing the same source file, cache, and context. Enqueued
-    // regions are not copied (BufferedInput contract).
+    // regions are not copied (BufferedInput contract). readMode_ is preserved.
     return std::make_unique<FileCacheBufferedInput>(
         sourceReadFile_,
         cache_,
@@ -161,7 +181,8 @@ std::unique_ptr<dwio::common::BufferedInput> FileCacheBufferedInput::clone() con
         executor_,
         readerOptions_,
         folly::F14FastMap<std::string, std::string>{},
-        cancellationToken_);
+        cancellationToken_,
+        readMode_);
 }
 
 } // namespace facebook::velox::ch

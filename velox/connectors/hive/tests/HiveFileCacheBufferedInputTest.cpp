@@ -30,9 +30,11 @@
 #include "velox/common/caching/FileHandle.h"
 #include "velox/common/file/File.h"
 #include "velox/common/file/FileSystems.h"
+#include "velox/common/file/LocalFile.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
 #include "velox/connectors/Connector.h"
+#include "velox/dwio/common/BufferedInputTrace.h"
 #include "velox/dwio/common/CachedBufferedInput.h"
 #include "velox/dwio/common/DirectBufferedInput.h"
 #include "velox/dwio/common/Options.h"
@@ -44,6 +46,7 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -451,6 +454,237 @@ TEST_F(HiveFileCacheBufferedInputTest, RealMissFillHit) {
       << "Second read must record a FileCache hit";
   EXPECT_GT(secondDelta.cacheReadBytes, 0u)
       << "Second read must record FileCache cache-read bytes";
+}
+
+// ===========================================================================
+// Task 3: Passthrough selection and streaming tests
+// ===========================================================================
+
+// When `ScopedFileCachePassthroughForBenchmark` is live and no manager or CBI
+// is installed, `createBufferedInput` must return a `FileCacheBufferedInput` in
+// passthrough (`ReadMode::kPassthrough`) mode.
+TEST_F(HiveFileCacheBufferedInputTest, PassthroughSelectsFileCacheBufferedInputWithoutManager)
+{
+  auto source = std::make_shared<InMemoryReadFile>(
+      std::string(256, 'A'), "/source/passthrough_selection.orc");
+  auto handle = makeFileHandle(source);
+  dwio::common::ReaderOptions readerOpts(pool_.get());
+  auto queryCtx = makeQueryCtx(nullptr);
+  auto ioStats = std::make_shared<io::IoStatistics>();
+  auto ioS = std::make_shared<velox::IoStats>();
+
+  ScopedFileCachePassthroughForBenchmark guard;
+
+  auto input = createBufferedInput(
+      handle, readerOpts, queryCtx.get(), ioStats, ioS, executor_.get(), {});
+
+  auto* fcbi = dynamic_cast<ch::FileCacheBufferedInput*>(input.get());
+  ASSERT_NE(fcbi, nullptr) << "Expected FileCacheBufferedInput in passthrough mode";
+  EXPECT_EQ(fcbi->readMode(), ch::FileCacheBufferedInput::ReadMode::kPassthrough)
+      << "readMode must be kPassthrough";
+}
+
+// The `buffered_input_perf_probe` session property alone must NOT activate the
+// passthrough path — it only enables probe statistics.
+TEST_F(HiveFileCacheBufferedInputTest, ProbePropertyAloneDoesNotSelectPassthrough)
+{
+  auto source = std::make_shared<InMemoryReadFile>(
+      std::string(128, 'B'), "/source/probe_only.orc");
+  auto handle = makeFileHandle(source);
+  dwio::common::ReaderOptions readerOpts(pool_.get());
+  config::ConfigBase sessionWithProbe{{{"buffered_input_perf_probe", "true"}}};
+  auto queryCtx = std::make_unique<connector::ConnectorQueryCtx>(
+      pool_.get(),
+      pool_.get(),
+      &sessionWithProbe,
+      nullptr,
+      common::PrefixSortConfig(),
+      nullptr,
+      nullptr,
+      "query.probe-only",
+      "task.probe-only",
+      "planNodeId.probe-only",
+      0,
+      "",
+      false,
+      folly::CancellationToken{});
+  auto ioStats = std::make_shared<io::IoStatistics>();
+  auto ioS = std::make_shared<velox::IoStats>();
+
+  // No ScopedFileCachePassthroughForBenchmark active.
+  auto input = createBufferedInput(
+      handle, readerOpts, queryCtx.get(), ioStats, ioS, executor_.get(), {});
+
+  // Without passthrough guard, expects Direct (no manager, no CBI).
+  EXPECT_NE(dynamic_cast<dwio::common::DirectBufferedInput*>(input.get()), nullptr)
+      << "Probe property alone must not select passthrough; expected DirectBufferedInput";
+}
+
+// Passthrough must throw when a FileCacheManager is installed because the
+// invariant (no FileCache state) cannot be guaranteed.
+TEST_F(HiveFileCacheBufferedInputTest, PassthroughRejectsInstalledFileCacheManager)
+{
+  installManager();
+
+  auto source = std::make_shared<InMemoryReadFile>(
+      std::string(128, 'C'), "/source/passthrough_reject.orc");
+  auto handle = makeFileHandle(source);
+  dwio::common::ReaderOptions readerOpts(pool_.get());
+  auto queryCtx = makeQueryCtx(nullptr);
+  auto ioStats = std::make_shared<io::IoStatistics>();
+  auto ioS = std::make_shared<velox::IoStats>();
+
+  ScopedFileCachePassthroughForBenchmark guard;
+
+  EXPECT_THROW(
+      createBufferedInput(
+          handle, readerOpts, queryCtx.get(), ioStats, ioS, executor_.get(), {}),
+      velox::VeloxException)
+      << "Passthrough with a live FileCacheManager must throw";
+}
+
+// Passthrough path must read the full source data correctly through
+// `FileCacheInputStream::readNextPassthroughChunk`.
+TEST_F(HiveFileCacheBufferedInputTest, PassthroughStreamsSourceDataCorrectly)
+{
+  const std::string sourceData(4096, 'D');
+  auto source = std::make_shared<InMemoryReadFile>(sourceData, "/source/passthrough_stream.orc");
+  auto handle = makeFileHandle(source);
+  dwio::common::ReaderOptions readerOpts(pool_.get());
+  auto queryCtx = makeQueryCtx(nullptr);
+  auto ioStats = std::make_shared<io::IoStatistics>();
+  auto ioS = std::make_shared<velox::IoStats>();
+
+  ScopedFileCachePassthroughForBenchmark guard;
+
+  auto input = createBufferedInput(
+      handle, readerOpts, queryCtx.get(), ioStats, ioS, executor_.get(), {});
+
+  auto* fcbi = dynamic_cast<ch::FileCacheBufferedInput*>(input.get());
+  ASSERT_NE(fcbi, nullptr);
+  ASSERT_EQ(fcbi->readMode(), ch::FileCacheBufferedInput::ReadMode::kPassthrough);
+
+  auto stream = input->read(0, sourceData.size(), dwio::common::LogType::STREAM);
+  ASSERT_NE(stream, nullptr);
+  std::string result = readAll(*stream);
+  EXPECT_EQ(result, sourceData) << "Passthrough stream must return exact source data";
+
+  // Source bytes were consumed via pread.
+  EXPECT_GT(source->preadBytes(), 0u) << "Passthrough must read from source";
+
+  // IoStatistics must record source read (not cache hit).
+  EXPECT_GT(ioStats->read().count(), 0u)
+      << "IoStatistics::read must be incremented for passthrough reads";
+  EXPECT_GT(ioStats->rawBytesRead(), 0u)
+      << "rawBytesRead must be incremented for passthrough reads";
+}
+
+// ===========================================================================
+// BufferedInput trace-capture integration tests
+// ===========================================================================
+
+// When no ScopedBufferedInputTraceCapture is active, createBufferedInput must
+// return the exact original dynamic type (DirectBufferedInput in the no-manager
+// / no-cache branch) — not a TracingBufferedInput wrapper.
+TEST_F(HiveFileCacheBufferedInputTest, TraceCaptureIsDefaultOff)
+{
+    ASSERT_FALSE(dwio::common::bufferedInputTraceCaptureEnabled())
+        << "No trace guard should be active at test start";
+
+    const std::string sourceData(64, 'z');
+    auto source = std::make_shared<InMemoryReadFile>(sourceData, "/src/off.orc");
+    auto handle = makeFileHandle(source);
+    dwio::common::ReaderOptions readerOpts(pool_.get());
+    auto queryCtx = makeQueryCtx(nullptr);
+    auto ioStats = std::make_shared<io::IoStatistics>();
+    auto ioS = std::make_shared<velox::IoStats>();
+
+    auto input = createBufferedInput(
+        handle, readerOpts, queryCtx.get(), ioStats, ioS, executor_.get(), {});
+
+    ASSERT_NE(input, nullptr);
+    EXPECT_NE(dynamic_cast<dwio::common::DirectBufferedInput*>(input.get()), nullptr)
+        << "Without an active capture guard, createBufferedInput must return "
+           "DirectBufferedInput unmodified";
+    EXPECT_EQ(
+        dynamic_cast<dwio::common::TracingBufferedInput*>(input.get()), nullptr)
+        << "TracingBufferedInput must not be returned when capture is off";
+}
+
+// When a ScopedBufferedInputTraceCapture is active, createBufferedInput must
+// return a TracingBufferedInput wrapper; reading a stream emits at least one
+// event visible after finish().
+TEST_F(HiveFileCacheBufferedInputTest, ActiveTraceWrapsDirectInput)
+{
+    // Create a real local file strictly inside sourceDir_ so that canonical
+    // path containment check passes.
+    const std::string fileName = "active_trace_source.bin";
+    const std::string filePath = sourceDir_->getPath() + "/" + fileName;
+    const std::string fileData(256, 'A');
+    {
+        std::ofstream f(filePath, std::ios::binary);
+        ASSERT_TRUE(f.is_open()) << "Could not create test file: " << filePath;
+        f.write(fileData.data(), static_cast<std::streamsize>(fileData.size()));
+    }
+
+    // Fresh temp dir for the trace output.
+    auto traceDir = TempDirectoryPath::create();
+    const std::string traceRoot = traceDir->getPath() + "/trace_out";
+
+    // Open the file with LocalReadFile so canonical identity is real.
+    auto localFile = std::make_shared<LocalReadFile>(filePath);
+    auto handle = makeFileHandle(localFile);
+
+    dwio::common::BufferedInputTraceCaptureConfig captureConfig;
+    captureConfig.traceRoot = traceRoot;
+    captureConfig.datasetRoot = sourceDir_->getPath();
+    captureConfig.queryId = 4;
+    captureConfig.drivers = 1;
+    captureConfig.binaryRealPath =
+        std::filesystem::canonical("/proc/self/exe").string();
+    captureConfig.binaryBuildId = "test-build-id";
+    captureConfig.veloxHead = "velox-head-hash";
+    captureConfig.glutenHead = "gluten-head-hash";
+    captureConfig.clickhouseHead = "ch-head-hash";
+    captureConfig.maxEvents = 100'000;
+
+    dwio::common::ScopedBufferedInputTraceCapture guard(
+        std::move(captureConfig));
+
+    ASSERT_TRUE(dwio::common::bufferedInputTraceCaptureEnabled());
+
+    dwio::common::ReaderOptions readerOpts(pool_.get());
+    auto queryCtx = makeQueryCtx(nullptr);
+    auto ioStats = std::make_shared<io::IoStatistics>();
+    auto ioS = std::make_shared<velox::IoStats>();
+
+    auto input = createBufferedInput(
+        handle, readerOpts, queryCtx.get(), ioStats, ioS, executor_.get(), {});
+
+    ASSERT_NE(input, nullptr);
+    EXPECT_NE(
+        dynamic_cast<dwio::common::TracingBufferedInput*>(input.get()), nullptr)
+        << "With an active capture guard, createBufferedInput must return "
+           "TracingBufferedInput";
+
+    // Drain a stream to emit at least one event.
+    auto stream = input->read(0, fileData.size(), dwio::common::LogType::STREAM);
+    ASSERT_NE(stream, nullptr);
+    readAll(*stream);
+    stream.reset();
+    input.reset();
+
+    guard.finish();
+
+    // Validate the written trace.
+    auto doc = dwio::common::loadBufferedInputTrace(traceRoot);
+    EXPECT_GE(doc.events.size(), 1u)
+        << "At least one event must be captured";
+    EXPECT_EQ(doc.manifest.queryId, 4);
+    EXPECT_EQ(doc.manifest.drivers, 1);
+    EXPECT_FALSE(doc.manifest.datasetRoot.empty());
+    EXPECT_FALSE(doc.files.empty())
+        << "File table must have at least one entry";
 }
 
 } // namespace

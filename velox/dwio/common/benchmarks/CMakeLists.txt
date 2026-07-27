@@ -85,3 +85,41 @@ target_link_libraries(
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)
 endif()
+
+# Deterministic A/B/C BufferedInput trace replay library.
+add_library(velox_buffered_input_trace_replay_lib
+            BufferedInputTraceReplay.cpp)
+target_link_libraries(
+  velox_buffered_input_trace_replay_lib
+  PUBLIC
+    velox_dwio_common
+    velox_ch_filecache_dwio
+    velox_ch_filecache_manager
+    velox_ch_filecache_core
+    velox_ch_filecache
+    velox_caching
+    velox_file
+    velox_memory
+    velox_exception
+    Folly::folly
+    gflags::gflags
+    glog::glog)
+
+add_executable(velox_buffered_input_trace_replay
+               BufferedInputTraceReplayMain.cpp)
+target_link_libraries(
+  velox_buffered_input_trace_replay
+  PRIVATE
+    velox_buffered_input_trace_replay_lib
+    velox_dwio_common
+    velox_ch_filecache_dwio
+    velox_ch_filecache_manager
+    velox_ch_filecache_core
+    velox_ch_filecache
+    velox_caching
+    velox_file
+    velox_memory
+    velox_exception
+    Folly::folly
+    gflags::gflags
+    glog::glog)

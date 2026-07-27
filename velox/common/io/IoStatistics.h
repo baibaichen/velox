@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -39,6 +40,20 @@ struct OperationCounters {
   uint64_t delayInjectedInSecs{0};
 
   void merge(const OperationCounters& other);
+};
+
+/// Point-in-time snapshot of per-query BufferedInput probe statistics.
+/// All fields are zero when the probe is disabled (the default).
+struct BufferedInputProbeSnapshot
+{
+  uint64_t enqueueCount{0};   ///< Number of `enqueue()` calls.
+  uint64_t enqueueBytes{0};   ///< Total bytes requested via `enqueue()`.
+  uint64_t nextCount{0};      ///< Number of `Next()` calls.
+  uint64_t returnedBytes{0};  ///< Total bytes returned by `Next()`.
+  uint64_t seekCount{0};      ///< Number of `seekToPosition()` calls.
+  uint64_t maxChunkBytes{0};  ///< Largest single `Next()` chunk seen.
+
+  bool operator==(const BufferedInputProbeSnapshot&) const = default;
 };
 
 class IoStatistics {
@@ -130,6 +145,79 @@ class IoStatistics {
 
   folly::dynamic getOperationStatsSnapshot() const;
 
+  // ---------------------------------------------------------------------------
+  // BufferedInput probe — lightweight per-query I/O accounting.
+  // Probe methods are no-ops when disabled (default) so they can be called
+  // unconditionally on every I/O path without branch overhead in steady state.
+  // ---------------------------------------------------------------------------
+
+  /// Enables the probe for this statistics instance. Not thread-safe; must be
+  /// called before the first I/O operation on the associated stream.
+  void enableBufferedInputProbe()
+  {
+    probeEnabled_.store(true, std::memory_order_release);
+  }
+
+  /// Records one `enqueue()` call requesting `bytes` bytes.
+  void recordBufferedInputEnqueue(uint64_t bytes)
+  {
+    if (!probeEnabled_.load(std::memory_order_acquire))
+    {
+      return;
+    }
+    probeEnqueueCount_.fetch_add(1, std::memory_order_relaxed);
+    probeEnqueueBytes_.fetch_add(bytes, std::memory_order_relaxed);
+  }
+
+  /// Records one `Next()` call returning `chunkBytes` bytes and updates the
+  /// running maximum via a CAS loop.
+  void recordBufferedInputNext(uint64_t chunkBytes)
+  {
+    if (!probeEnabled_.load(std::memory_order_acquire))
+    {
+      return;
+    }
+    probeNextCount_.fetch_add(1, std::memory_order_relaxed);
+    probeReturnedBytes_.fetch_add(chunkBytes, std::memory_order_relaxed);
+    uint64_t current = probeMaxChunkBytes_.load(std::memory_order_relaxed);
+    while (chunkBytes > current)
+    {
+      if (probeMaxChunkBytes_.compare_exchange_weak(
+              current, chunkBytes, std::memory_order_relaxed))
+      {
+        break;
+      }
+    }
+  }
+
+  /// Records one `seekToPosition()` call.
+  void recordBufferedInputSeek()
+  {
+    if (!probeEnabled_.load(std::memory_order_acquire))
+    {
+      return;
+    }
+    probeSeekCount_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  /// Returns a consistent snapshot of the probe counters. Returns an all-zero
+  /// struct when the probe is disabled.
+  BufferedInputProbeSnapshot bufferedInputProbeSnapshot() const
+  {
+    if (!probeEnabled_.load(std::memory_order_acquire))
+    {
+      return {};
+    }
+    BufferedInputProbeSnapshot s;
+    s.enqueueCount = probeEnqueueCount_.load(std::memory_order_relaxed);
+    s.enqueueBytes = probeEnqueueBytes_.load(std::memory_order_relaxed);
+    s.nextCount = probeNextCount_.load(std::memory_order_relaxed);
+    s.returnedBytes = probeReturnedBytes_.load(std::memory_order_relaxed);
+    s.seekCount = probeSeekCount_.load(std::memory_order_relaxed);
+    s.maxChunkBytes = probeMaxChunkBytes_.load(std::memory_order_relaxed);
+    return s;
+  }
+
  private:
   std::atomic_uint64_t rawBytesRead_{0};
   std::atomic_uint64_t rawBytesWritten_{0};
@@ -180,6 +268,15 @@ class IoStatistics {
 
   std::unordered_map<std::string, OperationCounters> operationStats_;
   mutable std::mutex operationStatsMutex_;
+
+  // --- BufferedInput probe ---
+  std::atomic<bool> probeEnabled_{false};
+  std::atomic_uint64_t probeEnqueueCount_{0};
+  std::atomic_uint64_t probeEnqueueBytes_{0};
+  std::atomic_uint64_t probeNextCount_{0};
+  std::atomic_uint64_t probeReturnedBytes_{0};
+  std::atomic_uint64_t probeSeekCount_{0};
+  std::atomic_uint64_t probeMaxChunkBytes_{0};
 };
 
 } // namespace facebook::velox::io

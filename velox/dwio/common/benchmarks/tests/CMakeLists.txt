@@ -31,3 +31,24 @@ target_link_libraries(
     velox_exception
     GTest::gtest
     GTest::gtest_main)
+
+add_executable(velox_buffered_input_trace_replay_test
+               BufferedInputTraceReplayTest.cpp)
+add_test(velox_buffered_input_trace_replay_test
+         velox_buffered_input_trace_replay_test)
+target_link_libraries(
+  velox_buffered_input_trace_replay_test
+  PRIVATE
+    velox_buffered_input_trace_replay_lib
+    velox_dwio_common
+    velox_ch_filecache_manager
+    velox_ch_filecache_core
+    velox_ch_filecache
+    velox_caching
+    velox_file
+    velox_memory
+    velox_exception
+    velox_test_util
+    Folly::folly
+    GTest::gtest
+    GTest::gtest_main)

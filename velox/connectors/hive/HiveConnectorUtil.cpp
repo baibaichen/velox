@@ -26,6 +26,7 @@
 #include "velox/connectors/hive/FileConnectorSplit.h"
 #include "velox/connectors/hive/FileConnectorUtil.h"
 #include "velox/connectors/hive/FileTableHandle.h"
+#include "velox/dwio/common/BufferedInputTrace.h"
 #include "velox/dwio/common/CachedBufferedInput.h"
 #include "velox/dwio/common/DirectBufferedInput.h"
 #include "velox/expression/Expr.h"
@@ -34,6 +35,35 @@
 #include "velox/expression/FieldReference.h"
 
 namespace facebook::velox::connector::hive {
+
+/// Process-wide flag: true while a ScopedFileCachePassthroughForBenchmark is
+/// live. Acquire/release ordering is sufficient because the flag is written by
+/// the benchmark main thread and read from threads that access storage, all of
+/// which synchronize on the benchmark's task-completion barrier.
+namespace {
+std::atomic_bool g_fileCachePassthroughForBenchmark{false};
+} // namespace
+
+ScopedFileCachePassthroughForBenchmark::ScopedFileCachePassthroughForBenchmark()
+{
+  bool expected = false;
+  VELOX_CHECK(
+      g_fileCachePassthroughForBenchmark.compare_exchange_strong(
+          expected, true, std::memory_order_release, std::memory_order_relaxed),
+      "ScopedFileCachePassthroughForBenchmark: another instance is already live");
+}
+
+ScopedFileCachePassthroughForBenchmark::
+    ~ScopedFileCachePassthroughForBenchmark()
+{
+  g_fileCachePassthroughForBenchmark.store(false, std::memory_order_release);
+}
+
+bool fileCachePassthroughForBenchmarkEnabled()
+{
+  return g_fileCachePassthroughForBenchmark.load(std::memory_order_acquire);
+}
+
 namespace {
 
 struct SubfieldSpec {
@@ -662,6 +692,70 @@ std::unique_ptr<dwio::common::BufferedInput> createBufferedInput(
     std::shared_ptr<IoStats> ioStats,
     folly::Executor* executor,
     const folly::F14FastMap<std::string, std::string>& fileReadOps) {
+  // Wrap the returned input through the active trace capture when one is live.
+  // When no capture is active, maybeWrapBufferedInputForTrace returns the
+  // original pointer unchanged (exact same dynamic type and value).
+  const auto maybeTrace =
+      [&](std::unique_ptr<dwio::common::BufferedInput> input)
+      -> std::unique_ptr<dwio::common::BufferedInput>
+  {
+      return dwio::common::maybeWrapBufferedInputForTrace(
+          std::move(input),
+          readerOpts.memoryPool(),
+          fileHandle.file);
+  };
+
+  // Enable probe statistics when the connector session property is set.
+  if (ioStatistics)
+  {
+    const auto* session = connectorQueryCtx->sessionProperties();
+    if (session->get<bool>(
+            std::string(kBufferedInputPerfProbeSession), false))
+    {
+      ioStatistics->enableBufferedInputProbe();
+    }
+  }
+
+  // Passthrough mode: FileCacheBufferedInput with no FileCache, used by the
+  // A/B benchmark to isolate the cost of the FileCacheBufferedInput code path
+  // without the on-disk caching effect. Requires no manager and no CBI cache.
+  if (fileCachePassthroughForBenchmarkEnabled())
+  {
+    VELOX_USER_CHECK_NULL(
+        ch::FileCacheManager::getInstance(),
+        "Passthrough mode requires no FileCacheManager to be installed");
+    VELOX_USER_CHECK_NULL(
+        connectorQueryCtx->cache(),
+        "Passthrough mode requires no AsyncDataCache to be installed");
+
+    ch::FileCacheRequestContext requestContext;
+    requestContext.queryId = connectorQueryCtx->queryId();
+    requestContext.cacheable = false;
+
+    ch::FileCacheOriginInfo origin(
+        /*userId=*/std::string{}, /*userWeight=*/0, ch::FileSegmentKeyType::Data);
+
+    const ch::FileCacheFileIdentity identity{
+        .path = fileHandle.file->getName(),
+        .etag = ""};
+
+    return maybeTrace(std::make_unique<ch::FileCacheBufferedInput>(
+        fileHandle.file,
+        /*cache=*/nullptr,
+        ch::FileCacheFileIdentity::deriveKey(identity),
+        std::move(origin),
+        ch::FileCacheReadOptions{},
+        std::move(requestContext),
+        dwio::common::MetricsLog::voidLog(),
+        std::move(ioStatistics),
+        std::move(ioStats),
+        executor,
+        readerOpts,
+        fileReadOps,
+        connectorQueryCtx->cancellationToken(),
+        ch::FileCacheBufferedInput::ReadMode::kPassthrough));
+  }
+
   if (auto* manager = ch::FileCacheManager::getInstance()) {
     VELOX_USER_CHECK_NULL(
         connectorQueryCtx->cache(),
@@ -686,7 +780,7 @@ std::unique_ptr<dwio::common::BufferedInput> createBufferedInput(
         .path = fileHandle.file->getName(),
         .etag = ""};
 
-    return std::make_unique<ch::FileCacheBufferedInput>(
+    return maybeTrace(std::make_unique<ch::FileCacheBufferedInput>(
         fileHandle.file,
         std::move(cache),
         ch::FileCacheFileIdentity::deriveKey(identity),
@@ -699,10 +793,10 @@ std::unique_ptr<dwio::common::BufferedInput> createBufferedInput(
         executor,
         readerOpts,
         fileReadOps,
-        connectorQueryCtx->cancellationToken());
+        connectorQueryCtx->cancellationToken()));
   }
   if (connectorQueryCtx->cache()) {
-    return std::make_unique<dwio::common::CachedBufferedInput>(
+    return maybeTrace(std::make_unique<dwio::common::CachedBufferedInput>(
         fileHandle.file,
         dwio::common::MetricsLog::voidLog(),
         fileHandle.uuid,
@@ -714,11 +808,11 @@ std::unique_ptr<dwio::common::BufferedInput> createBufferedInput(
         std::move(ioStats),
         executor,
         readerOpts,
-        fileReadOps);
+        fileReadOps));
   }
   if (readerOpts.fileFormat() == dwio::common::FileFormat::NIMBLE &&
       !readerOpts.nimbleDirectBufferedInputEnabled()) {
-    return std::make_unique<dwio::common::BufferedInput>(
+    return maybeTrace(std::make_unique<dwio::common::BufferedInput>(
         fileHandle.file,
         readerOpts.memoryPool(),
         dwio::common::MetricsLog::voidLog(),
@@ -726,9 +820,9 @@ std::unique_ptr<dwio::common::BufferedInput> createBufferedInput(
         ioStats.get(),
         dwio::common::BufferedInput::kMaxMergeDistance,
         std::nullopt,
-        fileReadOps);
+        fileReadOps));
   }
-  return std::make_unique<dwio::common::DirectBufferedInput>(
+  return maybeTrace(std::make_unique<dwio::common::DirectBufferedInput>(
       fileHandle.file,
       dwio::common::MetricsLog::voidLog(),
       fileHandle.uuid,
@@ -739,7 +833,7 @@ std::unique_ptr<dwio::common::BufferedInput> createBufferedInput(
       std::move(ioStats),
       executor,
       readerOpts,
-      fileReadOps);
+      fileReadOps));
 }
 
 namespace {

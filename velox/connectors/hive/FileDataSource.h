@@ -63,14 +63,32 @@ class FileDataSource : public DataSource {
   static constexpr std::string_view kMetadataPrefix{"metadata"};
   static constexpr std::string_view kNumPrefetch{"numPrefetch"};
   static constexpr std::string_view kPrefetchBytes{"prefetchBytes"};
+  static constexpr std::string_view kPrefetchOps{"prefetchOps"};
   static constexpr std::string_view kTotalScanTime{"totalScanTime"};
   static constexpr std::string_view kOverreadBytes{"overreadBytes"};
   static constexpr std::string_view kStorageReadBytes{"storageReadBytes"};
+  static constexpr std::string_view kStorageReadOps{"storageReadOps"};
   static constexpr std::string_view kNumLocalRead{"numLocalRead"};
   static constexpr std::string_view kLocalReadBytes{"localReadBytes"};
+  static constexpr std::string_view kLocalReadOps{"localReadOps"};
   static constexpr std::string_view kNumRamRead{"numRamRead"};
   static constexpr std::string_view kRamReadBytes{"ramReadBytes"};
   static constexpr std::string_view kReadGapBytes{"readGapBytes"};
+
+  // BufferedInput probe stat keys emitted in getRuntimeStats when probe is
+  // enabled. These keys are read by collectScanIoStats in AbBenchmarkBase.
+  static constexpr std::string_view kBufferedInputEnqueueCount{
+      "bufferedInputEnqueueCount"};
+  static constexpr std::string_view kBufferedInputEnqueueBytes{
+      "bufferedInputEnqueueBytes"};
+  static constexpr std::string_view kBufferedInputNextCount{
+      "bufferedInputNextCount"};
+  static constexpr std::string_view kBufferedInputReturnedBytes{
+      "bufferedInputReturnedBytes"};
+  static constexpr std::string_view kBufferedInputSeekCount{
+      "bufferedInputSeekCount"};
+  static constexpr std::string_view kBufferedInputMaxChunkBytes{
+      "bufferedInputMaxChunkBytes"};
 
   FileDataSource(
       const RowTypePtr& outputType,
