@@ -76,7 +76,7 @@ FileCachePtr buildFileCache(
         services.scheduler,
         services.workerPool,
         &services.memoryPool,
-        FileCacheOriginInfo(services.commonUserId),
+        FileCacheOriginInfo(services.commonUserId, 0),
         [fs](const std::string & path, bool append) -> std::unique_ptr<velox::WriteFile>
         {
             velox::filesystems::FileOptions options;

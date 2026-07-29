@@ -427,6 +427,64 @@ TEST_F(FileCacheFactoryManagerTest, InitializeOnCreateInitializesAllCaches)
     EXPECT_TRUE(manager->get("A")->isInitialized());
 }
 
+TEST_F(
+    FileCacheFactoryManagerTest,
+    ReloadFlatLayoutMetadataUsesCommonUserWeight)
+{
+    constexpr size_t kSegmentSize = 4096;
+    const auto dir = newCacheDir();
+    const auto key = FileCacheKey::random();
+    auto options = baseOptions();
+    options.caches = {{"A", makeConfig(dir), "cfg.A"}};
+    options.defaultCacheName = "A";
+
+    {
+        auto manager = FileCacheManager::create(options);
+        manager->initialize();
+        auto cache = manager->get("A");
+        const FileCacheOriginInfo origin(manager->commonUserId(), 0);
+
+        {
+            auto holder = cache->getOrSet(
+                key,
+                0,
+                kSegmentSize,
+                kSegmentSize,
+                CreateFileSegmentSettings{},
+                0,
+                origin);
+            auto segment = holder->getSingleFileSegment();
+            ASSERT_EQ(
+                segment->getOrSetDownloader(),
+                FileSegment::getCallerId());
+            std::string reason;
+            ASSERT_TRUE(segment->reserve(kSegmentSize, 1000, reason))
+                << "reserve failed: " << reason;
+            std::string data(kSegmentSize, 'z');
+            segment->write(
+                data.data(),
+                data.size(),
+                segment->getCurrentWriteOffset());
+            segment->resetDownloader();
+            ASSERT_EQ(
+                segment->state(),
+                FileSegment::State::DOWNLOADED);
+        }
+
+        manager->shutdown();
+    }
+
+    auto reloaded = FileCacheManager::create(options);
+    ASSERT_NO_THROW(reloaded->initialize());
+    const auto infos =
+        reloaded->get("A")->getFileSegmentInfos(key, options.commonUserId);
+    ASSERT_EQ(infos.size(), 1u);
+    EXPECT_EQ(infos[0].state, FileSegmentState::DOWNLOADED);
+    EXPECT_EQ(infos[0].range_left, 0u);
+    EXPECT_EQ(infos[0].range_right, kSegmentSize - 1);
+    reloaded->shutdown();
+}
+
 // ===========================================================================
 // Singleton publication / release
 // ===========================================================================
