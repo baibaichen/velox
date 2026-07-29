@@ -81,6 +81,9 @@ struct AbCsvRow
   std::optional<bool> resultMatch;
   uint64_t bytesRead{};
   double hitPct{};
+  uint64_t missCount{};
+  uint64_t sourceReadBytes{};
+  uint64_t cacheWriteBytes{};
   double cacheReadMib{};
   double predownloadMib{};
   double evictMib{};
@@ -99,13 +102,16 @@ struct BackendSnapshot
 {
   uint64_t lookups{0};
   uint64_t hits{0};
+  uint64_t misses{0};
+  uint64_t sourceReadBytes{0};
+  uint64_t cacheWriteBytes{0};
   uint64_t cacheReadBytes{0};
   uint64_t predownloadBytes{0};
   uint64_t evictedBytes{0};
   uint64_t evictionCount{0};
 };
 
-/// Writes the 32-field CSV header.
+/// Writes the 35-field CSV header.
 void writeCsvHeader(std::ostream& out);
 
 /// Writes one data row.

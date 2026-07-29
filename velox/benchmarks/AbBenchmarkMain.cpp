@@ -97,6 +97,14 @@ DEFINE_uint64(
     "Hard cap on the number of events buffered in memory during trace "
     "capture.  Capture fails closed when the limit is reached.");
 
+DECLARE_bool(cold_each_round);
+
+DEFINE_string(
+    filecache_root_mode,
+    "reset",
+    "Benchmark-only FileCache root lifecycle: 'reset' wipes before startup; "
+    "'reuse' requires and reloads an existing populated root.");
+
 namespace facebook::velox::benchmarks {
 
 namespace {
@@ -109,26 +117,35 @@ std::shared_ptr<filesystems::FileSystem> g_benchFs;
 std::shared_ptr<folly::ThreadWheelTimekeeper> g_benchTimekeeper;
 std::shared_ptr<ch::FileCacheManager> g_benchManager;
 
-// Wipes FLAGS_filecache_root, recreates it, builds a FileCacheManager sized to
-// FLAGS_filecache_disk_gib and installs it as the process-wide instance. The
-// owning shared_ptrs live in the g_bench* statics; teardownFileCache() drops
-// them in the documented order.
-void installFileCache() {
-  // Wipe cache root so round 1 is always a true cold miss. The shared helper is
-  // fail-close and 018-D sentinel-aware: it refuses to touch dangerous or
-  // unauthorized roots and preserves a sentinel when one is present.
-  dwio::common::bench::clearBenchmarkCacheRoot(FLAGS_filecache_root);
-  std::error_code ec;
-  std::filesystem::create_directories(FLAGS_filecache_root, ec);
-  VELOX_USER_CHECK(
-      !ec,
-      "Failed to create --filecache_root: {} ({})",
-      FLAGS_filecache_root,
-      ec.message());
-
-  // FileCacheManager cache paths must be absolute (validateOptions).
-  const std::string root =
-      std::filesystem::absolute(FLAGS_filecache_root).string();
+// Builds a FileCacheManager sized to FLAGS_filecache_disk_gib and installs it
+// as the process-wide instance. The owning shared_ptrs live in the g_bench*
+// statics; teardownFileCache() drops them in the documented order.
+//
+// rootMode == kReset: wipes and recreates FLAGS_filecache_root so round 1 is
+// always a true cold miss. The shared helper is fail-close and 018-D
+// sentinel-aware: it refuses to touch dangerous or unauthorized roots and
+// preserves a sentinel when one is present.
+//
+// rootMode == kReuse: never creates or clears the root; it must already exist
+// and be populated by a prior --filecache_root_mode=reset run. Validated by
+// the shared, non-destructive validateBenchmarkCacheRootForReuse() helper.
+void installFileCache(FileCacheRootMode rootMode) {
+  std::string root;
+  if (rootMode == FileCacheRootMode::kReset) {
+    dwio::common::bench::clearBenchmarkCacheRoot(FLAGS_filecache_root);
+    std::error_code ec;
+    std::filesystem::create_directories(FLAGS_filecache_root, ec);
+    VELOX_USER_CHECK(
+        !ec,
+        "Failed to create --filecache_root: {} ({})",
+        FLAGS_filecache_root,
+        ec.message());
+    // FileCacheManager cache paths must be absolute (validateOptions).
+    root = std::filesystem::absolute(FLAGS_filecache_root).string();
+  } else {
+    root = dwio::common::bench::validateBenchmarkCacheRootForReuse(
+        FLAGS_filecache_root);
+  }
 
   filesystems::registerLocalFileSystem();
   g_benchPool = memory::memoryManager()->addLeafPool("filecache_bench");
@@ -152,6 +169,25 @@ void installFileCache() {
 
   g_benchManager = ch::FileCacheManager::create(std::move(opts));
   ch::FileCacheManager::setInstance(g_benchManager.get());
+
+  if (rootMode == FileCacheRootMode::kReuse) {
+    // Metadata load is synchronous under current config: refreshStats()
+    // immediately after create() reflects what was loaded from disk. Fail
+    // close if the (already-validated, non-empty-directory) root turns out to
+    // hold no resident FileCache bytes, so a stale/irrelevant directory can't
+    // silently become a cold benchmark.
+    uint64_t residentBytes = 0;
+    for (const auto& [name, stats] :
+         g_benchManager->refreshStats().cachesByName) {
+      residentBytes += stats.usedSize;
+    }
+    VELOX_USER_CHECK_GT(
+        residentBytes,
+        0,
+        "--filecache_root_mode=reuse loaded no resident FileCache bytes from "
+        "'{}'; run a reset population first",
+        root);
+  }
 }
 
 // Tears the installed FileCacheManager down in the documented strict order:
@@ -208,9 +244,40 @@ AbInputSource parseAbInputSource(std::string_view token) {
       token);
 }
 
+FileCacheRootMode parseFileCacheRootMode(
+    const std::string& inputSource,
+    const std::string& rootMode,
+    bool coldEachRound)
+{
+  if (rootMode == "reset")
+  {
+    return FileCacheRootMode::kReset;
+  }
+  VELOX_USER_CHECK_EQ(
+      rootMode,
+      "reuse",
+      "--filecache_root_mode must be 'reset' or 'reuse'");
+  VELOX_USER_CHECK_EQ(
+      inputSource,
+      "filecache",
+      "--filecache_root_mode=reuse requires --input_source=filecache");
+  VELOX_USER_CHECK(
+      !coldEachRound,
+      "--filecache_root_mode=reuse is incompatible with "
+      "--cold_each_round=true");
+  return FileCacheRootMode::kReuse;
+}
+
 int32_t dispatchAbMain(
     AbBenchmarkBase& ab,
     const std::function<void()>& runLegacy) {
+  // Validate --filecache_root_mode before any benchmark initialization, so
+  // 'reuse' paired with an incompatible --input_source or
+  // --cold_each_round=true fails fast. The default ('reset') is inert/
+  // compatible with every --input_source, including the empty (legacy) value.
+  const FileCacheRootMode rootMode = parseFileCacheRootMode(
+      FLAGS_input_source, FLAGS_filecache_root_mode, FLAGS_cold_each_round);
+
   if (FLAGS_input_source.empty()) {
     runLegacy();
     return 0;
@@ -264,7 +331,7 @@ int32_t dispatchAbMain(
   // that QueryBenchmarkBase::initialize sets up.
   if (src == AbInputSource::kFileCache)
   {
-    installFileCache();
+    installFileCache(rootMode);
   }
 
   // For passthrough, install the process-wide RAII guard that signals
@@ -276,12 +343,18 @@ int32_t dispatchAbMain(
     passthroughOverride.emplace();
   }
 
-  // Wire the per-backend cold-reset used by --cold_each_round.
+  // Wire the per-backend cold-reset used by --cold_each_round and by the
+  // untimed reference-query reset. filecache tears down and reinstalls its
+  // singleton via the same installFileCache(rootMode) path used at startup:
+  // in kReset mode this continues wiping disk + metadata on every reset; in
+  // kReuse mode it releases <root>/status and reloads the same segment tree
+  // without ever clearing it. The else branch covers cbi (clears its
+  // AsyncDataCache) and direct (clearCbiCache is a no-op as no cache exists).
   if (src == AbInputSource::kFileCache)
   {
-    ab.setColdResetFn([]() {
+    ab.setColdResetFn([rootMode]() {
       teardownFileCache();
-      installFileCache();
+      installFileCache(rootMode);
     });
   }
   else

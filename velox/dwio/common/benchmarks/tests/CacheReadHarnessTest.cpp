@@ -272,5 +272,80 @@ TEST(ClearCacheRootTest, directorySentinelIsRejected) {
   fs::remove_all(root, ec);
 }
 
+TEST(ReuseCacheRootTest, tmpPayloadIsAcceptedWithoutMutation)
+{
+    const fs::path root =
+        fs::current_path() / "tmp" / uniqueName("reuse-valid");
+    const fs::path payload = root / "regular" / "segment.bin";
+    writeFile(payload, "cached-bytes");
+
+    const auto normalized = validateBenchmarkCacheRootForReuse(root.string());
+
+    EXPECT_EQ(normalized, fs::absolute(root).lexically_normal().string());
+    EXPECT_TRUE(fs::exists(payload));
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+TEST(ReuseCacheRootTest, missingEmptyAndStatusOnlyRootsAreRejected)
+{
+    const fs::path missing =
+        fs::current_path() / "tmp" / uniqueName("reuse-missing");
+    VELOX_ASSERT_THROW(
+        validateBenchmarkCacheRootForReuse(missing.string()),
+        "does not exist");
+
+    const fs::path empty =
+        fs::current_path() / "tmp" / uniqueName("reuse-empty");
+    fs::create_directories(empty);
+    VELOX_ASSERT_THROW(
+        validateBenchmarkCacheRootForReuse(empty.string()),
+        "no cache payload");
+
+    writeFile(empty / "status", "stale status");
+    VELOX_ASSERT_THROW(
+        validateBenchmarkCacheRootForReuse(empty.string()),
+        "no cache payload");
+    std::error_code ec;
+    fs::remove_all(empty, ec);
+}
+
+TEST(ReuseCacheRootTest, externalRootRequiresRegularSentinel)
+{
+    const fs::path root = fs::current_path() / uniqueName("reuse-external");
+    writeFile(root / "regular" / "segment.bin", "cached-bytes");
+    VELOX_ASSERT_THROW(
+        validateBenchmarkCacheRootForReuse(root.string()),
+        "without the sentinel file");
+
+    writeFile(root / kCacheSentinelName, "");
+    EXPECT_NO_THROW(validateBenchmarkCacheRootForReuse(root.string()));
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+TEST(ReuseCacheRootTest, dangerousAndNonDirectoryRootsAreRejected)
+{
+    VELOX_ASSERT_THROW(
+        validateBenchmarkCacheRootForReuse("/"),
+        "filesystem root");
+    VELOX_ASSERT_THROW(
+        validateBenchmarkCacheRootForReuse(fs::current_path().string()),
+        "current working directory");
+    VELOX_ASSERT_THROW(
+        validateBenchmarkCacheRootForReuse(
+            (fs::current_path() / "tmp").string()),
+        "tmp/ parent directory");
+
+    const fs::path file =
+        fs::current_path() / "tmp" / uniqueName("reuse-file");
+    writeFile(file, "not-a-directory");
+    EXPECT_THROW(
+        validateBenchmarkCacheRootForReuse(file.string()),
+        VeloxUserError);
+    std::error_code ec;
+    fs::remove(file, ec);
+}
+
 } // namespace
 } // namespace facebook::velox::dwio::common::bench

@@ -108,7 +108,8 @@ double quantileUs(const std::vector<int64_t>& samplesNs, double q) {
 
 void writeCsvHeader(std::ostream& out) {
   out << "round,query_id,wall_ms,rows,result_hash,result_match,bytes_read,"
-         "hit_pct,cache_read_mib,predownload_mib,evict_mib,evict_count,"
+         "hit_pct,miss_count,source_read_bytes,cache_write_bytes,"
+         "cache_read_mib,predownload_mib,evict_mib,evict_count,"
          "op_p50_us,op_p95_us,error,"
          "user_ns,system_ns,voluntary_csw,involuntary_csw,"
          "storage_read_ops,storage_read_bytes,"
@@ -128,6 +129,9 @@ void writeCsvRow(std::ostream& out, const AbCsvRow& row) {
       << fmt::format("{:.3f}", row.wallMs) << "," << row.rows << ","
       << row.resultHash << "," << resultMatch << "," << row.bytesRead << ","
       << fmt::format("{:.4f}", row.hitPct) << ","
+      << row.missCount << ","
+      << row.sourceReadBytes << ","
+      << row.cacheWriteBytes << ","
       << fmt::format("{:.4f}", row.cacheReadMib) << ","
       << fmt::format("{:.4f}", row.predownloadMib) << ","
       << fmt::format("{:.4f}", row.evictMib) << ","
@@ -153,6 +157,16 @@ void populateBackendDelta(
       after.lookups >= before.lookups ? after.lookups - before.lookups : 0;
   const uint64_t hits =
       after.hits >= before.hits ? after.hits - before.hits : 0;
+  const uint64_t missDelta =
+      after.misses >= before.misses ? after.misses - before.misses : 0;
+  const uint64_t sourceReadDelta =
+      after.sourceReadBytes >= before.sourceReadBytes
+      ? after.sourceReadBytes - before.sourceReadBytes
+      : 0;
+  const uint64_t cacheWriteDelta =
+      after.cacheWriteBytes >= before.cacheWriteBytes
+      ? after.cacheWriteBytes - before.cacheWriteBytes
+      : 0;
   const uint64_t cacheReadDelta = after.cacheReadBytes >= before.cacheReadBytes
       ? after.cacheReadBytes - before.cacheReadBytes
       : 0;
@@ -167,6 +181,9 @@ void populateBackendDelta(
       ? after.evictionCount - before.evictionCount
       : 0;
   row.hitPct = lookups ? 100.0 * hits / lookups : 0.0;
+  row.missCount = missDelta;
+  row.sourceReadBytes = sourceReadDelta;
+  row.cacheWriteBytes = cacheWriteDelta;
   row.cacheReadMib = static_cast<double>(cacheReadDelta) / (1ULL << 20);
   row.predownloadMib = static_cast<double>(predownloadDelta) / (1ULL << 20);
   row.evictMib = static_cast<double>(evictBytesDelta) / (1ULL << 20);
@@ -400,6 +417,9 @@ BackendSnapshot snapshotBackend() {
     const auto fc = ch::takeFileCacheStatsSnapshot();
     s.hits = fc.cacheHitCount;
     s.lookups = fc.cacheHitCount + fc.cacheMissCount;
+    s.misses = fc.cacheMissCount;
+    s.sourceReadBytes = fc.sourceReadBytes;
+    s.cacheWriteBytes = fc.cacheWriteBytes;
     s.cacheReadBytes = fc.cacheReadBytes;
     s.predownloadBytes = fc.predownloadedFromSourceBytes;
     s.evictedBytes = fc.evictedBytes;
@@ -409,6 +429,10 @@ BackendSnapshot snapshotBackend() {
     s.hits = static_cast<uint64_t>(dc.numHit);
     s.lookups =
         static_cast<uint64_t>(dc.numHit + dc.numNew + dc.numWaitExclusive);
+    // CBI: numNew + numWaitExclusive are cache misses (no direct miss
+    // counter); source/write byte counters have no CBI equivalent.
+    s.misses =
+        static_cast<uint64_t>(dc.numNew + dc.numWaitExclusive);
     // CBI: hitBytes maps to cache_read_mib; no predownload concept.
     s.cacheReadBytes = static_cast<uint64_t>(dc.hitBytes);
     s.predownloadBytes = 0;

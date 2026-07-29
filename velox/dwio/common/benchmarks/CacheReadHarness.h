@@ -120,6 +120,11 @@ inline constexpr const char* kCacheSentinelName =
 // path in the message.
 void clearBenchmarkCacheRoot(const std::string& root);
 
+/// Validates that root is a safe, existing cache directory containing payload
+/// that a fresh process may reuse. This function never creates, removes, or
+/// modifies filesystem entries. It returns an absolute normalized path.
+std::string validateBenchmarkCacheRootForReuse(const std::string& root);
+
 // Tier-aware byte counters for one measured sweep. sourceBytes should be ~0
 // when the working set is fully cache-resident.
 struct TierBytes {

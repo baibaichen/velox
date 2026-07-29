@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <string_view>
 
 #include <glog/logging.h>
 
@@ -96,18 +97,37 @@ bool isStrictSubpath(
   // descendant only if it has at least one further component.
   return q != qEnd;
 }
-} // namespace
 
-void clearBenchmarkCacheRoot(const std::string& root) {
+// Outcome of the shared root-safety policy: the normalized, absolute root
+// path, whether it lies strictly under the cwd's `tmp/` subtree (exempt from
+// the sentinel requirement), and whether a regular-file sentinel is present.
+struct BenchmarkCacheRootInfo {
+  std::filesystem::path normalized;
+  bool underTmp{false};
+  bool hasSentinel{false};
+};
+
+// Shared root-safety policy reused by every task-owned cache-root operation
+// (destructive clear and non-destructive reuse-validation alike). `operation`
+// is only used to prefix error messages so callers can be identified; the
+// checks themselves -- normalization, dangerous-root rejection, and
+// sentinel authentication -- are identical regardless of caller. See the
+// `clearBenchmarkCacheRoot` doc comment in CacheReadHarness.h for the exact
+// policy this implements. This function never creates, removes, or modifies
+// filesystem entries.
+BenchmarkCacheRootInfo inspectBenchmarkCacheRoot(
+    const std::string& root,
+    std::string_view operation) {
   namespace fs = std::filesystem;
   VELOX_USER_CHECK(
-      !root.empty(), "clearBenchmarkCacheRoot: refusing to clear an empty root");
+      !root.empty(), "{}: refusing to clear an empty root", operation);
 
   std::error_code ec;
   fs::path canonical = fs::absolute(fs::path(root), ec).lexically_normal();
   VELOX_USER_CHECK(
       !ec,
-      "clearBenchmarkCacheRoot: cannot resolve cache root '{}' ({})",
+      "{}: cannot resolve cache root '{}' ({})",
+      operation,
       root,
       ec.message());
   // Canonicalize away trailing separators and dot components before any
@@ -128,24 +148,26 @@ void clearBenchmarkCacheRoot(const std::string& root) {
   const fs::path cwd = fs::current_path(ec);
   VELOX_USER_CHECK(
       !ec,
-      "clearBenchmarkCacheRoot: cannot resolve current working directory ({})",
+      "{}: cannot resolve current working directory ({})",
+      operation,
       ec.message());
   const fs::path tmpParent = (cwd / "tmp").lexically_normal();
 
   // Reject dangerous roots before touching the filesystem.
   VELOX_USER_CHECK(
       canonical != canonical.root_path(),
-      "clearBenchmarkCacheRoot: refusing to clear the filesystem root '{}'",
+      "{}: refusing to clear the filesystem root '{}'",
+      operation,
       normalized);
   VELOX_USER_CHECK(
       canonical != cwd,
-      "clearBenchmarkCacheRoot: refusing to clear the current working "
-      "directory '{}'",
+      "{}: refusing to clear the current working directory '{}'",
+      operation,
       normalized);
   VELOX_USER_CHECK(
       canonical != tmpParent,
-      "clearBenchmarkCacheRoot: refusing to clear the tmp/ parent directory "
-      "'{}'",
+      "{}: refusing to clear the tmp/ parent directory '{}'",
+      operation,
       normalized);
 
   const bool underTmp = isStrictSubpath(tmpParent, canonical);
@@ -164,7 +186,8 @@ void clearBenchmarkCacheRoot(const std::string& root) {
   const bool sentinelMissing = sentinelStatus.type() == fs::file_type::not_found;
   VELOX_USER_CHECK(
       !ec || sentinelMissing,
-      "clearBenchmarkCacheRoot: cannot stat sentinel under '{}' ({})",
+      "{}: cannot stat sentinel under '{}' ({})",
+      operation,
       normalized,
       ec.message());
   const bool hasSentinel =
@@ -173,12 +196,25 @@ void clearBenchmarkCacheRoot(const std::string& root) {
   if (!underTmp) {
     VELOX_USER_CHECK(
         hasSentinel,
-        "clearBenchmarkCacheRoot: refusing to clear external cache root '{}' "
+        "{}: refusing to clear external cache root '{}' "
         "without the sentinel file '{}'; create it first to authorize "
         "destructive resets (Task 018-D protocol)",
+        operation,
         normalized,
         kCacheSentinelName);
   }
+  return {canonical, underTmp, hasSentinel};
+}
+} // namespace
+
+void clearBenchmarkCacheRoot(const std::string& root) {
+  namespace fs = std::filesystem;
+  const auto info =
+      inspectBenchmarkCacheRoot(root, "clearBenchmarkCacheRoot");
+  std::error_code ec;
+  const fs::path& canonical = info.normalized;
+  const std::string normalized = canonical.string();
+  const bool hasSentinel = info.hasSentinel;
 
   if (!fs::exists(canonical, ec)) {
     VELOX_USER_CHECK(
@@ -229,6 +265,53 @@ void clearBenchmarkCacheRoot(const std::string& root) {
         normalized,
         ec.message());
   }
+}
+
+std::string validateBenchmarkCacheRootForReuse(const std::string& root) {
+  namespace fs = std::filesystem;
+  const auto info =
+      inspectBenchmarkCacheRoot(root, "validateBenchmarkCacheRootForReuse");
+
+  std::error_code ec;
+  const fs::file_status rootStatus = fs::symlink_status(info.normalized, ec);
+  VELOX_USER_CHECK(
+      !ec && rootStatus.type() != fs::file_type::not_found,
+      "validateBenchmarkCacheRootForReuse: cache root '{}' does not exist",
+      info.normalized.string());
+  VELOX_USER_CHECK(
+      rootStatus.type() == fs::file_type::directory,
+      "validateBenchmarkCacheRootForReuse: cache root '{}' is not a "
+      "directory",
+      info.normalized.string());
+
+  // Enumerate only the top level: any entry other than the sentinel or a
+  // stale "status" file counts as cache payload. This never recurses and
+  // never touches the filesystem beyond reading directory entries.
+  bool hasPayload = false;
+  for (fs::directory_iterator it(info.normalized, ec), end; it != end;
+       it.increment(ec)) {
+    VELOX_USER_CHECK(
+        !ec,
+        "validateBenchmarkCacheRootForReuse: cannot enumerate '{}' ({})",
+        info.normalized.string(),
+        ec.message());
+    const auto name = it->path().filename();
+    if (name != kCacheSentinelName && name != "status") {
+      hasPayload = true;
+      break;
+    }
+  }
+  VELOX_USER_CHECK(
+      !ec,
+      "validateBenchmarkCacheRootForReuse: cannot enumerate '{}' ({})",
+      info.normalized.string(),
+      ec.message());
+  VELOX_USER_CHECK(
+      hasPayload,
+      "validateBenchmarkCacheRootForReuse: cache root '{}' has no cache "
+      "payload",
+      info.normalized.string());
+  return info.normalized.string();
 }
 
 // ---- DataLayout ----

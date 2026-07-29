@@ -15,7 +15,9 @@
  */
 #pragma once
 
+#include <cstdint>
 #include <functional>
+#include <string>
 #include <string_view>
 
 namespace facebook::velox::benchmarks {
@@ -42,6 +44,33 @@ AbInputSource parseAbInputSource(std::string_view token);
 /// clean sweep (failed == 0) returns 0. Pure function, safe to unit test
 /// directly.
 int32_t abExitCode(int32_t failed);
+
+/// Benchmark-only FileCache root lifecycle selected by --filecache_root_mode:
+///   kReset -> wipe/recreate --filecache_root before every (re)install (the
+///             pre-Task-022 default behavior).
+///   kReuse -> require and reload an existing, already-populated root without
+///             ever clearing it.
+enum class FileCacheRootMode : uint8_t
+{
+  kReset,
+  kReuse,
+};
+
+/// Parses/validates the benchmark-only FileCache root lifecycle mode. Pure
+/// function, safe to unit test directly.
+///
+/// @param inputSource The resolved --input_source value.
+/// @param rootMode The raw --filecache_root_mode value ("reset" or "reuse").
+/// @param coldEachRound The resolved --cold_each_round value.
+/// @return FileCacheRootMode::kReset when rootMode == "reset"; otherwise
+///     FileCacheRootMode::kReuse.
+/// @throws VeloxUserError when rootMode is neither "reset" nor "reuse", when
+///     rootMode == "reuse" and inputSource != "filecache", or when rootMode ==
+///     "reuse" and coldEachRound is true.
+FileCacheRootMode parseFileCacheRootMode(
+    const std::string& inputSource,
+    const std::string& rootMode,
+    bool coldEachRound);
 
 /// Common --input_source dispatch for any AbBenchmarkBase-derived suite:
 ///   empty                -> runLegacy() (the suite's existing folly::runBenchmarks path)

@@ -52,10 +52,25 @@ using namespace facebook::velox::test;
 using velox::common::testutil::TempDirectoryPath;
 
 // ---------------------------------------------------------------------------
-// Task-4: 32-field CSV schema (updated from 15-field after Task-4 expansion)
+// 35-field CSV schema (Task-4 expansion + Task-022 exact counters)
 // ---------------------------------------------------------------------------
 
-// NOTE: The header/row field-count tests below have been updated from 15→32
+// The exact 35-field header: 18 base + 4 rusage + 13 scan I/O.
+constexpr const char* kExpectedHeader =
+    "round,query_id,wall_ms,rows,result_hash,result_match,bytes_read,hit_pct,"
+    "miss_count,source_read_bytes,cache_write_bytes,"
+    "cache_read_mib,predownload_mib,evict_mib,evict_count,"
+    "op_p50_us,op_p95_us,error,"
+    "user_ns,system_ns,voluntary_csw,involuntary_csw,"
+    "storage_read_ops,storage_read_bytes,"
+    "local_read_ops,local_read_bytes,"
+    "prefetch_ops,prefetch_bytes,"
+    "enqueue_count,enqueue_bytes,"
+    "next_count,returned_bytes,"
+    "seek_count,max_chunk_bytes,"
+    "passthrough_read_bytes";
+
+// NOTE: The header/row field-count tests below have been updated from 15→35
 // fields as part of Task-4 CSV expansion. The ResultMatch serialization tests
 // validate field indices which remain stable at position 5.
 
@@ -68,25 +83,38 @@ TEST(AbBenchmarkSchemaTest, CsvHeaderHasExactly32Fields)
   {
     header.pop_back();
   }
+  EXPECT_EQ(header, kExpectedHeader)
+      << "CSV header must match the 35-field schema exactly";
   int commas = 0;
   for (char c : header)
   {
     if (c == ',')
       ++commas;
   }
-  EXPECT_EQ(commas, 31) << "32 fields require exactly 31 commas";
+  EXPECT_EQ(commas, 34) << "35 fields require exactly 34 commas";
 }
 
-TEST(AbBenchmarkSchemaTest, CsvRowHas32Fields)
+TEST(AbBenchmarkSchemaTest, CsvRowHas35Fields)
 {
   AbCsvRow row{};
   row.round = 1;
   row.queryId = 1;
-  row.wallMs = 100.0;
-  row.rows = 50;
-  row.resultHash = 123;
-  row.resultMatch = true;
-  row.bytesRead = 1000;
+  row.wallMs = 123.456;
+  row.rows = 100;
+  row.resultHash = 999;
+  row.resultMatch = std::nullopt;
+  row.bytesRead = 5000;
+  row.hitPct = 95.0;
+  row.missCount = 0;
+  row.sourceReadBytes = 0;
+  row.cacheWriteBytes = 0;
+  row.cacheReadMib = 4.5;
+  row.predownloadMib = 1.2;
+  row.evictMib = 0.3;
+  row.evictCount = 7;
+  row.opP50Us = 10.0;
+  row.opP95Us = 50.0;
+  row.error = "";
 
   std::ostringstream oss;
   writeCsvRow(oss, row);
@@ -101,7 +129,7 @@ TEST(AbBenchmarkSchemaTest, CsvRowHas32Fields)
     if (c == ',')
       ++commas;
   }
-  EXPECT_EQ(commas, 31) << "32 fields require exactly 31 commas";
+  EXPECT_EQ(commas, 34) << "35 fields require exactly 34 commas";
 }
 
 TEST(AbBenchmarkSchemaTest, ResultMatchSerializesEmpty)
@@ -129,7 +157,7 @@ TEST(AbBenchmarkSchemaTest, ResultMatchSerializesEmpty)
   {
     fields.back().pop_back();
   }
-  ASSERT_EQ(fields.size(), 32) << "Must have exactly 32 fields";
+  ASSERT_EQ(fields.size(), 35) << "Must have exactly 35 fields";
   EXPECT_EQ(fields[5], "") << "result_match must be empty for nullopt";
 }
 
@@ -154,7 +182,7 @@ TEST(AbBenchmarkSchemaTest, ResultMatchSerializesTrue)
   {
     fields.back().pop_back();
   }
-  ASSERT_EQ(fields.size(), 32) << "Must have exactly 32 fields";
+  ASSERT_EQ(fields.size(), 35) << "Must have exactly 35 fields";
   EXPECT_EQ(fields[5], "1") << "result_match must be 1 for true";
 }
 
@@ -179,7 +207,7 @@ TEST(AbBenchmarkSchemaTest, ResultMatchSerializesFalse)
   {
     fields.back().pop_back();
   }
-  ASSERT_EQ(fields.size(), 32) << "Must have exactly 32 fields";
+  ASSERT_EQ(fields.size(), 35) << "Must have exactly 35 fields";
   EXPECT_EQ(fields[5], "0") << "result_match must be 0 for false";
 }
 
@@ -342,6 +370,9 @@ TEST(AbBenchmarkSchemaTest, BackendSnapshotFileCacheMapping)
   BackendSnapshot snap;
   snap.lookups = 100;
   snap.hits = 80;
+  snap.misses = 20;
+  snap.sourceReadBytes = 1234567;
+  snap.cacheWriteBytes = 7654321;
   snap.cacheReadBytes = 1024 * 1024 * 10;   // 10 MiB
   snap.predownloadBytes = 1024 * 1024 * 2;   // 2 MiB
   snap.evictedBytes = 1024 * 1024 * 3;       // 3 MiB
@@ -350,6 +381,9 @@ TEST(AbBenchmarkSchemaTest, BackendSnapshotFileCacheMapping)
   BackendSnapshot before;
   before.lookups = 0;
   before.hits = 0;
+  before.misses = 0;
+  before.sourceReadBytes = 0;
+  before.cacheWriteBytes = 0;
   before.cacheReadBytes = 0;
   before.predownloadBytes = 0;
   before.evictedBytes = 0;
@@ -358,6 +392,9 @@ TEST(AbBenchmarkSchemaTest, BackendSnapshotFileCacheMapping)
   AbCsvRow row{};
   populateBackendDelta(row, before, snap);
   EXPECT_DOUBLE_EQ(row.hitPct, 80.0);
+  EXPECT_EQ(row.missCount, 20);
+  EXPECT_EQ(row.sourceReadBytes, 1234567);
+  EXPECT_EQ(row.cacheWriteBytes, 7654321);
   EXPECT_DOUBLE_EQ(row.cacheReadMib, 10.0);
   EXPECT_DOUBLE_EQ(row.predownloadMib, 2.0);
   EXPECT_DOUBLE_EQ(row.evictMib, 3.0);
@@ -369,6 +406,7 @@ TEST(AbBenchmarkSchemaTest, BackendSnapshotCbiMapping)
   BackendSnapshot snap;
   snap.lookups = 50;
   snap.hits = 40;
+  snap.misses = 10;
   snap.cacheReadBytes = 1024 * 1024 * 5;  // 5 MiB (hitBytes)
   snap.predownloadBytes = 0;
   snap.evictedBytes = 0;
@@ -377,6 +415,7 @@ TEST(AbBenchmarkSchemaTest, BackendSnapshotCbiMapping)
   BackendSnapshot before;
   before.lookups = 0;
   before.hits = 0;
+  before.misses = 0;
   before.cacheReadBytes = 0;
   before.predownloadBytes = 0;
   before.evictedBytes = 0;
@@ -385,6 +424,9 @@ TEST(AbBenchmarkSchemaTest, BackendSnapshotCbiMapping)
   AbCsvRow row{};
   populateBackendDelta(row, before, snap);
   EXPECT_DOUBLE_EQ(row.hitPct, 80.0);
+  EXPECT_EQ(row.missCount, 10);
+  EXPECT_EQ(row.sourceReadBytes, 0);
+  EXPECT_EQ(row.cacheWriteBytes, 0);
   EXPECT_DOUBLE_EQ(row.cacheReadMib, 5.0);
   EXPECT_DOUBLE_EQ(row.predownloadMib, 0.0);
   EXPECT_DOUBLE_EQ(row.evictMib, 0.0);
@@ -410,7 +452,7 @@ TEST(AbBenchmarkSchemaTest, MutationSwapBytesCountFails)
   EXPECT_LT(row.evictCount, 100);
 }
 
-TEST(AbBenchmarkSchemaTest, CsvRowHas15FieldsForFailure)
+TEST(AbBenchmarkSchemaTest, CsvRowHas35FieldsForFailure)
 {
   AbCsvRow row;
   row.round = 1;
@@ -421,6 +463,9 @@ TEST(AbBenchmarkSchemaTest, CsvRowHas15FieldsForFailure)
   row.resultMatch = std::nullopt;
   row.bytesRead = 0;
   row.hitPct = 0.0;
+  row.missCount = 0;
+  row.sourceReadBytes = 0;
+  row.cacheWriteBytes = 0;
   row.cacheReadMib = 0.0;
   row.predownloadMib = 0.0;
   row.evictMib = 0.0;
@@ -444,7 +489,7 @@ TEST(AbBenchmarkSchemaTest, CsvRowHas15FieldsForFailure)
     if (c == ',')
       ++commas;
   }
-  EXPECT_EQ(commas, 31) << "32 fields require exactly 31 commas, even on failure";
+  EXPECT_EQ(commas, 34) << "35 fields require exactly 34 commas";
 }
 
 TEST(AbBenchmarkSchemaTest, FailedReferenceCheckedRowSerializesResultMatchFalse)
@@ -463,6 +508,9 @@ TEST(AbBenchmarkSchemaTest, FailedReferenceCheckedRowSerializesResultMatchFalse)
   row.resultMatch = false;
   row.bytesRead = 0;
   row.hitPct = 0.0;
+  row.missCount = 0;
+  row.sourceReadBytes = 0;
+  row.cacheWriteBytes = 0;
   row.cacheReadMib = 0.0;
   row.predownloadMib = 0.0;
   row.evictMib = 0.0;
@@ -485,7 +533,7 @@ TEST(AbBenchmarkSchemaTest, FailedReferenceCheckedRowSerializesResultMatchFalse)
   {
     fields.push_back(field);
   }
-  ASSERT_EQ(fields.size(), 32) << "Must have exactly 32 fields";
+  ASSERT_EQ(fields.size(), 35) << "Must have exactly 35 fields";
   EXPECT_EQ(fields[5], "0")
       << "result_match must serialize as 0 for a failed, reference-checked row";
   EXPECT_FALSE(fields.back().empty())
@@ -1243,7 +1291,7 @@ TEST(AbBenchmarkCaptureCrashTest, FinishSuccessReturnsNoError)
 }
 
 // A finish() failure must produce a CSV-safe single-field diagnostic: the
-// benchmark writes row.error into an unquoted 32-field CSV, so the reason must
+// benchmark writes row.error into an unquoted 35-field CSV, so the reason must
 // contain no ',', '\n', or '\r' that could split the field or the row. Uses a
 // trace root path containing commas to prove the interpolated path text cannot
 // break the CSV field, while still retaining a useful reason such as
@@ -1290,6 +1338,50 @@ TEST(AbBenchmarkCaptureCrashTest, FinishFailureDiagnosticIsCsvSafe)
         << error;
     EXPECT_EQ(error.find('\r'), std::string::npos)
         << "capture diagnostic contains a carriage return: " << error;
+}
+
+// --- --filecache_root_mode validation tests (Task 022-4) ---
+
+TEST(AbBenchmarkFlagTest, FileCacheRootModeResetIsDefaultCompatible)
+{
+  EXPECT_EQ(
+      parseFileCacheRootMode("filecache", "reset", false),
+      FileCacheRootMode::kReset);
+  EXPECT_EQ(
+      parseFileCacheRootMode("direct", "reset", false),
+      FileCacheRootMode::kReset);
+  EXPECT_EQ(
+      parseFileCacheRootMode("cbi", "reset", false),
+      FileCacheRootMode::kReset);
+  EXPECT_EQ(
+      parseFileCacheRootMode("", "reset", false),
+      FileCacheRootMode::kReset);
+}
+
+TEST(AbBenchmarkFlagTest, FileCacheRootModeReuseIsFileCacheOnly)
+{
+  EXPECT_EQ(
+      parseFileCacheRootMode("filecache", "reuse", false),
+      FileCacheRootMode::kReuse);
+  EXPECT_THROW(
+      parseFileCacheRootMode("direct", "reuse", false),
+      VeloxUserError);
+  EXPECT_THROW(
+      parseFileCacheRootMode("cbi", "reuse", false),
+      VeloxUserError);
+  EXPECT_THROW(
+      parseFileCacheRootMode("", "reuse", false),
+      VeloxUserError);
+}
+
+TEST(AbBenchmarkFlagTest, FileCacheRootModeRejectsUnknownAndColdEachRound)
+{
+  EXPECT_THROW(
+      parseFileCacheRootMode("filecache", "keep", false),
+      VeloxUserError);
+  EXPECT_THROW(
+      parseFileCacheRootMode("filecache", "reuse", true),
+      VeloxUserError);
 }
 
 } // namespace
