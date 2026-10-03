@@ -731,6 +731,13 @@ endif()
 # TODO: Move this to use resolve_dependency(). For some reason, FBThrift
 # requires clients to explicitly install fizz and wangle.
 if(VELOX_NEEDS_FBTHRIFT)
+  # Installed FBOS static archives export this unnamespaced gflags target.
+  # Reuse the selected gflags implementation when BUNDLED builds only static
+  # variants, rather than leaving a literal -lgflags_shared on the link line.
+  if(gflags_SOURCE STREQUAL "BUNDLED" AND NOT TARGET gflags_shared)
+    add_library(gflags_shared INTERFACE)
+    target_link_libraries(gflags_shared INTERFACE gflags::gflags)
+  endif()
   find_package(fizz CONFIG REQUIRED)
   find_package(wangle CONFIG REQUIRED)
   find_package(FBThrift CONFIG REQUIRED)

@@ -34,7 +34,8 @@ ProcessorCount(NUM_JOBS)
 velox_set_with_default(NUM_JOBS NUM_THREADS ${NUM_JOBS})
 find_program(MAKE_PROGRAM make REQUIRED)
 
-set(ICU_CFG --disable-tests --disable-samples)
+# Embed the private install libdir so ICU can resolve its sibling shared libraries.
+set(ICU_CFG --disable-tests --disable-samples --enable-rpath)
 set(
   HOST_ENV_CMAKE
   ${CMAKE_COMMAND}
@@ -89,6 +90,7 @@ foreach(component ${icu_components})
     ICU::${component}
     PROPERTIES
       IMPORTED_LOCATION ${ICU_${component}_LIBRARY}
+      INTERFACE_INCLUDE_DIRECTORIES ${ICU_INCLUDE_DIRS}
       INTERFACE_SYSTEM_INCLUDE_DIRECTORIES ${ICU_INCLUDE_DIRS}
   )
   target_link_libraries(ICU::ICU INTERFACE ICU::${component})

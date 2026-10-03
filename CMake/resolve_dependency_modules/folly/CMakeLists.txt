@@ -32,10 +32,11 @@ velox_resolve_dependency_url(FOLLY)
 message(STATUS "Building Folly from source")
 
 if(gflags_SOURCE STREQUAL "BUNDLED")
-  set(glog_patch && git apply ${CMAKE_CURRENT_LIST_DIR}/folly-gflags-glog.patch)
-  # Together with the patch applied above prevents folly from test compiling a
-  # snippet to find the right namespace (which would fail because gflags isn't
-  # built yet)
+  # FetchContent redirects FindGflags without populating its legacy variables.
+  set(LIBGFLAGS_FOUND TRUE)
+  set(LIBGFLAGS_LIBRARY gflags::gflags)
+  set(LIBGFLAGS_INCLUDE_DIR ${gflags_BINARY_DIR}/include)
+  # Avoid probing the namespace by linking against gflags before it is built.
   set(FOLLY_UNUSUAL_GFLAGS_NAMESPACE OFF)
   set(FOLLY_GFLAGS_NAMESPACE gflags)
 endif()
@@ -44,7 +45,7 @@ FetchContent_Declare(
   folly
   URL ${VELOX_FOLLY_SOURCE_URL}
   URL_HASH ${VELOX_FOLLY_BUILD_SHA256_CHECKSUM}
-  PATCH_COMMAND git apply ${CMAKE_CURRENT_LIST_DIR}/folly-no-export.patch ${glog_patch}
+  PATCH_COMMAND git apply ${CMAKE_CURRENT_LIST_DIR}/folly-no-export.patch
   OVERRIDE_FIND_PACKAGE
   SYSTEM
   EXCLUDE_FROM_ALL

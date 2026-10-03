@@ -50,6 +50,7 @@ FetchContent_Declare(
 )
 
 # Configure the file before adding the header only libs
+set(BOOST_INCLUDE_LIBRARIES ${BOOST_COMPONENTS} ${BOOST_OPTIONAL_COMPONENTS})
 configure_file(
   ${CMAKE_CURRENT_LIST_DIR}/FindBoost.cmake.in
   ${CMAKE_CURRENT_LIST_DIR}/FindBoost.cmake
@@ -63,7 +64,7 @@ set(
   math
   multi_index
   multiprecision
-  numeric_conversion
+  numeric/conversion
   random
   uuid
   variant
@@ -75,6 +76,8 @@ list(REMOVE_ITEM BOOST_INCLUDE_LIBRARIES headers)
 set(BUILD_SHARED_LIBS OFF)
 FetchContent_MakeAvailable(Boost)
 
+list(TRANSFORM BOOST_HEADER_ONLY REPLACE "numeric/conversion" "numeric_conversion")
 list(TRANSFORM BOOST_HEADER_ONLY PREPEND Boost::)
 target_link_libraries(boost_headers INTERFACE ${BOOST_HEADER_ONLY})
 add_library(Boost::headers ALIAS boost_headers)
+add_library(Boost::boost ALIAS boost_headers)
