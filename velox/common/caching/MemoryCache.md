@@ -74,3 +74,20 @@ For hazard-pointer TSAN validation, configure MEMORY_CACHE_SANITIZERS=thread
 and MEMORY_CACHE_TSAN_FOLLY=ON. This additionally instruments bundled Folly
 translation units; template-only instrumentation can miss Folly synchronization
 and produce incomplete reports. Other dependencies are not fully instrumented.
+
+## State publication and reclamation
+
+The published state is an atomic raw pointer. Each operation holds a Folly
+hazard holder until all map/accounting work is complete; it does not update a
+shared state reference count. Before publication a state is tagged with its
+Core's cohort. Clear exchanges a fully constructed state, then retires the old
+state even on exceptions. Collected old entries are marked Removed and erased
+conditionally by identity, with successful deletions charged only to old size.
+Concurrent old writers remain valid and cannot modify the new state's size.
+
+The Core outlives all holders: foreground calls cannot race cache destruction,
+and accepted background tasks own Core. Core destruction deletes the current
+state and lets its cohort reclaim remaining retired states. No task wait is
+introduced into cache destruction. The atomic last-scan timestamp allows a
+lock-free interval check; maintenance admission still rechecks under its mutex
+and preserves pending rescans.
