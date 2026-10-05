@@ -1344,3 +1344,23 @@ TEST_F(MemoryCacheTest, scanDuringCandidateProcessingRunsAgain) {
   }
 }
 #endif
+
+#ifndef NDEBUG
+TEST_F(MemoryCacheTest, retiredStateReleasedBeforeCoreTeardownCompletes) {
+  using namespace common::testutil;
+  TestValue::enable();
+  std::weak_ptr<int> retiredValue;
+  {
+    Cache cache(options());
+    auto value = std::make_shared<int>(42);
+    retiredValue = value;
+    cache.set("old", std::move(value));
+    ScopedTestValue hook(
+        "MemoryCache::clear::exchanged",
+        std::function<void(void*)>([](void*) { throw std::bad_alloc(); }));
+    EXPECT_THROW(cache.clear(), std::bad_alloc);
+    EXPECT_EQ(cache.count(), 0);
+  }
+  EXPECT_TRUE(retiredValue.expired());
+}
+#endif

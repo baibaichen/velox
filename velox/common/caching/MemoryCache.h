@@ -5,6 +5,7 @@
 #include <folly/ScopeGuard.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/executors/task_queue/LifoSemMPMCQueue.h>
+#include <folly/synchronization/Hazptr.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -71,7 +72,7 @@ class MemoryCache {
   MemoryCache(const MemoryCache&) = delete;
   MemoryCache& operator=(const MemoryCache&) = delete;
   ValuePtr set(const Key& key, ValuePtr value, EntryOptions o = {}) {
-    auto c = core_;
+    const auto& c = core_;
     require(
         o.size.value_or(0) >= 0 &&
         o.slidingExpiration.value_or(Duration(1)).count() > 0 &&
@@ -93,7 +94,7 @@ class MemoryCache {
           TimePoint(Duration(now + ticks)));
     }
     auto entry = std::make_shared<Entry>(key, value, std::move(o), now);
-    auto state = c->state.load();
+    StatePtr state(c->state);
     auto prior = state->find(key);
     hook("MemoryCache::set::prior", &prior);
     if (prior)
@@ -127,8 +128,8 @@ class MemoryCache {
     return value;
   }
   bool tryGetValue(const Key& key, ValuePtr& result) {
-    auto c = core_;
-    auto state = c->state.load();
+    const auto& c = core_;
+    StatePtr state(c->state);
     auto entry = state->find(key);
     const auto now = c->now();
     const bool hit =
@@ -147,7 +148,7 @@ class MemoryCache {
     return hit;
   }
   void remove(const Key& key) {
-    auto s = core_->state.load();
+    StatePtr s(core_->state);
     EntryPtr retired;
     if (s->map.erase_if(key, [&](const auto& item) noexcept {
           retired = item.second;
@@ -159,28 +160,45 @@ class MemoryCache {
     core_->schedule(false, core_->now());
   }
   void clear() {
-    auto old = core_->state.exchange(std::make_shared<State>());
+    auto fresh = std::make_unique<State>();
+    fresh->set_cohort_tag(&core_->retired);
+    auto old = core_->state.exchange(fresh.release());
+    auto retire = folly::makeGuard([&] { old->retire(); });
     hook("MemoryCache::clear::exchanged", &old);
-    old->map.cvisit_all(
-        [](const auto& item) { item.second->expire(Reason::Removed); });
+    // Release existing entries outside Map locks, without waiting for readers.
+    std::vector<EntryPtr> entries;
+    old->map.cvisit_all([&](const auto& item) {
+      item.second->expire(Reason::Removed);
+      entries.push_back(item.second);
+    });
+    for (const auto& entry : entries) {
+      if (old->map.erase_if(
+              entry->key,
+              [&](const auto& item) noexcept {
+                return item.second == entry;
+              }) &&
+          core_->sizeLimit) {
+        old->size.fetch_sub(entry->weight());
+      }
+    }
   }
   void compact(double percentage) {
-    auto state = core_->state.load();
+    StatePtr state(core_->state);
     core_->compact(state, amount(state->map.size() * percentage), false);
   }
   size_t count() const {
-    return core_->state.load()->map.size();
+    return StatePtr(core_->state)->map.size();
   }
   std::vector<Key> keys() const {
     std::vector<Key> result;
-    core_->state.load()->map.cvisit_all([&](const auto& item) {
+    StatePtr(core_->state)->map.cvisit_all([&](const auto& item) {
       hook("MemoryCache::keys::collect", &result);
       result.push_back(item.first);
     });
     return result;
   }
   void report() const noexcept try {
-    auto c = core_;
+    const auto& c = core_;
     std::lock_guard lock(c->reportMutex);
     auto stats = getCurrentStatistics();
     if (!stats)
@@ -208,11 +226,11 @@ class MemoryCache {
   } catch (...) {
   }
   std::optional<Statistics> getCurrentStatistics() const {
-    auto c = core_;
+    const auto& c = core_;
     if (!c->trackStatistics) {
       return std::nullopt;
     }
-    auto s = c->state.load();
+    StatePtr s(c->state);
     return Statistics{
         c->totals[0],
         c->totals[1],
@@ -236,9 +254,8 @@ class MemoryCache {
     }
   }
   static int64_t amount(double value) {
-    if (!(value > 0)) {
+    if (!(value > 0))
       return 0;
-    }
     return value >= double(INT64_MAX) ? INT64_MAX : int64_t(value);
   }
   static void hook(std::string_view name, void* data) {
@@ -272,7 +289,7 @@ class MemoryCache {
     }
   };
   using EntryPtr = std::shared_ptr<Entry>;
-  struct State {
+  struct State : folly::hazptr_obj_base<State> {
     Map<Key, EntryPtr> map;
     std::atomic<uint64_t> size{0};
     EntryPtr find(const Key& key) {
@@ -281,15 +298,33 @@ class MemoryCache {
       return result;
     }
   };
-  using StatePtr = std::shared_ptr<State>;
+  struct StatePtr {
+    folly::hazptr_holder<> guard{folly::make_hazard_pointer()};
+    State* ptr;
+    explicit StatePtr(const std::atomic<State*>& source)
+        : ptr(guard.protect(source)) {}
+    State* operator->() const {
+      return ptr;
+    }
+  };
   struct Core : Options, std::enable_shared_from_this<Core> {
-    std::atomic<StatePtr> state{std::make_shared<State>()};
+    // Core outlives every holder: foreground calls precede destruction and
+    // accepted maintenance tasks own Core. Reclaim retired states at teardown.
+    folly::hazptr_obj_cohort<> retired;
+    std::atomic<State*> state{nullptr};
     std::atomic<uint64_t> totals[3]{};
     std::mutex maintenance, reportMutex;
     uint64_t reported[3]{};
     bool closed{false}, busy[2]{}, rescan{false};
-    int64_t lastScan;
-    explicit Core(Options o) : Options(std::move(o)), lastScan(now()) {}
+    std::atomic<int64_t> lastScan;
+    explicit Core(Options o) : Options(std::move(o)), lastScan(now()) {
+      auto initial = std::make_unique<State>();
+      initial->set_cohort_tag(&retired);
+      state = initial.release();
+    }
+    ~Core() {
+      delete state.load();
+    }
     int64_t now() const {
       const auto time = (this->clock ? this->clock()
                                      : std::chrono::time_point_cast<Duration>(
@@ -350,12 +385,14 @@ class MemoryCache {
         erase(s, std::get<2>(candidates[i]), true);
     }
     void schedule(bool capacity, int64_t time) {
+      if (!capacity &&
+          time - lastScan.load() <= this->expirationScanFrequency.count())
+        return;
       std::lock_guard lock(maintenance);
       if (closed ||
           (!capacity &&
-           time - lastScan <= this->expirationScanFrequency.count())) {
+           time - lastScan <= this->expirationScanFrequency.count()))
         return;
-      }
       if (busy[capacity]) {
         rescan |= !capacity;
         return;
@@ -367,17 +404,14 @@ class MemoryCache {
             for (;;) {
               try {
                 hook("MemoryCache::maintenance::start", self.get());
-                auto s = self->state.load();
+                StatePtr s(self->state);
                 int64_t target = -1;
                 if (capacity) {
                   const auto low = *self->sizeLimit -
                       amount(*self->sizeLimit * self->compactionPercentage);
                   target = std::max<int64_t>(0, s->size.load() - low);
-                } else {
-                  const auto now = self->now();
-                  std::lock_guard lock(self->maintenance);
-                  self->lastScan = now;
-                }
+                } else
+                  self->lastScan = self->now();
                 if (!capacity || target > 0)
                   self->compact(s, target, capacity);
               } catch (...) {
@@ -390,7 +424,8 @@ class MemoryCache {
             }
           });
       busy[capacity] = true;
-      lastScan = capacity ? lastScan : time;
+      if (!capacity)
+        lastScan = time;
     }
   };
   const std::shared_ptr<Core> core_;

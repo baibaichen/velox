@@ -22,6 +22,10 @@ not copied, and callers synchronize mutations of the pointed-to object.
   throws out_of_range. Allocation failures propagate bad_alloc.
 - Stats are diagnostic snapshots. No limit means estimated size is absent.
   Clear exchanges coherent state; in-flight old operations stay on old state.
+  Folly hazard holders protect state without shared reference-count updates.
+  Clear conditionally removes collected old entries outside visitor locks.
+  A per-Core tagged cohort reclaims remaining retired states at Core teardown;
+  accepted tasks keep Core alive until their holders are gone.
 - Capacity follows the fixed C# CAS algorithm. A stale prior-entry credit can
   admit a fallback insert above the limit; size remains accounted for. The
   controlled K=6/Q=10 interleaving produces size 16 in both implementations.
@@ -62,9 +66,11 @@ memory_cache_no_boost_test. Debug enables TestValue interleavings. The checked-i
 MEMORY_CACHE_SANITIZERS=address,undefined (or thread) instruments these test
 translation units and the cache template, not prebuilt dependency libraries.
 
-Formatted header budget: 398 lines maximum (20% of 1992 source lines):
-MemoryCache.cs 1009, CacheEntry.cs 346, MemoryCacheOptions.cs 111,
-MemoryCacheEntryOptions.cs 120, MemoryCacheStatistics.cs 49,
-CacheItemPriority.cs 32, EvictionReason.cs 41, ISystemClock.cs 18,
-SystemClock.cs 24, MemoryCacheExtensions.cs 242 (Set implementation).
-Unported token partials are excluded. Use the repository clang-format style.
+The user has relaxed the 398-line constraint for this performance work.
+The earlier 1992-line C# source accounting remains documented in development
+records; correctness and performance take priority during this revision.
+
+For hazard-pointer TSAN validation, configure MEMORY_CACHE_SANITIZERS=thread
+and MEMORY_CACHE_TSAN_FOLLY=ON. This additionally instruments bundled Folly
+translation units; template-only instrumentation can miss Folly synchronization
+and produce incomplete reports. Other dependencies are not fully instrumented.
