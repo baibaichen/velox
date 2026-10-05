@@ -25,4 +25,4 @@ target_link_libraries(fixed_time_boost PRIVATE Boost::unordered Folly::folly Fol
 add_executable(memory_cache_bench FixedTime.cpp)
 target_compile_features(memory_cache_bench PRIVATE cxx_std_20)
 target_compile_definitions(memory_cache_bench PRIVATE VELOX_BENCH_CHM_BOOST VELOX_BENCH_MEMORY_CACHE)
-target_link_libraries(memory_cache_bench PRIVATE Boost::unordered Folly::folly Folly::follybenchmark gflags::gflags glog::glog)
+target_link_libraries(memory_cache_bench PRIVATE velox_memory_cache Boost::unordered Folly::folly Folly::follybenchmark gflags::gflags glog::glog)

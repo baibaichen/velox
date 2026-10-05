@@ -7,27 +7,51 @@
 #ifdef VELOX_BENCH_MEMORY_CACHE
 #include "velox/common/caching/MemoryCache.h"
 
-// Preserve the dictionary workload and ownership semantics for an A/B comparison.
+// Preserve the dictionary workload and ownership semantics for an A/B
+// comparison.
 class CacheWorkload {
  public:
   using Value = std::shared_ptr<const std::string>;
+  CacheWorkload() : cache_(options()) {}
   void insert(const std::string& key, Value value) {
-    if (!cache_.put(key, std::move(value))) {
-      throw std::runtime_error("Unexpected cache admission failure");
-    }
+    Cache::EntryOptions entry;
+    entry.size = 1;
+    if (scenario_ == "expiry")
+      entry.absoluteExpirationRelativeToNow = std::chrono::milliseconds(10);
+    cache_.set(key, std::move(value), entry);
   }
   void insert_or_assign(const std::string& key, Value value) {
     insert(key, std::move(value));
   }
-  Value get(const std::string& key) { return cache_.get(key); }
-  size_t size() const { return cache_.size(); }
+  Value get(const std::string& key) {
+    Value result;
+    cache_.tryGetValue(key, result);
+    return result;
+  }
+  size_t size() const {
+    return cache_.count();
+  }
+
  private:
-  facebook::velox::MemoryCache<std::string, std::string> cache_{100000};
+  using Cache = facebook::velox::
+      MemoryCache<std::string, const std::string, boost::concurrent_flat_map>;
+  std::string scenario_{
+      std::getenv("CACHE_SCENARIO") ? std::getenv("CACHE_SCENARIO") : "steady"};
+  Cache::Options options() {
+    Cache::Options o;
+    o.sizeLimit = scenario_ == "capacity" ? 10000 : 100000;
+    o.expirationScanFrequency = std::chrono::milliseconds(10);
+    return o;
+  }
+  Cache cache_;
 };
 
-std::optional<CacheWorkload::Value> read(CacheWorkload& cache, const std::string& key) {
+std::optional<CacheWorkload::Value> read(
+    CacheWorkload& cache,
+    const std::string& key) {
   auto value = cache.get(key);
-  if (!value) return std::nullopt;
+  if (!value)
+    return std::nullopt;
   return value;
 }
 #endif
@@ -70,7 +94,8 @@ int main(int argc, char** argv) {
   std::barrier gate(n + 1);
   Clock::time_point deadline;
   struct Result {
-    uint64_t reads = 0, writes = 0, sum = 0;
+    uint64_t reads = 0, writes = 0, sum = 0, misses = 0;
+    std::vector<double> latency;
   };
   std::vector<Result> results(n);
   std::vector<std::thread> workers;
@@ -88,6 +113,8 @@ int main(int argc, char** argv) {
         do {
           for (unsigned b = 0; b < 256; ++b, ++index) {
             auto& k = keys[traces[w][index % 65536]];
+            auto sampleStart =
+                index % 1024 == 0 ? Clock::now() : Clock::time_point{};
             if ((index + w) % 100 < writes) {
               map.insert_or_assign(
                   k,
@@ -96,11 +123,20 @@ int main(int argc, char** argv) {
               ++result.writes;
             } else {
               auto v = read(map, k);
-              if (!v || (*v)->size() != 128)
-                std::abort();
-              result.sum += static_cast<unsigned char>((**v)[0]);
+              if (!v)
+                ++result.misses;
+              else {
+                if ((*v)->size() != 128)
+                  std::abort();
+                result.sum += static_cast<unsigned char>((**v)[0]);
+              }
               ++result.reads;
             }
+            if (index % 1024 == 0)
+              result.latency.push_back(
+                  std::chrono::duration<double, std::nano>(
+                      Clock::now() - sampleStart)
+                      .count());
           }
         } while (Clock::now() < deadline);
         results[w] = result;
@@ -119,21 +155,30 @@ int main(int argc, char** argv) {
   }
   for (auto& t : workers)
     t.join();
-  uint64_t reads = 0, updates = 0, sum = 0;
+  uint64_t reads = 0, updates = 0, sum = 0, misses = 0;
+  std::vector<double> latency;
   for (auto& r : results) {
+    latency.insert(latency.end(), r.latency.begin(), r.latency.end());
     reads += r.reads;
     updates += r.writes;
     sum += r.sum;
+    misses += r.misses;
   }
+#ifndef VELOX_BENCH_MEMORY_CACHE
   if (map.size() != 100000)
     return 3;
+#endif
+  std::sort(latency.begin(), latency.end());
   struct rusage usage;
   getrusage(RUSAGE_SELF, &usage);
   double cpu = usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1e6 +
       usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1e6;
   std::cout << "{\"reads\":" << reads << ",\"writes\":" << updates
+            << ",\"misses\":" << misses << ",\"entries\":" << map.size()
             << ",\"checksum\":" << sum << ",\"seconds\":" << elapsed
             << ",\"ops_per_second\":" << (reads + updates) / elapsed
             << ",\"process_cpu_seconds\":" << cpu
+            << ",\"sample_p50_ns\":" << latency[latency.size() / 2]
+            << ",\"sample_p99_ns\":" << latency[latency.size() * 99 / 100]
             << ",\"peak_rss_kb\":" << usage.ru_maxrss << "}\n";
 }

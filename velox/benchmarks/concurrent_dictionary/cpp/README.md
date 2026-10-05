@@ -74,53 +74,37 @@ removal. Copied values leave the callback; references never do. Workload traces
 and the benchmark harness are shared with both Folly variants. CTest includes
 concurrent_flat_map_self_test. The representative filter is the same as above.
 
-## MemoryCache overhead benchmark
+## MemoryCache benchmark
 
-Target memory_cache_bench reuses FixedTime.cpp with MemoryCache<string,string>,
-100000 slots, no TTL, and shared_ptr<const string> return values. It measures
-get/put including entry allocation, clock checks, and the cache's writer mutex.
-No TTL expiration, pruning, clear, or capacity rejection is exercised: all writes
-replace existing keys. These need separate scenarios, not interpretation of this
-steady-state result as a complete cache benchmark.
+Target memory_cache_bench now consumes velox_memory_cache and uses the current
+set/tryGetValue/count API with explicit Boost Map and Size=1. The old TTL PoC
+writer-mutex description no longer applies.
 
-Build from repository root:
+The six positional arguments remain: workers, write percentage, hot distribution,
+warmup seconds, measurement seconds, comma-separated worker CPU IDs.
+CACHE_SCENARIO selects steady (default), expiry (10ms relative TTL), or capacity
+(SizeLimit=10000 against 100000 keys). Steady/expiry use SizeLimit=100000.
+Both cache implementations use a 10ms expiration scan frequency. Writes replace
+prepopulated keys or reinsert evicted/expired keys; they allocate a new 128-character
+value. There is no independent ever-growing unique-key insertion workload.
 
-~~~bash
-cmake --build cmake-build-relwithdebinfo --target memory_cache_bench -j 12
-~~~
+Output includes attempted operations, misses, entry count, process peak RSS,
+and per-worker operation latency sampled every 1024 operations. The p50/p99
+are sampled request latencies, not inverse aggregate throughput. Sampling and
+sample storage add overhead, and mixed-workload samples can be biased by the
+periodic write selector. RSS includes runtime, setup, warmup and samples; it is
+not isolated cache memory. C# strings use UTF-16; C++ strings use bytes.
 
-Short correctness smoke (not performance measurement):
+The installed-runtime csharp-cache runner remains available but is not a
+fixed-source oracle. The approved MemoryCache comparison instead compiles
+unmodified caching sources from commit
+6f1d9331b9b477df73982a0fabedefe27f36d8a3 into a Release net10.0 executable,
+using the same FixedTime.cs workload. Its project, commands, binary hashes,
+logs and results are retained under the user's MemoryCache evidence directory.
+No instrumented correctness-oracle assembly is used for timing.
 
-~~~bash
-python3 velox/benchmarks/concurrent_dictionary/fixed_time.py \
-  --smoke --implementations cache --output /tmp/cache-bench-smoke
-~~~
-
-After approval, compare cache overhead with the bare Boost map at 99% reads:
-
-~~~bash
-python3 velox/benchmarks/concurrent_dictionary/fixed_time.py \
-  --approved --implementations boost cache --write-percent 1 \
-  --output /tmp/cache-vs-boost
-~~~
-
-28 cases, 10s warmup plus 50s measurement each: about 28 minutes plus setup.
-C# in this runner is ConcurrentDictionary, NOT Microsoft MemoryCache.
-
-## C# MemoryCache
-
-Select csharp-cache to run Microsoft.Extensions.Caching.Memory.MemoryCache from
-Microsoft.AspNetCore.App (installed runtime, not the user's locally modified
-MemoryCache.cs). --fixed-cache uses the same C# fixed-duration workload and CPU
-mapping as --fixed-time. SizeLimit=100000 and Size=1 on every entry; no TTL,
-linked entries or statistics are enabled. CacheEntry allocation and native
-capacity/compaction behavior are included. Each run prints its assembly path.
-
-.NET's capacity admission/compaction semantics differ from C++'s serialized
-replacement: under concurrent writes it may reject entries or evict others.
-JSON therefore includes entries and misses; writes counts Set attempts, not
-successful admissions. Do not rank throughput without inspecting these counts.
-
-After approval, use --implementations cache csharp-cache --write-percent 1
-with fixed_time.py to compare the two caches. This is not a comparison against
-the earlier ConcurrentDictionary result.
+Inspect misses and count before comparing throughput: expiry/capacity scenarios
+may do different amounts of successful lookup/eviction work. Foreground worker
+affinity is matched; native shared background pools are not pinned. This harness
+does not measure queue depth or queue waiting time, so it cannot establish that
+the shared 4096-task queue is sufficient for many simultaneous cache instances.
