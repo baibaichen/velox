@@ -59,5 +59,30 @@ target_link_libraries(
 velox_add_library(velox_caching_test_util INTERFACE HEADERS CacheTestUtil.h)
 
 add_executable(memory_cache_test MemoryCacheTest.cpp)
-target_link_libraries(memory_cache_test PRIVATE Boost::unordered GTest::gtest GTest::gtest_main)
+target_link_libraries(
+  memory_cache_test
+  PRIVATE velox_memory_cache Boost::unordered GTest::gtest GTest::gtest_main
+)
 add_test(NAME memory_cache_test COMMAND memory_cache_test)
+
+add_executable(memory_cache_contract_test MemoryCacheInfrastructureTest.cpp)
+target_link_libraries(
+  memory_cache_contract_test
+  PRIVATE Folly::folly Boost::unordered GTest::gtest GTest::gtest_main
+)
+add_test(NAME memory_cache_contract_test COMMAND memory_cache_contract_test)
+
+add_executable(memory_cache_no_boost_test MemoryCacheNoBoostTest.cpp)
+target_link_libraries(memory_cache_no_boost_test PRIVATE velox_memory_cache)
+add_test(NAME memory_cache_no_boost_test COMMAND memory_cache_no_boost_test)
+
+set(MEMORY_CACHE_SANITIZERS "" CACHE STRING "Sanitizers for MemoryCache template tests")
+if(MEMORY_CACHE_SANITIZERS)
+  foreach(target memory_cache_test memory_cache_contract_test memory_cache_no_boost_test)
+    target_compile_options(
+      ${target}
+      PRIVATE -fsanitize=${MEMORY_CACHE_SANITIZERS} -fno-omit-frame-pointer
+    )
+    target_link_options(${target} PRIVATE -fsanitize=${MEMORY_CACHE_SANITIZERS})
+  endforeach()
+endif()

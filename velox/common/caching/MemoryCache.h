@@ -1,148 +1,398 @@
-/*
- * Copyright (c) Facebook, Inc. and its affiliates.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) Facebook, Inc. and its affiliates.
+// SPDX-License-Identifier: Apache-2.0
+// Adapted from .NET Foundation and Contributors; see MemoryCache.LICENSE (MIT).
 #pragma once
-
-#include <boost/unordered/concurrent_flat_map.hpp>
+#include <folly/ScopeGuard.h>
+#include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/executors/task_queue/LifoSemMPMCQueue.h>
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cmath>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
-#include <utility>
+#include <string>
+#include <tuple>
 #include <vector>
-
+#include "velox/common/base/StatsReporter.h"
+#include "velox/common/testutil/TestValue.h"
 namespace facebook::velox {
+namespace detail {
+inline folly::CPUThreadPoolExecutor& memoryCacheExecutor() {
+  using Pool = folly::CPUThreadPoolExecutor;
+  static Pool pool(
+      std::pair<size_t, size_t>{1, 1},
+      std::make_unique<folly::LifoSemMPMCQueue<Pool::CPUTask>>(4096));
+  return pool;
+}
+} // namespace detail
 
-/// Bounded object cache. Full caches reject new keys; replacing existing keys
-/// is allowed. Expiration uses steady_clock and is checked lazily on get().
-/// Map must provide Boost-compatible visit, cvisit, cvisit_all, try_emplace,
-/// erase_if(key, predicate), size and clear with concurrent-reader safety.
-/// Cache destruction requires all operations to have completed. Returned values
-/// remain valid independently of the cache. Null values are not accepted.
-template <
-    typename Key,
-    typename Value,
-    template <typename...> class Map = boost::concurrent_flat_map>
+template <typename Key, typename Value, template <typename...> class Map>
 class MemoryCache {
  public:
-  using Clock = std::chrono::steady_clock;
-  using ValuePtr = std::shared_ptr<const Value>;
-
-  explicit MemoryCache(size_t maxEntries) : maxEntries_(maxEntries) {}
-
-  /// nullopt means no expiration; nonpositive TTL expires immediately.
-  /// TTL starts when put() is called, including time waiting for a writer.
-  bool put(
-      const Key& key,
-      ValuePtr value,
-      std::optional<Clock::duration> ttl = std::nullopt) {
-    if (!value) {
-      throw std::invalid_argument("MemoryCache does not accept null values");
+  using ValuePtr = std::shared_ptr<Value>;
+  using Duration = std::chrono::duration<int64_t, std::ratio<1, 10000000>>;
+  using TimePoint =
+      std::chrono::time_point<std::chrono::system_clock, Duration>;
+  enum class Priority : uint8_t { Low, Normal, High, NeverRemove };
+  struct EntryOptions {
+    std::optional<TimePoint> absoluteExpiration;
+    std::optional<Duration> absoluteExpirationRelativeToNow, slidingExpiration;
+    std::optional<int64_t> size;
+    Priority priority{Priority::Normal};
+  };
+  struct Options {
+    std::optional<int64_t> sizeLimit;
+    Duration expirationScanFrequency{std::chrono::minutes(1)};
+    double compactionPercentage{0.05};
+    bool trackStatistics{false};
+    std::string name{"Default"};
+    std::function<TimePoint()> clock;
+  };
+  struct Statistics {
+    uint64_t totalHits, totalMisses, totalEvictions;
+    size_t currentEntryCount;
+    std::optional<int64_t> currentEstimatedSize;
+  };
+  explicit MemoryCache(Options options = {})
+      : core_(std::make_shared<Core>(std::move(options))) {
+    const auto& o = *core_;
+    require(
+        o.sizeLimit.value_or(0) >= 0 &&
+        !(o.compactionPercentage < 0 || o.compactionPercentage > 1));
+  }
+  ~MemoryCache() noexcept {
+    std::lock_guard lock(core_->maintenance);
+    core_->closed = true;
+  }
+  MemoryCache(const MemoryCache&) = delete;
+  MemoryCache& operator=(const MemoryCache&) = delete;
+  ValuePtr set(const Key& key, ValuePtr value, EntryOptions o = {}) {
+    auto c = core_;
+    require(
+        o.size.value_or(0) >= 0 &&
+        o.slidingExpiration.value_or(Duration(1)).count() > 0 &&
+        o.absoluteExpirationRelativeToNow.value_or(Duration(1)).count() > 0);
+    if (c->sizeLimit && !o.size) {
+      throw std::logic_error("Size is required");
     }
-    auto deadline = Clock::time_point::max();
-    if (ttl) {
-      const auto now = Clock::now();
-      if (*ttl <= Clock::duration::zero()) {
-        deadline = now;
-      } else if (*ttl < Clock::time_point::max() - now) {
-        deadline = now + *ttl;
+    if (o.absoluteExpiration) {
+      checkTime(o.absoluteExpiration->time_since_epoch().count());
+    }
+    const auto now = c->now();
+    if (o.absoluteExpirationRelativeToNow) {
+      const auto ticks = o.absoluteExpirationRelativeToNow->count();
+      if (ticks > kMaxTime - now) {
+        throw std::out_of_range("Relative expiration exceeds UTC range");
       }
+      o.absoluteExpiration = std::min(
+          o.absoluteExpiration.value_or(TimePoint::max()),
+          TimePoint(Duration(now + ticks)));
     }
-    auto entry = std::make_shared<const Entry>(Entry{std::move(value), deadline});
-    // Declared before the lock so user value destructors run after unlocking.
+    auto entry = std::make_shared<Entry>(key, value, std::move(o), now);
+    auto state = c->state.load();
+    auto prior = state->find(key);
+    hook("MemoryCache::set::prior", &prior);
+    if (prior)
+      prior->expire(Reason::Replaced);
+    if (entry->expired(now)) {
+      c->erase(state, prior);
+    } else if (c->reserve(state, entry, prior)) {
+      bool added = false;
+      auto rollback = folly::makeGuard([&] {
+        state->size.fetch_sub(!added && c->sizeLimit ? entry->weight() : 0);
+      });
+      hook("MemoryCache::set::reserved", &entry);
+      if (prior) {
+        state->map.visit(key, [&](auto& item) noexcept {
+          if (item.second == prior) {
+            item.second.swap(entry);
+            added = true;
+          }
+        });
+        state->size.fetch_sub(added && c->sizeLimit ? prior->weight() : 0);
+      }
+      added = added || state->map.try_emplace(key, entry);
+      if (!added)
+        entry->expire(Reason::Replaced);
+    } else {
+      entry->expire(Reason::Capacity);
+      c->schedule(true, now);
+      c->erase(state, prior);
+    }
+    c->schedule(false, now);
+    return value;
+  }
+  bool tryGetValue(const Key& key, ValuePtr& result) {
+    auto c = core_;
+    auto state = c->state.load();
+    auto entry = state->find(key);
+    const auto now = c->now();
+    const bool hit =
+        entry && (!entry->expired(now) || entry->reason == Reason::Replaced);
+    if (hit) {
+      entry->accessed = now;
+      result = entry->value;
+    } else {
+      c->erase(state, entry, true);
+      result.reset();
+    }
+    c->schedule(false, now);
+    if (c->trackStatistics) {
+      ++c->totals[hit ? 0 : 1];
+    }
+    return hit;
+  }
+  void remove(const Key& key) {
+    auto s = core_->state.load();
     EntryPtr retired;
-    std::lock_guard lock(writeMutex_);
-    if (entries_.visit(key, [&](auto& item) {
-          retired = std::exchange(item.second, entry);
+    if (s->map.erase_if(key, [&](const auto& item) noexcept {
+          retired = item.second;
+          return true;
         })) {
-      return true;
+      retired->expire(Reason::Removed);
+      core_->account(s, retired, false);
     }
-    if (entries_.size() >= maxEntries_) {
-      return false;
-    }
-    return entries_.try_emplace(key, entry);
+    core_->schedule(false, core_->now());
   }
-
-  ValuePtr get(const Key& key) {
-    EntryPtr entry;
-    entries_.cvisit(key, [&](const auto& item) { entry = item.second; });
-    if (!entry) {
-      return nullptr;
-    }
-    if (entry->expiresAt <= Clock::now()) {
-      std::lock_guard lock(writeMutex_);
-      entries_.erase_if(key, [&](const auto& item) {
-        return item.second == entry;
-      });
-      return nullptr;
-    }
-    return entry->value;
-  }
-
-  bool erase(const Key& key) {
-    EntryPtr retired;
-    std::lock_guard lock(writeMutex_);
-    return entries_.erase_if(key, [&](const auto& item) {
-      retired = item.second;
-      return true;
-    }) != 0;
-  }
-
-  /// Reclaims expired entries. Expired entries consume slots until reclaimed.
-  size_t pruneExpired() {
-    std::vector<std::pair<Key, EntryPtr>> retired;
-    std::lock_guard lock(writeMutex_);
-    const auto now = Clock::now();
-    entries_.cvisit_all([&](const auto& item) {
-      if (item.second->expiresAt <= now) {
-        retired.emplace_back(item.first, item.second);
-      }
-    });
-    for (const auto& [key, entry] : retired) {
-      entries_.erase_if(key, [&](const auto& item) {
-        return item.second == entry;
-      });
-    }
-    return retired.size();
-  }
-
   void clear() {
-    std::vector<EntryPtr> retired;
-    std::lock_guard lock(writeMutex_);
-    retired.reserve(entries_.size());
-    entries_.cvisit_all([&](const auto& item) { retired.push_back(item.second); });
-    entries_.clear();
+    auto old = core_->state.exchange(std::make_shared<State>());
+    hook("MemoryCache::clear::exchanged", &old);
+    old->map.cvisit_all(
+        [](const auto& item) { item.second->expire(Reason::Removed); });
   }
-
-  /// Includes expired entries not yet reclaimed; concurrent diagnostic snapshot.
-  size_t size() const {
-    return entries_.size();
+  void compact(double percentage) {
+    auto state = core_->state.load();
+    core_->compact(state, amount(state->map.size() * percentage), false);
+  }
+  size_t count() const {
+    return core_->state.load()->map.size();
+  }
+  std::vector<Key> keys() const {
+    std::vector<Key> result;
+    core_->state.load()->map.cvisit_all([&](const auto& item) {
+      hook("MemoryCache::keys::collect", &result);
+      result.push_back(item.first);
+    });
+    return result;
+  }
+  void report() const noexcept try {
+    auto c = core_;
+    std::lock_guard lock(c->reportMutex);
+    auto stats = getCurrentStatistics();
+    if (!stats)
+      return;
+    const char* names[]{
+        "hits", "misses", "evictions", "entries", "estimated_size"};
+    for (int i = 0; i < (stats->currentEstimatedSize ? 5 : 4); ++i) {
+      uint64_t value = i < 3 ? c->totals[i].load()
+          : i == 3           ? stats->currentEntryCount
+                             : *stats->currentEstimatedSize;
+      if (i < 3)
+        value -= std::exchange(c->reported[i], value);
+      try {
+        const auto key = "velox.memory_cache." + c->name + "." + names[i];
+        if (!BaseStatsReporter::registered)
+          continue;
+        if (auto reporter = folly::Singleton<BaseStatsReporter>::try_get()) {
+          reporter->registerMetricExportType(
+              folly::StringPiece(key), i < 3 ? StatType::SUM : StatType::AVG);
+          reporter->addMetricValue(key, value);
+        }
+      } catch (...) {
+      }
+    }
+  } catch (...) {
+  }
+  std::optional<Statistics> getCurrentStatistics() const {
+    auto c = core_;
+    if (!c->trackStatistics) {
+      return std::nullopt;
+    }
+    auto s = c->state.load();
+    return Statistics{
+        c->totals[0],
+        c->totals[1],
+        c->totals[2],
+        s->map.size(),
+        c->sizeLimit ? std::optional<int64_t>(s->size.load()) : std::nullopt};
   }
 
  private:
-  struct Entry {
+  friend struct MemoryCacheTestAccess;
+  enum class Reason { None, Removed, Replaced, Expired, Capacity };
+  static constexpr int64_t kMinTime = -621355968000000000LL,
+                           kMaxTime = 2534023007999999999LL;
+  static void require(bool valid) {
+    if (!valid)
+      throw std::invalid_argument("Invalid MemoryCache options");
+  }
+  static void checkTime(int64_t time) {
+    if (time < kMinTime || time > kMaxTime) {
+      throw std::out_of_range("Time outside .NET UTC range");
+    }
+  }
+  static int64_t amount(double value) {
+    if (!(value > 0)) {
+      return 0;
+    }
+    return value >= double(INT64_MAX) ? INT64_MAX : int64_t(value);
+  }
+  static void hook(std::string_view name, void* data) {
+    common::testutil::TestValue::adjust(name, data);
+  }
+  struct Entry : EntryOptions {
+    Key key;
     ValuePtr value;
-    Clock::time_point expiresAt;
+    std::atomic<int64_t> accessed;
+    std::atomic<Reason> reason{Reason::None};
+    Entry(const Key& k, ValuePtr v, EntryOptions o, int64_t now)
+        : EntryOptions(std::move(o)),
+          key(k),
+          value(std::move(v)),
+          accessed(now) {}
+    uint64_t weight() const {
+      return this->size.value_or(0);
+    }
+    void expire(Reason why) {
+      auto expected = Reason::None;
+      reason.compare_exchange_strong(expected, why);
+    }
+    bool expired(int64_t now) {
+      if ((this->absoluteExpiration &&
+           now >= this->absoluteExpiration->time_since_epoch().count()) ||
+          (this->slidingExpiration &&
+           now - accessed.load() >= this->slidingExpiration->count())) {
+        expire(Reason::Expired);
+      }
+      return reason != Reason::None;
+    }
   };
-  using EntryPtr = std::shared_ptr<const Entry>;
-  const size_t maxEntries_;
-  // ponytail: serialize mutations for exact capacity and clear semantics;
-  // shard capacity accounting only if measured write contention warrants it.
-  std::mutex writeMutex_;
-  Map<Key, EntryPtr> entries_;
+  using EntryPtr = std::shared_ptr<Entry>;
+  struct State {
+    Map<Key, EntryPtr> map;
+    std::atomic<uint64_t> size{0};
+    EntryPtr find(const Key& key) {
+      EntryPtr result;
+      map.cvisit(key, [&](const auto& item) { result = item.second; });
+      return result;
+    }
+  };
+  using StatePtr = std::shared_ptr<State>;
+  struct Core : Options, std::enable_shared_from_this<Core> {
+    std::atomic<StatePtr> state{std::make_shared<State>()};
+    std::atomic<uint64_t> totals[3]{};
+    std::mutex maintenance, reportMutex;
+    uint64_t reported[3]{};
+    bool closed{false}, busy[2]{}, rescan{false};
+    int64_t lastScan;
+    explicit Core(Options o) : Options(std::move(o)), lastScan(now()) {}
+    int64_t now() const {
+      const auto time = (this->clock ? this->clock()
+                                     : std::chrono::time_point_cast<Duration>(
+                                           std::chrono::system_clock::now()))
+                            .time_since_epoch()
+                            .count();
+      checkTime(time);
+      return time;
+    }
+    bool reserve(const StatePtr& s, const EntryPtr& e, const EntryPtr& old) {
+      if (!this->sizeLimit)
+        return true;
+      auto size = s->size.load();
+      for (int i = 0; i < 100; ++i) {
+        if (__uint128_t(size) + e->weight() - (old ? old->weight() : 0) >
+            uint64_t(*this->sizeLimit))
+          return false;
+        if (s->size.compare_exchange_weak(size, size + e->weight()))
+          return true;
+      }
+      return false;
+    }
+    void account(const StatePtr& s, const EntryPtr& e, bool eviction) {
+      s->size.fetch_sub(this->sizeLimit ? e->weight() : 0);
+      totals[2] += eviction && this->trackStatistics;
+    }
+    void erase(const StatePtr& s, const EntryPtr& e, bool eviction = false) {
+      if (e && s->map.erase_if(e->key, [&](const auto& item) noexcept {
+            return item.second == e;
+          })) {
+        account(s, e, eviction);
+      }
+    }
+    void compact(const StatePtr& s, int64_t target, bool weighted) {
+      using Candidate = std::tuple<int, int64_t, EntryPtr>;
+      std::vector<Candidate> candidates;
+      const auto time = now();
+      s->map.cvisit_all([&](const auto& item) {
+        auto e = item.second;
+        const int priority = e->expired(time) ? -1 : int(e->priority);
+        require(target < 0 || priority <= int(Priority::NeverRemove));
+        if (priority < (target < 0 ? 0 : int(Priority::NeverRemove))) {
+          candidates.emplace_back(priority, e->accessed.load(), e);
+        }
+      });
+      std::sort(candidates.begin(), candidates.end());
+      size_t selected = 0;
+      for (auto& [priority, time, e] : candidates) {
+        if (priority >= 0 && target <= 0)
+          break;
+        e->expire(Reason::Capacity);
+        ++selected;
+        target =
+            std::max<int64_t>(0, target - int64_t(weighted ? e->weight() : 1));
+      }
+      hook("MemoryCache::compact::candidates", &candidates);
+      for (size_t i = 0; i < selected; ++i)
+        erase(s, std::get<2>(candidates[i]), true);
+    }
+    void schedule(bool capacity, int64_t time) {
+      std::lock_guard lock(maintenance);
+      if (closed ||
+          (!capacity &&
+           time - lastScan <= this->expirationScanFrequency.count())) {
+        return;
+      }
+      if (busy[capacity]) {
+        rescan |= !capacity;
+        return;
+      }
+      auto& executor = detail::memoryCacheExecutor();
+      auto self = this->shared_from_this();
+      executor.add(
+          [self, capacity, keep = folly::getKeepAliveToken(&executor)] {
+            for (;;) {
+              try {
+                hook("MemoryCache::maintenance::start", self.get());
+                auto s = self->state.load();
+                int64_t target = -1;
+                if (capacity) {
+                  const auto low = *self->sizeLimit -
+                      amount(*self->sizeLimit * self->compactionPercentage);
+                  target = std::max<int64_t>(0, s->size.load() - low);
+                } else {
+                  const auto now = self->now();
+                  std::lock_guard lock(self->maintenance);
+                  self->lastScan = now;
+                }
+                if (!capacity || target > 0)
+                  self->compact(s, target, capacity);
+              } catch (...) {
+              }
+              std::lock_guard lock(self->maintenance);
+              if (!capacity && std::exchange(self->rescan, false))
+                continue;
+              self->busy[capacity] = false;
+              return;
+            }
+          });
+      busy[capacity] = true;
+      lastScan = capacity ? lastScan : time;
+    }
+  };
+  const std::shared_ptr<Core> core_;
 };
-
 } // namespace facebook::velox
