@@ -59,3 +59,6 @@ endif()
 velox_add_library(velox_simple_lru_cache INTERFACE HEADERS SimpleLRUCache.h)
 
 velox_add_library(velox_cached_factory INTERFACE HEADERS CachedFactory.h)
+
+velox_add_library(velox_memory_cache INTERFACE HEADERS MemoryCache.h)
+velox_link_libraries(velox_memory_cache INTERFACE Boost::unordered)

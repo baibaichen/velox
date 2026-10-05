@@ -1,0 +1,28 @@
+add_executable(concurrent_hash_map_bench ConcurrentHashMapBench.cpp)
+target_compile_features(concurrent_hash_map_bench PRIVATE cxx_std_20)
+target_link_libraries(concurrent_hash_map_bench PRIVATE Folly::folly Folly::follybenchmark gflags::gflags glog::glog)
+add_test(NAME concurrent_hash_map_self_test COMMAND concurrent_hash_map_bench --self_test)
+
+add_executable(concurrent_hash_map_simd_bench ConcurrentHashMapBench.cpp)
+target_compile_features(concurrent_hash_map_simd_bench PRIVATE cxx_std_20)
+target_compile_definitions(concurrent_hash_map_simd_bench PRIVATE VELOX_BENCH_CHM_SIMD)
+target_link_libraries(concurrent_hash_map_simd_bench PRIVATE Folly::folly Folly::follybenchmark gflags::gflags glog::glog)
+add_test(NAME concurrent_hash_map_simd_self_test COMMAND concurrent_hash_map_simd_bench --self_test)
+
+add_executable(concurrent_flat_map_bench ConcurrentHashMapBench.cpp)
+target_compile_features(concurrent_flat_map_bench PRIVATE cxx_std_20)
+target_compile_definitions(concurrent_flat_map_bench PRIVATE VELOX_BENCH_CHM_BOOST)
+target_link_libraries(concurrent_flat_map_bench PRIVATE Boost::unordered Folly::folly Folly::follybenchmark gflags::gflags glog::glog)
+add_test(NAME concurrent_flat_map_self_test COMMAND concurrent_flat_map_bench --self_test)
+
+add_executable(fixed_time_simd FixedTime.cpp)
+add_executable(fixed_time_boost FixedTime.cpp)
+target_compile_definitions(fixed_time_simd PRIVATE VELOX_BENCH_CHM_SIMD)
+target_compile_definitions(fixed_time_boost PRIVATE VELOX_BENCH_CHM_BOOST)
+target_link_libraries(fixed_time_simd PRIVATE Boost::unordered Folly::folly Folly::follybenchmark gflags::gflags glog::glog)
+target_link_libraries(fixed_time_boost PRIVATE Boost::unordered Folly::folly Folly::follybenchmark gflags::gflags glog::glog)
+
+add_executable(memory_cache_bench FixedTime.cpp)
+target_compile_features(memory_cache_bench PRIVATE cxx_std_20)
+target_compile_definitions(memory_cache_bench PRIVATE VELOX_BENCH_CHM_BOOST VELOX_BENCH_MEMORY_CACHE)
+target_link_libraries(memory_cache_bench PRIVATE Boost::unordered Folly::folly Folly::follybenchmark gflags::gflags glog::glog)

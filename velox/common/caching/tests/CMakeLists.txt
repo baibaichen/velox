@@ -57,3 +57,7 @@ target_link_libraries(
 )
 
 velox_add_library(velox_caching_test_util INTERFACE HEADERS CacheTestUtil.h)
+
+add_executable(memory_cache_test MemoryCacheTest.cpp)
+target_link_libraries(memory_cache_test PRIVATE Boost::unordered GTest::gtest GTest::gtest_main)
+add_test(NAME memory_cache_test COMMAND memory_cache_test)

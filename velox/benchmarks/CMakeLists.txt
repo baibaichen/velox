@@ -70,6 +70,7 @@ if(${VELOX_ENABLE_BENCHMARKS_BASIC})
 endif()
 
 if(${VELOX_ENABLE_BENCHMARKS})
+  add_subdirectory(concurrent_dictionary/cpp)
   add_subdirectory(tpch)
   add_subdirectory(tpcds)
   add_subdirectory(filesystem)
