@@ -51,6 +51,41 @@ class ArrayConstructor : public exec::VectorFunction {
     } else {
       elementsResult->resize(baseOffset + numArgs * rows.countSelected());
 
+      // Fixed-width flat inputs can be interleaved directly. Avoid building
+      // a target selection and source-row mapping for each argument.
+      bool copied = false;
+      switch (elementsResult->typeKind()) {
+        case TypeKind::TINYINT:
+          copied = copyFlatValues<int8_t>(
+              rows, args, elementsResult, baseOffset, rawOffsets, rawSizes);
+          break;
+        case TypeKind::SMALLINT:
+          copied = copyFlatValues<int16_t>(
+              rows, args, elementsResult, baseOffset, rawOffsets, rawSizes);
+          break;
+        case TypeKind::INTEGER:
+          copied = copyFlatValues<int32_t>(
+              rows, args, elementsResult, baseOffset, rawOffsets, rawSizes);
+          break;
+        case TypeKind::BIGINT:
+          copied = copyFlatValues<int64_t>(
+              rows, args, elementsResult, baseOffset, rawOffsets, rawSizes);
+          break;
+        case TypeKind::REAL:
+          copied = copyFlatValues<float>(
+              rows, args, elementsResult, baseOffset, rawOffsets, rawSizes);
+          break;
+        case TypeKind::DOUBLE:
+          copied = copyFlatValues<double>(
+              rows, args, elementsResult, baseOffset, rawOffsets, rawSizes);
+          break;
+        default:
+          break;
+      }
+      if (copied) {
+        return;
+      }
+
       if (shouldCopyRanges(elementsResult->type())) {
         std::vector<BaseVector::CopyRange> ranges;
         ranges.reserve(rows.end());
@@ -119,6 +154,58 @@ class ArrayConstructor : public exec::VectorFunction {
   }
 
  private:
+  template <typename T>
+  static bool copyFlatValues(
+      const SelectivityVector& rows,
+      const std::vector<VectorPtr>& args,
+      const VectorPtr& elements,
+      vector_size_t baseOffset,
+      int32_t* offsets,
+      int32_t* sizes) {
+    bool hasNulls = false;
+    for (const auto& arg : args) {
+      if (arg->encoding() != VectorEncoding::Simple::FLAT) {
+        return false;
+      }
+      hasNulls |= arg->mayHaveNulls();
+    }
+    auto* output = elements->as<FlatVector<T>>();
+    auto* values = output->mutableRawValues();
+    // Existing elements precede baseOffset and must keep their NULL bits.
+    if (output->mayHaveNulls()) {
+      output->clearNulls(baseOffset, elements->size());
+    }
+    std::vector<const FlatVector<T>*> inputs;
+    inputs.reserve(args.size());
+    for (const auto& arg : args) {
+      inputs.push_back(arg->as<FlatVector<T>>());
+    }
+    vector_size_t offset = baseOffset;
+    if (!hasNulls) {
+      rows.applyToSelected([&](auto row) {
+        offsets[row] = offset;
+        sizes[row] = args.size();
+        for (const auto* input : inputs) {
+          values[offset++] = input->valueAt(row);
+        }
+      });
+    } else {
+      rows.applyToSelected([&](auto row) {
+        offsets[row] = offset;
+        sizes[row] = args.size();
+        for (const auto* input : inputs) {
+          if (input->isNullAt(row)) {
+            output->setNull(offset, true);
+          } else {
+            values[offset] = input->valueAt(row);
+          }
+          ++offset;
+        }
+      });
+    }
+    return true;
+  }
+
   // BaseVector::copyRange is faster for arrays and maps and slower for
   // primitive types. Check if 'type' is an array or map or contains an array or
   // map. If so, return true, otherwise, false.
