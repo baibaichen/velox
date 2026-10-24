@@ -74,13 +74,37 @@ class Unnest : public Operator {
     // @param rawMaxSizes Used to compute the end of each row.
     // @param firstInnerRowStart The index to start processing the first row.
     // Same with Unnest member firstInnerRowStart_.
+    template <typename Func>
     void forEachRow(
-        const std::function<void(
-            vector_size_t /*row*/,
-            vector_size_t /*start*/,
-            vector_size_t /*size*/)>& func,
+        const Func& func,
         const vector_size_t* rawMaxSizes,
-        vector_size_t firstInnerRowStart) const;
+        vector_size_t firstInnerRowStart) const {
+      // Process the first row.
+      const auto firstInnerRowEnd =
+          numInputRows == 1 && lastInnerRowEnd.has_value()
+          ? lastInnerRowEnd.value()
+          : rawMaxSizes[startInputRow];
+      func(
+          startInputRow,
+          firstInnerRowStart,
+          firstInnerRowEnd - firstInnerRowStart);
+
+      const auto lastInputRow = startInputRow + numInputRows - 1;
+      // Process the middle rows.
+      for (auto inputRow = startInputRow + 1; inputRow < lastInputRow;
+           ++inputRow) {
+        func(inputRow, 0, rawMaxSizes[inputRow]);
+      }
+
+      // Process the last row if exists.
+      if (numInputRows > 1) {
+        if (lastInnerRowEnd.has_value()) {
+          func(lastInputRow, 0, lastInnerRowEnd.value());
+        } else {
+          func(lastInputRow, 0, rawMaxSizes[lastInputRow]);
+        }
+      }
+    }
 
     // First input row in 'input_' to be included in the output.
     const vector_size_t startInputRow;
@@ -120,7 +144,8 @@ class Unnest : public Operator {
   struct UnnestChannelEncoding {
     BufferPtr indices;
     BufferPtr nulls;
-    bool identityMapping;
+    bool contiguousMapping;
+    vector_size_t sourceStart;
 
     VectorPtr wrap(const VectorPtr& base, vector_size_t wrapSize) const;
   };
@@ -130,6 +155,11 @@ class Unnest : public Operator {
   const UnnestChannelEncoding generateEncodingForChannel(
       column_index_t channel,
       const RowRange& rowRange);
+
+  template <bool trackContiguity, bool knownNulls, bool deferIndices>
+  const UnnestChannelEncoding generateEncodingForChannelImpl(
+      column_index_t channel,
+      const RowRange& range);
 
   // Invoked by generateOutput for the ordinality column.
   VectorPtr generateOrdinalityVector(const RowRange& rowRange);

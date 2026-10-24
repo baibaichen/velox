@@ -17,10 +17,34 @@
 #include "velox/exec/Unnest.h"
 #include "velox/common/base/Nulls.h"
 #include "velox/exec/OperatorType.h"
+#include "velox/common/base/Portability.h"
 #include "velox/vector/FlatVector.h"
 
 namespace facebook::velox::exec {
 namespace {
+// Keep the materialization fallback for encodings that cannot be sliced
+// without loading, or would retain a dictionary's large alphabet. Row
+// slices recursively slice their children, unlike array and map slices.
+bool supportsCompactSlice(const VectorPtr& vector) {
+  switch (vector->encoding()) {
+    case VectorEncoding::Simple::FLAT:
+    case VectorEncoding::Simple::CONSTANT:
+    case VectorEncoding::Simple::BIASED:
+    case VectorEncoding::Simple::ARRAY:
+    case VectorEncoding::Simple::MAP:
+      return true;
+    case VectorEncoding::Simple::ROW:
+      for (const auto& child : vector->as<RowVector>()->children()) {
+        if (child && !supportsCompactSlice(child)) {
+          return false;
+        }
+      }
+      return true;
+    default:
+      return false;
+  }
+}
+
 #ifndef NDEBUG
 void debugCheckOutput(const RowVectorPtr& output) {
   for (auto i = 0; i < output->childrenSize(); ++i) {
@@ -299,11 +323,16 @@ void Unnest::generateRepeatedColumns(
   }
 }
 
-const Unnest::UnnestChannelEncoding Unnest::generateEncodingForChannel(
+template <bool trackContiguity, bool knownNulls, bool deferIndices>
+const Unnest::UnnestChannelEncoding Unnest::generateEncodingForChannelImpl(
     column_index_t channel,
     const RowRange& range) {
-  BufferPtr innerRowIndices = allocateIndices(range.numInnerRows, pool());
-  auto* rawInnerRowIndices = innerRowIndices->asMutable<vector_size_t>();
+  BufferPtr innerRowIndices;
+  if constexpr (!deferIndices) {
+    innerRowIndices = allocateIndices(range.numInnerRows, pool());
+  }
+  auto* rawInnerRowIndices =
+      innerRowIndices ? innerRowIndices->asMutable<vector_size_t>() : nullptr;
 
   auto nulls = allocateNulls(range.numInnerRows, pool());
   auto* rawNulls = nulls->asMutable<uint64_t>();
@@ -315,42 +344,105 @@ const Unnest::UnnestChannelEncoding Unnest::generateEncodingForChannel(
 
   // Make dictionary index for elements column since they may be out of order.
   vector_size_t index = 0;
-  bool identityMapping = true;
+  bool contiguousMapping = trackContiguity;
+  [[maybe_unused]] vector_size_t firstSourceIndex = 0;
+  // Until continuity fails, the mapping is fully described by its start
+  // and length. On failure, materialize that prefix once, then continue
+  // filling the ordinary indices. This avoids a second input-row scan.
+  auto ensureIndices = [&]() {
+    if constexpr (deferIndices) {
+      if (!innerRowIndices) {
+        innerRowIndices = allocateIndices(range.numInnerRows, pool());
+        rawInnerRowIndices = innerRowIndices->asMutable<vector_size_t>();
+        std::iota(
+            rawInnerRowIndices, rawInnerRowIndices + index, firstSourceIndex);
+      }
+    }
+  };
+
   VELOX_DCHECK_GT(range.numInputRows, 0);
 
   range.forEachRow(
-      [&](vector_size_t row, vector_size_t start, vector_size_t size) {
-        const auto end = start + size;
-        if (size == 0 && withMarker_) {
-          identityMapping = false;
-          bits::setNull(rawNulls, index++, true);
-        } else if (!currentDecoded.isNullAt(row)) {
-          const auto offset = currentOffsets[currentIndices[row]];
-          const auto unnestSize = currentSizes[currentIndices[row]];
-          // The 'identityMapping' is false when there exists a partially
-          // processed row.
-          if (index != offset || start != 0 || end != rawMaxSizes_[row] ||
-              unnestSize < end) {
-            identityMapping = false;
-          }
-          const auto currentUnnestSize = std::min(end, unnestSize);
-          for (auto i = start; i < currentUnnestSize; ++i) {
-            rawInnerRowIndices[index++] = offset + i;
-          }
-          for (auto i = std::max(start, currentUnnestSize); i < end; ++i) {
-            bits::setNull(rawNulls, index++, true);
-          }
-        } else if (size > 0) {
-          identityMapping = false;
-          for (auto i = start; i < end; ++i) {
-            bits::setNull(rawNulls, index++, true);
-          }
-        }
-      },
+      [&](vector_size_t row, vector_size_t start, vector_size_t size)
+          INLINE_LAMBDA {
+            const auto end = start + size;
+            if (size == 0 && withMarker_) {
+              ensureIndices();
+              contiguousMapping = false;
+              bits::setNull(rawNulls, index++, true);
+            } else if (!currentDecoded.isNullAt(row)) {
+              const auto offset = currentOffsets[currentIndices[row]];
+              const auto unnestSize = currentSizes[currentIndices[row]];
+              const auto currentUnnestSize = std::min(end, unnestSize);
+              if constexpr (trackContiguity) {
+                if (contiguousMapping && currentUnnestSize > start) {
+                  const auto sourceStart = offset + start;
+                  if (index == 0) {
+                    firstSourceIndex = sourceStart;
+                  }
+                  // A contiguous slice may start at a non-zero source offset or
+                  // cover only part of an input row. Empty rows add no mapping.
+                  if (static_cast<int64_t>(sourceStart) !=
+                      static_cast<int64_t>(firstSourceIndex) + index) {
+                    ensureIndices();
+                    contiguousMapping = false;
+                  }
+                }
+              }
+              if constexpr (deferIndices) {
+                if (!innerRowIndices) {
+                  index +=
+                      std::max<vector_size_t>(0, currentUnnestSize - start);
+                } else {
+                  for (auto i = start; i < currentUnnestSize; ++i) {
+                    rawInnerRowIndices[index++] = offset + i;
+                  }
+                }
+              } else {
+                for (auto i = start; i < currentUnnestSize; ++i) {
+                  rawInnerRowIndices[index++] = offset + i;
+                }
+              }
+              if (std::max(start, currentUnnestSize) < end) {
+                ensureIndices();
+                contiguousMapping = false;
+              }
+              for (auto i = std::max(start, currentUnnestSize); i < end; ++i) {
+                bits::setNull(rawNulls, index++, true);
+              }
+            } else if (size > 0) {
+              ensureIndices();
+              contiguousMapping = false;
+              for (auto i = start; i < end; ++i) {
+                bits::setNull(rawNulls, index++, true);
+              }
+            }
+          },
       rawMaxSizes_,
       firstInnerRowStart_);
 
-  return {innerRowIndices, nulls, identityMapping};
+  return {innerRowIndices, nulls, contiguousMapping, firstSourceIndex};
+}
+
+const Unnest::UnnestChannelEncoding Unnest::generateEncodingForChannel(
+    column_index_t channel,
+    const RowRange& range) {
+  if (withMarker_ && range.hasEmptyUnnestValue) {
+    return generateEncodingForChannelImpl<true, true, false>(channel, range);
+  }
+  const auto* base = unnestDecoded_[channel].base();
+  bool canSlice;
+  if (base->typeKind() == TypeKind::ARRAY) {
+    canSlice = supportsCompactSlice(base->as<ArrayVector>()->elements());
+  } else {
+    const auto* map = base->as<MapVector>();
+    canSlice = supportsCompactSlice(map->mapKeys()) &&
+        supportsCompactSlice(map->mapValues());
+  }
+  if (canSlice) {
+    return generateEncodingForChannelImpl<true, false, true>(channel, range);
+  }
+  return generateEncodingForChannelImpl<true, false, false>(channel, range);
 }
 
 VectorPtr Unnest::generateOrdinalityVector(const RowRange& range) {
@@ -431,7 +523,9 @@ VectorPtr Unnest::generateMarkerVector(const RowRange& range) {
 
 RowVectorPtr Unnest::generateOutput(const RowRange& range) {
   std::vector<VectorPtr> outputs(outputType_->size());
-  generateRepeatedColumns(range, outputs);
+  if (!identityProjections_.empty()) {
+    generateRepeatedColumns(range, outputs);
+  }
 
   // Create unnest columns, one per emitted output column. Pruned columns are
   // absent from 'unnestOutputColumns_', so a fully pruned channel builds no
@@ -482,16 +576,26 @@ RowVectorPtr Unnest::generateOutput(const RowRange& range) {
 VectorPtr Unnest::UnnestChannelEncoding::wrap(
     const VectorPtr& base,
     vector_size_t wrapSize) const {
-  if (identityMapping) {
-    if (wrapSize == base->size()) {
+  if (contiguousMapping && supportsCompactSlice(base)) {
+    if (sourceStart == 0 && wrapSize == base->size()) {
       return base;
     }
-    auto* rawIndices = indices->asMutable<vector_size_t>();
-    return base->slice(rawIndices[0], wrapSize);
+    return base->slice(sourceStart, wrapSize);
   }
 
   const auto result =
       BaseVector::wrapInDictionary(nulls, indices, wrapSize, base);
+
+  if (base->typeKind() == TypeKind::VARCHAR ||
+      base->typeKind() == TypeKind::VARBINARY) {
+    // The selectivity-vector overload decodes dictionary indices/nulls
+    // once instead of invoking StringView dictionary accessors per row.
+    // Keep the existing flat output and shared string-buffer ownership.
+    auto flat = BaseVector::create(base->type(), wrapSize, base->pool());
+    SelectivityVector rows(wrapSize);
+    flat->copy(result.get(), rows, nullptr);
+    return flat;
+  }
 
   // Dictionary vectors whose size is much smaller than the size of the
   // 'alphabet' (base vector) create efficiency problems downstream. For
@@ -514,33 +618,4 @@ bool Unnest::isFinished() {
   return noMoreInput_ && input_ == nullptr;
 }
 
-void Unnest::RowRange::forEachRow(
-    const std::function<void(
-        vector_size_t /*row*/,
-        vector_size_t /*start*/,
-        vector_size_t /*size*/)>& func,
-    const vector_size_t* rawMaxSizes,
-    vector_size_t firstInnerRowStart) const {
-  // Process the first row.
-  const auto firstInnerRowEnd = numInputRows == 1 && lastInnerRowEnd.has_value()
-      ? lastInnerRowEnd.value()
-      : rawMaxSizes[startInputRow];
-  func(
-      startInputRow, firstInnerRowStart, firstInnerRowEnd - firstInnerRowStart);
-
-  const auto lastInputRow = startInputRow + numInputRows - 1;
-  // Process the middle rows.
-  for (auto inputRow = startInputRow + 1; inputRow < lastInputRow; ++inputRow) {
-    func(inputRow, 0, rawMaxSizes[inputRow]);
-  }
-
-  // Process the last row if exists.
-  if (numInputRows > 1) {
-    if (lastInnerRowEnd.has_value()) {
-      func(lastInputRow, 0, lastInnerRowEnd.value());
-    } else {
-      func(lastInputRow, 0, rawMaxSizes[lastInputRow]);
-    }
-  }
-}
 } // namespace facebook::velox::exec
