@@ -139,8 +139,20 @@ struct RemainderFunction {
       const std::vector<TypePtr>& /*inputTypes*/,
       const core::QueryConfig& config,
       const TInput* /*a*/,
-      const TInput* /*n*/) {
+      const TInput* n) {
     ansiEnabled_ = SparkQueryConfig{config}.ansiEnabled();
+    divisor_ = 0;
+    reciprocal_ = 0;
+    if constexpr (
+        std::is_integral_v<TInput> && sizeof(TInput) <= sizeof(uint64_t)) {
+      if (n != nullptr && *n != 0 && *n != 1 && *n != -1) {
+        divisor_ = *n < 0 ? uint64_t{0} - static_cast<uint64_t>(*n)
+                          : static_cast<uint64_t>(*n);
+        // floor(2^64 / divisor), computed once per constant argument.
+        reciprocal_ = static_cast<uint64_t>(
+            (static_cast<__uint128_t>(1) << 64) / divisor_);
+      }
+    }
   }
 
   template <
@@ -159,6 +171,71 @@ struct RemainderFunction {
     // int64_t.
     if (UNLIKELY(n == 1 || n == -1)) {
       result = 0;
+    } else if (divisor_ != 0) {
+      // Small constant divisors use compiler-generated signed magic-number
+      // sequences. Keep the general reciprocal path for other constants.
+      switch (divisor_) {
+        case 2:
+          result = a % 2;
+          return true;
+        case 3:
+          result = a % 3;
+          return true;
+        case 4:
+          result = a % 4;
+          return true;
+        case 5:
+          result = a % 5;
+          return true;
+        case 6:
+          result = a % 6;
+          return true;
+        case 7:
+          result = a % 7;
+          return true;
+        case 8:
+          result = a % 8;
+          return true;
+        case 9:
+          result = a % 9;
+          return true;
+        case 10:
+          result = a % 10;
+          return true;
+        case 11:
+          result = a % 11;
+          return true;
+        case 12:
+          result = a % 12;
+          return true;
+        case 13:
+          result = a % 13;
+          return true;
+        case 14:
+          result = a % 14;
+          return true;
+        case 15:
+          result = a % 15;
+          return true;
+        case 16:
+          result = a % 16;
+          return true;
+        default:
+          break;
+      }
+      // Work with unsigned magnitudes so INT64_MIN is representable.
+      // Multiplying by floor(2^64/d) underestimates the quotient by at
+      // most one; a single subtraction corrects the remainder.
+      const uint64_t magnitude = a < 0 ? uint64_t{0} - static_cast<uint64_t>(a)
+                                       : static_cast<uint64_t>(a);
+      const auto quotient = static_cast<uint64_t>(
+          (static_cast<__uint128_t>(magnitude) * reciprocal_) >> 64);
+      auto remainder = magnitude - quotient * divisor_;
+      if (remainder >= divisor_) {
+        remainder -= divisor_;
+      }
+      result = a < 0 ? -static_cast<int64_t>(remainder)
+                     : static_cast<int64_t>(remainder);
     } else {
       result = a % n;
     }
@@ -193,6 +270,8 @@ struct RemainderFunction {
 
  private:
   bool ansiEnabled_ = false;
+  uint64_t divisor_{0};
+  uint64_t reciprocal_{0};
 };
 
 template <typename T>
