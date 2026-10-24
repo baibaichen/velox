@@ -195,6 +195,30 @@ void SwitchExpr::evalSpecialForm(
   if (deferredRows.get() != nullptr) {
     if (localResult == nullptr) {
       inputs_[1]->eval(*deferredRows.get(), context, localResult);
+    } else if (
+        localResult.use_count() == 1 &&
+        localResult->encoding() == VectorEncoding::Simple::ARRAY &&
+        localResult->size() >= rows.end()) {
+      // A newly produced ELSE array already describes every payload row.
+      // When its vector object is exclusive, change only the constant-branch
+      // rows. Shared metadata buffers use the existing copy-on-write accessors;
+      // the elements are never mutated. Nested IFs can reuse this same object.
+      auto* array = localResult->as<ArrayVector>();
+      array->resetDataDependentFlags(deferredRows.get());
+      auto* offsets =
+          array->mutableOffsets(array->size())->asMutable<vector_size_t>();
+      auto* sizes =
+          array->mutableSizes(array->size())->asMutable<vector_size_t>();
+      auto* nulls = (nullThen || array->mayHaveNulls())
+          ? array->mutableRawNulls()
+          : nullptr;
+      deferredRows->applyToSelected([&](auto row) {
+        offsets[row] = 0;
+        sizes[row] = 0;
+        if (nulls != nullptr) {
+          bits::setNull(nulls, row, nullThen);
+        }
+      });
     } else {
       auto merged =
           BaseVector::create<ArrayVector>(type(), rows.end(), context.pool());
