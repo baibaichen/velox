@@ -201,6 +201,11 @@ class Unnest : public Operator {
   std::vector<const vector_size_t*> rawOffsets_;
   std::vector<const vector_size_t*> rawIndices_;
 
+  // True only for one inner unnest column with slice-compatible elements.
+  // The offset advances across output batches, including splits inside a row.
+  bool singleContiguousInput_{false};
+  vector_size_t contiguousOutputOffset_{0};
+
   // Next 'input_' row to process in getOutput().
   vector_size_t nextInputRow_{0};
 };

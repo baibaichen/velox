@@ -127,6 +127,8 @@ Unnest::Unnest(
 
 void Unnest::addInput(RowVectorPtr input) {
   input_ = std::move(input);
+  singleContiguousInput_ = false;
+  contiguousOutputOffset_ = 0;
 
   for (auto& child : input_->children()) {
     child->loadedVector();
@@ -163,13 +165,67 @@ void Unnest::addInput(RowVectorPtr input) {
       rawOffsets_[channel] = unnestBaseMap->rawOffsets();
     }
 
-    // Count max number of elements per row.
-    auto* currentSizes = rawSizes_[channel];
-    auto* currentIndices = rawIndices_[channel];
-    for (auto row = 0; row < size; ++row) {
-      if (!currentDecoded.isNullAt(row)) {
-        const auto unnestSize = currentSizes[currentIndices[row]];
-        rawMaxSizes_[row] = std::max(rawMaxSizes_[row], unnestSize);
+    // A single inner unnest has no cross-column padding. Check continuity
+    // while visiting sizes, so getOutput can reuse the contiguous mapping
+    // without scanning these rows again or allocating mapping buffers.
+    bool canUseContiguousInput = unnestChannels_.size() == 1 && !withMarker_;
+    if (canUseContiguousInput) {
+      const auto* base = currentDecoded.base();
+      if (base->typeKind() == TypeKind::ARRAY) {
+        canUseContiguousInput =
+            supportsCompactSlice(base->as<ArrayVector>()->elements());
+      } else {
+        const auto* map = base->as<MapVector>();
+        canUseContiguousInput = supportsCompactSlice(map->mapKeys()) &&
+            supportsCompactSlice(map->mapValues());
+      }
+    }
+    if (canUseContiguousInput) {
+      singleContiguousInput_ = true;
+      bool foundSource = false;
+      int64_t expectedOffset = 0;
+      const auto* sizes = rawSizes_[channel];
+      const auto* offsets = rawOffsets_[channel];
+      const auto* indices = rawIndices_[channel];
+      vector_size_t row = 0;
+      for (; row < size; ++row) {
+        if (!currentDecoded.isNullAt(row)) {
+          const auto index = indices[row];
+          const auto length = sizes[index];
+          rawMaxSizes_[row] = length;
+          if (length > 0) {
+            const auto offset = offsets[index];
+            if (!foundSource) {
+              contiguousOutputOffset_ = offset;
+              expectedOffset = offset;
+              foundSource = true;
+            }
+            if (offset != expectedOffset) {
+              singleContiguousInput_ = false;
+              ++row;
+              break;
+            }
+            expectedOffset += length;
+          }
+        }
+      }
+      // Once a gap is found, no later row can make the batch contiguous.
+      // Finish the size scan without continuity checks or a serial offset
+      // dependency. This keeps alternating and late-gap inputs inexpensive.
+      for (; row < size; ++row) {
+        if (!currentDecoded.isNullAt(row)) {
+          rawMaxSizes_[row] = sizes[indices[row]];
+        }
+      }
+    } else {
+      // Count max number of elements per row.
+      auto* currentSizes = rawSizes_[channel];
+      auto* currentIndices = rawIndices_[channel];
+      for (auto row = 0; row < size; ++row) {
+        if (!currentDecoded.isNullAt(row)) {
+          const auto unnestSize = currentSizes[currentIndices[row]];
+          rawMaxSizes_[row] = std::max(rawMaxSizes_[row], unnestSize);
+        }
       }
     }
   }
@@ -203,6 +259,9 @@ RowVectorPtr Unnest::getOutput() {
 
   const auto output = generateOutput(rowRange);
   VELOX_CHECK_NOT_NULL(output);
+  if (singleContiguousInput_) {
+    contiguousOutputOffset_ += rowRange.numInnerRows;
+  }
   if (rowRange.lastInnerRowEnd.has_value()) {
     // The last row is not processed completely.
     firstInnerRowStart_ = rowRange.lastInnerRowEnd.value();
@@ -427,6 +486,9 @@ const Unnest::UnnestChannelEncoding Unnest::generateEncodingForChannelImpl(
 const Unnest::UnnestChannelEncoding Unnest::generateEncodingForChannel(
     column_index_t channel,
     const RowRange& range) {
+  if (singleContiguousInput_) {
+    return {nullptr, nullptr, true, contiguousOutputOffset_};
+  }
   if (withMarker_ && range.hasEmptyUnnestValue) {
     return generateEncodingForChannelImpl<true, true, false>(channel, range);
   }
