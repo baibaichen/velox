@@ -15,6 +15,7 @@
  */
 #include "velox/expression/SwitchExpr.h"
 #include "velox/expression/BooleanMix.h"
+#include "velox/expression/ConstantExpr.h"
 #include "velox/expression/ExprConstants.h"
 #include "velox/expression/FieldReference.h"
 #include "velox/type/TypeCoercer.h"
@@ -96,6 +97,33 @@ void SwitchExpr::evalSpecialForm(
     }
   }
 
+  // A NULL/empty-array THEN branch has no elements to merge. Evaluate the
+  // other branch without a pre-existing result, then combine only metadata.
+  // For example IF(c, [], array(x, y)) can share array(x, y)'s elements.
+  const ConstantExpr* emptyThen = nullptr;
+  bool nullThen = false;
+  if (type()->isArray() && numCases_ == 1 && hasElseClause_) {
+    const auto* constant = dynamic_cast<const ConstantExpr*>(inputs_[1].get());
+    if (constant != nullptr) {
+      const auto& value = constant->value();
+      nullThen = value->isNullAt(0);
+      if (nullThen ||
+          value->wrappedVector()->as<ArrayVector>()->sizeAt(
+              value->wrappedIndex(0)) == 0) {
+        emptyThen = constant;
+      }
+    }
+  }
+  LocalSelectivityVector deferredRows(context);
+  auto evaluateThen = [&](size_t i, const SelectivityVector& selected) {
+    if (emptyThen != nullptr) {
+      deferredRows.get(selected.end(), false);
+      *deferredRows.get() = selected;
+    } else {
+      inputs_[2 * i + 1]->eval(selected, context, localResult);
+    }
+  };
+
   VectorPtr condition;
   const uint64_t* values;
 
@@ -127,7 +155,7 @@ void SwitchExpr::evalSpecialForm(
         nullptr);
     switch (booleanMix) {
       case BooleanMix::kAllTrue:
-        inputs_[2 * i + 1]->eval(*remainingRows.get(), context, localResult);
+        evaluateThen(i, *remainingRows.get());
         remainingRows->clearAll();
         continue;
       case BooleanMix::kAllNull:
@@ -144,7 +172,7 @@ void SwitchExpr::evalSpecialForm(
         thenRows.get()->updateBounds();
 
         if (thenRows.get()->hasSelections()) {
-          inputs_[2 * i + 1]->eval(*thenRows.get(), context, localResult);
+          evaluateThen(i, *thenRows.get());
           remainingRows.get()->deselect(*thenRows.get());
         }
       }
@@ -161,6 +189,52 @@ void SwitchExpr::evalSpecialForm(
       // fill in nulls for remainingRows
       remainingRows.get()->applyToSelected(
           [&](auto row) { localResult->setNull(row, true); });
+    }
+  }
+
+  if (deferredRows.get() != nullptr) {
+    if (localResult == nullptr) {
+      inputs_[1]->eval(*deferredRows.get(), context, localResult);
+    } else {
+      auto merged =
+          BaseVector::create<ArrayVector>(type(), rows.end(), context.pool());
+      // Initialize holes in bulk and update the owned metadata directly.
+      // Calling setNull per row would repeatedly check NULL-buffer capacity.
+      auto* offsets =
+          merged->mutableOffsets(rows.end())->asMutable<vector_size_t>();
+      auto* sizes =
+          merged->mutableSizes(rows.end())->asMutable<vector_size_t>();
+      std::fill(offsets, offsets + rows.end(), 0);
+      std::fill(sizes, sizes + rows.end(), 0);
+      auto nulls = allocateNulls(rows.end(), context.pool(), bits::kNull);
+      auto* rawNulls = nulls->asMutable<uint64_t>();
+      merged->setNulls(nulls);
+      LocalSelectivityVector payloadRows(context, rows);
+      payloadRows->deselect(*deferredRows.get());
+      if (context.errors()) {
+        context.deselectErrors(*payloadRows);
+      }
+      if (payloadRows->hasSelections()) {
+        LocalDecodedVector decoded(context, *localResult, *payloadRows);
+        const auto* source = decoded->base()->as<ArrayVector>();
+        // A constant NULL array has no underlying ArrayVector.
+        if (source != nullptr) {
+          merged->setElements(source->elements());
+        }
+        payloadRows->applyToSelected([&](auto row) {
+          if (!decoded->isNullAt(row)) {
+            auto index = decoded->index(row);
+            bits::setNull(rawNulls, row, false);
+            offsets[row] = source->offsetAt(index);
+            sizes[row] = source->sizeAt(index);
+          }
+        });
+      }
+      if (!nullThen) {
+        deferredRows->applyToSelected(
+            [&](auto row) { bits::setNull(rawNulls, row, false); });
+      }
+      localResult = std::move(merged);
     }
   }
 
