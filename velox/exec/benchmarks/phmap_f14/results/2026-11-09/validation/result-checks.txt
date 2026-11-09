@@ -1,0 +1,112 @@
+Verified: 360 paired cases, 7 rounds, 5040 estimates, 120 memory rows; source hashes match.
+Run: 2026-11-09T15:09:55.688700+00:00 2026-11-09T15:35:48.918284+00:00
+Load: [0.5830078125, 1.21435546875, 3.30126953125] [2.28515625, 2.05419921875, 2.08642578125] RSS KiB: 101060
+typical_range Counter({'no_stable_5pct_winner': 132, 'phmap': 79, 'F14': 55, 'unconverged': 34})
+grow Counter({'F14': 13, 'unconverged': 11, 'phmap': 1})
+reserved Counter({'F14': 15, 'unconverged': 5, 'no_stable_5pct_winner': 4, 'phmap': 1})
+duplicate Counter({'phmap': 25, 'no_stable_5pct_winner': 25})
+mixed_insert Counter({'no_stable_5pct_winner': 27, 'phmap': 15, 'F14': 8})
+find_hit Counter({'no_stable_5pct_winner': 39, 'phmap': 8, 'unconverged': 2, 'F14': 1})
+find_miss Counter({'no_stable_5pct_winner': 21, 'phmap': 18, 'F14': 11})
+find_half Counter({'unconverged': 16, 'no_stable_5pct_winner': 16, 'phmap': 11, 'F14': 7})
+container_stress Counter({'no_stable_5pct_winner': 25, 'unconverged': 23, 'phmap': 8, 'F14': 4})
+grow Counter({'unconverged': 5})
+reserved Counter({'unconverged': 5})
+duplicate Counter({'no_stable_5pct_winner': 7, 'unconverged': 2, 'phmap': 1})
+mixed_insert Counter({'no_stable_5pct_winner': 4, 'phmap': 3, 'unconverged': 2, 'F14': 1})
+find_hit Counter({'no_stable_5pct_winner': 7, 'unconverged': 2, 'phmap': 1})
+find_miss Counter({'unconverged': 6, 'F14': 2, 'no_stable_5pct_winner': 1, 'phmap': 1})
+find_half Counter({'no_stable_5pct_winner': 6, 'phmap': 2, 'F14': 1, 'unconverged': 1})
+Numeric uniform table: NDV, operation, F14 ns, phmap ns, ratio, winner, unconverged count
+16 duplicate/uniform 1.7328 1.5179 0.8764 phmap 0
+16 find_half/uniform 1.4043 1.2605 0.8976 unconverged 1
+16 find_hit/uniform 1.5612 1.4847 0.951 no_stable_5pct_winner 0
+16 find_miss/uniform 0.9162 1.0665 1.1635 F14 0
+16 grow 9.7193 20.8514 2.1468 F14 0
+16 mixed_insert/uniform 2.3196 2.303 0.9929 no_stable_5pct_winner 0
+16 reserved 4.8238 6.8785 1.425 F14 0
+300 duplicate/uniform 1.9559 1.6659 0.8601 phmap 0
+300 find_half/uniform 1.4013 1.2565 0.8993 unconverged 4
+300 find_hit/uniform 1.8631 1.6687 0.8944 phmap 0
+300 find_miss/uniform 1.0329 1.0436 1.01 no_stable_5pct_winner 0
+300 grow 7.2622 11.1793 1.544 F14 0
+300 mixed_insert/uniform 1.8184 1.81 0.9943 no_stable_5pct_winner 0
+300 reserved 3.3877 3.9838 1.1816 unconverged 1
+4096 duplicate/uniform 2.1646 1.9087 0.8812 phmap 0
+4096 find_half/uniform 1.6689 1.5709 0.9386 no_stable_5pct_winner 0
+4096 find_hit/uniform 2.0691 1.8685 0.903 phmap 0
+4096 find_miss/uniform 1.2287 1.1145 0.9108 phmap 0
+4096 grow 10.4395 16.1055 1.5148 unconverged 1
+4096 mixed_insert/uniform 2.1845 2.0311 0.9295 phmap 0
+4096 reserved 3.128 3.5026 1.127 F14 0
+32768 duplicate/uniform 2.5273 2.4752 0.973 no_stable_5pct_winner 0
+32768 find_half/uniform 6.2421 5.8688 0.9397 phmap 0
+32768 find_hit/uniform 2.4018 2.4501 1.0217 no_stable_5pct_winner 0
+32768 find_miss/uniform 1.7842 1.6435 0.9203 phmap 0
+32768 grow 8.7282 13.2483 1.5128 F14 0
+32768 mixed_insert/uniform 2.6378 2.5946 0.9949 no_stable_5pct_winner 0
+32768 reserved 3.4907 3.8577 1.1007 F14 0
+90000 duplicate/uniform 3.6444 3.2671 0.8882 phmap 0
+90000 find_half/uniform 8.3277 6.7579 0.8113 phmap 0
+90000 find_hit/uniform 3.5324 3.2592 0.9203 phmap 0
+90000 find_miss/uniform 4.3209 2.8334 0.655 phmap 0
+90000 grow 8.6676 11.9153 1.4009 unconverged 1
+90000 mixed_insert/uniform 3.8292 3.3404 0.8687 phmap 0
+90000 reserved 4.6598 4.3107 0.9251 unconverged 1
+100000 duplicate/uniform 3.6991 3.3492 0.9054 phmap 0
+100000 find_half/uniform 7.3633 7.5673 1.0252 no_stable_5pct_winner 0
+100000 find_hit/uniform 3.5395 3.3823 0.9555 no_stable_5pct_winner 0
+100000 find_miss/uniform 2.5717 4.2755 1.6719 F14 0
+100000 grow 16.9115 10.7854 0.6382 unconverged 2
+100000 mixed_insert/uniform 12.8481 3.465 0.2699 phmap 0
+100000 reserved 4.8664 4.4661 0.9184 unconverged 1
+String 4K: kind, operation, F14 ns, phmap ns, ratio, winner, unconverged count
+str128 duplicate/hot 8.7934 8.3739 0.9522 no_stable_5pct_winner 0
+str128 duplicate/uniform 10.3678 10.2562 0.9905 no_stable_5pct_winner 0
+str128 find_half/hot 13.3162 13.4508 1.0078 no_stable_5pct_winner 0
+str128 find_half/uniform 14.2872 14.7781 1.0319 no_stable_5pct_winner 0
+str128 find_hit/hot 8.6836 8.2197 0.945 no_stable_5pct_winner 0
+str128 find_hit/uniform 10.2564 10.1395 0.9886 no_stable_5pct_winner 0
+str128 find_miss/hot 6.0337 5.8099 0.9607 no_stable_5pct_winner 0
+str128 find_miss/uniform 5.8627 6.2698 1.0653 no_stable_5pct_winner 0
+str128 grow 22.5636 29.4287 1.2384 unconverged 1
+str128 mixed_insert/hot 9.252 11.1894 1.1923 F14 0
+str128 mixed_insert/uniform 10.1933 12.0243 1.182 F14 0
+str128 reserved 7.537 9.23 1.2235 F14 0
+str24 duplicate/hot 3.9911 3.7944 0.953 no_stable_5pct_winner 0
+str24 duplicate/uniform 4.9554 4.6342 0.9355 phmap 0
+str24 find_half/hot 5.9415 6.9419 1.1774 unconverged 1
+str24 find_half/uniform 6.5897 7.5263 1.1412 F14 0
+str24 find_hit/hot 3.9695 3.8139 0.9633 no_stable_5pct_winner 0
+str24 find_hit/uniform 4.8955 4.6297 0.9453 phmap 0
+str24 find_miss/hot 2.617 1.8233 0.6952 phmap 0
+str24 find_miss/uniform 2.3367 2.5026 1.071 F14 0
+str24 grow 13.859 19.2485 1.3794 unconverged 1
+str24 mixed_insert/hot 5.0091 5.2389 1.0389 no_stable_5pct_winner 0
+str24 mixed_insert/uniform 5.664 5.7498 1.0138 no_stable_5pct_winner 0
+str24 reserved 4.0763 4.6431 1.1431 F14 0
+str8 duplicate/hot 1.8254 1.6714 0.9115 phmap 0
+str8 duplicate/uniform 2.1409 1.9209 0.8955 phmap 0
+str8 find_half/hot 1.393 1.349 0.9745 unconverged 2
+str8 find_half/uniform 1.6411 1.5966 0.9606 unconverged 1
+str8 find_hit/hot 1.6629 1.6495 0.9848 no_stable_5pct_winner 0
+str8 find_hit/uniform 2.0346 1.8723 0.9203 phmap 0
+str8 find_miss/hot 1.128 1.0983 0.9741 no_stable_5pct_winner 0
+str8 find_miss/uniform 1.2405 1.1184 0.9009 phmap 0
+str8 grow 9.2723 12.2703 1.5547 unconverged 2
+str8 mixed_insert/hot 1.9426 1.8802 0.9656 no_stable_5pct_winner 0
+str8 mixed_insert/uniform 2.1953 2.0211 0.9202 phmap 0
+str8 reserved 3.1051 3.5244 1.1398 F14 0
+Memory: NDV, container, live KiB, peak KiB, allocations
+16 F14 0.5 0.734375 4
+16 phmap 0.53125 0.796875 5
+300 F14 8.0 12.0 8
+300 phmap 8.5 12.75 9
+4096 F14 128.0 192.5 13
+4096 phmap 136.0 204.0 13
+32768 F14 1024.0 1540.0 19
+32768 phmap 1088.0 1632.0 16
+90000 F14 2048.0 3080.0 21
+90000 phmap 2176.0 3264.0 17
+100000 F14 4096.0 6160.0 23
+100000 phmap 2176.0 3264.0 17

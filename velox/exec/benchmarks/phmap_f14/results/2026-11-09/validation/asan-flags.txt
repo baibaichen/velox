@@ -1,0 +1,1 @@
+CMAKE_CXX_FLAGS_RELEASE:STRING=-O1 -g -DNDEBUG -fsanitize=address,undefined -fno-omit-frame-pointer

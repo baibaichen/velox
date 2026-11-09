@@ -1,0 +1,11 @@
+Verified str24/4096
+For before/after comparisons, try `folly/tool/benchmark_ab.py --help`.
+============================================================================
+[...]phmap_f14/UniqueValueSetBenchmark.cpp     relative  time/iter   iters/s
+============================================================================
+F14/grow                                                  287.09ns     3.48M
+F14/mixed_insert/uniform                                  153.07ns     6.53M
+F14/find_hit/uniform                                       81.49ns    12.27M
+phmap/grow                                                225.42ns     4.44M
+phmap/mixed_insert/uniform                                 80.38ns    12.44M
+phmap/find_hit/uniform                                     57.54ns    17.38M

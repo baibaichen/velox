@@ -1,0 +1,8 @@
+[
+{
+  "directory": "/tmp/velox-phmap-f14-20261109/build",
+  "command": "/usr/bin/c++ -DBOOST_ATOMIC_DYN_LINK -DBOOST_ATOMIC_NO_LIB -DBOOST_CONTEXT_DYN_LINK -DBOOST_CONTEXT_NO_LIB -DBOOST_FILESYSTEM_DYN_LINK -DBOOST_FILESYSTEM_NO_LIB -DBOOST_PROGRAM_OPTIONS_DYN_LINK -DBOOST_PROGRAM_OPTIONS_NO_LIB -DBOOST_REGEX_DYN_LINK -DBOOST_REGEX_NO_LIB -DGFLAGS_IS_A_DLL=0 -DGLOG_CUSTOM_PREFIX_SUPPORT -I/home/chang/OpenSource/velox -I/tmp/velox-phmap-f14-20261109/phmap -I/home/chang/OpenSource/velox/velox/external/xxhash -isystem /usr/include/libdwarf -O3 -DNDEBUG -std=gnu++20 -mavx2 -mfma -mavx -mf16c -mlzcnt -mbmi2 -Wall -Wextra -Wno-unused-parameter -o CMakeFiles/unique_value_set_benchmark.dir/UniqueValueSetBenchmark.cpp.o -c /home/chang/OpenSource/velox/velox/exec/benchmarks/phmap_f14/UniqueValueSetBenchmark.cpp",
+  "file": "/home/chang/OpenSource/velox/velox/exec/benchmarks/phmap_f14/UniqueValueSetBenchmark.cpp",
+  "output": "CMakeFiles/unique_value_set_benchmark.dir/UniqueValueSetBenchmark.cpp.o"
+}
+]

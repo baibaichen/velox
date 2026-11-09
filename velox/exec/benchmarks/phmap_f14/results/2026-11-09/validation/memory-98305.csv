@@ -1,0 +1,5 @@
+container,kind,ndv,mode,object_bytes,live_bytes,peak_bytes,allocations,string_payload_bytes
+F14,i64_random,98305,grow,24,4194304,6307840,23,0
+phmap,i64_random,98305,grow,48,2228224,3342336,17,0
+F14,i64_random,98305,reserved,24,4194304,4194304,1,0
+phmap,i64_random,98305,reserved,48,2228224,2228224,1,0
